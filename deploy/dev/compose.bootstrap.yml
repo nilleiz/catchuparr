@@ -1,0 +1,37 @@
+name: catchuparr-dev
+
+# First Portainer stack revision. Restore and scrub the copied database before
+# adding the application services from compose.runtime.yml.
+services:
+  db:
+    image: postgres:17
+    container_name: catchuparr-dev-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dispatcharr_dev
+      POSTGRES_USER: dispatcharr_dev
+      POSTGRES_PASSWORD: ${DEV_POSTGRES_PASSWORD:?set-in-portainer}
+    volumes:
+      - ${DEV_DATA_ROOT:?set-in-portainer}/postgres:/var/lib/postgresql/data
+    networks: [private]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U dispatcharr_dev -d dispatcharr_dev']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7
+    container_name: catchuparr-dev-redis
+    restart: unless-stopped
+    command: [redis-server, --save, '', --appendonly, 'no']
+    networks: [private]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+networks:
+  private:
+    name: catchuparr-dev-private
+    internal: true

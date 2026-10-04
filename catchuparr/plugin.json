@@ -1,0 +1,47 @@
+{
+  "name": "Catchuparr",
+  "version": "0.1.0",
+  "description": "Local rolling catch-up archive and start-over for Dispatcharr",
+  "author": "nilleiz",
+  "help_url": "https://github.com/nilleiz/catchuparr",
+  "fields": [
+    {
+      "id": "channel_uuids",
+      "label": "Channel UUIDs (one per line)",
+      "type": "text",
+      "default": "",
+      "help_text": "Only selected channels are recorded."
+    },
+    {
+      "id": "archive_root",
+      "label": "Archive path",
+      "type": "string",
+      "default": "/data/catchuparr",
+      "help_text": "A local filesystem shared by web and Celery workers."
+    },
+    {
+      "id": "retention_hours",
+      "label": "Retention (hours)",
+      "type": "number",
+      "default": 24
+    },
+    {
+      "id": "max_storage_gib",
+      "label": "Storage limit (GiB)",
+      "type": "number",
+      "default": 20
+    },
+    {
+      "id": "playback_user_id",
+      "label": "User ID for new M3U token",
+      "type": "number",
+      "default": 0,
+      "help_text": "Set the Dispatcharr user ID before creating an access token."
+    }
+  ],
+  "actions": [
+    {"id": "status", "label": "Archive status", "button_label": "Show status"},
+    {"id": "reconcile", "label": "Reconcile recorders", "button_label": "Reconcile"},
+    {"id": "create_access_token", "label": "Create M3U access token", "button_label": "Create token"}
+  ]
+}
