@@ -28,6 +28,18 @@ class HLSPlaylistTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_hls_playlist(self.segments[:1], live=True, uri_for=lambda _: "bad\nuri")
 
+    def test_event_target_duration_is_fixed_and_checks_long_gop(self):
+        short_playlist = build_hls_playlist(self.segments[:1], live=True, target_duration=45)
+        long_gop = Segment("long", "ch", Path("long.ts"), self.segments[-1].start_utc,
+                           self.segments[-1].start_utc + timedelta(seconds=40))
+        later_playlist = build_hls_playlist([*self.segments, long_gop], live=True, target_duration=45)
+        self.assertIn("#EXT-X-TARGETDURATION:45", short_playlist)
+        self.assertIn("#EXT-X-TARGETDURATION:45", later_playlist)
+        too_long = Segment("huge", "ch", Path("huge.ts"), self.segments[-1].start_utc,
+                           self.segments[-1].start_utc + timedelta(seconds=46))
+        with self.assertRaisesRegex(ValueError, "fixed HLS target"):
+            build_hls_playlist([too_long], live=True, target_duration=45)
+
 
 if __name__ == "__main__":
     unittest.main()

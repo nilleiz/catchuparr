@@ -81,11 +81,14 @@ class ArchiveStore:
     indexed times are UTC instants; naive datetimes are rejected deliberately.
     """
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, orphan_grace_seconds: float = 3600):
+        if orphan_grace_seconds < 0:
+            raise ValueError("orphan_grace_seconds cannot be negative")
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / "archive.sqlite3"
         self._initialize()
+        self.reconcile_orphans(grace_seconds=orphan_grace_seconds)
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
@@ -190,8 +193,10 @@ class ArchiveStore:
             db = self._connect()
             try:
                 db.execute("BEGIN IMMEDIATE")
+                current = db.execute("SELECT token FROM recorder_fences WHERE channel_id=?", (channel,)).fetchone()
+                if current is not None and fencing_token is None:
+                    raise RuntimeError("fencing token required for this channel")
                 if fencing_token is not None:
-                    current = db.execute("SELECT token FROM recorder_fences WHERE channel_id=?", (channel,)).fetchone()
                     if current is not None and fencing_token < int(current[0]):
                         raise RuntimeError("stale recorder fencing token")
                     if current is None or fencing_token > int(current[0]):
@@ -227,6 +232,12 @@ class ArchiveStore:
                     final_path.unlink()
             raise
         return Segment(sid, channel, final_path, _datetime(start), _datetime(end), discontinuity)
+
+    def recorder_fence(self, channel_id: str) -> int:
+        """Return the last durable recorder fence, or zero before first use."""
+        with self._database() as db:
+            row = db.execute("SELECT token FROM recorder_fences WHERE channel_id=?", (_channel_key(channel_id),)).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def register_recorder_fence(self, channel_id: str, fencing_token: int) -> None:
         """Record a Redis fencing token before a recorder begins publishing.
@@ -366,9 +377,67 @@ class ArchiveStore:
             cur = db.execute("UPDATE playback_leases SET expires_at=? WHERE id=? AND expires_at>?", (time.time() + ttl_seconds, lease_id, time.time()))
             return cur.rowcount == 1
 
+    def extend_playback(
+        self, lease_id: str, end_utc: datetime | str | int | float, *, ttl_seconds: float = 120
+    ) -> bool:
+        """Renew an EVENT playback lease and extend its protected window end.
+
+        EVENT playlists append segments and cannot discard early entries, so a
+        session should keep this lease from the event's first segment and
+        extend it on every playlist reload.
+        """
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        with self._database() as db:
+            cur = db.execute(
+                "UPDATE playback_leases SET end_utc=MAX(end_utc,?),expires_at=? WHERE id=? AND expires_at>?",
+                (_utc_epoch(end_utc), time.time() + ttl_seconds, lease_id, time.time()),
+            )
+            return cur.rowcount == 1
+
     def end_playback(self, lease_id: str) -> None:
         with self._database() as db:
             db.execute("DELETE FROM playback_leases WHERE id=?", (lease_id,))
+
+    def reconcile_orphans(self, *, grace_seconds: float = 3600) -> tuple[int, int]:
+        """Remove stale unindexed segment files and index rows with missing files.
+
+        Recent unindexed files are left alone because another worker may be in
+        the rename-to-database-commit window. SQLite WAL/SHM files are managed
+        by SQLite itself and are intentionally not touched.
+        """
+        if grace_seconds < 0:
+            raise ValueError("grace_seconds cannot be negative")
+        cutoff = time.time() - grace_seconds
+        removed_files = removed_rows = 0
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT id,relpath FROM segments").fetchall()
+            for row in rows:
+                if not (self.root / row["relpath"]).is_file():
+                    db.execute("DELETE FROM segments WHERE id=?", (row["id"],))
+                    removed_rows += 1
+            indexed = {row[0] for row in db.execute("SELECT relpath FROM segments")}
+            db.commit()
+        segment_root = self.root / "segments"
+        if not segment_root.exists():
+            return removed_files, removed_rows
+        for path in segment_root.rglob("*"):
+            if not path.is_file():
+                continue
+            relpath = path.relative_to(self.root).as_posix()
+            try:
+                stale = path.stat().st_mtime <= cutoff
+            except FileNotFoundError:
+                continue
+            if relpath not in indexed and stale:
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+                    removed_files += 1
+        for directory in sorted((p for p in segment_root.rglob("*") if p.is_dir()), reverse=True):
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+        return removed_files, removed_rows
 
     def cleanup(self, *, older_than_utc: datetime | str | int | float, max_bytes: int | None = None) -> list[Path]:
         """Delete expired content by age and, if requested, oldest-first by quota.
