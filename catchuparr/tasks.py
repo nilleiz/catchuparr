@@ -17,8 +17,9 @@ def reconcile_recorders():
     from apps.channels.models import Channel
     from core.utils import RedisClient
 
-    from .runtime import load_config
+    from .runtime import load_config, require_supported_version
 
+    require_supported_version()
     config = load_config()
     if config is None:
         return {"queued": 0}
@@ -51,8 +52,9 @@ def record_channel(channel_uuid: str):
     from .engine.leases import RedisRecorderLease
     from .engine.recorder import FFmpegCopyRecorder
     from .engine.store import ArchiveStore
-    from .runtime import load_config
+    from .runtime import load_config, require_supported_version
 
+    require_supported_version()
     redis = RedisClient.get_client()
     redis.delete(f"catchuparr:dispatch:{channel_uuid}")
     config = load_config()

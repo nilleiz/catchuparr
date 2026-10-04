@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 PLUGIN_KEY = "catchuparr"
 RECONCILE_TASK = "catchuparr.reconcile"
 RECONCILE_SCHEDULE = "catchuparr-recorder-reconcile"
+SUPPORTED_DISPATCHARR_VERSION = "0.31.0"
 
 
 @dataclass(frozen=True)
@@ -52,15 +53,21 @@ def load_config() -> Config | None:
     return parse_settings(plugin.settings or {})
 
 
+def require_supported_version() -> None:
+    try:
+        from version import __version__ as dispatcharr_version
+    except ImportError as exc:
+        raise RuntimeError("Catchuparr requires Dispatcharr") from exc
+    if dispatcharr_version != SUPPORTED_DISPATCHARR_VERSION:
+        raise RuntimeError(f"Unsupported Dispatcharr version: {dispatcharr_version}")
+
+
 def bootstrap() -> None:
     """Register tasks/routes only for the inspected Dispatcharr version."""
     try:
-        from version import __version__ as dispatcharr_version
-    except ImportError:
-        logger.warning("Catchuparr is outside Dispatcharr; runtime hooks are inactive")
-        return
-    if dispatcharr_version != "0.31.0":
-        logger.error("Catchuparr runtime disabled for untested Dispatcharr %s", dispatcharr_version)
+        require_supported_version()
+    except RuntimeError as exc:
+        logger.error("Catchuparr runtime disabled: %s", exc)
         return
     # Import the tasks in every worker so Celery sees plugin task names.
     from . import tasks  # noqa: F401
@@ -81,12 +88,13 @@ def bootstrap() -> None:
 
 
 def _ensure_schedule() -> None:
+    require_supported_version()
     from django_celery_beat.models import IntervalSchedule, PeriodicTask
 
     interval, _ = IntervalSchedule.objects.get_or_create(every=30, period=IntervalSchedule.SECONDS)
     PeriodicTask.objects.update_or_create(
         name=RECONCILE_SCHEDULE,
-        defaults={"task": RECONCILE_TASK, "interval": interval, "enabled": True},
+        defaults={"task": RECONCILE_TASK, "interval": interval, "queue": "dvr", "enabled": True},
     )
 
 
@@ -106,10 +114,11 @@ def shutdown() -> None:
 
 
 def reconcile() -> None:
+    require_supported_version()
     _ensure_schedule()
     from .tasks import reconcile_recorders
 
-    reconcile_recorders.delay()
+    reconcile_recorders.apply_async(queue="dvr")
 
 
 def status(settings: dict) -> dict:
@@ -129,6 +138,7 @@ def status(settings: dict) -> dict:
 
 
 def create_access_token(settings: dict) -> dict:
+    require_supported_version()
     from apps.accounts.models import User
 
     from .security import AccessTokenStore
