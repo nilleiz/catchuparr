@@ -1,10 +1,12 @@
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from catchuparr.adapters.xc import (
     SUPPORTED_DISPATCHARR_VERSION,
     XCCallbacks,
     install_xc_hooks,
+    uninstall_xc_hooks,
 )
 
 
@@ -28,10 +30,11 @@ class Request:
 
 class Channel:
     id = 8
+    uuid = "channel-8-uuid"
 
 
 def modules():
-    calls = {"entry": 0, "epg": 0, "serve": 0}
+    calls = {"entry": 0, "epg": 0, "serve": 0, "epg_lookbacks": [], "programmes": None}
 
     def _xc_channel_entry(channel, channel_num_map, _get_default_group_id,
                           _logo_url_prefix, _logo_url_suffix, *, catchup_allowed=True):
@@ -40,11 +43,13 @@ def modules():
 
     def xc_get_epg(request, user, short=False):
         calls["epg"] += 1
-        return {"epg_listings": [{
+        calls["epg_lookbacks"].append(request.GET.get("prev_days"))
+        programmes = calls["programmes"] or [{
             "start": "2026-01-01 10:00:00",
             "end": "2026-01-01 11:00:00",
             "has_archive": 0,
-        }]}
+        }]
+        return {"epg_listings": programmes}
 
     def _serve_catchup(request, user, channel, timestamp, client_duration_hint=None):
         calls["serve"] += 1
@@ -129,13 +134,88 @@ class XCHookBehaviorTests(unittest.TestCase):
 
     def test_epg_only_marks_fully_covered_local_programmes(self):
         output, _, calls = self.install(XCCallbacks(
-            program_available=lambda channel_id, start, end, user: channel_id == "8" and end.endswith("11:00:00"),
+            channel_uuid_for_epg_id=lambda channel_id, user: "channel-8-uuid",
+            program_available=lambda channel_uuid, start, end, user:
+                channel_uuid == "channel-8-uuid" and end.endswith("11:00:00"),
         ))
         result = output.xc_get_epg(Request(), {"catchup": True})
         self.assertEqual(result["epg_listings"][0]["has_archive"], 1)
         self.assertEqual(calls["epg"], 1)
         result = output.xc_get_epg(Request(), {"catchup": False})
         self.assertEqual(result["epg_listings"][0]["has_archive"], 0)
+
+    def test_epg_requests_local_lookback_on_a_copy_and_preserves_larger_setting(self):
+        output, _, calls = self.install(XCCallbacks(
+            channel_uuid_for_epg_id=lambda channel_id, user: "channel-8-uuid",
+            epg_archive_days=lambda channel_id, user: 7,
+        ))
+        request = Request()
+        output.xc_get_epg(request, {"catchup": True})
+        self.assertEqual(calls["epg_lookbacks"], [None, "7"])
+        self.assertNotIn("prev_days", request.GET)
+
+        calls["epg_lookbacks"].clear()
+        request.GET["prev_days"] = "12"
+        output.xc_get_epg(request, {"catchup": True})
+        self.assertEqual(calls["epg_lookbacks"], ["12", "12"])
+
+    def test_local_epg_snapshots_fill_programmes_removed_by_core_refresh(self):
+        output, _, calls = self.install(XCCallbacks(
+            channel_uuid_for_epg_id=lambda channel_id, user: "channel-8-uuid",
+            epg_archive_days=lambda channel_uuid, user: 5,
+            epg_snapshots=lambda channel_uuid, user, days: [{
+                "start": "2026-09-01 10:00:00",
+                "end": "2026-09-01 11:00:00",
+                "title": "c25",
+                "has_archive": 0,
+            }],
+            program_available=lambda channel_uuid, start, end, user: True,
+        ))
+        result = output.xc_get_epg(Request(), {"catchup": True})
+        listings = result["epg_listings"]
+        self.assertEqual(len(listings), 2)
+        self.assertEqual(listings[1]["title"], "c25")
+        self.assertEqual(listings[1]["has_archive"], 1)
+        self.assertEqual(calls["epg_lookbacks"], [None, "5"])
+
+    def test_hook_reload_updates_callbacks_and_uninstall_restores_core(self):
+        output, timeshift, _ = modules()
+        originals = (output._xc_channel_entry, output.xc_get_epg, timeshift._serve_catchup)
+        first = install_xc_hooks(
+            output, timeshift, dispatcharr_version=SUPPORTED_DISPATCHARR_VERSION,
+            callbacks=XCCallbacks(channel_archive_days=lambda channel: 4),
+        )
+        wrapper = output._xc_channel_entry
+        reloaded = install_xc_hooks(
+            output, timeshift, dispatcharr_version=SUPPORTED_DISPATCHARR_VERSION,
+            callbacks=XCCallbacks(channel_archive_days=lambda channel: 8),
+        )
+        self.assertTrue(first.installed)
+        self.assertTrue(reloaded.installed)
+        self.assertIs(output._xc_channel_entry, wrapper)
+        entry = output._xc_channel_entry(Channel(), {}, lambda: 1, "p", "s")
+        self.assertEqual(entry["tv_archive_duration"], 8)
+        removed = uninstall_xc_hooks(output, timeshift)
+        self.assertTrue(removed.installed)
+        self.assertEqual((output._xc_channel_entry, output.xc_get_epg, timeshift._serve_catchup), originals)
+
+    def test_running_programme_archive_flag_uses_coverage_through_now(self):
+        checked = []
+        output, _, calls = self.install(XCCallbacks(
+            channel_uuid_for_epg_id=lambda channel_id, user: "channel-8-uuid",
+            program_available=lambda channel_uuid, programme_start, coverage_end, user:
+                checked.append((programme_start, coverage_end)) or True,
+        ))
+        # The mocked provider response is now expressed relative to wall clock as well.
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
+        future_end = (now + timedelta(minutes=40)).strftime("%Y-%m-%d %H:%M:%S")
+        calls["programmes"] = [{"start": start, "end": future_end, "has_archive": 0}]
+        result = output.xc_get_epg(Request(), {"catchup": True})
+        self.assertEqual(result["epg_listings"][0]["has_archive"], 1)
+        self.assertEqual(checked[0][0], start)
+        self.assertLessEqual(checked[0][1], datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+        self.assertLess(checked[0][1], future_end)
 
     def test_provider_path_is_preserved_when_local_programme_missing(self):
         _, timeshift, calls = self.install(XCCallbacks(playback_available=lambda *args: False))
@@ -176,15 +256,22 @@ class XCHookBehaviorTests(unittest.TestCase):
         self.assertEqual(calls["serve"], 0)
 
     def test_authorized_local_playback_calls_archive_callback(self):
+        observed = []
         callbacks = XCCallbacks(
-            playback_available=lambda *args: True,
+            playback_available=lambda channel_uuid, timestamp, duration, user:
+                observed.append((channel_uuid, duration)) or True,
             authorize_local_playback=lambda *args: True,
             serve_local_playback=lambda *args: Response("local"),
         )
         _, timeshift, calls = self.install(callbacks)
-        response = timeshift._serve_catchup(Request(), {"catchup": True}, Channel(), "2026-01-01:10-00")
-        self.assertEqual(response.content, "local")
+        for duration_hint in (None, 44):
+            response = timeshift._serve_catchup(
+                Request(), {"catchup": True}, Channel(), "2026-01-01:10-00",
+                client_duration_hint=duration_hint,
+            )
+            self.assertEqual(response.content, "local")
         self.assertEqual(calls["serve"], 0)
+        self.assertEqual(observed, [("channel-8-uuid", None), ("channel-8-uuid", 44)])
 
     def test_coverage_and_authorization_errors_fall_back_or_fail_closed(self):
         output, timeshift, calls = self.install(XCCallbacks(
