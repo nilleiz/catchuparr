@@ -73,6 +73,16 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertEqual([first.path], removed)
         self.assertEqual([], self.store.segments("channel-1"))
 
+    def test_event_lease_can_extend_and_protects_early_playlist_segments(self):
+        first = self.add(0)
+        second = self.add(6)
+        lease = self.store.begin_playback("channel-1", first.start_utc, first.end_utc, ttl_seconds=120)
+        self.assertTrue(self.store.extend_playback(lease.id, second.end_utc, ttl_seconds=120))
+        removed = self.store.cleanup(older_than_utc=self.base + timedelta(days=1), max_bytes=0)
+        self.assertEqual([], removed)
+        self.assertTrue(first.path.exists())
+        self.assertTrue(second.path.exists())
+
     def test_expired_lease_does_not_protect_retention(self):
         seg = self.add(0)
         lease = self.store.begin_playback("channel-1", seg.start_utc, seg.end_utc, ttl_seconds=1)
@@ -88,9 +98,23 @@ class ArchiveStoreTests(unittest.TestCase):
         self.store.register_recorder_fence("channel-1", 12)
         accepted = self.add(0, fencing_token=12)
         self.assertTrue(accepted.path.exists())
+        with self.assertRaisesRegex(RuntimeError, "required"):
+            self.add(3)
         with self.assertRaises(RuntimeError):
             self.add(6, fencing_token=11)
         self.assertEqual(1, len(self.store.segments("channel-1")))
+
+    def test_reconcile_removes_unindexed_or_missing_segment_files(self):
+        indexed = self.add(0)
+        indexed.path.unlink()
+        orphan = self.store.root / "segments" / "channel-1" / "orphan.ts"
+        orphan.write_bytes(b"orphan")
+        partial = orphan.parent / ".segment-crash.partial"
+        partial.write_bytes(b"partial")
+        recovered = ArchiveStore(self.store.root, orphan_grace_seconds=0)
+        self.assertEqual([], recovered.segments("channel-1"))
+        self.assertFalse(orphan.exists())
+        self.assertFalse(partial.exists())
 
 
 if __name__ == "__main__":

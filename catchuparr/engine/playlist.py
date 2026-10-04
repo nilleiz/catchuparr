@@ -17,6 +17,7 @@ def build_hls_playlist(
     live: bool,
     uri_for: Callable[[Segment], str] | None = None,
     media_sequence: int = 0,
+    target_duration: int = 60,
 ) -> str:
     """Build an EVENT playlist for a growing capture or VOD for a closed one.
 
@@ -29,11 +30,17 @@ def build_hls_playlist(
     durations = [segment.duration for segment in items]
     if any(duration <= 0 for duration in durations):
         raise ValueError("HLS segments must have positive duration")
-    target = max(1, math.ceil(max(durations, default=1)))
+    if target_duration < 1:
+        raise ValueError("target_duration must be positive")
+    # EXT-X-TARGETDURATION is fixed for a media playlist across reloads. Keep
+    # it independent of the current EVENT contents; reject an unexpectedly
+    # long GOP rather than emit a playlist with a changing/invalid target.
+    if any(math.floor(duration + 0.5) > target_duration for duration in durations):
+        raise ValueError("segment duration exceeds the fixed HLS target duration; configure a larger stable value")
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
-        f"#EXT-X-TARGETDURATION:{target}",
+        f"#EXT-X-TARGETDURATION:{target_duration}",
         f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
     ]
     if live:
