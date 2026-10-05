@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import tempfile
@@ -114,6 +115,34 @@ class RecorderTests(unittest.TestCase):
             first_pts.append(pts[0])
         self.assertEqual(first_pts, sorted(first_pts))
         self.assertTrue(all(b > a for a, b in zip(first_pts, first_pts[1:])))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg and ffprobe are required")
+    def test_private_data_pid_does_not_abort_recording_or_drop_audio_tracks(self):
+        data = self.root / "private-data.bin"
+        data.write_bytes(b"private transport data")
+        source = self.root / "source-with-data.ts"
+        subprocess.run([
+            "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=25",
+            "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
+            "-f", "lavfi", "-i", "sine=frequency=1200:sample_rate=48000",
+            "-f", "data", "-i", str(data),
+            "-t", "3", "-map", "0", "-map", "1", "-map", "2", "-map", "3",
+            "-c:v", "mpeg2video", "-c:a", "mp2", "-c:d", "copy",
+            "-f", "mpegts", str(source),
+        ], check=True, timeout=30)
+        recorder = FFmpegCopyRecorder(
+            self.store, "data-pid", str(source), self.root / "data-work", segment_seconds=2,
+        )
+        self.assertGreaterEqual(recorder.run_once(threading.Event()), 1)
+        recorded = self.store.segments("data-pid")
+        probe = subprocess.check_output([
+            "ffprobe", "-v", "error", "-show_streams", "-of", "json", str(recorded[0].path),
+        ], text=True, timeout=15)
+        stream_types = [stream["codec_type"] for stream in json.loads(probe)["streams"]]
+        self.assertEqual(stream_types.count("video"), 1)
+        self.assertEqual(stream_types.count("audio"), 2)
+        self.assertNotIn("data", stream_types)
 
 
 if __name__ == "__main__":
