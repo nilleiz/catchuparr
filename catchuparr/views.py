@@ -58,7 +58,7 @@ def _authenticate(request, *, playback: bool = False):
         config = load_config()
         if config is None:
             return None, None, None
-        token = request.GET.get("access_token") or request.GET.get("token", "")
+        token = _access_token(request)
         if not token:
             return None, None, None
         user_id = AccessTokenStore(config.archive_root).lookup(token)
@@ -73,6 +73,12 @@ def _authenticate(request, *, playback: bool = False):
     except Exception:
         logger.exception("Catchuparr authentication failed")
         return None, None, None
+
+
+def _access_token(request) -> str:
+    """Allow private HTTP clients to keep bearer values out of request URLs."""
+    header = getattr(request, "headers", {}).get("X-Catchuparr-Token", "")
+    return header or request.GET.get("access_token") or request.GET.get("token", "")
 
 
 def _network_allowed(request, user, checker, *, playback: bool) -> bool:
@@ -156,6 +162,10 @@ def xmltv_view(request):
         return _no_cache(HttpResponse(content_type="application/xml"))
 
     request_copy = _core_request(request)
+    # Dispatcharr treats days=0 as unbounded future EPG. Keep the plugin's
+    # default XMLTV response practical for a client importing the full list.
+    if "days" not in request_copy.GET:
+        request_copy.GET["days"] = "2"
     request_copy.GET["prev_days"] = str(min(30, math.ceil(config.retention_hours / 24)))
     response = generate_epg(request_copy, user=user)
     if response.status_code != 200:

@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from catchuparr.views import _catchup_epoch, _core_request, _network_allowed
+from catchuparr.views import _access_token, _catchup_epoch, _core_request, _network_allowed
 
 
 class ViewBoundaryTests(unittest.TestCase):
@@ -19,6 +19,13 @@ class ViewBoundaryTests(unittest.TestCase):
         core = _core_request(request)
         self.assertEqual(core.GET, {"days": "2"})
         self.assertIn("access_token", request.GET)
+
+    def test_header_token_takes_precedence_over_url_token(self):
+        request = SimpleNamespace(
+            headers={"X-Catchuparr-Token": "private-header"},
+            GET={"access_token": "url-value"},
+        )
+        self.assertEqual(_access_token(request), "private-header")
 
     def test_archive_requires_stream_network_permission_as_well_as_playlist_permission(self):
         checked = []
