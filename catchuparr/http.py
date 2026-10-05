@@ -273,7 +273,7 @@ class ArchiveHTTPService:
         if user_id is None:
             return _error(401, "unauthorized")
         request_key = hashlib.sha256(
-            f"{user_id}\0{channel_id}\0{start:.6f}\0{end:.6f}\0{int(live)}".encode()
+            f"{user_id}\0{channel_id}\0{start:.6f}\0{end:.6f}".encode()
         ).hexdigest()
         try:
             # Protect the entire requested window before reading the index. A
