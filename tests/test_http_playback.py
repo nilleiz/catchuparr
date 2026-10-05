@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from catchuparr.engine.store import ArchiveStore
 from catchuparr.http import ArchiveHTTPService, parse_byte_range
 from catchuparr.security import TokenStore
 
@@ -194,6 +195,33 @@ class RangeParserTests(unittest.TestCase):
             with self.subTest(header=header):
                 with self.assertRaises(ValueError):
                     parse_byte_range(header, 10)
+
+
+class RealStoreHTTPTests(unittest.TestCase):
+    def test_playlist_lease_protects_cleanup_and_indexed_range_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.ts"
+            source.write_bytes(b"0123456789")
+            store = ArchiveStore(root / "archive")
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            item = store.add_segment("news", source, start, start + timedelta(seconds=6))
+            tokens = TokenStore(store.root)
+            token = tokens.create("viewer")
+            service = ArchiveHTTPService(
+                store, tokens,
+                authorize_user_channel=lambda user, channel: user == "viewer" and channel == "news",
+                catchup_enabled=lambda *_: True,
+            )
+            playlist = service.playlist(token, "news", start, start + timedelta(seconds=10))
+            self.assertEqual(playlist.status, 200)
+            lease_id = playlist.body.decode().split("&lease=")[1].splitlines()[0]
+            self.assertEqual(
+                store.cleanup(older_than_utc=start + timedelta(days=1), max_bytes=0),
+                [],
+            )
+            response = service.segment(token, "news", item.id, lease_id, range_header="bytes=3-6")
+            self.assertEqual((response.status, response.body), (206, b"3456"))
 
 
 if __name__ == "__main__":
