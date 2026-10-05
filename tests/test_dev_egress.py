@@ -124,6 +124,15 @@ class InstalledRulesTests(unittest.TestCase):
         with patch.object(dev_egress, "command", return_value=completed):
             self.assertFalse(dev_egress.jump_is_first("192.0.2.0/24"))
 
+    def test_jump_check_rejects_a_second_dev_chain_jump(self):
+        output = """-N DOCKER-USER
+-A DOCKER-USER -s 192.0.2.0/24 -j CATCHUPARR_DEV_EGRESS
+-A DOCKER-USER -s 198.51.100.0/24 -j CATCHUPARR_DEV_EGRESS
+"""
+        completed = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        with patch.object(dev_egress, "command", return_value=completed):
+            self.assertFalse(dev_egress.jump_is_first("192.0.2.0/24"))
+
     def test_apply_moves_late_dev_jump_before_existing_accept(self):
         current_rules = [["-j", "ACCEPT"], ["-s", "192.0.2.0/24", "-j", dev_egress.CHAIN]]
 
