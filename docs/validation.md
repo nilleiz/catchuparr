@@ -26,15 +26,18 @@ archive route returned an appendable HLS event playlist and a real segment;
 `Range: bytes=188-563` returned HTTP 206, the corresponding `Content-Range`,
 and 376 bytes. These HTTP checks used a token in a private request header.
 
-TiviMate 5.3.3 on Shield TV still needs to establish catch-up recognition,
-start-over during recording, repeated forward and backward seeks, pause and
-resume, programme change, restart and retention behavior. Record request
-methods, time arguments, Range headers, status codes and observed playback
-without recording bearer tokens. XC must be tested separately before its
-hooks are enabled.
+Programme change, service restart and retention behavior still need a
+real-player check. Record request methods, time arguments, Range headers,
+status codes and observed playback without recording bearer tokens. XC must
+be tested separately before its hooks are enabled.
 
 On 2026-10-06, the Dev AIO was rebound from loopback to the host's LAN
 interface for the Shield test. Its mounts and restricted Vu+ egress rule were
 rechecked. An unauthenticated LAN request returned HTTP 401; a separate
 device token fetched M3U and XMLTV successfully. The token and complete
 playlist URLs are stored only in a private local file outside this repository.
+The user then confirmed on TiviMate 5.3.3 running on Shield TV that the
+M3U/XMLTV setup, start-over from the beginning of the current programme,
+pause and seeking all work for **Das Erste HD**. The user did not provide a
+request trace or a separate result for programme changes, restarts, retention
+or XC; those remain open validation items.
