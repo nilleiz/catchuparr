@@ -80,14 +80,15 @@ class ArchiveStore:
     indexed times are UTC instants; naive datetimes are rejected deliberately.
     """
 
-    def __init__(self, root: Path, *, orphan_grace_seconds: float = 3600):
-        if orphan_grace_seconds < 0:
+    def __init__(self, root: Path, *, orphan_grace_seconds: float | None = None):
+        if orphan_grace_seconds is not None and orphan_grace_seconds < 0:
             raise ValueError("orphan_grace_seconds cannot be negative")
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / "archive.sqlite3"
         self._initialize()
-        self.reconcile_orphans(grace_seconds=orphan_grace_seconds)
+        if orphan_grace_seconds is not None:
+            self.reconcile_orphans(grace_seconds=orphan_grace_seconds)
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
@@ -135,6 +136,8 @@ class ArchiveStore:
                 );
                 CREATE INDEX IF NOT EXISTS programs_time
                     ON programs(channel_id, start_utc, end_utc);
+                CREATE INDEX IF NOT EXISTS programs_identity
+                    ON programs(channel_id, start_utc, end_utc, title);
                 CREATE TABLE IF NOT EXISTS playback_leases (
                     id TEXT PRIMARY KEY,
                     channel_id TEXT NOT NULL,
@@ -279,6 +282,20 @@ class ArchiveStore:
             ).fetchall()
         return [self._row_segment(row) for row in rows if (self.root / row["relpath"]).is_file()]
 
+    def segment(self, channel_id: str, segment_id: str) -> Segment | None:
+        """Look up one immutable segment by the indexed ID and channel."""
+        channel = _channel_key(channel_id)
+        if not segment_id or len(segment_id) > 128:
+            return None
+        with self._database() as db:
+            row = db.execute(
+                "SELECT * FROM segments WHERE id=? AND channel_id=?",
+                (segment_id, channel),
+            ).fetchone()
+        if row is None or not (self.root / row["relpath"]).is_file():
+            return None
+        return self._row_segment(row)
+
     def _row_segment(self, row: sqlite3.Row) -> Segment:
         return Segment(
             row["id"], row["channel_id"], self.root / row["relpath"],
@@ -335,6 +352,12 @@ class ArchiveStore:
             raise ValueError("end_utc must be after start_utc")
         body = payload if isinstance(payload, str) else json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
         with self._database() as db:
+            existing = db.execute(
+                "SELECT id FROM programs WHERE channel_id=? AND start_utc=? AND end_utc=? AND title=? LIMIT 1",
+                (channel, start, end, str(title)),
+            ).fetchone()
+            if existing is not None:
+                return int(existing[0])
             cur = db.execute(
                 "INSERT INTO programs(channel_id,start_utc,end_utc,title,payload,captured_at) VALUES(?,?,?,?,?,?)",
                 (channel, start, end, str(title), body, _utc_epoch(captured_at) if captured_at is not None else time.time()),

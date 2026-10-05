@@ -134,7 +134,7 @@ def xmltv_view(request):
     from apps.output.epg import generate_epg
     from django.http import HttpResponse
 
-    from .adapters.m3u import MAX_XMLTV_BYTES, filter_xmltv
+    from .adapters.m3u import MAX_XMLTV_BYTES, filter_xmltv, merge_xmltv_snapshots
     from .engine.store import ArchiveStore
 
     if request.method not in {"GET", "HEAD"}:
@@ -165,7 +165,19 @@ def xmltv_view(request):
         return bool(archive_channel and store.coverage(archive_channel, start, end).complete)
 
     filtered = filter_xmltv(bytes(content), is_covered, now=now)
-    return _no_cache(HttpResponse(filtered, content_type="application/xml"))
+    snapshots = {
+        epg_channel: store.program_snapshots(
+            archive_channel,
+            now.timestamp() - config.retention_hours * 3600,
+            now,
+        )
+        for epg_channel, archive_channel in channel_map.items()
+    }
+    try:
+        merged = merge_xmltv_snapshots(filtered, snapshots, is_covered, now=now)
+    except ValueError:
+        return _no_cache(HttpResponse("Guide too large", status=413))
+    return _no_cache(HttpResponse(merged, content_type="application/xml"))
 
 
 def _xmltv_channel_map(request, user, config):

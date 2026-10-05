@@ -65,6 +65,28 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(datetime(2026, 1, 1, 0, 0, 4, tzinfo=timezone.utc), segment.start_utc)
         self.assertTrue(segment.discontinuity)
 
+    def test_pts_reset_reanchors_to_close_time_after_source_switch(self):
+        import os
+
+        out = self.root / "pts-reset"
+        out.mkdir()
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+        rows = [(0, 6, 6), (6, 12, 12), (0, 6, 18)]
+        listing = out / "segments.csv"
+        listing.write_text(
+            "".join(f"segment-{index}.ts,{start},{end}\n" for index, (start, end, _) in enumerate(rows)),
+            encoding="utf-8",
+        )
+        for index, (_start, _end, close_second) in enumerate(rows):
+            media = out / f"segment-{index}.ts"
+            media.write_bytes(b"synthetic ts")
+            os.utime(media, (base + close_second, base + close_second))
+        _, count = self.recorder._publish_csv_rows(listing, 0)
+        self.assertEqual(count, 3)
+        published = self.store.segments("ch1")
+        self.assertEqual([base, base + 6, base + 12], [item.start_utc.timestamp() for item in published])
+        self.assertTrue(published[-1].discontinuity)
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg and ffprobe are required")
     def test_real_ffmpeg_stream_copy_keeps_pts_monotonic_across_segments(self):
         source = self.root / "synthetic.ts"

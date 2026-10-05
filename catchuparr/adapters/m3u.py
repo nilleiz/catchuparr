@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 from urllib.parse import quote, urlsplit
 
 MAX_XMLTV_BYTES = 64 * 1024 * 1024
@@ -128,6 +128,48 @@ def filter_xmltv(
         if not is_covered(channel, start, stop):
             root.remove(programme)
     return ET.tostring(root, encoding="unicode", xml_declaration=False)
+
+
+def merge_xmltv_snapshots(
+    xmltv: str,
+    snapshots: Mapping[str, Iterable[dict]],
+    is_covered: Callable[[str, datetime, datetime], bool],
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Restore archived past EPG entries removed by a provider refresh.
+
+    Keys in ``snapshots`` are the effective XMLTV channel IDs emitted in the
+    M3U. Stored schedule times are absolute instants, so DST transitions do
+    not need local-time reconstruction.
+    """
+    root = ET.fromstring(xmltv)
+    present = {
+        (item.get("channel"), item.get("start"), item.get("stop"))
+        for item in root.findall("programme")
+    }
+    current = _as_utc(now or datetime.now(timezone.utc))
+    for channel_id, programs in snapshots.items():
+        for program in programs:
+            start = _as_utc(program["start_utc"])
+            end = _as_utc(program["end_utc"])
+            if end >= current or not is_covered(channel_id, start, end):
+                continue
+            start_text = start.strftime("%Y%m%d%H%M%S +0000")
+            end_text = end.strftime("%Y%m%d%H%M%S +0000")
+            key = (channel_id, start_text, end_text)
+            if key in present:
+                continue
+            entry = ET.SubElement(root, "programme", start=start_text, stop=end_text, channel=channel_id)
+            ET.SubElement(entry, "title").text = str(program["title"])
+            description = program.get("payload", {}).get("description")
+            if description:
+                ET.SubElement(entry, "desc").text = str(description)
+            present.add(key)
+    result = ET.tostring(root, encoding="unicode", xml_declaration=False)
+    if len(result.encode("utf-8")) > MAX_XMLTV_BYTES:
+        raise ValueError("XMLTV output exceeds size limit")
+    return result
 
 
 def _parse_extinf_attributes(line: str) -> dict[str, str]:

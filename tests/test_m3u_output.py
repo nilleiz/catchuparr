@@ -3,7 +3,12 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from catchuparr.adapters import m3u
-from catchuparr.adapters.m3u import annotate_m3u, build_catchup_source, filter_xmltv
+from catchuparr.adapters.m3u import (
+    annotate_m3u,
+    build_catchup_source,
+    filter_xmltv,
+    merge_xmltv_snapshots,
+)
 
 
 class M3UOutputTests(unittest.TestCase):
@@ -119,6 +124,26 @@ class M3UOutputTests(unittest.TestCase):
     with patch.object(m3u, "MAX_XMLTV_BYTES", 4):
       with self.assertRaisesRegex(ValueError, "byte limit"):
         filter_xmltv("<tv />", lambda *_: True)
+
+  def test_xmltv_restores_only_covered_missing_schedule(self):
+    from datetime import timedelta
+
+    now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
+    start = now - timedelta(hours=2)
+    stop = now - timedelta(hours=1)
+    program = {"start_utc": start, "end_utc": stop, "title": "Earlier news", "payload": {"description": "Summary"}}
+    xml = '<tv><channel id="news" /></tv>'
+    restored = merge_xmltv_snapshots(
+        xml, {"news": [program], "other": [program]},
+        lambda channel, *_: channel == "news", now=now,
+    )
+    self.assertIn("Earlier news", restored)
+    self.assertIn("Summary", restored)
+    self.assertEqual(restored.count("<programme"), 1)
+    self.assertEqual(
+        merge_xmltv_snapshots(restored, {"news": [program]}, lambda *_: True, now=now).count("<programme"),
+        1,
+    )
 
 
 if __name__ == "__main__":
