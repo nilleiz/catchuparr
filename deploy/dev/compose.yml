@@ -1,0 +1,26 @@
+name: catchuparr-dev
+
+# Match the production Dispatcharr AIO topology. Only the copied Dev paths
+# are mounted; PostgreSQL, Redis, web and Celery run inside this one image.
+services:
+  dispatcharr:
+    image: ${DISPATCHARR_DEV_AIO_IMAGE:?pin-production-aio-image-digest}
+    container_name: catchuparr-dev-aio
+    restart: unless-stopped
+    environment:
+      DISPATCHARR_ENV: aio
+      DISPATCHARR_LOG_LEVEL: info
+      DISPATCHARR_PLUGINS_DIR: /data/plugins
+      PUID: '1000'
+      PGID: '1000'
+    ports:
+      - '${DEV_BIND_IP:?set-local-bind-ip}:15656:9191'
+    volumes:
+      - ${DEV_AIO_ROOT:?set-private-dev-root}/data:/data
+      - ${DEV_AIO_ROOT:?set-private-dev-root}/archive:/data/catchuparr
+    networks: [lan]
+
+networks:
+  lan:
+    name: catchuparr-dev-lan
+    external: true

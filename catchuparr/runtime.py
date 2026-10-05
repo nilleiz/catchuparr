@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 PLUGIN_KEY = "catchuparr"
 RECONCILE_TASK = "catchuparr.reconcile"
 RECONCILE_SCHEDULE = "catchuparr-recorder-reconcile"
+SNAPSHOT_TASK = "catchuparr.snapshot_epg"
+SNAPSHOT_SCHEDULE = "catchuparr-epg-snapshot"
 SUPPORTED_DISPATCHARR_VERSION = "0.31.0"
 
 
@@ -96,13 +98,25 @@ def _ensure_schedule() -> None:
         name=RECONCILE_SCHEDULE,
         defaults={"task": RECONCILE_TASK, "interval": interval, "queue": "dvr", "enabled": True},
     )
+    snapshot_interval, _ = IntervalSchedule.objects.get_or_create(
+        every=300, period=IntervalSchedule.SECONDS
+    )
+    PeriodicTask.objects.update_or_create(
+        name=SNAPSHOT_SCHEDULE,
+        defaults={
+            "task": SNAPSHOT_TASK, "interval": snapshot_interval,
+            "queue": "dvr", "enabled": True,
+        },
+    )
 
 
 def shutdown() -> None:
     try:
         from django_celery_beat.models import PeriodicTask
 
-        PeriodicTask.objects.filter(name=RECONCILE_SCHEDULE).update(enabled=False)
+        PeriodicTask.objects.filter(
+            name__in=(RECONCILE_SCHEDULE, SNAPSHOT_SCHEDULE)
+        ).update(enabled=False)
     except Exception:
         logger.exception("Failed to disable Catchuparr scheduler")
     try:
@@ -116,9 +130,10 @@ def shutdown() -> None:
 def reconcile() -> None:
     require_supported_version()
     _ensure_schedule()
-    from .tasks import reconcile_recorders
+    from .tasks import reconcile_recorders, snapshot_epg
 
     reconcile_recorders.apply_async(queue="dvr")
+    snapshot_epg.apply_async(queue="dvr")
 
 
 def status(settings: dict) -> dict:
