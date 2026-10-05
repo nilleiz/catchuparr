@@ -19,6 +19,8 @@ inspected image.
 
 The first compatibility target is Dispatcharr v0.31.0. Any custom or later image requires the adapter signature and request tests before enabling recording or XC output.
 
+Create a separate archive access token for each playback device. A token identifies one device and keeps one active playback session across channels and programmes. Playlist reloads for the same programme reuse its session; switching programmes replaces that device's session while preserving its previous segment URLs for a 30-second grace period.
+
 The first active client path is the authenticated M3U/XMLTV output with HLS
 archive playback. The XC adapter currently contains version-checked wrappers
 and unit tests, but is **not installed at runtime**. Dispatcharr's XC timeshift
