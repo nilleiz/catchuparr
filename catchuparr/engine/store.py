@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+TIMELINE_GAP_TOLERANCE_SECONDS = 0.25
+
 
 def _utc_epoch(value: datetime | str | int | float) -> float:
     if isinstance(value, datetime):
@@ -340,17 +342,20 @@ class ArchiveStore:
             left, right = max(start, item.start_utc.timestamp()), min(end, item.end_utc.timestamp())
             if right <= left:
                 continue
-            if merged and left <= merged[-1][1]:
+            # FFmpeg's segment CSV can leave a repeatable sub-frame offset
+            # between otherwise continuous TS files (0.14 s on the Dev Vu+
+            # stream). Treat only larger holes as unavailable archive time.
+            if merged and left <= merged[-1][1] + TIMELINE_GAP_TOLERANCE_SECONDS:
                 merged[-1][1] = max(merged[-1][1], right)
             else:
                 merged.append([left, right])
         gaps: list[tuple[datetime, datetime]] = []
         cursor = start
         for left, right in merged:
-            if left > cursor:
+            if left > cursor + TIMELINE_GAP_TOLERANCE_SECONDS:
                 gaps.append((_datetime(cursor), _datetime(left)))
             cursor = max(cursor, right)
-        if cursor < end:
+        if cursor < end - TIMELINE_GAP_TOLERANCE_SECONDS:
             gaps.append((_datetime(cursor), _datetime(end)))
         spans = tuple((_datetime(left), _datetime(right)) for left, right in merged)
         return Coverage(
