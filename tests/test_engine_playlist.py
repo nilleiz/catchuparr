@@ -21,10 +21,12 @@ class HLSPlaylistTests(unittest.TestCase):
         self.assertNotIn("#EXT-X-ENDLIST", text)
         self.assertIn("/archive/a", text)
 
-    def test_vod_playlist_closes_and_rejects_newlines_in_uri(self):
+    def test_finished_event_playlist_closes_and_rejects_newlines_in_uri(self):
         text = build_hls_playlist(self.segments, live=False)
-        self.assertIn("#EXT-X-PLAYLIST-TYPE:VOD", text)
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", text)
         self.assertTrue(text.endswith("#EXT-X-ENDLIST\n"))
+        growing = build_hls_playlist(self.segments, live=True)
+        self.assertEqual(text, growing + "#EXT-X-ENDLIST\n")
         with self.assertRaises(ValueError):
             build_hls_playlist(self.segments[:1], live=True, uri_for=lambda _: "bad\nuri")
 

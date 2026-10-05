@@ -19,7 +19,7 @@ def build_hls_playlist(
     media_sequence: int = 0,
     target_duration: int = 60,
 ) -> str:
-    """Build an EVENT playlist for a growing capture or VOD for a closed one.
+    """Build an EVENT playlist that can close after the capture ends.
 
     For live playback call again periodically so newly committed segments are
     appended. URIs should normally be authenticated plugin endpoint URLs.
@@ -43,10 +43,10 @@ def build_hls_playlist(
         f"#EXT-X-TARGETDURATION:{target_duration}",
         f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
     ]
-    if live:
-        lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
-    else:
-        lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+    # A start-over URL is reloaded as one media playlist while the programme
+    # crosses its end time. Changing its type from EVENT to VOD on that reload
+    # would violate HLS playlist mutability rules; EVENT may add ENDLIST.
+    lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
     for item in items:
         if item.discontinuity:
             lines.append("#EXT-X-DISCONTINUITY")

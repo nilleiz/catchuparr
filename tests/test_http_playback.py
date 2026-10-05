@@ -171,6 +171,16 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(len(self.archive.leases), 1)
         self.assertEqual(self.service.segment(self.token, "news", "seg-A", first_lease).status, 200)
 
+    def test_event_closure_preserves_segment_urls_and_lease(self):
+        self.service.playlist_builder = None
+        end = self.start + timedelta(minutes=30)
+        growing = self.service.playlist(self.token, "news", self.start, end, live=True)
+        closed = self.service.playlist(self.token, "news", self.start, end, live=False)
+        self.assertEqual(growing.status, 200)
+        self.assertEqual(closed.status, 200)
+        self.assertEqual(closed.body, growing.body + b"#EXT-X-ENDLIST\n")
+        self.assertEqual(len(self.archive.leases), 1)
+
     def test_new_session_limit_blocks_other_program_but_allows_reload(self):
         self.service.allow_new_session = lambda user, channel, count: count < 1
         first = self._playlist()
