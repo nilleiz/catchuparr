@@ -24,12 +24,12 @@ def network_state() -> dict:
     return json.loads(command("docker", "network", "inspect", NETWORK).stdout)[0]
 
 
-def rules(subnet: str, target: str, port: int) -> list[list[str]]:
-    return [
-        ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"],
-        ["-d", f"{target}/32", "-p", "tcp", "--dport", str(port), "-j", "RETURN"],
-        ["-j", "REJECT"],
-    ]
+def rules(subnet: str, target: str | None, port: int) -> list[list[str]]:
+    result = [["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"]]
+    if target is not None:
+        result.append(["-d", f"{target}/32", "-p", "tcp", "--dport", str(port), "-j", "RETURN"])
+    result.append(["-j", "REJECT"])
+    return result
 
 
 def assert_network(subnet: str, *, empty: bool = False) -> None:
@@ -48,11 +48,13 @@ def installed_rules() -> list[str] | None:
     return result.stdout.splitlines()[1:]
 
 
-def matches_rules(subnet: str, target: str, port: int) -> bool:
+def matches_rules(subnet: str, target: str | None, port: int) -> bool:
     installed = installed_rules()
-    if installed is None or len(installed) != 3:
+    if installed is None or len(installed) != len(rules(subnet, target, port)):
         return False
-    if "conntrack" not in installed[0] or target not in installed[1] or not installed[2].endswith("-j REJECT"):
+    if "conntrack" not in installed[0] or "-j REJECT" not in installed[-1]:
+        return False
+    if target is not None and target not in installed[1]:
         return False
     return all(
         command("iptables", "-w", "-C", CHAIN, *rule, check=False).returncode == 0
@@ -67,7 +69,7 @@ def jump_exists(subnet: str) -> bool:
     ).returncode == 0
 
 
-def apply(subnet: str, target: str, port: int) -> None:
+def apply(subnet: str, target: str | None, port: int) -> None:
     assert_network(subnet)
     existing = installed_rules()
     if existing is not None and not matches_rules(subnet, target, port):
@@ -100,8 +102,6 @@ def main() -> None:
     if not isinstance(ipaddress.ip_network(subnet), ipaddress.IPv4Network):
         parser.error("the Dev bridge must use IPv4")
     target = str(ipaddress.IPv4Address(args.vu_ip)) if args.vu_ip else None
-    if args.action != "remove" and target is None:
-        parser.error("--vu-ip is required for apply/check")
     if not 1 <= args.vu_port <= 65535:
         parser.error("--vu-port must be a TCP port")
     if args.action == "apply":
