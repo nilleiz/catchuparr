@@ -14,6 +14,20 @@ _ROUTE_NAMES = frozenset(
 )
 
 
+def _session_limit_allows(stream_limit, plugin_sessions, redis_client, active_connections):
+    """Fail closed if Dispatcharr's active connection count cannot be verified."""
+    if stream_limit <= 0:
+        return True
+    try:
+        redis_client.ping()
+        dispatcharr_sessions = len(active_connections())
+        redis_client.ping()
+    except Exception:
+        logger.exception("Unable to verify active connections; denying archive playback")
+        return False
+    return dispatcharr_sessions + plugin_sessions < stream_limit
+
+
 def install_routes() -> None:
     """Install routes before Dispatcharr's broad XC and React catch-all paths."""
     import dispatcharr.urls as root_urls
@@ -166,7 +180,8 @@ def xmltv_view(request):
     # default XMLTV response practical for a client importing the full list.
     if "days" not in request_copy.GET:
         request_copy.GET["days"] = "2"
-    request_copy.GET["prev_days"] = str(min(30, math.ceil(config.retention_hours / 24)))
+    if "prev_days" not in request_copy.GET:
+        request_copy.GET["prev_days"] = str(min(30, math.ceil(config.retention_hours / 24)))
     response = generate_epg(request_copy, user=user)
     if response.status_code != 200:
         return response
@@ -177,14 +192,20 @@ def xmltv_view(request):
             return _no_cache(HttpResponse("Guide too large", status=413))
 
     store = ArchiveStore(config.archive_root)
-    channel_map = _xmltv_channel_map(request, user, config)
+    channel_map = {
+        epg_id: channel
+        for epg_id, channel in _xmltv_channel_map(request, user, config).items()
+        if store.segments(channel)
+    }
     now = datetime.now(timezone.utc)
 
     def is_covered(epg_channel_id, start, end):
         archive_channel = channel_map.get(epg_channel_id)
         return bool(archive_channel and store.coverage(archive_channel, start, end).complete)
 
-    filtered = filter_xmltv(bytes(content), is_covered, now=now)
+    filtered = filter_xmltv(
+        bytes(content), is_covered, now=now, local_channel_ids=channel_map.keys()
+    )
     snapshots = {
         epg_channel: store.program_snapshots(
             archive_channel,
@@ -203,8 +224,12 @@ def xmltv_view(request):
 def _xmltv_channel_map(request, user, config):
     from apps.output.views import generate_m3u
 
-    playlist = generate_m3u(_core_request(request), user=user).content.decode("utf-8")
+    response = generate_m3u(_core_request(request), user=user)
+    if response.status_code != 200:
+        return {}
+    playlist = response.content.decode("utf-8")
     mapping = {}
+    ambiguous = set()
     pending_id = None
     for line in playlist.splitlines():
         if line.startswith("#EXTINF:"):
@@ -212,10 +237,26 @@ def _xmltv_channel_map(request, user, config):
             pending_id = found.group(1) if found else None
         elif pending_id and "/proxy/ts/stream/" in line:
             channel = line.split("/proxy/ts/stream/", 1)[1].split("?", 1)[0].strip("/")
-            if channel in config.channel_uuids:
-                mapping[pending_id] = channel
+            if channel in config.channel_uuids and pending_id not in ambiguous:
+                if pending_id in mapping and mapping[pending_id] != channel:
+                    mapping.pop(pending_id)
+                    ambiguous.add(pending_id)
+                else:
+                    mapping[pending_id] = channel
             pending_id = None
     return mapping
+
+
+def _selected_proxy_channels(playlist: str, channel_uuids) -> set[str]:
+    """Find authorized archive UUIDs independently of optional/shared EPG IDs."""
+    selected = set(channel_uuids)
+    return {
+        match.group(1)
+        for line in playlist.splitlines()
+        if not line.startswith("#")
+        and (match := re.search(r"/proxy/ts/stream/([^/?#\s]+)", line))
+        and match.group(1) in selected
+    }
 
 
 def _url_token(token: str) -> str:
@@ -297,13 +338,19 @@ def _catchup_epoch(value: str) -> float:
 
 def _archive_service(request, user, config):
     from apps.channels.utils import is_catchup_enabled
+    from apps.output.views import generate_m3u
     from apps.proxy.utils import get_user_active_connections
+    from core.utils import RedisClient
 
     from .engine.store import ArchiveStore
     from .http import ArchiveHTTPService
     from .security import AccessTokenStore
 
-    allowed = set(_xmltv_channel_map(request, user, config).values())
+    response = generate_m3u(_core_request(request), user=user)
+    allowed = (
+        _selected_proxy_channels(response.content.decode("utf-8"), config.channel_uuids)
+        if response.status_code == 200 else set()
+    )
     user_id = str(user.id)
     catchup_allowed = bool(is_catchup_enabled(user=user))
 
@@ -313,8 +360,15 @@ def _archive_service(request, user, config):
         limit = int(getattr(user, "stream_limit", 0) or 0)
         if limit <= 0:
             return True
-        dispatcharr_sessions = len(get_user_active_connections(user.id))
-        return dispatcharr_sessions + plugin_sessions < limit
+        try:
+            redis = RedisClient.get_client()
+        except Exception:
+            logger.exception("Unable to verify Redis availability; denying archive playback")
+            return False
+        return _session_limit_allows(
+            limit, plugin_sessions, redis,
+            lambda: get_user_active_connections(user.id),
+        )
 
     return ArchiveHTTPService(
         ArchiveStore(config.archive_root),
