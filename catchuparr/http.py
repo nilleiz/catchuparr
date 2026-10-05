@@ -110,6 +110,7 @@ class ArchiveHTTPService:
         *,
         authorize_user_channel: Callable[[str, str], bool],
         catchup_enabled: Callable[[str, str], bool],
+        allow_new_session: Callable[[str, str, int], bool] | None = None,
         base_path: str = "/catchuparr",
         lease_ttl_seconds: float = 4 * 60 * 60,
         clock: Callable[[], float] = time.time,
@@ -123,6 +124,7 @@ class ArchiveHTTPService:
         self.tokens = token_store
         self.authorize_user_channel = authorize_user_channel
         self.catchup_enabled = catchup_enabled
+        self.allow_new_session = allow_new_session
         self.base_path = base_path.rstrip("/")
         self.lease_ttl_seconds = lease_ttl_seconds
         self.clock = clock
@@ -197,6 +199,13 @@ class ArchiveHTTPService:
                     )
                     return existing_id
                 db.execute("DELETE FROM http_playback_sessions WHERE lease_id=?", (existing_id,))
+            if self.allow_new_session is not None:
+                active_count = int(db.execute(
+                    "SELECT COUNT(*) FROM http_playback_sessions WHERE user_id=? AND expires_at>?",
+                    (user_id, now),
+                ).fetchone()[0])
+                if not self.allow_new_session(user_id, channel_id, active_count):
+                    raise _PermissionDenied
         lease = self.store.begin_playback(
             channel_id, start, end, ttl_seconds=self.lease_ttl_seconds
         )
@@ -221,7 +230,10 @@ class ArchiveHTTPService:
             ).fetchone()
         if row is None:
             return False
-        if segment.start_utc.timestamp() < float(row["start_utc"]) or segment.end_utc.timestamp() > float(row["end_utc"]):
+        if (
+            segment.end_utc.timestamp() <= float(row["start_utc"])
+            or segment.start_utc.timestamp() >= float(row["end_utc"])
+        ):
             return False
         if not self.store.renew_playback(lease_id, ttl_seconds=self.lease_ttl_seconds):
             return False
@@ -243,10 +255,10 @@ class ArchiveHTTPService:
     ) -> HTTPResponse:
         """Render an authenticated playlist for indexed segments in a range.
 
-        For a growing recording, call this route again periodically. Each
-        response receives its own expiring cleanup lease; only committed
-        segments are included. Partial archive coverage is reflected by omitted
-        segments, while HLS program date-time tags retain their absolute times.
+        For a growing recording, call this route again periodically. Reloads
+        reuse a stable cleanup lease and segment URLs; only committed segments
+        are included. Partial coverage is reflected by omitted segments while
+        HLS program date-time tags retain their absolute times.
         """
         try:
             start, end = _epoch(start_utc), _epoch(end_utc)
@@ -268,6 +280,8 @@ class ArchiveHTTPService:
             # concurrent cleanup cannot remove segments selected below.
             lease_id = self._new_lease(user_id, channel_id, start, end, request_key)
             segments = self.store.segments(channel_id, start, end)
+        except _PermissionDenied:
+            return _error(403, "stream limit exceeded")
         except (TypeError, ValueError):
             return _error(400, "invalid channel")
         if not segments:

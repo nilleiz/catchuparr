@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
 
 from catchuparr.engine import ArchiveStore
 from catchuparr.engine.recorder import FFmpegCopyRecorder

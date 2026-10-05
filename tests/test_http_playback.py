@@ -170,6 +170,17 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(len(self.archive.leases), 1)
         self.assertEqual(self.service.segment(self.token, "news", "seg-A", first_lease).status, 200)
 
+    def test_new_session_limit_blocks_other_program_but_allows_reload(self):
+        self.service.allow_new_session = lambda user, channel, count: count < 1
+        first = self._playlist()
+        self.assertEqual(first.status, 200)
+        self.assertEqual(self._playlist().status, 200)
+        different = self.service.playlist(
+            self.token, "news", self.start + timedelta(seconds=1),
+            self.start + timedelta(seconds=10),
+        )
+        self.assertEqual(different.status, 403)
+
 
 class RangeParserTests(unittest.TestCase):
     def test_open_suffix_and_clamped_ranges(self):

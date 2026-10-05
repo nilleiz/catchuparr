@@ -1,7 +1,7 @@
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from catchuparr.engine import ArchiveStore
 

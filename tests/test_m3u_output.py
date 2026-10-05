@@ -1,6 +1,5 @@
-from datetime import datetime, timezone
-
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from catchuparr.adapters import m3u

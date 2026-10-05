@@ -16,9 +16,8 @@ _ROUTE_NAMES = frozenset(
 
 def install_routes() -> None:
     """Install routes before Dispatcharr's broad XC and React catch-all paths."""
-    from django.urls import clear_url_caches, path
-
     import dispatcharr.urls as root_urls
+    from django.urls import clear_url_caches, path
 
     if any(getattr(route, "name", None) == "catchuparr-m3u" for route in root_urls.urlpatterns):
         return
@@ -37,9 +36,8 @@ def install_routes() -> None:
 
 
 def uninstall_routes() -> None:
-    from django.urls import clear_url_caches
-
     import dispatcharr.urls as root_urls
+    from django.urls import clear_url_caches
 
     root_urls.urlpatterns[:] = [
         route for route in root_urls.urlpatterns if getattr(route, "name", None) not in _ROUTE_NAMES
@@ -88,11 +86,10 @@ def _no_cache(response):
 
 
 def m3u_view(request):
-    from django.http import HttpResponse
-
     from apps.channels.utils import is_catchup_enabled
     from apps.output.views import generate_m3u
     from core.utils import build_absolute_uri_with_port
+    from django.http import HttpResponse
 
     from .adapters.m3u import annotate_m3u
     from .engine.store import ArchiveStore
@@ -105,7 +102,7 @@ def m3u_view(request):
     if request.method == "HEAD":
         return _no_cache(HttpResponse(content_type="audio/x-mpegurl"))
 
-    response = generate_m3u(request, user=user)
+    response = generate_m3u(_core_request(request), user=user)
     if response.status_code != 200:
         return response
     playlist = response.content.decode("utf-8")
@@ -134,9 +131,8 @@ def m3u_view(request):
 
 
 def xmltv_view(request):
-    from django.http import HttpResponse
-
     from apps.output.epg import generate_epg
+    from django.http import HttpResponse
 
     from .adapters.m3u import MAX_XMLTV_BYTES, filter_xmltv
     from .engine.store import ArchiveStore
@@ -149,8 +145,7 @@ def xmltv_view(request):
     if request.method == "HEAD":
         return _no_cache(HttpResponse(content_type="application/xml"))
 
-    request_copy = copy.copy(request)
-    request_copy.GET = request.GET.copy()
+    request_copy = _core_request(request)
     request_copy.GET["prev_days"] = str(min(30, math.ceil(config.retention_hours / 24)))
     response = generate_epg(request_copy, user=user)
     if response.status_code != 200:
@@ -176,7 +171,7 @@ def xmltv_view(request):
 def _xmltv_channel_map(request, user, config):
     from apps.output.views import generate_m3u
 
-    playlist = generate_m3u(request, user=user).content.decode("utf-8")
+    playlist = generate_m3u(_core_request(request), user=user).content.decode("utf-8")
     mapping = {}
     pending_id = None
     for line in playlist.splitlines():
@@ -195,6 +190,16 @@ def _url_token(token: str) -> str:
     from urllib.parse import quote
 
     return quote(token, safe="")
+
+
+def _core_request(request):
+    """Keep bearer credentials out of Dispatcharr's M3U/EPG cache keys."""
+    clean = copy.copy(request)
+    clean.GET = request.GET.copy()
+    clean.GET.pop("access_token", None)
+    clean.GET.pop("token", None)
+    clean.GET.pop("lease", None)
+    return clean
 
 
 def archive_view(request):
@@ -260,6 +265,7 @@ def _catchup_epoch(value: str) -> float:
 
 def _archive_service(request, user, config):
     from apps.channels.utils import is_catchup_enabled
+    from apps.proxy.utils import get_user_active_connections
 
     from .engine.store import ArchiveStore
     from .http import ArchiveHTTPService
@@ -268,6 +274,16 @@ def _archive_service(request, user, config):
     allowed = set(_xmltv_channel_map(request, user, config).values())
     user_id = str(user.id)
     catchup_allowed = bool(is_catchup_enabled(user=user))
+
+    def allow_new_session(subject, channel, plugin_sessions):
+        if subject != user_id or channel not in allowed:
+            return False
+        limit = int(getattr(user, "stream_limit", 0) or 0)
+        if limit <= 0:
+            return True
+        dispatcharr_sessions = len(get_user_active_connections(user.id))
+        return dispatcharr_sessions + plugin_sessions < limit
+
     return ArchiveHTTPService(
         ArchiveStore(config.archive_root),
         AccessTokenStore(config.archive_root),
@@ -277,6 +293,7 @@ def _archive_service(request, user, config):
         catchup_enabled=lambda subject, channel: (
             catchup_allowed and subject == user_id and channel in config.channel_uuids
         ),
+        allow_new_session=allow_new_session,
     )
 
 
