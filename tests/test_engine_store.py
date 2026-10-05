@@ -32,6 +32,8 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertNotEqual(earlier.path, self.source)
         self.assertEqual(self.source.read_bytes(), earlier.path.read_bytes())
         self.assertEqual([later.id], [s.id for s in self.store.segments("channel-1", start_utc=self.base + timedelta(seconds=7))])
+        self.assertEqual(earlier, self.store.segment("channel-1", earlier.id))
+        self.assertIsNone(self.store.segment("other-channel", earlier.id))
 
     def test_coverage_merges_adjacent_segments_and_reports_gaps(self):
         self.add(0)
@@ -55,8 +57,13 @@ class ArchiveStoreTests(unittest.TestCase):
         # This instant is in the repeated local hour during the EU DST rollback.
         local = datetime(2026, 10, 25, 2, 30, tzinfo=timezone(timedelta(hours=2)))
         rowid = self.store.save_program_snapshot("channel-1", local, local + timedelta(minutes=30), "News", {"epg_id": "42"})
+        repeated = self.store.save_program_snapshot(
+            "channel-1", local, local + timedelta(minutes=30), "News", {"epg_id": "43"}
+        )
         rows = self.store.program_snapshots("channel-1", self.base, self.base + timedelta(hours=3))
         self.assertGreater(rowid, 0)
+        self.assertEqual(rowid, repeated)
+        self.assertEqual(1, len(rows))
         self.assertEqual("News", rows[0]["title"])
         self.assertEqual(datetime(2026, 10, 25, 0, 30, tzinfo=timezone.utc), rows[0]["start_utc"])
         self.assertEqual({"epg_id": "42"}, rows[0]["payload"])

@@ -75,16 +75,31 @@ class FFmpegCopyRecorder:
             if len(row) < 3:
                 continue
             name, start_s, end_s = row[0], float(row[1]), float(row[2])
+            if end_s <= start_s:
+                self._mark_next_discontinuity = True
+                continue
             segment_path = Path(name)
             if not segment_path.is_absolute():
                 segment_path = list_path.parent / segment_path
+            file_mtime = segment_path.stat().st_mtime
             if self._session_anchor is None:
                 # The output file's mtime is written when the segment muxer
                 # closes it, after the proxy input has connected. This avoids
                 # anchoring a delayed stream at the earlier Popen time.
-                file_mtime = segment_path.stat().st_mtime
                 self._session_anchor = (anchor if anchor is not None else file_mtime - end_s)
             start, end = self._session_anchor + start_s, self._session_anchor + end_s
+            # A proxy failover can reset or jump the incoming MPEG-TS PTS while
+            # FFmpeg keeps writing the same CSV. Re-anchor at the closed file's
+            # wall-clock time so old archive slots are never reused.
+            if self._last_end_epoch is not None and (
+                start < self._last_end_epoch - 0.5
+                or abs(end - file_mtime) > max(30, self.segment_seconds * 5)
+            ):
+                self._session_anchor = max(
+                    file_mtime - end_s, self._last_end_epoch - start_s
+                )
+                start, end = self._session_anchor + start_s, self._session_anchor + end_s
+                self._mark_next_discontinuity = True
             discontinuity = self._mark_next_discontinuity
             if self._last_end_epoch is not None and abs(start - self._last_end_epoch) > 0.5:
                 discontinuity = True
