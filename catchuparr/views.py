@@ -14,6 +14,20 @@ _ROUTE_NAMES = frozenset(
 )
 
 
+def _session_limit_allows(stream_limit, plugin_sessions, redis_client, active_connections):
+    """Fail closed if Dispatcharr's active connection count cannot be verified."""
+    if stream_limit <= 0:
+        return True
+    try:
+        redis_client.ping()
+        dispatcharr_sessions = len(active_connections())
+        redis_client.ping()
+    except Exception:
+        logger.exception("Unable to verify active connections; denying archive playback")
+        return False
+    return dispatcharr_sessions + plugin_sessions < stream_limit
+
+
 def install_routes() -> None:
     """Install routes before Dispatcharr's broad XC and React catch-all paths."""
     import dispatcharr.urls as root_urls
@@ -298,6 +312,7 @@ def _catchup_epoch(value: str) -> float:
 def _archive_service(request, user, config):
     from apps.channels.utils import is_catchup_enabled
     from apps.proxy.utils import get_user_active_connections
+    from core.utils import RedisClient
 
     from .engine.store import ArchiveStore
     from .http import ArchiveHTTPService
@@ -313,8 +328,17 @@ def _archive_service(request, user, config):
         limit = int(getattr(user, "stream_limit", 0) or 0)
         if limit <= 0:
             return True
-        dispatcharr_sessions = len(get_user_active_connections(user.id))
-        return dispatcharr_sessions + plugin_sessions < limit
+        try:
+            redis = RedisClient.get_client()
+        except Exception:
+            logger.exception("Unable to verify Redis availability; denying archive playback")
+            return False
+        return _session_limit_allows(
+            limit,
+            plugin_sessions,
+            redis,
+            lambda: get_user_active_connections(user.id),
+        )
 
     return ArchiveHTTPService(
         ArchiveStore(config.archive_root),
