@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import shlex
 import subprocess
 
 CHAIN = "CATCHUPARR_DEV_EGRESS"
@@ -24,12 +25,12 @@ def network_state() -> dict:
     return json.loads(command("docker", "network", "inspect", NETWORK).stdout)[0]
 
 
-def rules(subnet: str, target: str, port: int) -> list[list[str]]:
-    return [
-        ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"],
-        ["-d", f"{target}/32", "-p", "tcp", "--dport", str(port), "-j", "RETURN"],
-        ["-j", "REJECT"],
-    ]
+def rules(target: str | None, port: int) -> list[list[str]]:
+    result = [["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"]]
+    if target is not None:
+        result.append(["-d", f"{target}/32", "-p", "tcp", "--dport", str(port), "-j", "RETURN"])
+    result.append(["-j", "REJECT"])
+    return result
 
 
 def assert_network(subnet: str, *, empty: bool = False) -> None:
@@ -41,23 +42,29 @@ def assert_network(subnet: str, *, empty: bool = False) -> None:
         raise RuntimeError("Stop the Dev runtime containers before changing the firewall rule")
 
 
-def installed_rules() -> list[str] | None:
+def _canonical_rule(rule: list[str]) -> list[str]:
+    """Normalize iptables' unordered conntrack state list for exact comparison."""
+    result = list(rule)
+    if "--ctstate" in result:
+        index = result.index("--ctstate") + 1
+        result[index] = ",".join(sorted(result[index].split(",")))
+    return result
+
+
+def installed_rules() -> list[list[str]] | None:
     result = command("iptables", "-w", "-S", CHAIN, check=False)
     if result.returncode:
         return None
-    return result.stdout.splitlines()[1:]
+    lines = [shlex.split(line) for line in result.stdout.splitlines()[1:]]
+    if any(len(line) < 3 or line[:2] != ["-A", CHAIN] for line in lines):
+        return None
+    return [_canonical_rule(line[2:]) for line in lines]
 
 
-def matches_rules(subnet: str, target: str, port: int) -> bool:
+def matches_rules(target: str | None, port: int) -> bool:
     installed = installed_rules()
-    if installed is None or len(installed) != 3:
-        return False
-    if "conntrack" not in installed[0] or target not in installed[1] or not installed[2].endswith("-j REJECT"):
-        return False
-    return all(
-        command("iptables", "-w", "-C", CHAIN, *rule, check=False).returncode == 0
-        for rule in rules(subnet, target, port)
-    )
+    expected = [_canonical_rule(rule) for rule in rules(target, port)]
+    return installed == expected
 
 
 def jump_exists(subnet: str) -> bool:
@@ -67,14 +74,14 @@ def jump_exists(subnet: str) -> bool:
     ).returncode == 0
 
 
-def apply(subnet: str, target: str, port: int) -> None:
+def apply(subnet: str, target: str | None, port: int) -> None:
     assert_network(subnet)
     existing = installed_rules()
-    if existing is not None and not matches_rules(subnet, target, port):
+    if existing is not None and not matches_rules(target, port):
         raise RuntimeError("Existing Dev egress chain differs; stop runtime and remove it first")
     if existing is None:
         command("iptables", "-w", "-N", CHAIN)
-        for rule in rules(subnet, target, port):
+        for rule in rules(target, port):
             command("iptables", "-w", "-A", CHAIN, *rule)
     if not jump_exists(subnet):
         command("iptables", "-w", "-I", "DOCKER-USER", "1", "-s", subnet, "-j", CHAIN)
@@ -100,17 +107,17 @@ def main() -> None:
     if not isinstance(ipaddress.ip_network(subnet), ipaddress.IPv4Network):
         parser.error("the Dev bridge must use IPv4")
     target = str(ipaddress.IPv4Address(args.vu_ip)) if args.vu_ip else None
-    if args.action != "remove" and target is None:
-        parser.error("--vu-ip is required for apply/check")
     if not 1 <= args.vu_port <= 65535:
         parser.error("--vu-port must be a TCP port")
+    if target is None and args.vu_port != 8001:
+        parser.error("--vu-port requires --vu-ip")
     if args.action == "apply":
         apply(subnet, target, args.vu_port)
     elif args.action == "remove":
         remove(subnet)
     else:
         assert_network(subnet)
-        if not matches_rules(subnet, target, args.vu_port) or not jump_exists(subnet):
+        if not matches_rules(target, args.vu_port) or not jump_exists(subnet):
             raise RuntimeError("Dev egress restriction is not installed as expected")
 
 
