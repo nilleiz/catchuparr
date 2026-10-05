@@ -118,6 +118,13 @@ class M3UOutputTests(unittest.TestCase):
     )
     self.assertNotIn("Local gap", result)
     self.assertIn("Provider archive", result)
+    disabled = filter_xmltv(
+        xml, lambda *_: False,
+        now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+        local_channel_ids=set(),
+    )
+    self.assertIn("Local gap", disabled)
+    self.assertIn("Provider archive", disabled)
 
 
   def test_xmltv_retains_history_with_missing_or_invalid_bounds(self):
