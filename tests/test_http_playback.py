@@ -49,6 +49,18 @@ class FakeArchive:
     def renew_playback(self, lease_id, *, ttl_seconds):
         return lease_id in self.leases
 
+    def extend_playback(self, lease_id, end, *, ttl_seconds):
+        if lease_id not in self.leases:
+            return False
+        self.leases[lease_id]["end"] = max(self.leases[lease_id]["end"], float(end))
+        return True
+
+    def segment(self, channel_id, segment_id):
+        return next(
+            (item for item in self.items if item.channel_id == channel_id and item.id == segment_id),
+            None,
+        )
+
     def end_playback(self, lease_id):
         self.leases.pop(lease_id, None)
 
@@ -110,6 +122,7 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(response.body, b"2345")
         self.assertEqual(response.headers["Content-Range"], "bytes 2-5/10")
         self.assertEqual(response.headers["Accept-Ranges"], "bytes")
+        self.assertEqual(response.headers["Content-Type"], "video/mp2t")
 
         head = self.service.segment(self.token, "news", "seg-A", lease_id, method="HEAD")
         self.assertEqual(head.status, 200)
@@ -136,6 +149,26 @@ class ArchiveHTTPTests(unittest.TestCase):
     def test_revoked_token_cannot_read_archive(self):
         self.tokens.revoke(self.token)
         self.assertEqual(self._playlist().status, 401)
+
+    def test_event_reload_reuses_lease_and_appends_segments(self):
+        end = self.start + timedelta(minutes=30)
+        first = self.service.playlist(self.token, "news", self.start, end, live=True)
+        self.assertEqual(first.status, 200)
+        first_text = first.body.decode()
+        first_lease = first_text.split("&lease=")[1].splitlines()[0]
+        second_path = self.root / "second.ts"
+        second_path.write_bytes(b"abcdefghij")
+        self.archive.items.append(
+            Segment("seg-B", "news", second_path, self.start + timedelta(seconds=6),
+                    self.start + timedelta(seconds=12))
+        )
+        second = self.service.playlist(self.token, "news", self.start, end, live=True)
+        second_text = second.body.decode()
+        self.assertEqual(second.status, 200)
+        self.assertTrue(second_text.startswith(first_text))
+        self.assertIn(f"&lease={first_lease}", second_text)
+        self.assertEqual(len(self.archive.leases), 1)
+        self.assertEqual(self.service.segment(self.token, "news", "seg-A", first_lease).status, 200)
 
 
 class RangeParserTests(unittest.TestCase):
