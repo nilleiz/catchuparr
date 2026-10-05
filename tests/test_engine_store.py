@@ -58,6 +58,20 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertEqual([(self.base + timedelta(seconds=12), self.base + timedelta(seconds=18))], list(coverage.gaps))
         self.assertTrue(self.store.coverage("channel-1", self.base, self.base + timedelta(seconds=12)).complete)
 
+    def test_small_muxer_offsets_do_not_hide_an_archived_programme(self):
+        self.add(0)
+        self.add(6.14)
+        near = self.store.coverage(
+            "channel-1", self.base, self.base + timedelta(seconds=12.14)
+        )
+        self.assertTrue(near.complete)
+        self.add(12.54)
+        missing = self.store.coverage(
+            "channel-1", self.base, self.base + timedelta(seconds=18.54)
+        )
+        self.assertFalse(missing.complete)
+        self.assertEqual(1, len(missing.gaps))
+
     def test_requires_aware_utc_instants_and_valid_ranges(self):
         with self.assertRaises(ValueError):
             self.store.add_segment("channel-1", self.source, datetime(2026, 1, 1), self.base)

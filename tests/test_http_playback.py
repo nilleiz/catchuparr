@@ -181,6 +181,22 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(closed.body, growing.body + b"#EXT-X-ENDLIST\n")
         self.assertEqual(len(self.archive.leases), 1)
 
+    def test_muxer_offset_does_not_emit_discontinuity_but_real_gap_does(self):
+        self.service.playlist_builder = None
+        for segment_id, offset in (("near", 6.14), ("after-gap", 12.54)):
+            path = self.root / f"{segment_id}.ts"
+            path.write_bytes(b"transport stream")
+            self.archive.items.append(Segment(
+                segment_id, "news", path,
+                self.start + timedelta(seconds=offset),
+                self.start + timedelta(seconds=offset + 6),
+            ))
+        playlist = self.service.playlist(
+            self.token, "news", self.start, self.start + timedelta(seconds=20), live=True
+        )
+        self.assertEqual(playlist.status, 200)
+        self.assertEqual(playlist.body.count(b"#EXT-X-DISCONTINUITY"), 1)
+
     def test_new_session_limit_blocks_other_program_but_allows_reload(self):
         self.service.allow_new_session = lambda user, channel, count: count < 1
         first = self._playlist()

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import quote
 
+from .engine.store import TIMELINE_GAP_TOLERANCE_SECONDS
+
 
 @dataclass(frozen=True)
 class HTTPResponse:
@@ -294,7 +296,10 @@ class ArchiveHTTPService:
         marked = []
         previous_end = None
         for segment in ordered:
-            has_gap = previous_end is not None and segment.start_utc.timestamp() > previous_end + 0.05
+            has_gap = (
+                previous_end is not None
+                and segment.start_utc.timestamp() > previous_end + TIMELINE_GAP_TOLERANCE_SECONDS
+            )
             marked.append(replace(segment, discontinuity=segment.discontinuity or has_gap))
             previous_end = max(previous_end or segment.end_utc.timestamp(), segment.end_utc.timestamp())
         try:
