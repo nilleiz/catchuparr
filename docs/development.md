@@ -10,6 +10,14 @@ Import `dist/catchuparr-<version>.zip` from Dispatcharr's Plugins page and enabl
 
 The first compatibility target is Dispatcharr v0.31.0. Any custom or later image requires the adapter signature and request tests before enabling recording or XC output.
 
+The first active client path is the authenticated M3U/XMLTV output with HLS
+archive playback. The XC adapter currently contains version-checked wrappers
+and unit tests, but is **not installed at runtime**. Dispatcharr's XC timeshift
+endpoint serves `.ts` with byte-range seeking; advertising local XC archive
+before a matching authenticated TS/Range response and shared session-limit
+policy exists would expose listings that cannot play. Complete those callbacks
+and test actual TiviMate XC requests before enabling the hooks.
+
 ## Isolated development stack
 
 Never mount production directories into Dev. Keep host-specific names, addresses and source backup paths in private deployment records outside this repository.
