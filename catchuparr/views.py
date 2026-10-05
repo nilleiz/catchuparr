@@ -45,7 +45,7 @@ def uninstall_routes() -> None:
     clear_url_caches()
 
 
-def _authenticate(request):
+def _authenticate(request, *, playback: bool = False):
     """Return (user, config, token) or (None, None, None), without logging tokens."""
     from apps.accounts.models import User
     from dispatcharr.utils import network_access_allowed
@@ -65,12 +65,22 @@ def _authenticate(request):
         if user_id is None:
             return None, None, None
         user = User.objects.filter(id=user_id, is_active=True).first()
-        if user is None or not network_access_allowed(request, "M3U_EPG", user):
+        if user is None or not _network_allowed(
+            request, user, network_access_allowed, playback=playback
+        ):
             return None, None, None
         return user, config, token
     except Exception:
         logger.exception("Catchuparr authentication failed")
         return None, None, None
+
+
+def _network_allowed(request, user, checker, *, playback: bool) -> bool:
+    """Archive playback must pass both playlist and stream network policies."""
+    return bool(
+        checker(request, "M3U_EPG", user)
+        and (not playback or checker(request, "STREAMS", user))
+    )
 
 
 def _denied():
@@ -220,7 +230,7 @@ def archive_view(request):
 
     if request.method not in {"GET", "HEAD"}:
         return HttpResponse(status=405)
-    user, config, token = _authenticate(request)
+    user, config, token = _authenticate(request, playback=True)
     if user is None:
         return _denied()
     channel = request.GET.get("channel_id", "")
@@ -250,7 +260,7 @@ def segment_view(request, channel_id: str, segment_id: str):
 
     if request.method not in {"GET", "HEAD"}:
         return HttpResponse(status=405)
-    user, config, token = _authenticate(request)
+    user, config, token = _authenticate(request, playback=True)
     if user is None:
         return _denied()
     service = _archive_service(request, user, config)
