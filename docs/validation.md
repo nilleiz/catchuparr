@@ -32,3 +32,9 @@ resume, programme change, restart and retention behavior. Record request
 methods, time arguments, Range headers, status codes and observed playback
 without recording bearer tokens. XC must be tested separately before its
 hooks are enabled.
+
+On 2026-10-06, the Dev AIO was rebound from loopback to the host's LAN
+interface for the Shield test. Its mounts and restricted Vu+ egress rule were
+rechecked. An unauthenticated LAN request returned HTTP 401; a separate
+device token fetched M3U and XMLTV successfully. The token and complete
+playlist URLs are stored only in a private local file outside this repository.
