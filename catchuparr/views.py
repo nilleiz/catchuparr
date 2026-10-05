@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+ARCHIVE_FINALIZATION_GRACE_SECONDS = 120
 _ROUTE_NAMES = frozenset(
     {"catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive", "catchuparr-segment"}
 )
@@ -161,6 +162,7 @@ def m3u_view(request):
 
 
 def xmltv_view(request):
+    from apps.channels.utils import is_catchup_enabled
     from apps.output.epg import generate_epg
     from django.http import HttpResponse
 
@@ -192,11 +194,14 @@ def xmltv_view(request):
             return _no_cache(HttpResponse("Guide too large", status=413))
 
     store = ArchiveStore(config.archive_root)
-    channel_map = {
-        epg_id: channel
-        for epg_id, channel in _xmltv_channel_map(request, user, config).items()
-        if store.segments(channel)
-    }
+    channel_map = (
+        {
+            epg_id: channel
+            for epg_id, channel in _xmltv_channel_map(request, user, config).items()
+            if store.segments(channel)
+        }
+        if is_catchup_enabled(user=user) else {}
+    )
     now = datetime.now(timezone.utc)
 
     def is_covered(epg_channel_id, start, end):
@@ -298,9 +303,11 @@ def archive_view(request):
     if start_epoch > now_epoch or start_epoch + duration_seconds < now_epoch - config.retention_hours * 3600:
         return _no_cache(HttpResponse("No archived programme", status=404))
     service = _archive_service(request, user, config)
+    end_epoch = start_epoch + duration_seconds
     response = service.playlist(
-        token, channel, start_epoch, start_epoch + duration_seconds,
-        live=start_epoch + duration_seconds > now_epoch,
+        token, channel, start_epoch, end_epoch,
+        # The final FFmpeg segment may be indexed shortly after the EPG end.
+        live=end_epoch + ARCHIVE_FINALIZATION_GRACE_SECONDS > now_epoch,
     )
     return _to_django_response(response, request.method)
 
