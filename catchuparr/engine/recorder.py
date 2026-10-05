@@ -53,7 +53,11 @@ class FFmpegCopyRecorder:
         output_dir.mkdir(parents=True, exist_ok=True)
         return [
             self.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "warning",
-            "-i", self.proxy_url, "-map", "0", "-c", "copy",
+            "-i", self.proxy_url,
+            # Vu+/DVB transport streams may contain private data PIDs that
+            # FFmpeg cannot remux. Keep every audio/video/subtitle track while
+            # excluding unsupported data streams.
+            "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy",
             "-f", "segment", "-segment_time", str(self.segment_seconds),
             "-segment_format", "mpegts",
             "-segment_list", str(output_dir / "segments.csv"),
