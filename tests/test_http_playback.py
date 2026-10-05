@@ -1,6 +1,7 @@
 import multiprocessing
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -244,7 +245,7 @@ class ArchiveHTTPTests(unittest.TestCase):
             catchup_enabled=lambda *_: True,
             allow_new_session=lambda _user, _channel, count: count < 2,
             playlist_builder=_builder,
-            replacement_grace_seconds=0.1,
+            replacement_grace_seconds=0.5,
         )
         first = service.playlist(self.token, "news", self.start, self.start + timedelta(seconds=10))
         first_lease = first.body.decode().split("&lease=")[1].splitlines()[0]
@@ -266,7 +267,7 @@ class ArchiveHTTPTests(unittest.TestCase):
         )
         self.assertEqual({lease_id for lease_id, grace_until in rows if grace_until is not None}, {first_lease})
         old_expiry = self.archive.leases[first_lease]["expires_at"]
-        self.assertLessEqual(old_expiry, time.time() + 0.1)
+        self.assertLessEqual(old_expiry, time.time() + 0.5)
 
         reload = service.playlist(
             self.token, "news", self.start + timedelta(seconds=1), self.start + timedelta(seconds=11)
@@ -281,7 +282,7 @@ class ArchiveHTTPTests(unittest.TestCase):
         )
         self.assertEqual(second_device.status, 200)
         self.assertEqual(service.segment(self.token, "news", "seg-A", first_lease).status, 200)
-        time.sleep(0.12)
+        time.sleep(0.55)
         self.assertEqual(service.segment(self.token, "news", "seg-A", first_lease).status, 403)
 
     def test_same_device_switch_fits_within_a_one_session_limit(self):
@@ -314,6 +315,59 @@ class ArchiveHTTPTests(unittest.TestCase):
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM http_playback_sessions").fetchone()[0], 0
             )
+
+    def test_failed_reload_keeps_the_previously_delivered_lease(self):
+        first = self._playlist()
+        old_lease = first.body.decode().split("&lease=")[1].splitlines()[0]
+        self.service.playlist_builder = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("temporary render failure")
+        )
+        self.assertEqual(self._playlist().status, 503)
+        self.assertEqual(self.service.segment(self.token, "news", "seg-A", old_lease).status, 200)
+        self.service.playlist_builder = _builder
+        self.assertIn(f"&lease={old_lease}", self._playlist().body.decode())
+
+    def test_failed_switch_restores_the_previous_active_programme(self):
+        self.service.allow_new_session = lambda _user, _channel, count: count < 1
+        first = self._playlist()
+        old_lease = first.body.decode().split("&lease=")[1].splitlines()[0]
+        self.service.playlist_builder = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("temporary render failure")
+        )
+        switched = self.service.playlist(
+            self.token, "news", self.start + timedelta(seconds=1),
+            self.start + timedelta(seconds=10),
+        )
+        self.assertEqual(switched.status, 503)
+        self.assertEqual(self.service.segment(self.token, "news", "seg-A", old_lease).status, 200)
+        self.service.playlist_builder = _builder
+        self.assertIn(f"&lease={old_lease}", self._playlist().body.decode())
+
+    def test_failed_initial_render_cannot_delete_a_concurrent_successful_reload(self):
+        entered = threading.Event()
+        delivered = threading.Event()
+        results = []
+
+        def render(segments, *, live, uri_for):
+            if not entered.is_set():
+                entered.set()
+                if not delivered.wait(timeout=5):
+                    raise RuntimeError("reload did not finish")
+                raise RuntimeError("initial render failed")
+            return _builder(segments, live=live, uri_for=uri_for)
+
+        self.service.playlist_builder = render
+        worker = threading.Thread(target=lambda: results.append(self._playlist().status))
+        worker.start()
+        self.assertTrue(entered.wait(timeout=5))
+        second = self._playlist()
+        self.assertEqual(second.status, 200)
+        delivered.set()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [503])
+        second_lease = second.body.decode().split("&lease=")[1].splitlines()[0]
+        self.assertEqual(self.service.segment(self.token, "news", "seg-A", second_lease).status, 200)
 
     def test_existing_user_scoped_sessions_move_to_short_grace_on_upgrade(self):
         legacy_lease = "legacy-session"
