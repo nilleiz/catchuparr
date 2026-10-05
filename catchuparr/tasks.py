@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -42,11 +41,58 @@ def reconcile_recorders():
         older_than_utc=datetime.now(timezone.utc) - timedelta(hours=config.retention_hours),
         max_bytes=config.max_storage_bytes,
     )
+    if redis.set("catchuparr:orphan-reconcile", "1", nx=True, ex=600):
+        store.reconcile_orphans(grace_seconds=3600)
     return {"queued": queued}
+
+
+@shared_task(name="catchuparr.snapshot_epg")
+def snapshot_epg():
+    """Keep the schedule visible when Dispatcharr later replaces EPG rows."""
+    from apps.channels.managers import with_effective_values
+    from apps.channels.models import Channel
+
+    from .engine.store import ArchiveStore
+    from .runtime import load_config, require_supported_version
+
+    require_supported_version()
+    config = load_config()
+    if config is None:
+        return {"saved": 0}
+    store = ArchiveStore(config.archive_root)
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=config.retention_hours)
+    window_end = now + timedelta(days=2)
+    channels = with_effective_values(
+        Channel.objects.filter(uuid__in=config.channel_uuids),
+        select_related_fks=True,
+    ).select_related("epg_data__epg_source", "override__epg_data__epg_source")
+    saved = 0
+    for channel in channels:
+        epg_data = channel.effective_epg_data_obj
+        if epg_data is None:
+            continue
+        programs = epg_data.programs.filter(
+            end_time__gt=window_start,
+            start_time__lt=window_end,
+        ).order_by("start_time")
+        for program in programs.iterator(chunk_size=500):
+            store.save_program_snapshot(
+                str(channel.uuid), program.start_time, program.end_time,
+                program.title or "",
+                {
+                    "description": program.description or "",
+                    "epg_id": str(epg_data.id),
+                    "source_program_id": str(program.id),
+                },
+            )
+            saved += 1
+    return {"saved": saved}
 
 
 @shared_task(name="catchuparr.record_channel")
 def record_channel(channel_uuid: str):
+    from apps.channels.tasks import get_dvr_stream_base_url
     from core.utils import RedisClient
 
     from .engine.leases import RedisRecorderLease
@@ -67,9 +113,8 @@ def record_channel(channel_uuid: str):
     store = ArchiveStore(config.archive_root)
     store.register_recorder_fence(channel_uuid, fence)
     stop_event = threading.Event()
-    proxy_host = os.environ.get("DISPATCHARR_WEB_HOST", "web")
-    proxy_port = int(os.environ.get("DISPATCHARR_PORT", "9191"))
-    proxy_url = f"http://{proxy_host}:{proxy_port}/proxy/ts/stream/{channel_uuid}"
+    # Dispatcharr's DVR helper accounts for modular and AIO deployments.
+    proxy_url = f"{get_dvr_stream_base_url().rstrip('/')}/proxy/ts/stream/{channel_uuid}"
     recorder = FFmpegCopyRecorder(
         store, channel_uuid, proxy_url, config.archive_root / "work",
         fencing_token=fence,
