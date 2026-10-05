@@ -1,8 +1,10 @@
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from catchuparr.views import (
     _access_token,
+    _archive_window_live,
     _catchup_epoch,
     _core_request,
     _network_allowed,
@@ -55,6 +57,19 @@ class ViewBoundaryTests(unittest.TestCase):
             f'#EXTINF:-1,Other\nhttp://host/proxy/ts/stream/{first}\n'
         )
         self.assertEqual(_selected_proxy_channels(playlist, (first, second)), {first, second})
+
+    def test_recently_ended_programme_waits_for_final_indexed_segment(self):
+        tail = []
+        service = SimpleNamespace(
+            authorize_user_channel=lambda *_: True,
+            catchup_enabled=lambda *_: True,
+            store=SimpleNamespace(segments=lambda *_: tail),
+        )
+        self.assertTrue(_archive_window_live(service, "viewer", "news", 1000, 1010))
+        tail.append(SimpleNamespace(end_utc=datetime.fromtimestamp(1000, timezone.utc)))
+        self.assertFalse(_archive_window_live(service, "viewer", "news", 1000, 1010))
+        tail.clear()
+        self.assertFalse(_archive_window_live(service, "viewer", "news", 1000, 1120))
 
 
 if __name__ == "__main__":

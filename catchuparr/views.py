@@ -306,10 +306,30 @@ def archive_view(request):
     end_epoch = start_epoch + duration_seconds
     response = service.playlist(
         token, channel, start_epoch, end_epoch,
-        # The final FFmpeg segment may be indexed shortly after the EPG end.
-        live=end_epoch + ARCHIVE_FINALIZATION_GRACE_SECONDS > now_epoch,
+        live=_archive_window_live(service, str(user.id), channel, end_epoch, now_epoch),
     )
     return _to_django_response(response, request.method)
+
+
+def _archive_window_live(service, user_id, channel_id, end_epoch, now_epoch):
+    """Wait briefly for a final indexed segment after the EPG boundary."""
+    from .engine.store import TIMELINE_GAP_TOLERANCE_SECONDS
+
+    if end_epoch > now_epoch:
+        return True
+    if now_epoch >= end_epoch + ARCHIVE_FINALIZATION_GRACE_SECONDS:
+        return False
+    if not (
+        service.authorize_user_channel(user_id, channel_id)
+        and service.catchup_enabled(user_id, channel_id)
+    ):
+        return False
+    tail = service.store.segments(
+        channel_id, end_epoch - ARCHIVE_FINALIZATION_GRACE_SECONDS, end_epoch
+    )
+    return not tail or max(segment.end_utc.timestamp() for segment in tail) < (
+        end_epoch - TIMELINE_GAP_TOLERANCE_SECONDS
+    )
 
 
 def segment_view(request, channel_id: str, segment_id: str):
