@@ -1,6 +1,6 @@
+import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import unittest
 
 from catchuparr.engine import Segment, build_hls_playlist
 

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .store import ArchiveStore, Segment
+from .store import ArchiveStore
 
 
 class FFmpegCopyRecorder:

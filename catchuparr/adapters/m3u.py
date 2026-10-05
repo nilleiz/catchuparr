@@ -7,11 +7,11 @@ placeholders and must be verified against the target client.
 
 from __future__ import annotations
 
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Callable, Mapping
 from urllib.parse import quote, urlsplit
-import re
-import xml.etree.ElementTree as ET
 
 MAX_XMLTV_BYTES = 64 * 1024 * 1024
 

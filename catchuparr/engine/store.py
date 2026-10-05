@@ -13,7 +13,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 
 def _utc_epoch(value: datetime | str | int | float) -> float:
@@ -314,7 +313,10 @@ class ArchiveStore:
         if cursor < end:
             gaps.append((_datetime(cursor), _datetime(end)))
         spans = tuple((_datetime(left), _datetime(right)) for left, right in merged)
-        return Coverage(_datetime(start), _datetime(end), sum(r - l for l, r in merged), spans, tuple(gaps))
+        return Coverage(
+            _datetime(start), _datetime(end),
+            sum(right - left for left, right in merged), spans, tuple(gaps),
+        )
 
     def save_program_snapshot(
         self,
