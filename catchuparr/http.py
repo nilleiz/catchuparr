@@ -8,6 +8,7 @@ parameter from access logs.
 
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 import re
 import sqlite3
@@ -110,7 +111,7 @@ class ArchiveHTTPService:
         authorize_user_channel: Callable[[str, str], bool],
         catchup_enabled: Callable[[str, str], bool],
         base_path: str = "/catchuparr",
-        lease_ttl_seconds: float = 120,
+        lease_ttl_seconds: float = 4 * 60 * 60,
         clock: Callable[[], float] = time.time,
         playlist_builder: Callable[..., str] | None = None,
     ):
@@ -142,12 +143,17 @@ class ArchiveHTTPService:
                     lease_id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
                     channel_id TEXT NOT NULL,
+                    request_key TEXT,
                     start_utc REAL NOT NULL,
                     end_utc REAL NOT NULL,
                     expires_at REAL NOT NULL
                 )"""
             )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(http_playback_sessions)")}
+            if "request_key" not in columns:
+                db.execute("ALTER TABLE http_playback_sessions ADD COLUMN request_key TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS http_sessions_user ON http_playback_sessions(user_id, channel_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS http_sessions_request ON http_playback_sessions(request_key, expires_at)")
 
     def _authorize(self, token: str | None, channel_id: str) -> str | None:
         if not token:
@@ -171,7 +177,26 @@ class ArchiveHTTPService:
             builder = build_hls_playlist
         return builder(segments, live=live, uri_for=uri_for)
 
-    def _new_lease(self, user_id: str, channel_id: str, start: float, end: float) -> str:
+    def _new_lease(
+        self, user_id: str, channel_id: str, start: float, end: float, request_key: str
+    ) -> str:
+        now = self.clock()
+        with closing(self._connect()) as db:
+            existing = db.execute(
+                "SELECT lease_id FROM http_playback_sessions WHERE request_key=? AND expires_at>? ORDER BY expires_at DESC LIMIT 1",
+                (request_key, now),
+            ).fetchone()
+            if existing is not None:
+                existing_id = str(existing["lease_id"])
+                if self.store.extend_playback(
+                    existing_id, end, ttl_seconds=self.lease_ttl_seconds
+                ):
+                    db.execute(
+                        "UPDATE http_playback_sessions SET end_utc=MAX(end_utc,?),expires_at=? WHERE lease_id=?",
+                        (end, now + self.lease_ttl_seconds, existing_id),
+                    )
+                    return existing_id
+                db.execute("DELETE FROM http_playback_sessions WHERE lease_id=?", (existing_id,))
         lease = self.store.begin_playback(
             channel_id, start, end, ttl_seconds=self.lease_ttl_seconds
         )
@@ -179,8 +204,8 @@ class ArchiveHTTPService:
             with closing(self._connect()) as db:
                 db.execute("DELETE FROM http_playback_sessions WHERE expires_at<=?", (self.clock(),))
                 db.execute(
-                    "INSERT INTO http_playback_sessions(lease_id,user_id,channel_id,start_utc,end_utc,expires_at) VALUES(?,?,?,?,?,?)",
-                    (lease.id, user_id, channel_id, start, end, lease.expires_at),
+                    "INSERT INTO http_playback_sessions(lease_id,user_id,channel_id,request_key,start_utc,end_utc,expires_at) VALUES(?,?,?,?,?,?,?)",
+                    (lease.id, user_id, channel_id, request_key, start, end, lease.expires_at),
                 )
         except BaseException:
             self.store.end_playback(lease.id)
@@ -235,11 +260,18 @@ class ArchiveHTTPService:
             return _error(403, "forbidden")
         if user_id is None:
             return _error(401, "unauthorized")
+        request_key = hashlib.sha256(
+            f"{user_id}\0{channel_id}\0{start:.6f}\0{end:.6f}\0{int(live)}".encode()
+        ).hexdigest()
         try:
+            # Protect the entire requested window before reading the index. A
+            # concurrent cleanup cannot remove segments selected below.
+            lease_id = self._new_lease(user_id, channel_id, start, end, request_key)
             segments = self.store.segments(channel_id, start, end)
         except (TypeError, ValueError):
             return _error(400, "invalid channel")
         if not segments:
+            self.end_session(token, channel_id, lease_id)
             return _error(404, "no archived segments in requested range")
 
         # Expose discontinuities for both explicit transport discontinuities
@@ -251,10 +283,7 @@ class ArchiveHTTPService:
             has_gap = previous_end is not None and segment.start_utc.timestamp() > previous_end + 0.05
             marked.append(replace(segment, discontinuity=segment.discontinuity or has_gap))
             previous_end = max(previous_end or segment.end_utc.timestamp(), segment.end_utc.timestamp())
-        lease_start = min(item.start_utc.timestamp() for item in marked)
-        lease_end = max(item.end_utc.timestamp() for item in marked)
         try:
-            lease_id = self._new_lease(user_id, channel_id, lease_start, lease_end)
             root = self.base_path
             channel_component = quote(str(channel_id), safe="")
 
@@ -302,10 +331,9 @@ class ArchiveHTTPService:
         if not lease_id:
             return _error(403, "playback lease required")
         try:
-            segments = self.store.segments(channel_id)
+            segment = self.store.segment(channel_id, segment_id)
         except (TypeError, ValueError):
             return _error(400, "invalid channel")
-        segment = next((item for item in segments if item.id == segment_id), None)
         if segment is None:
             return _error(404, "segment not found")
         if not self._renew_lease(user_id, channel_id, lease_id, segment):
@@ -326,7 +354,10 @@ class ArchiveHTTPService:
         except (OSError, ValueError):
             return _error(404, "segment not found")
 
-        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        content_type = (
+            "video/mp2t" if path.suffix.lower() == ".ts"
+            else mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        )
         headers = {
             "Accept-Ranges": "bytes",
             "Cache-Control": "private, max-age=31536000, immutable",

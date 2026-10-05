@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -47,6 +46,7 @@ def reconcile_recorders():
 
 @shared_task(name="catchuparr.record_channel")
 def record_channel(channel_uuid: str):
+    from apps.channels.tasks import get_dvr_stream_base_url
     from core.utils import RedisClient
 
     from .engine.leases import RedisRecorderLease
@@ -67,9 +67,8 @@ def record_channel(channel_uuid: str):
     store = ArchiveStore(config.archive_root)
     store.register_recorder_fence(channel_uuid, fence)
     stop_event = threading.Event()
-    proxy_host = os.environ.get("DISPATCHARR_WEB_HOST", "web")
-    proxy_port = int(os.environ.get("DISPATCHARR_PORT", "9191"))
-    proxy_url = f"http://{proxy_host}:{proxy_port}/proxy/ts/stream/{channel_uuid}"
+    # Dispatcharr's DVR helper accounts for modular and AIO deployments.
+    proxy_url = f"{get_dvr_stream_base_url().rstrip('/')}/proxy/ts/stream/{channel_uuid}"
     recorder = FFmpegCopyRecorder(
         store, channel_uuid, proxy_url, config.archive_root / "work",
         fencing_token=fence,
