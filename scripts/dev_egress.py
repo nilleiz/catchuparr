@@ -98,7 +98,14 @@ def _dev_jump(subnet: str) -> list[str]:
 def jump_is_first(subnet: str) -> bool:
     installed = chain_rules("DOCKER-USER")
     expected = _dev_jump(subnet)
-    return installed is not None and bool(installed) and installed[0] == expected and installed.count(expected) == 1
+    if installed is None or not installed or installed[0] != expected:
+        return False
+    targets = [
+        rule for rule in installed
+        if ("-j" in rule and rule[rule.index("-j") + 1] == CHAIN)
+        or ("-g" in rule and rule[rule.index("-g") + 1] == CHAIN)
+    ]
+    return targets == [expected]
 
 
 def ensure_jump_first(subnet: str) -> None:
