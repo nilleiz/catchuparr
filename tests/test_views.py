@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from catchuparr.views import _catchup_epoch, _core_request
+from catchuparr.views import _catchup_epoch, _core_request, _network_allowed
 
 
 class ViewBoundaryTests(unittest.TestCase):
@@ -19,6 +19,19 @@ class ViewBoundaryTests(unittest.TestCase):
         core = _core_request(request)
         self.assertEqual(core.GET, {"days": "2"})
         self.assertIn("access_token", request.GET)
+
+    def test_archive_requires_stream_network_permission_as_well_as_playlist_permission(self):
+        checked = []
+
+        def checker(_request, area, _user):
+            checked.append(area)
+            return area != "STREAMS"
+
+        self.assertTrue(_network_allowed(None, None, checker, playback=False))
+        self.assertEqual(checked, ["M3U_EPG"])
+        checked.clear()
+        self.assertFalse(_network_allowed(None, None, checker, playback=True))
+        self.assertEqual(checked, ["M3U_EPG", "STREAMS"])
 
 
 if __name__ == "__main__":
