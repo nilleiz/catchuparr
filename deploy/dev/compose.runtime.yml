@@ -72,3 +72,4 @@ networks:
     internal: true
   lan:
     name: catchuparr-dev-lan
+    external: true
