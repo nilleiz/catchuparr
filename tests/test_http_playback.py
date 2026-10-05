@@ -1,4 +1,7 @@
+import multiprocessing
+import sqlite3
 import tempfile
+import time
 import unittest
 import uuid
 from dataclasses import dataclass
@@ -43,17 +46,26 @@ class FakeArchive:
 
     def begin_playback(self, channel, start, end, *, ttl_seconds):
         key = uuid.uuid4().hex
-        lease = SimpleNamespace(id=key, expires_at=9999999999)
-        self.leases[key] = {"channel": channel, "start": float(start), "end": float(end)}
+        expiry = time.time() + ttl_seconds
+        lease = SimpleNamespace(id=key, expires_at=expiry)
+        self.leases[key] = {
+            "channel": channel, "start": float(start), "end": float(end),
+            "expires_at": expiry,
+        }
         return lease
 
     def renew_playback(self, lease_id, *, ttl_seconds):
-        return lease_id in self.leases
+        lease = self.leases.get(lease_id)
+        if lease is None or lease["expires_at"] <= time.time():
+            return False
+        lease["expires_at"] = time.time() + ttl_seconds
+        return True
 
     def extend_playback(self, lease_id, end, *, ttl_seconds):
         if lease_id not in self.leases:
             return False
         self.leases[lease_id]["end"] = max(self.leases[lease_id]["end"], float(end))
+        self.leases[lease_id]["expires_at"] = time.time() + ttl_seconds
         return True
 
     def segment(self, channel_id, segment_id):
@@ -73,6 +85,21 @@ def _builder(segments, *, live, uri_for):
     if not live:
         lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines) + "\n"
+
+
+def _concurrent_playlist_request(root, token, barrier, results, start, end):
+    store = ArchiveStore(root)
+    tokens = TokenStore(root)
+    service = ArchiveHTTPService(
+        store,
+        tokens,
+        authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+        catchup_enabled=lambda *_: True,
+        allow_new_session=lambda _user, _channel, count: time.sleep(0.1) is None and count < 1,
+    )
+    barrier.wait(timeout=10)
+    response = service.playlist(token, "news", start, end)
+    results.put(response.status)
 
 
 class ArchiveHTTPTests(unittest.TestCase):
@@ -197,16 +224,137 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(playlist.status, 200)
         self.assertEqual(playlist.body.count(b"#EXT-X-DISCONTINUITY"), 1)
 
-    def test_new_session_limit_blocks_other_program_but_allows_reload(self):
+    def test_new_session_limit_blocks_other_device_but_allows_reload(self):
         self.service.allow_new_session = lambda user, channel, count: count < 1
         first = self._playlist()
         self.assertEqual(first.status, 200)
         self.assertEqual(self._playlist().status, 200)
+        other_device = self.tokens.create("user-a")
         different = self.service.playlist(
-            self.token, "news", self.start + timedelta(seconds=1),
+            other_device, "news", self.start + timedelta(seconds=1),
             self.start + timedelta(seconds=10),
         )
         self.assertEqual(different.status, 403)
+
+    def test_same_device_switch_replaces_active_session_and_keeps_old_urls_briefly(self):
+        service = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
+            allow_new_session=lambda _user, _channel, count: count < 2,
+            playlist_builder=_builder,
+            replacement_grace_seconds=0.1,
+        )
+        first = service.playlist(self.token, "news", self.start, self.start + timedelta(seconds=10))
+        first_lease = first.body.decode().split("&lease=")[1].splitlines()[0]
+        switched = service.playlist(
+            self.token, "news", self.start + timedelta(seconds=1), self.start + timedelta(seconds=11)
+        )
+        self.assertEqual(switched.status, 200)
+        switched_lease = switched.body.decode().split("&lease=")[1].splitlines()[0]
+        self.assertNotEqual(switched_lease, first_lease)
+
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            rows = db.execute(
+                "SELECT lease_id,grace_until FROM http_playback_sessions ORDER BY lease_id"
+            ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {lease_id for lease_id, grace_until in rows if grace_until is None},
+            {switched_lease},
+        )
+        self.assertEqual({lease_id for lease_id, grace_until in rows if grace_until is not None}, {first_lease})
+        old_expiry = self.archive.leases[first_lease]["expires_at"]
+        self.assertLessEqual(old_expiry, time.time() + 0.1)
+
+        reload = service.playlist(
+            self.token, "news", self.start + timedelta(seconds=1), self.start + timedelta(seconds=11)
+        )
+        self.assertEqual(reload.status, 200)
+        self.assertIn(f"&lease={switched_lease}", reload.body.decode())
+        # Grace rows are excluded from admission counts, so a second device can
+        # use the remaining slot even while the old segment URLs are valid.
+        other_device = self.tokens.create("user-a")
+        second_device = service.playlist(
+            other_device, "news", self.start, self.start + timedelta(seconds=10)
+        )
+        self.assertEqual(second_device.status, 200)
+        self.assertEqual(service.segment(self.token, "news", "seg-A", first_lease).status, 200)
+        time.sleep(0.12)
+        self.assertEqual(service.segment(self.token, "news", "seg-A", first_lease).status, 403)
+
+    def test_same_device_switch_fits_within_a_one_session_limit(self):
+        service = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
+            allow_new_session=lambda _user, _channel, count: count < 1,
+            playlist_builder=_builder,
+        )
+        self.assertEqual(
+            service.playlist(self.token, "news", self.start, self.start + timedelta(seconds=10)).status,
+            200,
+        )
+        switched = service.playlist(
+            self.token, "news", self.start + timedelta(seconds=1), self.start + timedelta(seconds=11)
+        )
+        self.assertEqual(switched.status, 200)
+
+    def test_playlist_builder_failure_releases_session_and_lease(self):
+        def fail_builder(*_args, **_kwargs):
+            raise RuntimeError("playlist generation failed")
+
+        self.service.playlist_builder = fail_builder
+        response = self._playlist()
+        self.assertEqual(response.status, 503)
+        self.assertEqual(self.archive.leases, {})
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM http_playback_sessions").fetchone()[0], 0
+            )
+
+    def test_existing_user_scoped_sessions_move_to_short_grace_on_upgrade(self):
+        legacy_lease = "legacy-session"
+        expires_at = time.time() + 4 * 60 * 60
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            db.execute("DROP TABLE http_playback_sessions")
+            db.execute(
+                "CREATE TABLE http_playback_sessions ("
+                "lease_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,channel_id TEXT NOT NULL,"
+                "request_key TEXT,start_utc REAL NOT NULL,end_utc REAL NOT NULL,expires_at REAL NOT NULL)"
+            )
+            db.execute(
+                "INSERT INTO http_playback_sessions VALUES(?,?,?,?,?,?,?)",
+                (
+                    legacy_lease, "user-a", "news", "old-request", self.start.timestamp(),
+                    (self.start + timedelta(seconds=10)).timestamp(), expires_at,
+                ),
+            )
+        self.archive.leases[legacy_lease] = {
+            "channel": "news", "start": self.start.timestamp(),
+            "end": (self.start + timedelta(seconds=10)).timestamp(),
+            "expires_at": expires_at,
+        }
+        service = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
+            replacement_grace_seconds=3,
+            playlist_builder=_builder,
+        )
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            grace_until = db.execute(
+                "SELECT grace_until FROM http_playback_sessions WHERE lease_id=?", (legacy_lease,)
+            ).fetchone()[0]
+        self.assertGreater(grace_until, time.time())
+        self.assertLess(grace_until, expires_at)
+        self.assertEqual(
+            service.segment(self.token, "news", "seg-A", legacy_lease).status, 200
+        )
+        self.assertEqual(self._playlist().status, 200)
 
 
 class RangeParserTests(unittest.TestCase):
@@ -248,6 +396,51 @@ class RealStoreHTTPTests(unittest.TestCase):
             )
             response = service.segment(token, "news", item.id, lease_id, range_header="bytes=3-6")
             self.assertEqual((response.status, response.body), (206, b"3456"))
+
+    def test_concurrent_processes_cannot_both_admit_different_devices_over_limit(self):
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.ts"
+            source.write_bytes(b"0123456789")
+            store = ArchiveStore(root)
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            store.add_segment("news", source, start, start + timedelta(seconds=6))
+            tokens = TokenStore(root)
+            device_tokens = [tokens.create("user-a"), tokens.create("user-a")]
+            ArchiveHTTPService(
+                store, tokens,
+                authorize_user_channel=lambda *_: True,
+                catchup_enabled=lambda *_: True,
+                allow_new_session=lambda _user, _channel, count: count < 1,
+            )
+            barrier = context.Barrier(2)
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_concurrent_playlist_request,
+                    args=(
+                        str(root), token, barrier, results,
+                        start.timestamp(), (start + timedelta(seconds=10)).timestamp(),
+                    ),
+                )
+                for token in device_tokens
+            ]
+            for process in processes:
+                process.start()
+            statuses = [results.get(timeout=15) for _ in processes]
+            for process in processes:
+                process.join(timeout=15)
+                self.assertEqual(process.exitcode, 0)
+            self.assertCountEqual(statuses, [200, 403])
+            with sqlite3.connect(root / "archive.sqlite3") as db:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT COUNT(*) FROM http_playback_sessions "
+                        "WHERE grace_until IS NULL AND expires_at>?", (time.time(),)
+                    ).fetchone()[0],
+                    1,
+                )
 
 
 if __name__ == "__main__":
