@@ -343,6 +343,33 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.service.playlist_builder = _builder
         self.assertIn(f"&lease={old_lease}", self._playlist().body.decode())
 
+    def test_slow_failed_switch_preserves_old_store_lease_past_grace_window(self):
+        service = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
+            allow_new_session=lambda _user, _channel, count: count < 1,
+            playlist_builder=_builder,
+            replacement_grace_seconds=0.05,
+        )
+        first = service.playlist(
+            self.token, "news", self.start, self.start + timedelta(seconds=10)
+        )
+        old_lease = first.body.decode().split("&lease=")[1].splitlines()[0]
+
+        def slow_failure(*_args, **_kwargs):
+            time.sleep(0.15)
+            raise RuntimeError("replacement render failed")
+
+        service.playlist_builder = slow_failure
+        switched = service.playlist(
+            self.token, "news", self.start + timedelta(seconds=1),
+            self.start + timedelta(seconds=10),
+        )
+        self.assertEqual(switched.status, 503)
+        self.assertEqual(service.segment(self.token, "news", "seg-A", old_lease).status, 200)
+
     def test_failed_initial_render_cannot_delete_a_concurrent_successful_reload(self):
         entered = threading.Event()
         delivered = threading.Event()
