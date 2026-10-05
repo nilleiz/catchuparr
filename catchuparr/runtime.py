@@ -142,6 +142,17 @@ def status(settings: dict) -> dict:
     config = parse_settings(settings)
     store = ArchiveStore(config.archive_root)
     try:
+        from apps.channels.models import Channel
+
+        names = {
+            str(uuid): name
+            for uuid, name in Channel.objects.filter(uuid__in=config.channel_uuids).values_list(
+                "uuid", "name"
+            )
+        }
+    except Exception:
+        names = {}
+    try:
         from core.utils import RedisClient
 
         redis = RedisClient.get_client()
@@ -158,7 +169,12 @@ def status(settings: dict) -> dict:
                 recorder_running = bool(redis.exists(f"catchuparr:recorder:{channel}"))
             except Exception:
                 recorder_running = None
-        channels.append({"uuid": channel, **stats, "recorder_running": recorder_running})
+        channels.append({
+            "uuid": channel,
+            "name": names.get(channel),
+            **stats,
+            "recorder_running": recorder_running,
+        })
     return {
         "channels": channels,
         "archive_root": str(config.archive_root),
