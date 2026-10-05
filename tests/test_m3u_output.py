@@ -106,6 +106,19 @@ class M3UOutputTests(unittest.TestCase):
     self.assertEqual(len(calls), 2)
     self.assertEqual(calls[0][1].tzinfo, timezone.utc)
 
+  def test_xmltv_keeps_unselected_provider_history(self):
+    xml = '''<tv>
+      <programme channel="local" start="20261004190000 +0000" stop="20261004200000 +0000"><title>Local gap</title></programme>
+      <programme channel="provider" start="20261004190000 +0000" stop="20261004200000 +0000"><title>Provider archive</title></programme>
+    </tv>'''
+    result = filter_xmltv(
+        xml, lambda *_: False,
+        now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+        local_channel_ids={"local"},
+    )
+    self.assertNotIn("Local gap", result)
+    self.assertIn("Provider archive", result)
+
 
   def test_xmltv_retains_history_with_missing_or_invalid_bounds(self):
     xml = '''<tv>

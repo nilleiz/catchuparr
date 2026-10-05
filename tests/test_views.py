@@ -1,7 +1,13 @@
 import unittest
 from types import SimpleNamespace
 
-from catchuparr.views import _access_token, _catchup_epoch, _core_request, _network_allowed
+from catchuparr.views import (
+    _access_token,
+    _catchup_epoch,
+    _core_request,
+    _network_allowed,
+    _selected_proxy_channels,
+)
 
 
 class ViewBoundaryTests(unittest.TestCase):
@@ -39,6 +45,16 @@ class ViewBoundaryTests(unittest.TestCase):
         checked.clear()
         self.assertFalse(_network_allowed(None, None, checker, playback=True))
         self.assertEqual(checked, ["M3U_EPG", "STREAMS"])
+
+    def test_archive_authorization_does_not_depend_on_epg_ids(self):
+        first = "00000000-0000-4000-8000-000000000001"
+        second = "00000000-0000-4000-8000-000000000002"
+        playlist = (
+            f'#EXTINF:-1 tvg-id="shared",First\nhttp://host/proxy/ts/stream/{first}\n'
+            f'#EXTINF:-1 tvg-id="shared",Second\nhttp://host/proxy/ts/stream/{second}\n'
+            f'#EXTINF:-1,Other\nhttp://host/proxy/ts/stream/{first}\n'
+        )
+        self.assertEqual(_selected_proxy_channels(playlist, (first, second)), {first, second})
 
 
 if __name__ == "__main__":
