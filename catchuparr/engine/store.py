@@ -282,6 +282,29 @@ class ArchiveStore:
             ).fetchall()
         return [self._row_segment(row) for row in rows if (self.root / row["relpath"]).is_file()]
 
+    def channel_stats(self, channel_id: str) -> dict:
+        """Return indexed recorder progress without loading every segment."""
+        channel = _channel_key(channel_id)
+        with self._database() as db:
+            row = db.execute(
+                """SELECT COUNT(*) AS segments, COALESCE(SUM(size_bytes), 0) AS size_bytes,
+                          MAX(end_utc) AS latest_end_utc,
+                          COALESCE(SUM(discontinuity), 0) AS discontinuities
+                   FROM segments WHERE channel_id=?""",
+                (channel,),
+            ).fetchone()
+        return {
+            "segments": int(row["segments"]),
+            "size_bytes": int(row["size_bytes"]),
+            "latest_end_utc": _datetime(row["latest_end_utc"]).isoformat() if row["latest_end_utc"] is not None else None,
+            "discontinuities": int(row["discontinuities"]),
+        }
+
+    def indexed_size_bytes(self) -> int:
+        """Count all archived channels, including ones no longer selected."""
+        with self._database() as db:
+            return int(db.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM segments").fetchone()[0])
+
     def segment(self, channel_id: str, segment_id: str) -> Segment | None:
         """Look up one immutable segment by the indexed ID and channel."""
         channel = _channel_key(channel_id)

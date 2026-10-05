@@ -35,6 +35,19 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertEqual(earlier, self.store.segment("channel-1", earlier.id))
         self.assertIsNone(self.store.segment("other-channel", earlier.id))
 
+    def test_status_stats_include_progress_and_unselected_archive_usage(self):
+        self.assertEqual(0, self.store.channel_stats("channel-1")["segments"])
+        first = self.add(0, discontinuity=True)
+        self.store.add_segment(
+            "former-channel", self.source,
+            self.base, self.base + timedelta(seconds=6),
+        )
+        stats = self.store.channel_stats("channel-1")
+        self.assertEqual(1, stats["segments"])
+        self.assertEqual(first.end_utc.isoformat(), stats["latest_end_utc"])
+        self.assertEqual(1, stats["discontinuities"])
+        self.assertEqual(first.path.stat().st_size * 2, self.store.indexed_size_bytes())
+
     def test_coverage_merges_adjacent_segments_and_reports_gaps(self):
         self.add(0)
         self.add(6)

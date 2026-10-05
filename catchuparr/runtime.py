@@ -141,14 +141,30 @@ def status(settings: dict) -> dict:
 
     config = parse_settings(settings)
     store = ArchiveStore(config.archive_root)
+    try:
+        from core.utils import RedisClient
+
+        redis = RedisClient.get_client()
+        redis.ping()
+    except Exception:
+        redis = None
+    channels = []
+    for channel in config.channel_uuids:
+        stats = store.channel_stats(channel)
+        if redis is None:
+            recorder_running = None
+        else:
+            try:
+                recorder_running = bool(redis.exists(f"catchuparr:recorder:{channel}"))
+            except Exception:
+                recorder_running = None
+        channels.append({"uuid": channel, **stats, "recorder_running": recorder_running})
     return {
-        "channels": [
-            {"uuid": channel, "segments": len(store.segments(channel))}
-            for channel in config.channel_uuids
-        ],
+        "channels": channels,
         "archive_root": str(config.archive_root),
         "retention_hours": config.retention_hours,
         "max_storage_bytes": config.max_storage_bytes,
+        "indexed_storage_bytes": store.indexed_size_bytes(),
     }
 
 
