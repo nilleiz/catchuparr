@@ -209,13 +209,7 @@ def xmltv_view(request):
     if request.method == "HEAD":
         return _no_cache(HttpResponse(content_type="application/xml"))
 
-    request_copy = _core_request(request)
-    # Dispatcharr treats days=0 as unbounded future EPG. Keep the plugin's
-    # default XMLTV response practical for a client importing the full list.
-    if "days" not in request_copy.GET:
-        request_copy.GET["days"] = "2"
-    if "prev_days" not in request_copy.GET:
-        request_copy.GET["prev_days"] = str(min(30, math.ceil(config.retention_hours / 24)))
+    request_copy = _epg_request(request, config.retention_hours)
     response = generate_epg(request_copy, user=user)
     if response.status_code != 200:
         return response
@@ -282,6 +276,18 @@ def _xmltv_channel_map(request, user, config):
                     mapping[pending_id] = channel
             pending_id = None
     return mapping
+
+
+def _epg_request(request, retention_hours: int):
+    """Add local history defaults without reducing requested provider history."""
+    copied = _core_request(request)
+    # Dispatcharr treats days=0 as unbounded future EPG. Keep a default import
+    # practical while preserving an explicitly requested provider lookback.
+    if "days" not in copied.GET:
+        copied.GET["days"] = "2"
+    if "prev_days" not in copied.GET:
+        copied.GET["prev_days"] = str(min(30, math.ceil(retention_hours / 24)))
+    return copied
 
 
 def _selected_proxy_channels(playlist: str, channel_uuids) -> set[str]:
