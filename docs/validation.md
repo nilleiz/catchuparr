@@ -38,6 +38,7 @@ device token fetched M3U and XMLTV successfully. The token and complete
 playlist URLs are stored only in a private local file outside this repository.
 The user then confirmed on TiviMate 5.3.3 running on Shield TV that the
 M3U/XMLTV setup, start-over from the beginning of the current programme,
-pause and seeking all work for **Das Erste HD**. The user did not provide a
-request trace or a separate result for programme changes, restarts, retention
-or XC; those remain open validation items.
+pause and seeking all work for **Das Erste HD** with the plugin's
+`catchup="default"` and `{utc}`/`{duration}` URL template. A request trace
+and separate results for programme changes, restarts, retention and XC remain
+open validation items.
