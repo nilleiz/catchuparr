@@ -8,6 +8,15 @@ Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q catchu
 
 Import `dist/catchuparr-<version>.zip` from Dispatcharr's Plugins page and enable it after inspecting its settings. The plugin code is installed under Dispatcharr's `/data/plugins/catchuparr`. The AIO container runs web and Celery with the same `/data/catchuparr` archive mount. During an update, stop the recorders, install the new ZIP, reload plugins, run the compatibility check, and resume the selected channels. Keep the prior ZIP and archive snapshot until playback smoke tests pass.
 
+Dispatcharr v0.31.0 also accepts a manual update at authenticated admin
+`POST /api/plugins/plugins/import/` with multipart field `file` and explicit
+`overwrite=true`; the response must contain `success: true` and the expected
+plugin key/version. `POST /api/plugins/plugins/reload/` refreshes web-process
+discovery. Restart the isolated AIO after the import so its Celery workers use
+the same package, then verify plugin status, recording and playback. Keep the
+previous ZIP for rollback. Both POST routes require an admin account in the
+inspected image.
+
 The first compatibility target is Dispatcharr v0.31.0. Any custom or later image requires the adapter signature and request tests before enabling recording or XC output.
 
 The first active client path is the authenticated M3U/XMLTV output with HLS
