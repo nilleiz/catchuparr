@@ -410,7 +410,9 @@ class ArchiveHTTPTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(old_during, old_before)
         self.assertIsNone(old_during[1])
+        read_started = time.monotonic()
         self.assertEqual(service.segment(self.token, "news", "seg-A", old_lease).status, 200)
+        self.assertLess(time.monotonic() - read_started, 1)
         release.set()
         worker.join(timeout=5)
         other_worker.join(timeout=5)
@@ -418,6 +420,42 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(results, [503])
         self.assertEqual(other_results, [200])
         self.assertEqual(service.segment(self.token, "news", "seg-A", old_lease).status, 200)
+
+    def test_post_commit_predecessor_failure_keeps_new_session_usable(self):
+        first = self._playlist()
+        old_lease = first.body.decode().split("&lease=")[1].splitlines()[0]
+        original_renew = self.archive.renew_playback
+
+        def fail_old_grace(lease_id, *, ttl_seconds):
+            if lease_id == old_lease and ttl_seconds == self.service.replacement_grace_seconds:
+                raise RuntimeError("predecessor renewal failed")
+            return original_renew(lease_id, ttl_seconds=ttl_seconds)
+
+        self.archive.renew_playback = fail_old_grace
+        switched = self.service.playlist(
+            self.token, "news", self.start + timedelta(seconds=1),
+            self.start + timedelta(seconds=10),
+        )
+        self.assertEqual(switched.status, 200)
+        new_lease = switched.body.decode().split("&lease=")[1].splitlines()[0]
+        self.assertNotEqual(new_lease, old_lease)
+        self.assertEqual(self.service.segment(self.token, "news", "seg-A", new_lease).status, 200)
+        self.assertEqual(
+            self.service.playlist(
+                self.token, "news", self.start + timedelta(seconds=1),
+                self.start + timedelta(seconds=10),
+            ).status,
+            200,
+        )
+
+    def test_missing_store_lease_is_recreated_on_reload(self):
+        old_lease = self._playlist().body.decode().split("&lease=")[1].splitlines()[0]
+        self.archive.end_playback(old_lease)
+        reloaded = self._playlist()
+        self.assertEqual(reloaded.status, 200)
+        new_lease = reloaded.body.decode().split("&lease=")[1].splitlines()[0]
+        self.assertNotEqual(new_lease, old_lease)
+        self.assertEqual(self.service.segment(self.token, "news", "seg-A", new_lease).status, 200)
 
     def test_nested_switch_serializes_and_finalizes_the_original_lease(self):
         first = self._playlist()
