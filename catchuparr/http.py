@@ -182,6 +182,7 @@ class ArchiveHTTPService:
                     ("committed", "INTEGER NOT NULL DEFAULT 1"),
                     ("pending_admissions", "INTEGER NOT NULL DEFAULT 0"),
                     ("replacement_pending", "INTEGER NOT NULL DEFAULT 0"),
+                    ("replacement_of", "TEXT"),
                 ):
                     if name not in columns:
                         db.execute(f"ALTER TABLE http_playback_sessions ADD COLUMN {name} {definition}")
@@ -307,24 +308,23 @@ class ArchiveHTTPService:
             lease = self.store.begin_playback(
                 channel_id, start, end, ttl_seconds=self.lease_ttl_seconds
             )
-            grace_until = now + self.replacement_grace_seconds
             try:
                 with closing(self._connect()) as db:
                     db.execute("BEGIN IMMEDIATE")
                     if old_id is not None:
                         db.execute(
                             "UPDATE http_playback_sessions "
-                            "SET grace_until=?,expires_at=?,replacement_pending=1 "
+                            "SET grace_until=?,replacement_pending=1 "
                             "WHERE lease_id=? AND device_key=? AND grace_until IS NULL",
-                            (grace_until, grace_until, old_id, device_key),
+                            (existing["expires_at"], old_id, device_key),
                         )
                     db.execute(
                         "INSERT INTO http_playback_sessions "
-                        "(lease_id,user_id,channel_id,request_key,device_key,start_utc,end_utc,expires_at,grace_until,committed,pending_admissions) "
-                        "VALUES(?,?,?,?,?,?,?,?,NULL,0,1)",
+                        "(lease_id,user_id,channel_id,request_key,device_key,start_utc,end_utc,expires_at,grace_until,committed,pending_admissions,replacement_of) "
+                        "VALUES(?,?,?,?,?,?,?,?,NULL,0,1,?)",
                         (
                             lease.id, user_id, channel_id, request_key, device_key,
-                            start, end, lease.expires_at,
+                            start, end, lease.expires_at, old_id,
                         ),
                     )
                     db.execute("COMMIT")
@@ -343,47 +343,42 @@ class ArchiveHTTPService:
         """Make a rendered playlist's lease durable against other failed renders."""
         if not acquisition.provisional:
             return
-        previous_grace_until = None
-        previous_missing = False
+        previous_to_finalize = None
         with self._admission_lock():
             with closing(self._connect()) as db:
                 db.execute("BEGIN IMMEDIATE")
+                grace_until = self.clock() + self.replacement_grace_seconds
+                current = db.execute(
+                    "SELECT replacement_of FROM http_playback_sessions WHERE lease_id=?",
+                    (acquisition.lease_id,),
+                ).fetchone()
+                if current is not None and current["replacement_of"] is not None:
+                    previous_to_finalize = str(current["replacement_of"])
+                    cursor = db.execute(
+                        "UPDATE http_playback_sessions "
+                        "SET grace_until=?,expires_at=?,replacement_pending=0 "
+                        "WHERE lease_id=? AND replacement_pending=1",
+                        (grace_until, grace_until, previous_to_finalize),
+                    )
+                    if cursor.rowcount != 1:
+                        previous_to_finalize = None
                 db.execute(
                     "UPDATE http_playback_sessions SET committed=1,pending_admissions=0 "
                     "WHERE lease_id=?",
                     (acquisition.lease_id,),
                 )
-                if acquisition.previous_lease_id is not None:
-                    previous = db.execute(
-                        "SELECT grace_until FROM http_playback_sessions WHERE lease_id=?",
-                        (acquisition.previous_lease_id,),
-                    ).fetchone()
-                    if previous is None:
-                        previous_missing = True
-                    elif previous["grace_until"] is not None:
-                        previous_grace_until = previous["grace_until"]
-                        db.execute(
-                            "UPDATE http_playback_sessions SET replacement_pending=0 "
-                            "WHERE lease_id=?",
-                            (acquisition.previous_lease_id,),
-                        )
                 db.execute("COMMIT")
-            if (
-                acquisition.previous_lease_id is not None
-                and not previous_missing
-                and previous_grace_until is not None
-            ):
-                remaining = (previous_grace_until or self.clock()) - self.clock()
-                if remaining <= 0 or not self.store.renew_playback(
-                    acquisition.previous_lease_id, ttl_seconds=remaining
+            if previous_to_finalize is not None:
+                if not self.store.renew_playback(
+                    previous_to_finalize, ttl_seconds=self.replacement_grace_seconds
                 ):
                     with closing(self._connect()) as db:
                         db.execute(
                             "DELETE FROM http_playback_sessions WHERE lease_id=? "
                             "AND grace_until IS NOT NULL",
-                            (acquisition.previous_lease_id,),
+                            (previous_to_finalize,),
                         )
-                    self.store.end_playback(acquisition.previous_lease_id)
+                    self.store.end_playback(previous_to_finalize)
 
     def _rollback_acquisition(
         self, acquisition: _LeaseAcquisition, user_id: str, device_key: str
@@ -478,6 +473,8 @@ class ArchiveHTTPService:
                 or segment.start_utc.timestamp() >= float(row["end_utc"])
             ):
                 return False
+            if row["replacement_pending"]:
+                return True
             grace_until = row["grace_until"]
             ttl = self.lease_ttl_seconds
             if grace_until is not None:
