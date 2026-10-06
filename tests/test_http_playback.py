@@ -361,6 +361,8 @@ class ArchiveHTTPTests(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
         results = []
+        other_started = threading.Event()
+        other_results = []
 
         def slow_failure(*_args, **_kwargs):
             entered.set()
@@ -382,59 +384,95 @@ class ArchiveHTTPTests(unittest.TestCase):
         time.sleep(0.1)
         service.playlist_builder = _builder
         other_device = self.tokens.create("user-a")
-        other = service.playlist(
-            other_device, "news", self.start, self.start + timedelta(seconds=10)
+        other_worker = threading.Thread(
+            target=lambda: (
+                other_started.set(),
+                other_results.append(
+                    service.playlist(
+                        other_device, "news", self.start,
+                        self.start + timedelta(seconds=10),
+                    ).status
+                ),
+            )
         )
-        self.assertEqual(other.status, 200)
         with sqlite3.connect(self.root / "archive.sqlite3") as db:
-            pending = db.execute(
-                "SELECT replacement_pending FROM http_playback_sessions WHERE lease_id=?",
+            old_before = db.execute(
+                "SELECT expires_at,grace_until FROM http_playback_sessions WHERE lease_id=?",
                 (old_lease,),
             ).fetchone()
-        self.assertEqual(pending, (1,))
+        other_worker.start()
+        self.assertTrue(other_started.wait(timeout=5))
+        time.sleep(0.1)
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            old_during = db.execute(
+                "SELECT expires_at,grace_until FROM http_playback_sessions WHERE lease_id=?",
+                (old_lease,),
+            ).fetchone()
+        self.assertEqual(old_during, old_before)
+        self.assertIsNone(old_during[1])
         self.assertEqual(service.segment(self.token, "news", "seg-A", old_lease).status, 200)
         release.set()
         worker.join(timeout=5)
-        self.assertFalse(worker.is_alive())
+        other_worker.join(timeout=5)
+        self.assertFalse(worker.is_alive() or other_worker.is_alive())
         self.assertEqual(results, [503])
+        self.assertEqual(other_results, [200])
         self.assertEqual(service.segment(self.token, "news", "seg-A", old_lease).status, 200)
 
-    def test_concurrent_successful_reload_finalizes_the_replaced_lease(self):
+    def test_nested_switch_serializes_and_finalizes_the_original_lease(self):
         first = self._playlist()
         old_lease = first.body.decode().split("&lease=")[1].splitlines()[0]
         entered = threading.Event()
-        delivered = threading.Event()
-        results = []
+        release = threading.Event()
+        later_started = threading.Event()
+        first_results = []
+        later_results = []
 
         def render(segments, *, live, uri_for):
             if not entered.is_set():
                 entered.set()
-                if not delivered.wait(timeout=5):
-                    raise RuntimeError("concurrent reload did not finish")
+                if not release.wait(timeout=5):
+                    raise RuntimeError("test did not release the first switch")
                 raise RuntimeError("first replacement render failed")
             return _builder(segments, live=live, uri_for=uri_for)
 
         self.service.playlist_builder = render
-        start = self.start + timedelta(seconds=1)
         end = self.start + timedelta(seconds=10)
-        worker = threading.Thread(
-            target=lambda: results.append(self.service.playlist(self.token, "news", start, end).status)
+        first_switch = threading.Thread(
+            target=lambda: first_results.append(
+                self.service.playlist(
+                    self.token, "news", self.start + timedelta(seconds=1), end
+                ).status
+            )
         )
-        worker.start()
+        first_switch.start()
         self.assertTrue(entered.wait(timeout=5))
-        second = self.service.playlist(self.token, "news", start, end)
-        self.assertEqual(second.status, 200)
-        delivered.set()
-        worker.join(timeout=5)
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(results, [503])
+        later_switch = threading.Thread(
+            target=lambda: (
+                later_started.set(),
+                later_results.append(
+                    self.service.playlist(
+                        self.token, "news", self.start + timedelta(seconds=2), end
+                    )
+                ),
+            )
+        )
+        later_switch.start()
+        self.assertTrue(later_started.wait(timeout=5))
+        release.set()
+        first_switch.join(timeout=5)
+        later_switch.join(timeout=5)
+        self.assertFalse(first_switch.is_alive() or later_switch.is_alive())
+        self.assertEqual(first_results, [503])
+        self.assertEqual(len(later_results), 1)
+        self.assertEqual(later_results[0].status, 200)
 
         with sqlite3.connect(self.root / "archive.sqlite3") as db:
             old_row = db.execute(
-                "SELECT expires_at,replacement_pending FROM http_playback_sessions WHERE lease_id=?",
+                "SELECT expires_at,grace_until FROM http_playback_sessions WHERE lease_id=?",
                 (old_lease,),
             ).fetchone()
-        self.assertEqual(old_row[1], 0)
+        self.assertIsNotNone(old_row[1])
         self.assertLessEqual(old_row[0], time.time() + self.service.replacement_grace_seconds)
         self.assertLessEqual(
             self.archive.leases[old_lease]["expires_at"],
@@ -444,14 +482,16 @@ class ArchiveHTTPTests(unittest.TestCase):
 
     def test_failed_initial_render_cannot_delete_a_concurrent_successful_reload(self):
         entered = threading.Event()
-        delivered = threading.Event()
+        release = threading.Event()
+        second_started = threading.Event()
         results = []
+        second_results = []
 
         def render(segments, *, live, uri_for):
             if not entered.is_set():
                 entered.set()
-                if not delivered.wait(timeout=5):
-                    raise RuntimeError("reload did not finish")
+                if not release.wait(timeout=5):
+                    raise RuntimeError("test did not release the first render")
                 raise RuntimeError("initial render failed")
             return _builder(segments, live=live, uri_for=uri_for)
 
@@ -459,12 +499,22 @@ class ArchiveHTTPTests(unittest.TestCase):
         worker = threading.Thread(target=lambda: results.append(self._playlist().status))
         worker.start()
         self.assertTrue(entered.wait(timeout=5))
-        second = self._playlist()
-        self.assertEqual(second.status, 200)
-        delivered.set()
+        second_worker = threading.Thread(
+            target=lambda: (
+                second_started.set(),
+                second_results.append(self._playlist()),
+            )
+        )
+        second_worker.start()
+        self.assertTrue(second_started.wait(timeout=5))
+        release.set()
         worker.join(timeout=5)
-        self.assertFalse(worker.is_alive())
+        second_worker.join(timeout=5)
+        self.assertFalse(worker.is_alive() or second_worker.is_alive())
         self.assertEqual(results, [503])
+        self.assertEqual(len(second_results), 1)
+        second = second_results[0]
+        self.assertEqual(second.status, 200)
         second_lease = second.body.decode().split("&lease=")[1].splitlines()[0]
         self.assertEqual(self.service.segment(self.token, "news", "seg-A", second_lease).status, 200)
 

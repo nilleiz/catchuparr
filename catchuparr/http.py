@@ -52,10 +52,8 @@ class _PermissionDenied(Exception):
 @dataclass(frozen=True)
 class _LeaseAcquisition:
     lease_id: str
-    state: str
+    reused: bool
     previous_lease_id: str | None = None
-    previous_expires_at: float | None = None
-    provisional: bool = False
 
 
 SESSION_REPLACEMENT_GRACE_SECONDS = 30.0
@@ -179,10 +177,6 @@ class ArchiveHTTPService:
                     ("request_key", "TEXT"),
                     ("device_key", "TEXT"),
                     ("grace_until", "REAL"),
-                    ("committed", "INTEGER NOT NULL DEFAULT 1"),
-                    ("pending_admissions", "INTEGER NOT NULL DEFAULT 0"),
-                    ("replacement_pending", "INTEGER NOT NULL DEFAULT 0"),
-                    ("replacement_of", "TEXT"),
                 ):
                     if name not in columns:
                         db.execute(f"ALTER TABLE http_playback_sessions ADD COLUMN {name} {definition}")
@@ -252,205 +246,119 @@ class ArchiveHTTPService:
         request_key: str,
         device_key: str,
     ) -> _LeaseAcquisition:
-        with self._admission_lock():
-            now = self.clock()
+        now = self.clock()
+        with closing(self._connect()) as db:
+            expired = [
+                str(row["lease_id"])
+                for row in db.execute(
+                    "SELECT lease_id FROM http_playback_sessions WHERE expires_at<=?", (now,)
+                )
+            ]
+            db.execute("DELETE FROM http_playback_sessions WHERE expires_at<=?", (now,))
+            existing = db.execute(
+                "SELECT lease_id,request_key,expires_at FROM http_playback_sessions "
+                "WHERE device_key=? AND grace_until IS NULL AND expires_at>?",
+                (device_key, now),
+            ).fetchone()
+        for expired_id in expired:
+            self.store.end_playback(expired_id)
+
+        old_id = str(existing["lease_id"]) if existing is not None else None
+        if existing is not None and existing["request_key"] == request_key:
+            return _LeaseAcquisition(old_id, reused=True)
+
+        if self.allow_new_session is not None:
             with closing(self._connect()) as db:
-                expired = [
-                    str(row["lease_id"])
-                    for row in db.execute(
-                        "SELECT lease_id FROM http_playback_sessions WHERE expires_at<=?", (now,)
-                    )
-                ]
-                db.execute("DELETE FROM http_playback_sessions WHERE expires_at<=?", (now,))
-                existing = db.execute(
-                    "SELECT lease_id,request_key,expires_at,committed FROM http_playback_sessions "
-                    "WHERE device_key=? AND grace_until IS NULL AND expires_at>?",
-                    (device_key, now),
-                ).fetchone()
-            for old_id in expired:
-                self.store.end_playback(old_id)
+                active_count = int(db.execute(
+                    "SELECT COUNT(*) FROM http_playback_sessions "
+                    "WHERE user_id=? AND expires_at>? AND grace_until IS NULL "
+                    "AND (device_key IS NULL OR device_key<>?)",
+                    (user_id, now, device_key),
+                ).fetchone()[0])
+            if not self.allow_new_session(user_id, channel_id, active_count):
+                raise _PermissionDenied
 
-            old_id = str(existing["lease_id"]) if existing is not None else None
-            if existing is not None and existing["request_key"] == request_key:
-                if self.store.extend_playback(
-                    old_id, end, ttl_seconds=self.lease_ttl_seconds
-                ):
-                    with closing(self._connect()) as db:
-                        db.execute(
-                            "UPDATE http_playback_sessions "
-                            "SET end_utc=MAX(end_utc,?),expires_at=? WHERE lease_id=?",
-                            (end, now + self.lease_ttl_seconds, old_id),
-                        )
-                        provisional = not bool(existing["committed"])
-                        if provisional:
-                            db.execute(
-                                "UPDATE http_playback_sessions "
-                                "SET pending_admissions=pending_admissions+1 WHERE lease_id=?",
-                                (old_id,),
-                            )
-                    return _LeaseAcquisition(old_id, "reused", provisional=provisional)
-                with closing(self._connect()) as db:
-                    db.execute("DELETE FROM http_playback_sessions WHERE lease_id=?", (old_id,))
-                self.store.end_playback(old_id)
-                old_id = None
+        lease = self.store.begin_playback(
+            channel_id, start, end, ttl_seconds=self.lease_ttl_seconds
+        )
+        return _LeaseAcquisition(
+            lease.id,
+            reused=False,
+            previous_lease_id=old_id,
+        )
 
-            if self.allow_new_session is not None:
-                with closing(self._connect()) as db:
-                    active_count = int(db.execute(
-                        "SELECT COUNT(*) FROM http_playback_sessions "
-                        "WHERE user_id=? AND expires_at>? AND grace_until IS NULL "
-                        "AND (device_key IS NULL OR device_key<>?)",
-                        (user_id, now, device_key),
-                    ).fetchone()[0])
-                if not self.allow_new_session(user_id, channel_id, active_count):
-                    raise _PermissionDenied
+    def _commit_acquisition(
+        self,
+        acquisition: _LeaseAcquisition,
+        user_id: str,
+        channel_id: str,
+        request_key: str,
+        device_key: str,
+        start: float,
+        end: float,
+    ) -> bool:
+        """Commit a rendered playlist while the caller holds the admission lock."""
+        now = self.clock()
+        if acquisition.reused:
+            if not self.store.extend_playback(
+                acquisition.lease_id,
+                end,
+                ttl_seconds=self.lease_ttl_seconds,
+            ):
+                return False
+            with closing(self._connect()) as db:
+                db.execute(
+                    "UPDATE http_playback_sessions SET end_utc=MAX(end_utc,?),expires_at=? "
+                    "WHERE lease_id=?",
+                    (end, now + self.lease_ttl_seconds, acquisition.lease_id),
+                )
+            return True
 
-            lease = self.store.begin_playback(
-                channel_id, start, end, ttl_seconds=self.lease_ttl_seconds
-            )
-            try:
-                with closing(self._connect()) as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    if old_id is not None:
-                        db.execute(
-                            "UPDATE http_playback_sessions "
-                            "SET grace_until=?,replacement_pending=1 "
-                            "WHERE lease_id=? AND device_key=? AND grace_until IS NULL",
-                            (existing["expires_at"], old_id, device_key),
-                        )
-                    db.execute(
-                        "INSERT INTO http_playback_sessions "
-                        "(lease_id,user_id,channel_id,request_key,device_key,start_utc,end_utc,expires_at,grace_until,committed,pending_admissions,replacement_of) "
-                        "VALUES(?,?,?,?,?,?,?,?,NULL,0,1,?)",
-                        (
-                            lease.id, user_id, channel_id, request_key, device_key,
-                            start, end, lease.expires_at, old_id,
-                        ),
-                    )
-                    db.execute("COMMIT")
-            except BaseException:
-                self.store.end_playback(lease.id)
-                raise
-            return _LeaseAcquisition(
-                lease.id,
-                "replaced" if old_id is not None else "created",
-                previous_lease_id=old_id,
-                previous_expires_at=float(existing["expires_at"]) if old_id is not None else None,
-                provisional=True,
-            )
-
-    def _commit_acquisition(self, acquisition: _LeaseAcquisition) -> None:
-        """Make a rendered playlist's lease durable against other failed renders."""
-        if not acquisition.provisional:
-            return
-        previous_to_finalize = None
-        with self._admission_lock():
+        if not self.store.renew_playback(
+            acquisition.lease_id, ttl_seconds=self.lease_ttl_seconds
+        ):
+            return False
+        grace_until = now + self.replacement_grace_seconds
+        try:
             with closing(self._connect()) as db:
                 db.execute("BEGIN IMMEDIATE")
-                grace_until = self.clock() + self.replacement_grace_seconds
-                current = db.execute(
-                    "SELECT replacement_of FROM http_playback_sessions WHERE lease_id=?",
-                    (acquisition.lease_id,),
-                ).fetchone()
-                if current is not None and current["replacement_of"] is not None:
-                    previous_to_finalize = str(current["replacement_of"])
-                    cursor = db.execute(
-                        "UPDATE http_playback_sessions "
-                        "SET grace_until=?,expires_at=?,replacement_pending=0 "
-                        "WHERE lease_id=? AND replacement_pending=1",
-                        (grace_until, grace_until, previous_to_finalize),
+                if acquisition.previous_lease_id is not None:
+                    db.execute(
+                        "UPDATE http_playback_sessions SET grace_until=?,expires_at=? "
+                        "WHERE lease_id=? AND grace_until IS NULL",
+                        (grace_until, grace_until, acquisition.previous_lease_id),
                     )
-                    if cursor.rowcount != 1:
-                        previous_to_finalize = None
                 db.execute(
-                    "UPDATE http_playback_sessions SET committed=1,pending_admissions=0 "
-                    "WHERE lease_id=?",
-                    (acquisition.lease_id,),
+                    "INSERT INTO http_playback_sessions "
+                    "(lease_id,user_id,channel_id,request_key,device_key,start_utc,end_utc,expires_at,grace_until) "
+                    "VALUES(?,?,?,?,?,?,?,?,NULL)",
+                    (
+                        acquisition.lease_id, user_id, channel_id,
+                        request_key, device_key, start, end, now + self.lease_ttl_seconds,
+                    ),
                 )
                 db.execute("COMMIT")
-            if previous_to_finalize is not None:
-                if not self.store.renew_playback(
-                    previous_to_finalize, ttl_seconds=self.replacement_grace_seconds
-                ):
-                    with closing(self._connect()) as db:
-                        db.execute(
-                            "DELETE FROM http_playback_sessions WHERE lease_id=? "
-                            "AND grace_until IS NOT NULL",
-                            (previous_to_finalize,),
-                        )
-                    self.store.end_playback(previous_to_finalize)
+        except BaseException:
+            self.store.end_playback(acquisition.lease_id)
+            raise
+        if acquisition.previous_lease_id is not None:
+            if not self.store.renew_playback(
+                acquisition.previous_lease_id, ttl_seconds=self.replacement_grace_seconds
+            ):
+                with closing(self._connect()) as db:
+                    db.execute(
+                        "DELETE FROM http_playback_sessions WHERE lease_id=? AND grace_until IS NOT NULL",
+                        (acquisition.previous_lease_id,),
+                    )
+                self.store.end_playback(acquisition.previous_lease_id)
+        return True
 
     def _rollback_acquisition(
-        self, acquisition: _LeaseAcquisition, user_id: str, device_key: str
+        self, acquisition: _LeaseAcquisition
     ) -> None:
-        """Release a failed provisional lease without destroying a reused session."""
-        if not acquisition.provisional:
-            return
-        now = self.clock()
-        restore_previous = False
-        with self._admission_lock():
-            with closing(self._connect()) as db:
-                db.execute("BEGIN IMMEDIATE")
-                created = db.execute(
-                    "SELECT grace_until,committed,pending_admissions FROM http_playback_sessions "
-                    "WHERE lease_id=? AND user_id=? AND device_key=?",
-                    (acquisition.lease_id, user_id, device_key),
-                ).fetchone()
-                if created is None:
-                    db.execute("COMMIT")
-                    return
-                if created["committed"]:
-                    db.execute("COMMIT")
-                    return
-                if created["pending_admissions"] > 1:
-                    db.execute(
-                        "UPDATE http_playback_sessions SET pending_admissions=pending_admissions-1 "
-                        "WHERE lease_id=?",
-                        (acquisition.lease_id,),
-                    )
-                    db.execute("COMMIT")
-                    return
-                active = db.execute(
-                    "SELECT lease_id FROM http_playback_sessions "
-                    "WHERE device_key=? AND grace_until IS NULL AND expires_at>?",
-                    (device_key, now),
-                ).fetchone()
-                can_restore = (
-                    acquisition.state == "replaced"
-                    and acquisition.previous_lease_id is not None
-                    and acquisition.previous_expires_at is not None
-                    and acquisition.previous_expires_at > now
-                    and created["grace_until"] is None
-                    and (active is None or active["lease_id"] == acquisition.lease_id)
-                )
-                db.execute(
-                    "DELETE FROM http_playback_sessions WHERE lease_id=? AND user_id=? AND device_key=?",
-                    (acquisition.lease_id, user_id, device_key),
-                )
-                if can_restore:
-                    cursor = db.execute(
-                        "UPDATE http_playback_sessions "
-                        "SET grace_until=NULL,expires_at=?,replacement_pending=0 "
-                        "WHERE lease_id=? AND user_id=? AND device_key=? AND grace_until IS NOT NULL",
-                        (
-                            acquisition.previous_expires_at,
-                            acquisition.previous_lease_id,
-                            user_id,
-                            device_key,
-                        ),
-                    )
-                    restore_previous = cursor.rowcount == 1
-                db.execute("COMMIT")
+        """Discard only the new store lease; the previous session is untouched."""
+        if not acquisition.reused:
             self.store.end_playback(acquisition.lease_id)
-            if acquisition.previous_lease_id is not None and restore_previous:
-                ttl = max(0.001, acquisition.previous_expires_at - now)
-                if not self.store.renew_playback(acquisition.previous_lease_id, ttl_seconds=ttl):
-                    self.store.end_playback(acquisition.previous_lease_id)
-            elif acquisition.previous_lease_id is not None and not can_restore:
-                # The prior session has either expired or a newer programme is
-                # already active. Leave newer playback intact and let the old
-                # grace lease expire on its own deadline.
-                pass
 
     def _renew_lease(
         self, user_id: str, channel_id: str, lease_id: str, device_key: str, segment
@@ -459,7 +367,7 @@ class ArchiveHTTPService:
         with self._admission_lock():
             with closing(self._connect()) as db:
                 row = db.execute(
-                    "SELECT start_utc,end_utc,grace_until,replacement_pending "
+                    "SELECT start_utc,end_utc,grace_until "
                     "FROM http_playback_sessions "
                     "WHERE lease_id=? AND user_id=? AND channel_id=? "
                     "AND (device_key=? OR (device_key IS NULL AND grace_until IS NOT NULL)) "
@@ -473,17 +381,13 @@ class ArchiveHTTPService:
                 or segment.start_utc.timestamp() >= float(row["end_utc"])
             ):
                 return False
-            if row["replacement_pending"]:
-                return True
             grace_until = row["grace_until"]
             ttl = self.lease_ttl_seconds
             if grace_until is not None:
                 ttl = min(ttl, float(grace_until) - now)
                 if ttl <= 0:
                     return False
-            if not row["replacement_pending"] and not self.store.renew_playback(
-                lease_id, ttl_seconds=ttl
-            ):
+            if not self.store.renew_playback(lease_id, ttl_seconds=ttl):
                 return False
             expires_at = now + ttl
             with closing(self._connect()) as db:
@@ -526,9 +430,26 @@ class ArchiveHTTPService:
         request_key = hashlib.sha256(
             f"{device_key}\0{channel_id}\0{start:.6f}\0{end:.6f}".encode()
         ).hexdigest()
+        with self._admission_lock():
+            return self._playlist_locked(
+                token, user_id, channel_id, start, end, request_key, device_key, live
+            )
+
+    def _playlist_locked(
+        self,
+        token: str,
+        user_id: str,
+        channel_id: str,
+        start: float,
+        end: float,
+        request_key: str,
+        device_key: str,
+        live: bool,
+    ) -> HTTPResponse:
+        acquisition = None
         try:
-            # Protect the entire requested window before reading the index. A
-            # concurrent cleanup cannot remove segments selected below.
+            # The lock protects the archive window and serializes admission until
+            # the rendered playlist and its session row are committed.
             acquisition = self._new_lease(
                 user_id, channel_id, start, end, request_key, device_key
             )
@@ -537,13 +458,17 @@ class ArchiveHTTPService:
         except _PermissionDenied:
             return _error(403, "stream limit exceeded")
         except (TypeError, ValueError):
+            if acquisition is not None:
+                self._rollback_acquisition(acquisition)
             return _error(400, "invalid channel")
+        except (OSError, RuntimeError, sqlite3.Error):
+            if acquisition is not None:
+                self._rollback_acquisition(acquisition)
+            return _error(503, "archive temporarily unavailable")
         if not segments:
-            self._rollback_acquisition(acquisition, user_id, device_key)
+            self._rollback_acquisition(acquisition)
             return _error(404, "no archived segments in requested range")
 
-        # Expose discontinuities for both explicit transport discontinuities
-        # and holes between indexed segments. PDT tags preserve wall-clock time.
         ordered = sorted(segments, key=lambda item: (item.start_utc, item.id))
         marked = []
         previous_end = None
@@ -567,9 +492,18 @@ class ArchiveHTTPService:
 
             body = self._make_playlist(marked, live=bool(live), uri_for=uri_for).encode("utf-8")
         except (OSError, RuntimeError, ValueError):
-            self._rollback_acquisition(acquisition, user_id, device_key)
+            self._rollback_acquisition(acquisition)
             return _error(503, "archive temporarily unavailable")
-        self._commit_acquisition(acquisition)
+        try:
+            committed = self._commit_acquisition(
+                acquisition, user_id, channel_id, request_key, device_key, start, end
+            )
+        except (OSError, RuntimeError, sqlite3.Error):
+            self._rollback_acquisition(acquisition)
+            return _error(503, "archive temporarily unavailable")
+        if not committed:
+            self._rollback_acquisition(acquisition)
+            return _error(503, "archive temporarily unavailable")
         return HTTPResponse(
             200,
             {
