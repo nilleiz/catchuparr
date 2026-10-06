@@ -7,6 +7,7 @@ from catchuparr.views import (
     _archive_window_live,
     _catchup_epoch,
     _core_request,
+    _epg_request,
     _network_allowed,
     _selected_proxy_channels,
     _trace_component,
@@ -29,6 +30,12 @@ class ViewBoundaryTests(unittest.TestCase):
         core = _core_request(request)
         self.assertEqual(core.GET, {"days": "2"})
         self.assertIn("access_token", request.GET)
+
+    def test_epg_request_preserves_requested_provider_history(self):
+        request = SimpleNamespace(GET={"access_token": "secret", "prev_days": "14"})
+        copied = _epg_request(request, retention_hours=24)
+        self.assertEqual(copied.GET, {"prev_days": "14", "days": "2"})
+        self.assertEqual(request.GET["access_token"], "secret")
 
     def test_header_token_takes_precedence_over_url_token(self):
         request = SimpleNamespace(
