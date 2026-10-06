@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import os
 import re
 from datetime import datetime, timezone
 
@@ -114,6 +115,37 @@ def _no_cache(response):
     response["Cache-Control"] = "private, no-store"
     response["Referrer-Policy"] = "no-referrer"
     return response
+
+
+def _trace_component(value: str) -> str:
+    return value if re.fullmatch(r"[0-9a-fA-F-]{1,64}", value) else "invalid"
+
+
+def _trace_range(value: str | None) -> str:
+    if value is None:
+        return "none"
+    if len(value) <= 128 and re.fullmatch(
+        r"bytes=(?:\d{0,20}-\d{0,20})(?:,\d{0,20}-\d{0,20}){0,4}", value
+    ):
+        return value
+    return "other"
+
+
+def _trace_archive_request(request, channel: str, start: float, duration: int, status: int):
+    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
+        logger.info(
+            "Catchuparr request route=archive method=%s channel=%s utc=%.3f duration=%d status=%d",
+            request.method, _trace_component(channel), start, duration, status,
+        )
+
+
+def _trace_segment_request(request, channel: str, segment: str, status: int):
+    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
+        logger.info(
+            "Catchuparr request route=segment method=%s channel=%s segment=%s range=%s status=%d",
+            request.method, _trace_component(channel), _trace_component(segment),
+            _trace_range(request.headers.get("Range")), status,
+        )
 
 
 def m3u_view(request):
@@ -308,6 +340,7 @@ def archive_view(request):
         token, channel, start_epoch, end_epoch,
         live=_archive_window_live(service, str(user.id), channel, end_epoch, now_epoch),
     )
+    _trace_archive_request(request, channel, start_epoch, duration_seconds, response.status)
     return _to_django_response(response, request.method)
 
 
@@ -346,6 +379,7 @@ def segment_view(request, channel_id: str, segment_id: str):
         token, channel_id, segment_id, request.GET.get("lease"),
         method=request.method, range_header=request.headers.get("Range"),
     )
+    _trace_segment_request(request, channel_id, segment_id, response.status)
     return _to_django_response(response, request.method)
 
 

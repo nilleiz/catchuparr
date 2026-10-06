@@ -9,6 +9,8 @@ from catchuparr.views import (
     _core_request,
     _network_allowed,
     _selected_proxy_channels,
+    _trace_component,
+    _trace_range,
 )
 
 
@@ -70,6 +72,14 @@ class ViewBoundaryTests(unittest.TestCase):
         self.assertFalse(_archive_window_live(service, "viewer", "news", 1000, 1010))
         tail.clear()
         self.assertFalse(_archive_window_live(service, "viewer", "news", 1000, 1120))
+
+    def test_request_trace_redacts_untrusted_values(self):
+        self.assertEqual(_trace_range("bytes=188-563"), "bytes=188-563")
+        self.assertEqual(_trace_range("bytes=0-188,376-"), "bytes=0-188,376-")
+        self.assertEqual(_trace_range("bytes=0-\nsecret"), "other")
+        self.assertEqual(_trace_component("123e4567-e89b-12d3-a456-426614174000"),
+                         "123e4567-e89b-12d3-a456-426614174000")
+        self.assertEqual(_trace_component("token=secret"), "invalid")
 
 
 if __name__ == "__main__":
