@@ -30,6 +30,14 @@ Never mount production directories into Dev. Keep host-specific names, addresses
 6. Before enabling a recorder, agree on a numeric `DEV_VU_IP` and `DEV_VU_PORT`. Stop Dev AIO; run `sudo python3 scripts/dev_egress.py remove --subnet "$DEV_LAN_SUBNET"`, then `apply` and `check` with `--vu-ip "$DEV_VU_IP" --vu-port "$DEV_VU_PORT"`; restart Dev. The rule permits established replies and new TCP connections only to that Vu+ endpoint. If the endpoint redirects elsewhere, leave it blocked and revise the allowlist explicitly.
 7. For a real player test, bind `DEV_BIND_IP` to the Dev host's LAN address and recreate only the Dev AIO. A fixed Shield TV address is optional; the M3U, XMLTV and archive routes authenticate with a separate, revocable token for that test device. Keep URLs containing the token in a private file outside the repository. Verify that an unauthenticated LAN request is rejected before importing the M3U and XMLTV URLs in TiviMate. Capture the installed TiviMate version/device. Test XC and M3U/XMLTV separately: archive icon, live start-over, repeated seeks, pause/resume, programme boundary, service restart, retention and rollback. Record HTTP method, URL template, time arguments, Range headers and response codes without logging credentials.
 
+For a Dev player trace, set `CATCHUPARR_TRACE_REQUESTS=1` in the private Dev
+Compose environment and recreate only the Dev AIO. The plugin then logs the
+archive method, UTC start, duration and response status, plus each segment's
+method, numeric Range and status. It does not log bearer tokens or leases in
+these trace lines. Collect only lines beginning `Catchuparr request`, keep
+them private, and set the flag back to `0` after the test. Do not publish raw
+web-server access logs because URL query strings may contain bearer tokens.
+
 The current Dev instance was prepared from a consistent custom-format `pg_dump` before this API preference was clarified. For a future rebuild, the verified Dispatcharr ZIP and API flow above is the default. If no compatible ZIP exists, use `pg_dump -Fc`, verify it with `pg_restore -l` in a networkless container, restore into an isolated temporary PostgreSQL 17 container, apply `scrub.sql`, stop it, and copy only its cold cluster into the AIO Dev `/data/db` path (UID/GID 1000). A cold cluster prepared under a different glibc version may need `REINDEX DATABASE` for each copied database, followed by `ALTER DATABASE ... REFRESH COLLATION VERSION` inside the AIO image. Never mount a production database directory into Dev.
 
 After stopping the Dev AIO container, remove the egress rule with `sudo python3 scripts/dev_egress.py remove --subnet "$DEV_LAN_SUBNET"`, then remove the dedicated bridge. Its isolated container and `${DEV_AIO_ROOT}` data can then be removed after the private backup and test findings are retained. Deleting the Dev stack never touches production mounts.
