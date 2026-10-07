@@ -431,21 +431,38 @@ class ArchiveStore:
             return cur.rowcount == 1
 
     def extend_playback(
-        self, lease_id: str, end_utc: datetime | str | int | float, *, ttl_seconds: float = 120
+        self,
+        lease_id: str,
+        end_utc: datetime | str | int | float,
+        *,
+        start_utc: datetime | str | int | float | None = None,
+        ttl_seconds: float = 120,
     ) -> bool:
-        """Renew an EVENT playback lease and extend its protected window end.
+        """Renew a playback lease and expand its protected window.
 
-        EVENT playlists append segments and cannot discard early entries, so a
-        session should keep this lease from the event's first segment and
-        extend it on every playlist reload.
+        EVENT playlists append segments, while XC TS seeks can move both
+        backwards and forwards. ``start_utc`` expands the protected start when
+        supplied; omitting it preserves the original start.
         """
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        end = _utc_epoch(end_utc)
+        start = _utc_epoch(start_utc) if start_utc is not None else None
+        if start is not None and end <= start:
+            raise ValueError("end_utc must be after start_utc")
         with self._database() as db:
-            cur = db.execute(
-                "UPDATE playback_leases SET end_utc=MAX(end_utc,?),expires_at=? WHERE id=? AND expires_at>?",
-                (_utc_epoch(end_utc), time.time() + ttl_seconds, lease_id, time.time()),
-            )
+            if start is None:
+                cur = db.execute(
+                    "UPDATE playback_leases SET end_utc=MAX(end_utc,?),expires_at=? "
+                    "WHERE id=? AND expires_at>?",
+                    (end, time.time() + ttl_seconds, lease_id, time.time()),
+                )
+            else:
+                cur = db.execute(
+                    "UPDATE playback_leases SET start_utc=MIN(start_utc,?),"
+                    "end_utc=MAX(end_utc,?),expires_at=? WHERE id=? AND expires_at>?",
+                    (start, end, time.time() + ttl_seconds, lease_id, time.time()),
+                )
             return cur.rowcount == 1
 
     def end_playback(self, lease_id: str) -> None:
