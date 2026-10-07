@@ -11,6 +11,7 @@ import re
 import secrets
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,14 @@ def _trace_range(value: str | None) -> str:
     return "other"
 
 
+def _trace_enabled() -> bool:
+    # AIO starts uWSGI through `su -`, which strips custom container variables.
+    # This private, empty marker enables sanitized traces without a core patch.
+    return os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1" or Path(
+        __file__
+    ).with_name(".trace-requests").is_file()
+
+
 def _trace_session(lease: str | None) -> str:
     """Use a non-redeemable, stable trace label for a random playback lease."""
     if not isinstance(lease, str) or re.fullmatch(r"[0-9a-f]{32}", lease) is None:
@@ -173,7 +182,7 @@ def _trace_archive_request(
     request, start: float | None, duration: int | None, epg_end, response,
     *, trace_id: str, reason: str, next_epg_end=None,
 ):
-    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") != "1":
+    if not _trace_enabled():
         return
     body = getattr(response, "body", getattr(response, "content", b""))
     first_start, last_end = _playlist_segment_bounds(body)
@@ -233,7 +242,7 @@ def _trace_segment_request(
     request, channel: str, segment: str, status: int, *, segment_start=None,
     segment_end=None,
 ):
-    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
+    if _trace_enabled():
         method = str(getattr(request, "method", "")).upper()
         if method not in {"GET", "HEAD"}:
             method = "OTHER"
@@ -423,7 +432,7 @@ def archive_view(request):
     """Serve a growing HLS playlist for a covered catch-up time window."""
     from django.http import HttpResponse
 
-    trace_id = secrets.token_hex(6) if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1" else ""
+    trace_id = secrets.token_hex(6) if _trace_enabled() else ""
     start_epoch = None
     duration_seconds = None
     programme_end_epoch = None
@@ -645,7 +654,7 @@ def segment_view(request, channel_id: str, segment_id: str):
         method=request.method, range_header=request.headers.get("Range"),
     )
     segment_start = segment_end = None
-    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
+    if _trace_enabled():
         try:
             segment = service.store.segment(channel_id, segment_id)
             if segment is not None:
