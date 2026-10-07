@@ -116,6 +116,77 @@ class XCRuntimeTests(unittest.TestCase):
             self.assertEqual(active_ts_session_count(root, "viewer"), 2)
             self.assertEqual(_active_hls_session_count(root, "viewer"), 1)
 
+    def test_xc_first_admission_upgrades_legacy_http_sessions_and_preserves_grace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ArchiveStore(root)
+            start = datetime.now(timezone.utc) - timedelta(days=1)
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"legacy lease segment")
+            store.add_segment("news", segment_path, start, start + timedelta(seconds=6))
+            legacy_lease = store.begin_playback(
+                "news", start, start + timedelta(seconds=6), ttl_seconds=4 * 60 * 60
+            )
+            now = time.time()
+            previous_expiry = now + 4 * 60 * 60
+            with sqlite3.connect(store.db_path) as db:
+                db.execute(
+                    "CREATE TABLE http_playback_sessions ("
+                    "lease_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,"
+                    "channel_id TEXT NOT NULL,request_key TEXT,start_utc REAL NOT NULL,"
+                    "end_utc REAL NOT NULL,expires_at REAL NOT NULL)"
+                )
+                db.execute(
+                    "INSERT INTO http_playback_sessions VALUES(?,?,?,?,?,?,?)",
+                    (
+                        legacy_lease.id, "viewer", "news", "old-request",
+                        start.timestamp(), (start + timedelta(seconds=6)).timestamp(),
+                        previous_expiry,
+                    ),
+                )
+
+            admission_hls_counts = []
+
+            def allow_new_session(user_id, _channel_id, plugin_sessions):
+                hls_sessions = _active_hls_session_count(root, user_id)
+                admission_hls_counts.append(hls_sessions)
+                return plugin_sessions + hls_sessions < 1
+
+            service = ArchiveTSPlaybackService(
+                store,
+                authorize_user_channel=lambda *_: True,
+                catchup_enabled=lambda *_: True,
+                allow_new_session=allow_new_session,
+            )
+            response = service.stream_for_user(
+                "viewer", "news", start, start + timedelta(seconds=6),
+                session_id="xc-request", device_key="b" * 64, method="HEAD",
+            )
+
+            with sqlite3.connect(store.db_path) as db:
+                columns = {
+                    row[1] for row in db.execute(
+                        "PRAGMA table_info(http_playback_sessions)"
+                    )
+                }
+                session_expiry, grace_until = db.execute(
+                    "SELECT expires_at,grace_until FROM http_playback_sessions "
+                    "WHERE lease_id=?", (legacy_lease.id,),
+                ).fetchone()
+                lease_expiry = db.execute(
+                    "SELECT expires_at FROM playback_leases WHERE id=?",
+                    (legacy_lease.id,),
+                ).fetchone()[0]
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(admission_hls_counts, [0])
+        self.assertTrue({"request_key", "device_key", "grace_until"}.issubset(columns))
+        self.assertGreater(grace_until, now)
+        self.assertLess(grace_until, previous_expiry)
+        self.assertEqual(session_expiry, grace_until)
+        self.assertGreater(lease_expiry, now)
+        self.assertLess(lease_expiry, previous_expiry)
+
     def test_current_epg_coverage_ends_at_latest_committed_segment(self):
         now = datetime.now(timezone.utc)
         edge = now - timedelta(seconds=8)

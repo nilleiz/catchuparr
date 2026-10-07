@@ -62,7 +62,28 @@ def active_ts_session_count(archive_root: Path | str, user_id: str | int) -> int
 
 
 def _active_hls_session_count(archive_root: Path | str, user_id: str | int) -> int:
+    _ensure_http_session_schema_for_count(archive_root)
     return _active_session_count(archive_root, user_id, table_prefix="http")
+
+
+def _ensure_http_session_schema_for_count(archive_root: Path | str) -> None:
+    database = Path(archive_root) / "archive.sqlite3"
+    with closing(sqlite3.connect(database, timeout=5)) as db:
+        row = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("http_playback_sessions",),
+        ).fetchone()
+        if row is None:
+            return
+        columns = {
+            column[1]
+            for column in db.execute("PRAGMA table_info(http_playback_sessions)")
+        }
+    if "grace_until" in columns:
+        return
+    from .http import ensure_http_playback_sessions
+
+    ensure_http_playback_sessions(_archive_store(Path(archive_root)))
 
 
 def _active_session_count(
