@@ -1,9 +1,11 @@
+import sqlite3
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from catchuparr.http import HTTPResponse
 from catchuparr.views import (
     _access_token,
     _archive_epg_bounds,
@@ -20,6 +22,7 @@ from catchuparr.views import (
     _trace_range,
     _trace_segment_request,
     archive_view,
+    segment_view,
 )
 
 
@@ -281,8 +284,11 @@ class ViewBoundaryTests(unittest.TestCase):
         }), patch("catchuparr.views._authenticate", return_value=(
             SimpleNamespace(id="viewer"), SimpleNamespace(retention_hours=48), "token"
         )), patch("catchuparr.views._archive_service", return_value=service), patch(
+            "catchuparr.views._archive_epg_bounds",
+            return_value=(end.timestamp(), end.timestamp() + 2700),
+        ), patch(
             "catchuparr.views._archive_window_live", return_value=False
-        ), patch("catchuparr.views._to_django_response", return_value=FakeResponse(
+        ) as live_check, patch("catchuparr.views._to_django_response", return_value=FakeResponse(
             status=200
         )):
             response = archive_view(request)
@@ -290,6 +296,7 @@ class ViewBoundaryTests(unittest.TestCase):
         self.assertEqual(service.playlist.call_args.args[2:4], (
             start.timestamp(), end.timestamp()
         ))
+        self.assertEqual(live_check.call_args.args[3], end.timestamp())
 
     def test_full_length_initial_programme_can_continue_after_boundary(self):
         start = datetime(2026, 10, 7, 15, 15, tzinfo=timezone.utc).timestamp()
@@ -330,9 +337,219 @@ class ViewBoundaryTests(unittest.TestCase):
         )
         with patch.dict("os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}):
             with self.assertLogs("catchuparr.views", level="WARNING") as logs:
-                _trace_archive_request(None, 1791388794, 2700, 1791390000, response)
+                _trace_archive_request(
+                    SimpleNamespace(
+                        method="GET", GET={"channel_id": "bad?token=secret"},
+                        headers={"Range": "bytes=0-188"},
+                    ),
+                    1791388794, 2700, 1791390000, response,
+                    trace_id="abc123", reason="ok", next_epg_end=1791392700,
+                )
         self.assertIn("epg_end=1791390000.000", logs.output[0])
+        self.assertIn("next_epg_end=1791392700.000", logs.output[0])
+        self.assertIn("trace=abc123", logs.output[0])
+        self.assertIn("range=bytes=0-188", logs.output[0])
+        self.assertIn("channel=invalid", logs.output[0])
         self.assertNotIn("secret", logs.output[0])
+
+    def test_archive_trace_includes_early_http_failures_without_user_values(self):
+        class FakeResponse:
+            def __init__(self, content="", status=200):
+                self.content = content
+                self.status_code = status
+                self.headers = {}
+
+            def __setitem__(self, key, value):
+                self.headers[key] = value
+
+        django = types.ModuleType("django")
+        django.__path__ = []
+        django_http = types.ModuleType("django.http")
+        django_http.HttpResponse = FakeResponse
+        now = datetime.now(timezone.utc)
+        cases = (
+            ("POST", {}, None, 405, "method_not_allowed"),
+            ("GET", {}, (None, None, None), 401, "unauthorized"),
+            ("GET", {"utc": "token=secret", "duration": "2700"},
+             (SimpleNamespace(id="viewer"), SimpleNamespace(retention_hours=48), "token"),
+             400, "invalid_time"),
+            ("GET", {"utc": str((now - timedelta(days=3)).timestamp()), "duration": "2700"},
+             (SimpleNamespace(id="viewer"), SimpleNamespace(retention_hours=48), "token"),
+             404, "outside_retention"),
+        )
+        with patch.dict("sys.modules", {"django": django, "django.http": django_http}), patch.dict(
+            "os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}
+        ):
+            for method, query, authentication, status, reason in cases:
+                with self.subTest(reason=reason), patch(
+                    "catchuparr.views._authenticate", return_value=authentication
+                ), self.assertLogs("catchuparr.views", level="WARNING") as logs:
+                    response = archive_view(SimpleNamespace(
+                        method=method,
+                        GET={"channel_id": "bad?token=secret", **query},
+                        headers={},
+                    ))
+                self.assertEqual(response.status_code, status)
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(f"status={status} reason={reason}", logs.output[0])
+                self.assertIn("channel=invalid", logs.output[0])
+                self.assertNotIn("secret", logs.output[0])
+
+    def test_archive_trace_distinguishes_missing_epg_and_service_denial(self):
+        class FakeResponse:
+            def __init__(self, content="", status=200):
+                self.content = content
+                self.status_code = status
+                self.headers = {}
+
+            def __setitem__(self, key, value):
+                self.headers[key] = value
+
+        django = types.ModuleType("django")
+        django.__path__ = []
+        django_http = types.ModuleType("django.http")
+        django_http.HttpResponse = FakeResponse
+        now = datetime.now(timezone.utc)
+        request = SimpleNamespace(
+            method="GET",
+            GET={"channel_id": "a" * 32,
+                 "utc": str((now - timedelta(minutes=5)).timestamp()),
+                 "duration": "2700", "token": "token-secret"},
+            headers={},
+        )
+        user = SimpleNamespace(id="viewer")
+        config = SimpleNamespace(retention_hours=48)
+        service = SimpleNamespace(
+            authorize_user_channel=lambda *_: True,
+            catchup_enabled=lambda *_: True,
+            store=SimpleNamespace(),
+        )
+        with patch.dict("sys.modules", {"django": django, "django.http": django_http}), patch.dict(
+            "os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}
+        ), patch("catchuparr.views._authenticate", return_value=(user, config, "token-secret")), patch(
+            "catchuparr.views._archive_service", return_value=service
+        ), patch("catchuparr.views._archive_epg_bounds", return_value=(None, None)):
+            with self.assertLogs("catchuparr.views", level="WARNING") as logs:
+                response = archive_view(request)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("status=404 reason=missing_epg", logs.output[0])
+        self.assertNotIn("token-secret", logs.output[0])
+
+        service.authorize_user_channel = lambda *_: False
+        service.playlist = Mock(return_value=HTTPResponse(403, {}, b"forbidden"))
+        with patch.dict("sys.modules", {"django": django, "django.http": django_http}), patch.dict(
+            "os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}
+        ), patch("catchuparr.views._authenticate", return_value=(user, config, "token-secret")), patch(
+            "catchuparr.views._archive_service", return_value=service
+        ):
+            with self.assertLogs("catchuparr.views", level="WARNING") as logs:
+                response = archive_view(request)
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("status=403 reason=forbidden", logs.output[0])
+        self.assertNotIn("token-secret", logs.output[0])
+
+    def test_archive_and_segment_traces_share_only_a_lease_digest(self):
+        lease = "a" * 32
+        response = SimpleNamespace(
+            body=(
+                "#EXT-X-PROGRAM-DATE-TIME:2026-10-07T15:59:54Z\n"
+                "#EXTINF:6.000,\n"
+                f"/segment/channel/segment?token=token-secret&lease={lease}\n"
+            ).encode(),
+            status=200,
+        )
+        request = SimpleNamespace(method="GET", GET={"channel_id": "channel"}, headers={})
+        segment_request = SimpleNamespace(
+            method="GET", GET={"lease": lease, "token": "token-secret"},
+            headers={"Range": "bytes=0-"},
+        )
+        with patch.dict("os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}):
+            with self.assertLogs("catchuparr.views", level="WARNING") as logs:
+                _trace_archive_request(
+                    request, 1791388794, 2700, 1791390000, response,
+                    trace_id="abc123", reason="ok",
+                )
+                _trace_segment_request(
+                    segment_request, "b" * 32, "c" * 32, 206,
+                    segment_start=1791388794, segment_end=1791388800,
+                )
+        session = logs.output[0].split("session=", 1)[1].split(" ", 1)[0]
+        self.assertEqual(len(session), 16)
+        self.assertIn(f"session={session}", logs.output[1])
+        self.assertIn("segment_start=1791388794.000", logs.output[1])
+        self.assertNotIn(lease, " ".join(logs.output))
+        self.assertNotIn("token-secret", " ".join(logs.output))
+
+    def test_segment_view_traces_indexed_segment_times(self):
+        django = types.ModuleType("django")
+        django.__path__ = []
+        django_http = types.ModuleType("django.http")
+        django_http.HttpResponse = Mock()
+        start = datetime(2026, 10, 7, 15, 59, 54, tzinfo=timezone.utc)
+        segment = SimpleNamespace(start_utc=start, end_utc=start + timedelta(seconds=6))
+        service = SimpleNamespace(
+            segment=Mock(return_value=HTTPResponse(206, {})),
+            store=SimpleNamespace(segment=Mock(return_value=segment)),
+        )
+        request = SimpleNamespace(
+            method="GET", GET={"lease": "a" * 32, "token": "token-secret"},
+            headers={"Range": "bytes=0-188"},
+        )
+        with patch.dict("sys.modules", {"django": django, "django.http": django_http}), patch.dict(
+            "os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}
+        ), patch("catchuparr.views._authenticate", return_value=(
+            SimpleNamespace(id="viewer"), SimpleNamespace(), "token-secret"
+        )), patch("catchuparr.views._archive_service", return_value=service), patch(
+            "catchuparr.views._to_django_response", return_value="response"
+        ), self.assertLogs("catchuparr.views", level="WARNING") as logs:
+            response = segment_view(request, "b" * 32, "c" * 32)
+        self.assertEqual(response, "response")
+        self.assertEqual(service.store.segment.call_args.args, ("b" * 32, "c" * 32))
+        self.assertIn(f"segment_start={start.timestamp():.3f}", logs.output[0])
+        self.assertIn("range=bytes=0-188", logs.output[0])
+        self.assertNotIn("token-secret", logs.output[0])
+
+    def test_segment_trace_database_error_keeps_successful_media_response(self):
+        django_http = types.ModuleType("django.http")
+        django_http.HttpResponse = Mock()
+        expected = HTTPResponse(206, {}, b"media")
+        service = SimpleNamespace(
+            segment=Mock(return_value=expected),
+            store=SimpleNamespace(segment=Mock(side_effect=sqlite3.OperationalError("busy"))),
+        )
+        request = SimpleNamespace(method="GET", GET={}, headers={"Range": "bytes=0-"})
+        with patch.dict("sys.modules", {"django.http": django_http}), patch.dict(
+            "os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}
+        ), patch("catchuparr.views._authenticate", return_value=(
+            SimpleNamespace(id="viewer"), SimpleNamespace(), "private"
+        )), patch("catchuparr.views._archive_service", return_value=service), patch(
+            "catchuparr.views._to_django_response", side_effect=lambda response, method: response
+        ), self.assertLogs("catchuparr.views", level="WARNING"):
+            self.assertIs(segment_view(request, "b" * 32, "c" * 32), expected)
+
+    def test_segment_view_traces_method_and_authentication_rejections(self):
+        class FakeResponse:
+            def __init__(self, content="", status=200):
+                self.status_code = status
+
+        django = types.ModuleType("django")
+        django.__path__ = []
+        django_http = types.ModuleType("django.http")
+        django_http.HttpResponse = FakeResponse
+        with patch.dict("sys.modules", {"django": django, "django.http": django_http}), patch.dict(
+            "os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}
+        ):
+            for method, status in (("POST", 405), ("GET", 401)):
+                with self.subTest(method=method), patch(
+                    "catchuparr.views._authenticate", return_value=(None, None, None)
+                ), self.assertLogs("catchuparr.views", level="WARNING") as logs:
+                    response = segment_view(SimpleNamespace(
+                        method=method, GET={"lease": "a" * 32, "token": "token-secret"},
+                        headers={"Range": "bytes=0-188"},
+                    ), "b" * 32, "c" * 32)
+                self.assertEqual(response.status_code, status)
+                self.assertIn(f"status={status}", logs.output[0])
+                self.assertNotIn("token-secret", logs.output[0])
 
     def test_request_trace_redacts_untrusted_values(self):
         self.assertEqual(_trace_range("bytes=188-563"), "bytes=188-563")
