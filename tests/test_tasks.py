@@ -86,8 +86,8 @@ class RecorderTaskTests(unittest.TestCase):
                 "core.utils": core_utils,
             }
 
-            sys.modules.pop("catchuparr.tasks", None)
             with patch.dict(sys.modules, fake_modules):
+                sys.modules.pop("catchuparr.tasks", None)
                 tasks = importlib.import_module("catchuparr.tasks")
                 with patch("catchuparr.runtime.require_supported_version"), patch(
                     "catchuparr.runtime.load_config", return_value=config

@@ -19,6 +19,7 @@ from catchuparr.views import (
     _selected_proxy_channels,
     _trace_archive_request,
     _trace_component,
+    _trace_enabled,
     _trace_range,
     _trace_segment_request,
     archive_view,
@@ -27,6 +28,16 @@ from catchuparr.views import (
 
 
 class ViewBoundaryTests(unittest.TestCase):
+    def test_private_trace_marker_survives_aio_environment_stripping(self):
+        with patch.dict("os.environ", {"CATCHUPARR_TRACE_REQUESTS": "0"}), patch(
+            "catchuparr.views.Path.is_file", return_value=False
+        ):
+            self.assertFalse(_trace_enabled())
+        with patch.dict("os.environ", {"CATCHUPARR_TRACE_REQUESTS": "0"}), patch(
+            "catchuparr.views.Path.is_file", return_value=True
+        ):
+            self.assertTrue(_trace_enabled())
+
     def test_utc_epoch_and_iso_timestamp_agree(self):
         epoch = _catchup_epoch("2026-10-05T12:00:00+02:00")
         self.assertEqual(epoch, _catchup_epoch(str(int(epoch))))
