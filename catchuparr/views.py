@@ -17,7 +17,10 @@ from urllib.parse import parse_qs, urlsplit
 logger = logging.getLogger(__name__)
 ARCHIVE_FINALIZATION_GRACE_SECONDS = 120
 _ROUTE_NAMES = frozenset(
-    {"catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive", "catchuparr-segment"}
+    {
+        "catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive",
+        "catchuparr-segment", "catchuparr-recorder",
+    }
 )
 
 
@@ -39,9 +42,13 @@ def install_routes() -> None:
     """Install routes before Dispatcharr's broad XC and React catch-all paths."""
     import dispatcharr.urls as root_urls
     from django.urls import clear_url_caches, path
+    from . import recorder_proxy
+    from .adapters.recorder_proxy import install_proxyserver_cleanup_hook
 
-    if any(getattr(route, "name", None) == "catchuparr-m3u" for route in root_urls.urlpatterns):
-        return
+    # Resource cleanup is process-local, so install the guard in every web
+    # process even when another plugin route already registered the URL.
+    install_proxyserver_cleanup_hook()
+
     new_routes = [
         path("catchuparr/m3u", m3u_view, name="catchuparr-m3u"),
         path("catchuparr/xmltv", xmltv_view, name="catchuparr-xmltv"),
@@ -51,7 +58,16 @@ def install_routes() -> None:
             segment_view,
             name="catchuparr-segment",
         ),
+        path(
+            "catchuparr/recorder/<str:channel_uuid>",
+            recorder_proxy.stream_recorder_view,
+            name="catchuparr-recorder",
+        ),
     ]
+    existing_names = {getattr(route, "name", None) for route in root_urls.urlpatterns}
+    new_routes = [route for route in new_routes if route.name not in existing_names]
+    if not new_routes:
+        return
     root_urls.urlpatterns[0:0] = new_routes
     clear_url_caches()
 
@@ -59,11 +75,18 @@ def install_routes() -> None:
 def uninstall_routes() -> None:
     import dispatcharr.urls as root_urls
     from django.urls import clear_url_caches
+    from .adapters.recorder_proxy import (
+        stop_managed_workers,
+        uninstall_proxyserver_cleanup_hook,
+    )
 
     root_urls.urlpatterns[:] = [
         route for route in root_urls.urlpatterns if getattr(route, "name", None) not in _ROUTE_NAMES
     ]
     clear_url_caches()
+    stopped = stop_managed_workers()
+    if stopped:
+        uninstall_proxyserver_cleanup_hook()
 
 
 def _authenticate(request, *, playback: bool = False):
