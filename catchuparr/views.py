@@ -473,11 +473,10 @@ def archive_view(request):
         programme_end_epoch,
         next_programme_end_epoch if programme_end_epoch is not None else None,
     )
-    final_end_epoch = continuation_end_epoch or end_epoch
     response = service.playlist(
         token, channel, start_epoch, end_epoch,
         live=_archive_window_live(
-            service, str(user.id), channel, final_end_epoch, now_epoch
+            service, str(user.id), channel, end_epoch, now_epoch
         ),
         request_identity_end=requested_end_epoch,
         programme_end_utc=programme_end_epoch,
