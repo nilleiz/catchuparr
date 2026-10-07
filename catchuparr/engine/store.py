@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+TIMELINE_GAP_TOLERANCE_SECONDS = 0.25
+
 
 def _utc_epoch(value: datetime | str | int | float) -> float:
     if isinstance(value, datetime):
@@ -282,6 +284,29 @@ class ArchiveStore:
             ).fetchall()
         return [self._row_segment(row) for row in rows if (self.root / row["relpath"]).is_file()]
 
+    def channel_stats(self, channel_id: str) -> dict:
+        """Return indexed recorder progress without loading every segment."""
+        channel = _channel_key(channel_id)
+        with self._database() as db:
+            row = db.execute(
+                """SELECT COUNT(*) AS segments, COALESCE(SUM(size_bytes), 0) AS size_bytes,
+                          MAX(end_utc) AS latest_end_utc,
+                          COALESCE(SUM(discontinuity), 0) AS discontinuities
+                   FROM segments WHERE channel_id=?""",
+                (channel,),
+            ).fetchone()
+        return {
+            "segments": int(row["segments"]),
+            "size_bytes": int(row["size_bytes"]),
+            "latest_end_utc": _datetime(row["latest_end_utc"]).isoformat() if row["latest_end_utc"] is not None else None,
+            "discontinuities": int(row["discontinuities"]),
+        }
+
+    def indexed_size_bytes(self) -> int:
+        """Count all archived channels, including ones no longer selected."""
+        with self._database() as db:
+            return int(db.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM segments").fetchone()[0])
+
     def segment(self, channel_id: str, segment_id: str) -> Segment | None:
         """Look up one immutable segment by the indexed ID and channel."""
         channel = _channel_key(channel_id)
@@ -317,17 +342,20 @@ class ArchiveStore:
             left, right = max(start, item.start_utc.timestamp()), min(end, item.end_utc.timestamp())
             if right <= left:
                 continue
-            if merged and left <= merged[-1][1]:
+            # FFmpeg's segment CSV can leave a repeatable sub-frame offset
+            # between otherwise continuous TS files (0.14 s on the Dev Vu+
+            # stream). Treat only larger holes as unavailable archive time.
+            if merged and left <= merged[-1][1] + TIMELINE_GAP_TOLERANCE_SECONDS:
                 merged[-1][1] = max(merged[-1][1], right)
             else:
                 merged.append([left, right])
         gaps: list[tuple[datetime, datetime]] = []
         cursor = start
         for left, right in merged:
-            if left > cursor:
+            if left > cursor + TIMELINE_GAP_TOLERANCE_SECONDS:
                 gaps.append((_datetime(cursor), _datetime(left)))
             cursor = max(cursor, right)
-        if cursor < end:
+        if cursor < end - TIMELINE_GAP_TOLERANCE_SECONDS:
             gaps.append((_datetime(cursor), _datetime(end)))
         spans = tuple((_datetime(left), _datetime(right)) for left, right in merged)
         return Coverage(

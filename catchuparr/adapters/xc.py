@@ -1,4 +1,4 @@
-"""Version-guarded XC compatibility hooks for Dispatcharr 0.31.0.
+"""Version-guarded XC compatibility hooks for inspected Dispatcharr releases.
 
 Dispatcharr does not expose public hooks for its XC serializers or catch-up
 handler. This module wraps only the three inspected functions and refuses to
@@ -16,7 +16,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-SUPPORTED_DISPATCHARR_VERSION = "0.31.0"
+from ..compatibility import (
+    SUPPORTED_DISPATCHARR_VERSION as SUPPORTED_DISPATCHARR_VERSION,
+)
+from ..compatibility import (
+    is_supported_dispatcharr_version,
+)
+
 _HOOK_MARKER = "__catchuparr_xc_hook__"
 logger = logging.getLogger(__name__)
 
@@ -93,7 +99,7 @@ def install_xc_hooks(
     No mutation occurs unless the exact supported version and every target
     signature match. An already-installed hook is reported as success.
     """
-    if dispatcharr_version != SUPPORTED_DISPATCHARR_VERSION:
+    if not is_supported_dispatcharr_version(dispatcharr_version):
         return HookInstallResult(False, f"unsupported Dispatcharr version: {dispatcharr_version}")
 
     targets = (
@@ -187,6 +193,12 @@ def install_xc_hooks(
         listings = result.get("epg_listings")
         if not isinstance(listings, list):
             return result
+        # Dispatcharr may cache and reuse this response. Keep annotations and
+        # locally restored rows on a shallow copy of both the response and
+        # each mutable listing dictionary.
+        result = dict(result)
+        listings = [dict(item) if isinstance(item, dict) else item for item in listings]
+        result["epg_listings"] = listings
         if not short and local_days and callbacks.epg_snapshots is not None:
             try:
                 snapshots = callbacks.epg_snapshots(channel_uuid, user, local_days)

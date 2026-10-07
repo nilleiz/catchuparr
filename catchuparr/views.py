@@ -5,10 +5,12 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import os
 import re
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+ARCHIVE_FINALIZATION_GRACE_SECONDS = 120
 _ROUTE_NAMES = frozenset(
     {"catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive", "catchuparr-segment"}
 )
@@ -115,6 +117,37 @@ def _no_cache(response):
     return response
 
 
+def _trace_component(value: str) -> str:
+    return value if re.fullmatch(r"[0-9a-fA-F-]{1,64}", value) else "invalid"
+
+
+def _trace_range(value: str | None) -> str:
+    if value is None:
+        return "none"
+    if len(value) <= 128 and re.fullmatch(
+        r"bytes=(?:\d{0,20}-\d{0,20})(?:,\d{0,20}-\d{0,20}){0,4}", value
+    ):
+        return value
+    return "other"
+
+
+def _trace_archive_request(request, channel: str, start: float, duration: int, status: int):
+    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
+        logger.info(
+            "Catchuparr request route=archive method=%s channel=%s utc=%.3f duration=%d status=%d",
+            request.method, _trace_component(channel), start, duration, status,
+        )
+
+
+def _trace_segment_request(request, channel: str, segment: str, status: int):
+    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
+        logger.info(
+            "Catchuparr request route=segment method=%s channel=%s segment=%s range=%s status=%d",
+            request.method, _trace_component(channel), _trace_component(segment),
+            _trace_range(request.headers.get("Range")), status,
+        )
+
+
 def m3u_view(request):
     from apps.channels.utils import is_catchup_enabled
     from apps.output.views import generate_m3u
@@ -161,6 +194,7 @@ def m3u_view(request):
 
 
 def xmltv_view(request):
+    from apps.channels.utils import is_catchup_enabled
     from apps.output.epg import generate_epg
     from django.http import HttpResponse
 
@@ -175,12 +209,7 @@ def xmltv_view(request):
     if request.method == "HEAD":
         return _no_cache(HttpResponse(content_type="application/xml"))
 
-    request_copy = _core_request(request)
-    # Dispatcharr treats days=0 as unbounded future EPG. Keep the plugin's
-    # default XMLTV response practical for a client importing the full list.
-    if "days" not in request_copy.GET:
-        request_copy.GET["days"] = "2"
-    request_copy.GET["prev_days"] = str(min(30, math.ceil(config.retention_hours / 24)))
+    request_copy = _epg_request(request, config.retention_hours)
     response = generate_epg(request_copy, user=user)
     if response.status_code != 200:
         return response
@@ -191,14 +220,23 @@ def xmltv_view(request):
             return _no_cache(HttpResponse("Guide too large", status=413))
 
     store = ArchiveStore(config.archive_root)
-    channel_map = _xmltv_channel_map(request, user, config)
+    channel_map = (
+        {
+            epg_id: channel
+            for epg_id, channel in _xmltv_channel_map(request, user, config).items()
+            if store.segments(channel)
+        }
+        if is_catchup_enabled(user=user) else {}
+    )
     now = datetime.now(timezone.utc)
 
     def is_covered(epg_channel_id, start, end):
         archive_channel = channel_map.get(epg_channel_id)
         return bool(archive_channel and store.coverage(archive_channel, start, end).complete)
 
-    filtered = filter_xmltv(bytes(content), is_covered, now=now)
+    filtered = filter_xmltv(
+        bytes(content), is_covered, now=now, local_channel_ids=channel_map.keys()
+    )
     snapshots = {
         epg_channel: store.program_snapshots(
             archive_channel,
@@ -217,8 +255,12 @@ def xmltv_view(request):
 def _xmltv_channel_map(request, user, config):
     from apps.output.views import generate_m3u
 
-    playlist = generate_m3u(_core_request(request), user=user).content.decode("utf-8")
+    response = generate_m3u(_core_request(request), user=user)
+    if response.status_code != 200:
+        return {}
+    playlist = response.content.decode("utf-8")
     mapping = {}
+    ambiguous = set()
     pending_id = None
     for line in playlist.splitlines():
         if line.startswith("#EXTINF:"):
@@ -226,10 +268,38 @@ def _xmltv_channel_map(request, user, config):
             pending_id = found.group(1) if found else None
         elif pending_id and "/proxy/ts/stream/" in line:
             channel = line.split("/proxy/ts/stream/", 1)[1].split("?", 1)[0].strip("/")
-            if channel in config.channel_uuids:
-                mapping[pending_id] = channel
+            if channel in config.channel_uuids and pending_id not in ambiguous:
+                if pending_id in mapping and mapping[pending_id] != channel:
+                    mapping.pop(pending_id)
+                    ambiguous.add(pending_id)
+                else:
+                    mapping[pending_id] = channel
             pending_id = None
     return mapping
+
+
+def _epg_request(request, retention_hours: int):
+    """Add local history defaults without reducing requested provider history."""
+    copied = _core_request(request)
+    # Dispatcharr treats days=0 as unbounded future EPG. Keep a default import
+    # practical while preserving an explicitly requested provider lookback.
+    if "days" not in copied.GET:
+        copied.GET["days"] = "2"
+    if "prev_days" not in copied.GET:
+        copied.GET["prev_days"] = str(min(30, math.ceil(retention_hours / 24)))
+    return copied
+
+
+def _selected_proxy_channels(playlist: str, channel_uuids) -> set[str]:
+    """Find authorized archive UUIDs independently of optional/shared EPG IDs."""
+    selected = set(channel_uuids)
+    return {
+        match.group(1)
+        for line in playlist.splitlines()
+        if not line.startswith("#")
+        and (match := re.search(r"/proxy/ts/stream/([^/?#\s]+)", line))
+        and match.group(1) in selected
+    }
 
 
 def _url_token(token: str) -> str:
@@ -271,11 +341,34 @@ def archive_view(request):
     if start_epoch > now_epoch or start_epoch + duration_seconds < now_epoch - config.retention_hours * 3600:
         return _no_cache(HttpResponse("No archived programme", status=404))
     service = _archive_service(request, user, config)
+    end_epoch = start_epoch + duration_seconds
     response = service.playlist(
-        token, channel, start_epoch, start_epoch + duration_seconds,
-        live=start_epoch + duration_seconds > now_epoch,
+        token, channel, start_epoch, end_epoch,
+        live=_archive_window_live(service, str(user.id), channel, end_epoch, now_epoch),
     )
+    _trace_archive_request(request, channel, start_epoch, duration_seconds, response.status)
     return _to_django_response(response, request.method)
+
+
+def _archive_window_live(service, user_id, channel_id, end_epoch, now_epoch):
+    """Wait briefly for a final indexed segment after the EPG boundary."""
+    from .engine.store import TIMELINE_GAP_TOLERANCE_SECONDS
+
+    if end_epoch > now_epoch:
+        return True
+    if now_epoch >= end_epoch + ARCHIVE_FINALIZATION_GRACE_SECONDS:
+        return False
+    if not (
+        service.authorize_user_channel(user_id, channel_id)
+        and service.catchup_enabled(user_id, channel_id)
+    ):
+        return False
+    tail = service.store.segments(
+        channel_id, end_epoch - ARCHIVE_FINALIZATION_GRACE_SECONDS, end_epoch
+    )
+    return not tail or max(segment.end_utc.timestamp() for segment in tail) < (
+        end_epoch - TIMELINE_GAP_TOLERANCE_SECONDS
+    )
 
 
 def segment_view(request, channel_id: str, segment_id: str):
@@ -292,6 +385,7 @@ def segment_view(request, channel_id: str, segment_id: str):
         token, channel_id, segment_id, request.GET.get("lease"),
         method=request.method, range_header=request.headers.get("Range"),
     )
+    _trace_segment_request(request, channel_id, segment_id, response.status)
     return _to_django_response(response, request.method)
 
 
@@ -311,6 +405,7 @@ def _catchup_epoch(value: str) -> float:
 
 def _archive_service(request, user, config):
     from apps.channels.utils import is_catchup_enabled
+    from apps.output.views import generate_m3u
     from apps.proxy.utils import get_user_active_connections
     from core.utils import RedisClient
 
@@ -318,7 +413,11 @@ def _archive_service(request, user, config):
     from .http import ArchiveHTTPService
     from .security import AccessTokenStore
 
-    allowed = set(_xmltv_channel_map(request, user, config).values())
+    response = generate_m3u(_core_request(request), user=user)
+    allowed = (
+        _selected_proxy_channels(response.content.decode("utf-8"), config.channel_uuids)
+        if response.status_code == 200 else set()
+    )
     user_id = str(user.id)
     catchup_allowed = bool(is_catchup_enabled(user=user))
 
@@ -334,9 +433,7 @@ def _archive_service(request, user, config):
             logger.exception("Unable to verify Redis availability; denying archive playback")
             return False
         return _session_limit_allows(
-            limit,
-            plugin_sessions,
-            redis,
+            limit, plugin_sessions, redis,
             lambda: get_user_active_connections(user.id),
         )
 

@@ -8,7 +8,18 @@ Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q catchu
 
 Import `dist/catchuparr-<version>.zip` from Dispatcharr's Plugins page and enable it after inspecting its settings. The plugin code is installed under Dispatcharr's `/data/plugins/catchuparr`. The AIO container runs web and Celery with the same `/data/catchuparr` archive mount. During an update, stop the recorders, install the new ZIP, reload plugins, run the compatibility check, and resume the selected channels. Keep the prior ZIP and archive snapshot until playback smoke tests pass.
 
+Dispatcharr v0.31.0 also accepts a manual update at authenticated admin
+`POST /api/plugins/plugins/import/` with multipart field `file` and explicit
+`overwrite=true`; the response must contain `success: true` and the expected
+plugin key/version. `POST /api/plugins/plugins/reload/` refreshes web-process
+discovery. Restart the isolated AIO after the import so its Celery workers use
+the same package, then verify plugin status, recording and playback. Keep the
+previous ZIP for rollback. Both POST routes require an admin account in the
+inspected image.
+
 The first compatibility target is Dispatcharr v0.31.0. Any custom or later image requires the adapter signature and request tests before enabling recording or XC output.
+
+Create a separate archive access token for each playback device. A token identifies one device and keeps one active playback session across channels and programmes. Playlist reloads for the same programme reuse its session; switching programmes replaces that device's session while preserving its previous segment URLs for a 30-second grace period.
 
 The first active client path is the authenticated M3U/XMLTV output with HLS
 archive playback. The XC adapter currently contains version-checked wrappers
@@ -28,7 +39,15 @@ Never mount production directories into Dev. Keep host-specific names, addresses
 4. Restore using an authenticated **Dev admin** request: `POST /api/backups/<copied-zip-filename>/restore/`. In Dispatcharr v0.31.0, this route requires `IsAdmin`, returns HTTP 202 with `task_id` and `task_token`, and runs the restore in Celery. The backup must already be in Dev `/data/backups`; `POST /api/backups/upload/` is an alternative to copying it. Check completion at `GET /api/backups/status/<task_id>/?token=<task_token>` or through the Dev admin UI. Keep the token private; the restore can invalidate the initial admin session. A completed API task is still followed by a database content check. Do not assume elapsed time means success.
 5. While Beat remains stopped, apply `deploy/dev/scrub.sql` to **Dev** PostgreSQL (`docker exec -i catchuparr-dev-aio psql -U dispatch -d dispatcharr -v ON_ERROR_STOP=1 < deploy/dev/scrub.sql`). Verify zero enabled periodic tasks, provider accounts, EPG sources and plugins. The scrub disables DVR rules, recording jobs, provider refreshes, notifications and integrations too. Then send `SIGCONT` to the recorded Beat PID and restart only the Dev AIO container. Recheck the zero counts and an unauthenticated-denial endpoint. Select one test channel only after agreeing on its source connection and tuner usage.
 6. Before enabling a recorder, agree on a numeric `DEV_VU_IP` and `DEV_VU_PORT`. Stop Dev AIO; run `sudo python3 scripts/dev_egress.py remove --subnet "$DEV_LAN_SUBNET"`, then `apply` and `check` with `--vu-ip "$DEV_VU_IP" --vu-port "$DEV_VU_PORT"`; restart Dev. The rule permits established replies and new TCP connections only to that Vu+ endpoint. If the endpoint redirects elsewhere, leave it blocked and revise the allowlist explicitly.
-7. Capture the installed TiviMate version/device. Test XC and M3U/XMLTV separately: archive icon, live start-over, repeated seeks, pause/resume, programme boundary, service restart, retention and rollback. Record HTTP method, URL template, time arguments, Range headers and response codes without logging credentials.
+7. For a real player test, bind `DEV_BIND_IP` to the Dev host's LAN address and recreate only the Dev AIO. A fixed Shield TV address is optional; the M3U, XMLTV and archive routes authenticate with a separate, revocable token for that test device. Keep URLs containing the token in a private file outside the repository. Verify that an unauthenticated LAN request is rejected before importing the M3U and XMLTV URLs in TiviMate. Capture the installed TiviMate version/device. Test XC and M3U/XMLTV separately: archive icon, live start-over, repeated seeks, pause/resume, programme boundary, service restart, retention and rollback. Record HTTP method, URL template, time arguments, Range headers and response codes without logging credentials.
+
+For a Dev player trace, set `CATCHUPARR_TRACE_REQUESTS=1` in the private Dev
+Compose environment and recreate only the Dev AIO. The plugin then logs the
+archive method, UTC start, duration and response status, plus each segment's
+method, numeric Range and status. It does not log bearer tokens or leases in
+these trace lines. Collect only lines beginning `Catchuparr request`, keep
+them private, and set the flag back to `0` after the test. Do not publish raw
+web-server access logs because URL query strings may contain bearer tokens.
 
 The current Dev instance was prepared from a consistent custom-format `pg_dump` before this API preference was clarified. For a future rebuild, the verified Dispatcharr ZIP and API flow above is the default. If no compatible ZIP exists, use `pg_dump -Fc`, verify it with `pg_restore -l` in a networkless container, restore into an isolated temporary PostgreSQL 17 container, apply `scrub.sql`, stop it, and copy only its cold cluster into the AIO Dev `/data/db` path (UID/GID 1000). A cold cluster prepared under a different glibc version may need `REINDEX DATABASE` for each copied database, followed by `ALTER DATABASE ... REFRESH COLLATION VERSION` inside the AIO image. Never mount a production database directory into Dev.
 

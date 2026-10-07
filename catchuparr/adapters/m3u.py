@@ -1,8 +1,7 @@
 """Pure M3U/XMLTV helpers for exposing locally archived channel programmes.
 
-These functions intentionally do not assume a particular TiviMate template
-implementation. ``{utc}`` and ``{duration}`` are emitted as configured protocol
-placeholders and must be verified against the target client.
+These functions emit TiviMate's ``{utc}`` and ``{duration}`` placeholders in
+seconds, as validated with TiviMate 5.3.3.
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Collection, Iterable, Mapping
 from urllib.parse import quote, urlsplit
 
 MAX_XMLTV_BYTES = 64 * 1024 * 1024
@@ -90,6 +89,7 @@ def annotate_m3u(
         stripped = _set_extinf_attribute(stripped, "catchup", "default")
         stripped = _set_extinf_attribute(stripped, "catchup-source", source)
         stripped = _set_extinf_attribute(stripped, "catchup-days", str(catchup_days))
+        stripped = _set_extinf_attribute(stripped, "catchup-timezone", "UTC")
         output.append(stripped + ending)
     return "".join(output)
 
@@ -98,14 +98,16 @@ def filter_xmltv(
     xmltv: str | bytes,
     is_covered: Callable[[str, datetime, datetime], bool],
     now: datetime | None = None,
+    *,
+    local_channel_ids: Collection[str] | None = None,
 ) -> str:
-    """Drop historical XMLTV programmes without archive coverage.
+    """Drop selected local history without archive coverage.
 
-    Current/future entries, entries without parseable boundaries, channels, and
-    all non-programme XMLTV elements are retained. ``is_covered`` receives the
+    With ``local_channel_ids`` set, all other channels retain their provider
+    history. Current/future entries, entries without parseable boundaries and
+    non-programme XMLTV elements are retained. ``is_covered`` receives the
     XMLTV channel ID and UTC-aware start/stop datetimes. The in-memory tree is
-    limited to ``MAX_XMLTV_BYTES``; larger guides must be filtered upstream or
-    handled by a streaming adapter.
+    limited to ``MAX_XMLTV_BYTES``.
     """
     size = len(xmltv.encode("utf-8")) if isinstance(xmltv, str) else len(xmltv)
     if size > MAX_XMLTV_BYTES:
@@ -117,6 +119,8 @@ def filter_xmltv(
         start_text = programme.get("start")
         channel = programme.get("channel")
         if not (stop_text and start_text and channel):
+            continue
+        if local_channel_ids is not None and channel not in local_channel_ids:
             continue
         try:
             stop = _parse_xmltv_time(stop_text)
