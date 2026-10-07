@@ -90,7 +90,7 @@ def probe():
     store = ArchiveStore(root)
     source = root / "fixture.ts"
     source.write_bytes(b"\x47" + bytes(187))
-    start = timezone.now() - timedelta(seconds=12)
+    start = timezone.now().replace(microsecond=0) - timedelta(seconds=12)
     store.add_segment(str(channel.uuid), source, start, start + timedelta(seconds=6))
     source.write_bytes((b"\x47" + bytes([1]) * 187) * 2)
     store.add_segment(str(channel.uuid), source, start + timedelta(seconds=6),
@@ -139,7 +139,7 @@ def probe():
     require(time_key + "={utc}" in xc_text)
 
     def xc_playback(start_epoch):
-        selected = dict(xc_params, **{time_key: str(start_epoch)})
+        selected = dict(xc_params, **{time_key: str(int(start_epoch))})
         result = timeshift.timeshift_proxy_query(request(
             "/streaming/timeshift.php", selected, HTTP_RANGE="bytes=0-187",
             HTTP_USER_AGENT="Catchuparr synthetic integration",
@@ -153,12 +153,12 @@ def probe():
     require(xc_playback(start.timestamp()) == b"\x47" + bytes(187))
     require(xc_playback((start + timedelta(seconds=6)).timestamp())
             == b"\x47" + bytes([1]) * 187, "Timestamp seek must reset byte origin")
-    bad_credentials = dict(xc_params, password="invalid", **{time_key: str(start.timestamp())})
+    bad_credentials = dict(xc_params, password="invalid", **{time_key: str(int(start.timestamp()))})
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", bad_credentials,
     )).status_code == 403)
     forbidden_channel = dict(xc_params, stream=str(private_channel.id),
-                             **{time_key: str(start.timestamp())})
+                             **{time_key: str(int(start.timestamp()))})
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", forbidden_channel,
     )).status_code == 403)
@@ -167,7 +167,7 @@ def probe():
     cache.clear()
     disabled = views.archive_view(request("/catchuparr/archive", params))
     require(disabled.status_code in (401, 403))
-    disabled_params = dict(xc_params, **{time_key: str(start.timestamp())})
+    disabled_params = dict(xc_params, **{time_key: str(int(start.timestamp()))})
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", disabled_params,
     )).status_code == 403)
