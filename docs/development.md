@@ -8,7 +8,7 @@ Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q catchu
 
 Import `dist/catchuparr-<version>.zip` from Dispatcharr's Plugins page and enable it after inspecting its settings. The plugin code is installed under Dispatcharr's `/data/plugins/catchuparr`. The AIO container runs web and Celery with the same `/data/catchuparr` archive mount. During an update, stop the recorders, install the new ZIP, reload plugins, run the compatibility check, and resume the selected channels. Keep the prior ZIP and archive snapshot until playback smoke tests pass.
 
-Dispatcharr v0.31.0 also accepts a manual update at authenticated admin
+Dispatcharr v0.31.0 and v0.32.0 accept a manual update at authenticated admin
 `POST /api/plugins/plugins/import/` with multipart field `file` and explicit
 `overwrite=true`; the response must contain `success: true` and the expected
 plugin key/version. `POST /api/plugins/plugins/reload/` refreshes web-process
@@ -17,17 +17,48 @@ the same package, then verify plugin status, recording and playback. Keep the
 previous ZIP for rollback. Both POST routes require an admin account in the
 inspected image.
 
-The first compatibility target is Dispatcharr v0.31.0. Any custom or later image requires the adapter signature and request tests before enabling recording or XC output.
+The inspected compatibility targets are Dispatcharr v0.31.0 and v0.32.0. Unknown versions are refused. Custom images must retain the inspected core signatures and pass request tests before enabling XC output.
 
-Create a separate archive access token for each playback device. A token identifies one device and keeps one active playback session across channels and programmes. Playlist reloads for the same programme reuse its session; switching programmes replaces that device's session while preserving its previous segment URLs for a 30-second grace period.
+Create a separate archive access token for each playback device. Session identity is scoped to the credential, not proof of physical device identity: copying a playlist to another player shares its slot. Playlist reloads for the same programme reuse its session; switching programmes replaces that credential's session while preserving its previous segment URLs for a 30-second grace period.
 
-The first active client path is the authenticated M3U/XMLTV output with HLS
-archive playback. The XC adapter currently contains version-checked wrappers
-and unit tests, but is **not installed at runtime**. Dispatcharr's XC timeshift
-endpoint serves `.ts` with byte-range seeking; advertising local XC archive
-before a matching authenticated TS/Range response and shared session-limit
-policy exists would expose listings that cannot play. Complete those callbacks
-and test actual TiviMate XC requests before enabling the hooks.
+The validated client path is the authenticated M3U/XMLTV output with HLS archive
+playback. The plugin endpoint uses `{utc}` epoch seconds and `{duration}` seconds;
+Dispatcharr's native XC timeshift endpoint uses `{duration:60}` minutes. Keep
+those contracts separate. UTC metadata is attached only to locally annotated
+entries, so provider catch-up metadata is preserved. XC TS/Range playback must
+pass the AIO integration checks and a separate TiviMate test before being
+described as player-validated. Local availability is never persisted into
+Dispatcharr's provider-derived channel catch-up fields.
+
+## Upgrading the isolated AIO to 0.32.0
+
+Use `ghcr.io/dispatcharr/dispatcharr@sha256:b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`
+with `DISPATCHARR_ENV=aio`. This remains one container with PostgreSQL 17,
+Redis, web and workers. The official image replaces the Dev custom image only;
+production is not updated. Preserve Dev bind addresses, volumes and egress rules.
+
+1. Stop only the Dev AIO and verify it is stopped. Create a private cold archive
+   of its entire `data` and `archive` directories, preserving ownership. Retain
+   the old private environment file/image digest and verify the archive can be read.
+2. Verify `scripts/dev_egress.py check` against the agreed Dev subnet and source.
+   Change only the private `DISPATCHARR_DEV_AIO_IMAGE` pin, then recreate the Dev AIO.
+3. Verify Dispatcharr version, migration completion and PostgreSQL major version.
+   Confirm only the intended test provider, Catchuparr and its schedules are active.
+   Import the updated plugin through the authenticated API and restart Dev AIO
+   so web and workers load the same version. Check anonymous requests are denied,
+   recording progresses and both output adapters obey user catch-up restrictions.
+4. Repeat TiviMate 5.3.3/Shield tests for start-over, pause, multiple seeks,
+   programme boundary, restart and retention. Enable sanitized tracing only for
+   the test and record numeric time/range/status fields; never capture full URLs.
+5. To roll back, stop Dev, retain the failed Dev data privately, restore both cold
+   directories and the old private image pin, then recreate Dev. Do not run the
+   old application against a database migrated by the new release.
+
+For a rebuild instead of an in-place upgrade, use the backup ZIP/API restoration
+procedure below. Run `python3 scripts/run_aio_integration.py --image <pinned-image>`
+for a disposable, networkless AIO probe; it refuses databases containing users or
+channels. CI runs the same synthetic probe against both supported releases and
+collects no container data, recordings or credentials as artifacts.
 
 ## Isolated development stack
 

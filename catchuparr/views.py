@@ -412,6 +412,7 @@ def _archive_service(request, user, config):
     from .engine.store import ArchiveStore
     from .http import ArchiveHTTPService
     from .security import AccessTokenStore
+    from .xc_runtime import active_ts_session_count
 
     response = generate_m3u(_core_request(request), user=user)
     allowed = (
@@ -431,6 +432,11 @@ def _archive_service(request, user, config):
             redis = RedisClient.get_client()
         except Exception:
             logger.exception("Unable to verify Redis availability; denying archive playback")
+            return False
+        try:
+            plugin_sessions += active_ts_session_count(config.archive_root, subject)
+        except Exception:
+            logger.exception("Unable to verify active TS sessions; denying archive playback")
             return False
         return _session_limit_allows(
             limit, plugin_sessions, redis,
