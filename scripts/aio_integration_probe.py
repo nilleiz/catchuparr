@@ -4,6 +4,7 @@ import inspect
 import os
 import signal
 import sys
+import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -63,7 +64,11 @@ def probe():
         if b"beat" in args and any(b"celery" in arg for arg in args):
             os.kill(int(proc.name), signal.SIGSTOP)
 
-    user = User.objects.create_user(username="synthetic-player", user_level=0)
+    xc_password = uuid.uuid4().hex
+    user = User.objects.create_user(
+        username="synthetic-player", user_level=0, stream_limit=1,
+        custom_properties={"xc_password": xc_password},
+    )
     channel = Channel.objects.create(name="Synthetic", channel_number=1, user_level=0)
     private_channel = Channel.objects.create(name="Private", channel_number=2, user_level=10)
     root = Path("/data/ci-archive")
@@ -87,7 +92,7 @@ def probe():
     source.write_bytes(b"\x47" + bytes(187))
     start = timezone.now() - timedelta(seconds=12)
     store.add_segment(str(channel.uuid), source, start, start + timedelta(seconds=6))
-    source.write_bytes((b"\x47" + bytes(187)) * 2)
+    source.write_bytes((b"\x47" + bytes([1]) * 187) * 2)
     store.add_segment(str(channel.uuid), source, start + timedelta(seconds=6),
                       start + timedelta(seconds=12))
     token = AccessTokenStore(root).create(str(user.id))
@@ -119,11 +124,53 @@ def probe():
     ranged = views.segment_view(request(parts.path, query, HTTP_RANGE="bytes=0-"),
                                 path_parts[-2], path_parts[-1])
     require(ranged.status_code == 206 and ranged["Content-Range"].startswith("bytes 0-"))
+    service = views._archive_service(request("/catchuparr/archive", params), user,
+                                     runtime.load_config())
+    require(service.end_session(token, str(channel.uuid), query["lease"]))
+
+    xc_params = {"username": user.username, "password": xc_password,
+                 "stream": str(channel.id), "duration": "1"}
+    xc_playlist = output.generate_m3u(request("/get.php", xc_params), user=user)
+    require(xc_playlist.status_code == 200)
+    xc_text = xc_playlist.content.decode()
+    require('catchup="default"' in xc_text)
+    require("duration={duration:60}" in xc_text)
+    time_key = "utc" if __version__ == "0.32.0" else "start"
+    require(time_key + "={utc}" in xc_text)
+
+    def xc_playback(start_epoch):
+        selected = dict(xc_params, **{time_key: str(start_epoch)})
+        result = timeshift.timeshift_proxy_query(request(
+            "/streaming/timeshift.php", selected, HTTP_RANGE="bytes=0-187",
+            HTTP_USER_AGENT="Catchuparr synthetic integration",
+        ))
+        require(result.status_code == 206, f"XC range status {result.status_code}")
+        try:
+            return b"".join(result.streaming_content)
+        finally:
+            result.close()
+
+    require(xc_playback(start.timestamp()) == b"\x47" + bytes(187))
+    require(xc_playback((start + timedelta(seconds=6)).timestamp())
+            == b"\x47" + bytes([1]) * 187, "Timestamp seek must reset byte origin")
+    bad_credentials = dict(xc_params, password="invalid", **{time_key: str(start.timestamp())})
+    require(timeshift.timeshift_proxy_query(request(
+        "/streaming/timeshift.php", bad_credentials,
+    )).status_code == 403)
+    forbidden_channel = dict(xc_params, stream=str(private_channel.id),
+                             **{time_key: str(start.timestamp())})
+    require(timeshift.timeshift_proxy_query(request(
+        "/streaming/timeshift.php", forbidden_channel,
+    )).status_code == 403)
     user.custom_properties = {"catchup_enabled": False}
     user.save(update_fields=["custom_properties"])
     cache.clear()
     disabled = views.archive_view(request("/catchuparr/archive", params))
     require(disabled.status_code in (401, 403))
+    disabled_params = dict(xc_params, **{time_key: str(start.timestamp())})
+    require(timeshift.timeshift_proxy_query(request(
+        "/streaming/timeshift.php", disabled_params,
+    )).status_code == 403)
     runtime.shutdown()
     print(f"AIO integration passed: Dispatcharr {__version__}")
 
