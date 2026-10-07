@@ -4,15 +4,27 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from .store import ArchiveStore
+
+
+@dataclass(frozen=True)
+class RecorderAttemptResult:
+    """Outcome of one bounded source attempt."""
+
+    status: str
+    useful_segments: int
+    return_code: int | None
 
 
 class FFmpegCopyRecorder:
@@ -35,6 +47,8 @@ class FFmpegCopyRecorder:
         ffmpeg: str = "ffmpeg",
         on_error: Callable[[str], None] | None = None,
         fencing_token: int | None = None,
+        input_headers: dict[str, str] | None = None,
+        require_media_progress: bool = False,
     ):
         if segment_seconds < 2:
             raise ValueError("segment_seconds must be at least 2")
@@ -44,6 +58,8 @@ class FFmpegCopyRecorder:
         self.work_root = Path(work_root)
         self.segment_seconds, self.ffmpeg, self.on_error = segment_seconds, ffmpeg, on_error
         self.fencing_token = fencing_token
+        self.input_headers = self._validate_input_headers(input_headers or {})
+        self.require_media_progress = bool(require_media_progress)
         existing = self.store.segments(self.channel_id)
         self._last_end_epoch = max((item.end_utc.timestamp() for item in existing), default=None)
         self._session_anchor: float | None = None
@@ -51,8 +67,13 @@ class FFmpegCopyRecorder:
 
     def command(self, output_dir: Path) -> list[str]:
         output_dir.mkdir(parents=True, exist_ok=True)
-        return [
+        command = [
             self.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "warning",
+        ]
+        if self.input_headers:
+            header_block = "".join(f"{name}: {value}\r\n" for name, value in self.input_headers.items())
+            command.extend(["-headers", header_block])
+        command.extend([
             "-i", self.proxy_url,
             # Vu+/DVB transport streams may contain private data PIDs that
             # FFmpeg cannot remux. Keep every audio/video/subtitle track while
@@ -62,11 +83,33 @@ class FFmpegCopyRecorder:
             "-segment_format", "mpegts",
             "-segment_list", str(output_dir / "segments.csv"),
             "-segment_list_type", "csv", str(output_dir / "segment-%06d.ts"),
-        ]
+        ])
+        return command
 
-    def _publish_csv_rows(self, list_path: Path, offset: int, anchor: float | None = None) -> tuple[int, int]:
+    @staticmethod
+    def _validate_input_headers(headers: dict[str, str]) -> dict[str, str]:
+        validated = {}
+        for name, value in headers.items():
+            name, value = str(name), str(value)
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                raise ValueError("invalid FFmpeg input header name")
+            if "\r" in value or "\n" in value:
+                raise ValueError("invalid FFmpeg input header value")
+            validated[name] = value
+        return validated
+
+    def _publish_csv_rows(
+        self,
+        list_path: Path,
+        offset: int,
+        anchor: float | None = None,
+        *,
+        require_useful_media: bool | None = None,
+    ) -> tuple[int, int]:
         if not list_path.exists():
             return offset, 0
+        if require_useful_media is None:
+            require_useful_media = self.require_media_progress
         with list_path.open("rb") as stream:
             stream.seek(offset)
             chunk = stream.read()
@@ -85,6 +128,10 @@ class FFmpegCopyRecorder:
             segment_path = Path(name)
             if not segment_path.is_absolute():
                 segment_path = list_path.parent / segment_path
+            if require_useful_media and not has_useful_transport_stream(segment_path):
+                segment_path.unlink(missing_ok=True)
+                self._mark_next_discontinuity = True
+                continue
             file_mtime = segment_path.stat().st_mtime
             if self._session_anchor is None:
                 # The output file's mtime is written when the segment muxer
@@ -120,6 +167,80 @@ class FFmpegCopyRecorder:
             self._mark_next_discontinuity = False
             committed += 1
         return offset + consumed, committed
+
+    def run_candidate(
+        self,
+        stop_event: threading.Event,
+        *,
+        startup_timeout: float = 60.0,
+        media_idle_timeout: float = 120.0,
+        poll_interval: float = 0.5,
+    ) -> RecorderAttemptResult:
+        """Run a single source until it stops or useful media stalls.
+
+        Keepalive/null packets are discarded and do not count as media progress.
+        A caller can then move to the next policy-approved source.
+        """
+        if startup_timeout <= 0 or media_idle_timeout <= 0 or poll_interval <= 0:
+            raise ValueError("recorder attempt timeouts must be positive")
+        self.work_root.mkdir(parents=True, exist_ok=True)
+        output_dir = self.work_root / f"{self.channel_id}-{uuid.uuid4().hex}"
+        output_dir.mkdir()
+        list_path = output_dir / "segments.csv"
+        offset = useful = 0
+        self._session_anchor = None
+        process = None
+        start_clock = time.monotonic()
+        last_useful_at = start_clock
+        status = "exited"
+        return_code = None
+        try:
+            process = subprocess.Popen(
+                self.command(output_dir),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            while process.poll() is None and not stop_event.is_set():
+                offset, committed = self._publish_csv_rows(
+                    list_path, offset, require_useful_media=True
+                )
+                if committed:
+                    useful += committed
+                    last_useful_at = time.monotonic()
+                now = time.monotonic()
+                if useful == 0 and now - start_clock >= startup_timeout:
+                    status = "no_media"
+                    break
+                if useful and now - last_useful_at >= media_idle_timeout:
+                    status = "media_stalled"
+                    break
+                stop_event.wait(poll_interval)
+
+            if stop_event.is_set():
+                status = "stopped"
+            elif process.poll() is None and status == "exited":
+                process.terminate()
+                status = "no_media" if useful == 0 else "media_stalled"
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            return_code = process.poll()
+            offset, committed = self._publish_csv_rows(
+                list_path, offset, require_useful_media=True
+            )
+            useful += committed
+            if status == "exited" and useful == 0:
+                status = "no_media"
+            return RecorderAttemptResult(status, useful, return_code)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            shutil.rmtree(output_dir, ignore_errors=True)
 
     def run_once(self, stop_event: threading.Event) -> int:
         """Run FFmpeg until stopped or it exits; return committed segment count."""
@@ -168,3 +289,32 @@ class FFmpegCopyRecorder:
             if stop_event.wait(backoff):
                 break
             backoff = min(max_backoff, backoff * 2)
+
+
+def has_useful_transport_stream(path: Path) -> bool:
+    """Reject FFmpeg segments made only from Dispatcharr null keepalives."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    if len(data) < 188 * 2:
+        return False
+    counts: dict[int, int] = {}
+    starts: set[int] = set()
+    for offset in range(0, len(data) - 187, 188):
+        packet = data[offset : offset + 188]
+        if packet[0] != 0x47:
+            return False
+        pid = ((packet[1] & 0x1F) << 8) | packet[2]
+        adaptation_control = (packet[3] >> 4) & 0x03
+        if pid >= 0x1FFF or pid <= 0x20 or adaptation_control not in (1, 3):
+            continue
+        payload_offset = 4
+        if adaptation_control == 3:
+            payload_offset += 1 + packet[4]
+        if payload_offset >= 188:
+            continue
+        counts[pid] = counts.get(pid, 0) + 1
+        if packet[1] & 0x40:
+            starts.add(pid)
+    return any(count >= 2 and pid in starts for pid, count in counts.items())
