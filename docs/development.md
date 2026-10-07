@@ -41,7 +41,9 @@ programme's end even if TiviMate sends its original full duration after a
 seek. HLS reloads may append newly indexed segments within that programme.
 Fetching or prefetching its tail cannot unlock the next programme. Automatic
 cross-programme continuation is temporarily disabled pending a separate Shield
-test. The playlist target stays at 60 seconds because stream-copy segmentation
+test. A segment crossing the programme's end is omitted rather than serving
+content from the next programme; playback may therefore end one segment early.
+The playlist target stays at 60 seconds because stream-copy segmentation
 can have delayed keyframes.
 
 Local XC windows use the exact positive duration hint in minutes. With no
