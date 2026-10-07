@@ -62,7 +62,28 @@ def active_ts_session_count(archive_root: Path | str, user_id: str | int) -> int
 
 
 def _active_hls_session_count(archive_root: Path | str, user_id: str | int) -> int:
+    _ensure_http_session_schema_for_count(archive_root)
     return _active_session_count(archive_root, user_id, table_prefix="http")
+
+
+def _ensure_http_session_schema_for_count(archive_root: Path | str) -> None:
+    database = Path(archive_root) / "archive.sqlite3"
+    with closing(sqlite3.connect(database, timeout=5)) as db:
+        row = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("http_playback_sessions",),
+        ).fetchone()
+        if row is None:
+            return
+        columns = {
+            column[1]
+            for column in db.execute("PRAGMA table_info(http_playback_sessions)")
+        }
+    if "grace_until" in columns:
+        return
+    from .http import ensure_http_playback_sessions
+
+    ensure_http_playback_sessions(_archive_store(Path(archive_root)))
 
 
 def _active_session_count(
@@ -214,24 +235,12 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
         channel = _channel_by_uuid(channel_uuid)
         if channel is None or not _channel_policy_allows(timeshift_views, user, channel):
             return False
-        parser = getattr(timeshift_views, "parse_catchup_timestamp", None)
-        duration_resolver = getattr(timeshift_views, "resolve_catchup_duration", None)
-        if parser is None or duration_resolver is None:
+        window = _local_playback_window(
+            timeshift_views, channel, timestamp, duration_hint
+        )
+        if window is None:
             return False
-        try:
-            start = parser(timestamp)
-            duration_minutes = int(duration_resolver(
-                channel, timestamp, client_hint=duration_hint
-            ))
-        except Exception:
-            return False
-        if start is None or duration_minutes <= 0 or duration_minutes > 24 * 60:
-            return False
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=timezone.utc)
-        else:
-            start = start.astimezone(timezone.utc)
-        end = start + timedelta(minutes=duration_minutes)
+        start, end = window
         now = datetime.now(timezone.utc)
         if start > now:
             return False
@@ -261,24 +270,12 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
         config = _load_config()
         if config is None:
             return _service_unavailable(timeshift_views)
-        parser = getattr(timeshift_views, "parse_catchup_timestamp", None)
-        duration_resolver = getattr(timeshift_views, "resolve_catchup_duration", None)
-        if parser is None or duration_resolver is None:
+        window = _local_playback_window(
+            timeshift_views, channel, timestamp, duration_hint
+        )
+        if window is None:
             return _service_unavailable(timeshift_views)
-        try:
-            start = parser(timestamp)
-            duration_minutes = int(duration_resolver(
-                channel, timestamp, client_hint=duration_hint
-            ))
-            if start is None or duration_minutes <= 0 or duration_minutes > 24 * 60:
-                return _service_unavailable(timeshift_views)
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=timezone.utc)
-            else:
-                start = start.astimezone(timezone.utc)
-            end = start + timedelta(minutes=duration_minutes)
-        except Exception:
-            return _service_unavailable(timeshift_views)
+        start, end = window
 
         service = _ts_service(config.archive_root, timeshift_views)
         session_id, device_key = _xc_session_keys(request, user, channel, start)
@@ -333,6 +330,107 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
         authorize_xc_m3u=authorize_xc_m3u,
         m3u_channel_archive_days=m3u_channel_archive_days,
     )
+
+
+def _local_playback_window(timeshift_views, channel, timestamp, duration_hint):
+    """Resolve the exact requested local window without provider lag padding."""
+    parser = getattr(timeshift_views, "parse_catchup_timestamp", None)
+    if parser is None:
+        return None
+    try:
+        start = parser(timestamp)
+    except Exception:
+        return None
+    if start is None:
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    else:
+        start = start.astimezone(timezone.utc)
+
+    maximum_value = getattr(timeshift_views, "MAX_DURATION_MINUTES", None)
+    if maximum_value is None:
+        maximum_value = _timeshift_helper("MAX_DURATION_MINUTES", 480)
+    maximum = _positive_duration_constant(maximum_value, 480)
+    minutes = _client_duration_minutes(duration_hint, maximum)
+    if minutes is not None:
+        return start, start + timedelta(minutes=minutes)
+
+    # For URL shapes without a usable duration, use the guide's actual end.
+    # Provider playback keeps using Dispatcharr's padded resolver unchanged.
+    programme_info = getattr(timeshift_views, "get_programme_info", None)
+    if programme_info is None:
+        programme_info = _timeshift_helper("get_programme_info")
+    if programme_info is not None:
+        try:
+            info = programme_info(channel, timestamp)
+        except Exception:
+            info = None
+        end = _programme_end_utc(info)
+        if end is not None and end > start:
+            return start, min(end, start + timedelta(minutes=maximum))
+    return None
+
+
+def _timeshift_helper(name, default=None):
+    try:
+        from importlib import import_module
+
+        helpers = import_module("apps.timeshift.helpers")
+    except Exception:
+        return default
+    return getattr(helpers, name, default)
+
+
+def _client_duration_minutes(value, maximum):
+    if value is None:
+        return None
+    try:
+        minutes = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if minutes <= 0 or minutes > maximum:
+        return None
+    return minutes
+
+
+def _positive_duration_constant(value, fallback):
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return minutes if minutes > 0 else fallback
+
+
+def _programme_end_utc(info):
+    if not isinstance(info, dict):
+        return None
+    end = _epg_datetime_utc(info.get("end_time"))
+    if end is not None:
+        return end
+    programme_start = _epg_datetime_utc(info.get("start_time"))
+    try:
+        duration_seconds = float(info.get("duration_secs"))
+    except (TypeError, ValueError):
+        return None
+    if programme_start is None or duration_seconds <= 0:
+        return None
+    return programme_start + timedelta(seconds=duration_seconds)
+
+
+def _epg_datetime_utc(value):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _load_config():
