@@ -111,6 +111,94 @@ def _error(status: int, message: str = "") -> HTTPResponse:
     return HTTPResponse(status, headers, body)
 
 
+@contextmanager
+def _archive_file_lock(root: Path | str, name: str):
+    lock_path = Path(root) / f".http-playback-{name}.lock"
+    with lock_path.open("a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_http_playback_sessions(
+    store,
+    *,
+    replacement_grace_seconds: float = SESSION_REPLACEMENT_GRACE_SECONDS,
+    clock: Callable[[], float] = time.time,
+) -> None:
+    """Create or upgrade the HLS lease table and preserve legacy lease grace."""
+    if replacement_grace_seconds <= 0:
+        raise ValueError("replacement_grace_seconds must be positive")
+    legacy = []
+    with _archive_file_lock(store.root, "schema"):
+        now = clock()
+        db_path = Path(store.root) / "archive.sqlite3"
+        with closing(sqlite3.connect(db_path, timeout=30, isolation_level=None)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA busy_timeout=30000")
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS http_playback_sessions (
+                    lease_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    request_key TEXT,
+                    device_key TEXT,
+                    start_utc REAL NOT NULL,
+                    end_utc REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    grace_until REAL
+                )"""
+            )
+            columns = {
+                row[1] for row in db.execute(
+                    "PRAGMA table_info(http_playback_sessions)"
+                )
+            }
+            for name, definition in (
+                ("request_key", "TEXT"),
+                ("device_key", "TEXT"),
+                ("grace_until", "REAL"),
+            ):
+                if name not in columns:
+                    db.execute(
+                        f"ALTER TABLE http_playback_sessions ADD COLUMN {name} {definition}"
+                    )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS http_sessions_user "
+                "ON http_playback_sessions(user_id, channel_id)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS http_sessions_request "
+                "ON http_playback_sessions(request_key, expires_at)"
+            )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS http_sessions_device_active "
+                "ON http_playback_sessions(device_key) "
+                "WHERE device_key IS NOT NULL AND grace_until IS NULL"
+            )
+            legacy = [
+                (
+                    str(row["lease_id"]),
+                    min(float(row["expires_at"]), now + replacement_grace_seconds),
+                )
+                for row in db.execute(
+                    "SELECT lease_id,expires_at FROM http_playback_sessions "
+                    "WHERE device_key IS NULL AND grace_until IS NULL AND expires_at>?",
+                    (now,),
+                )
+            ]
+            db.executemany(
+                "UPDATE http_playback_sessions SET grace_until=?,expires_at=? WHERE lease_id=?",
+                [(expiry, expiry, lease_id) for lease_id, expiry in legacy],
+            )
+    for lease_id, expiry in legacy:
+        ttl = max(0.001, expiry - now)
+        if not store.renew_playback(lease_id, ttl_seconds=ttl):
+            store.end_playback(lease_id)
+
+
 class ArchiveHTTPService:
     """Serve HLS playlists and immutable archive segments.
 
@@ -160,64 +248,17 @@ class ArchiveHTTPService:
         return db
 
     def _init_sessions(self) -> None:
-        with self._file_lock("schema"):
-            now = self.clock()
-            with closing(self._connect()) as db:
-                db.execute(
-                    """CREATE TABLE IF NOT EXISTS http_playback_sessions (
-                        lease_id TEXT PRIMARY KEY,
-                        user_id TEXT NOT NULL,
-                        channel_id TEXT NOT NULL,
-                        request_key TEXT,
-                        device_key TEXT,
-                        start_utc REAL NOT NULL,
-                        end_utc REAL NOT NULL,
-                        expires_at REAL NOT NULL,
-                        grace_until REAL
-                    )"""
-                )
-                columns = {row[1] for row in db.execute("PRAGMA table_info(http_playback_sessions)")}
-                for name, definition in (
-                    ("request_key", "TEXT"),
-                    ("device_key", "TEXT"),
-                    ("grace_until", "REAL"),
-                ):
-                    if name not in columns:
-                        db.execute(f"ALTER TABLE http_playback_sessions ADD COLUMN {name} {definition}")
-                db.execute("CREATE INDEX IF NOT EXISTS http_sessions_user ON http_playback_sessions(user_id, channel_id)")
-                db.execute("CREATE INDEX IF NOT EXISTS http_sessions_request ON http_playback_sessions(request_key, expires_at)")
-                db.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS http_sessions_device_active "
-                    "ON http_playback_sessions(device_key) "
-                    "WHERE device_key IS NOT NULL AND grace_until IS NULL"
-                )
-                legacy = [
-                    (str(row["lease_id"]), min(float(row["expires_at"]), now + self.replacement_grace_seconds))
-                    for row in db.execute(
-                        "SELECT lease_id,expires_at FROM http_playback_sessions "
-                        "WHERE device_key IS NULL AND grace_until IS NULL AND expires_at>?",
-                        (now,),
-                    )
-                ]
-                db.executemany(
-                    "UPDATE http_playback_sessions SET grace_until=?,expires_at=? WHERE lease_id=?",
-                    [(expiry, expiry, lease_id) for lease_id, expiry in legacy],
-                )
-            for lease_id, expiry in legacy:
-                ttl = max(0.001, expiry - now)
-                if not self.store.renew_playback(lease_id, ttl_seconds=ttl):
-                    self.store.end_playback(lease_id)
+        ensure_http_playback_sessions(
+            self.store,
+            replacement_grace_seconds=self.replacement_grace_seconds,
+            clock=self.clock,
+        )
 
     @contextmanager
     def _file_lock(self, name: str):
         """Serialize a short named operation across web workers and processes."""
-        lock_path = Path(self.store.root) / f".http-playback-{name}.lock"
-        with lock_path.open("a") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with _archive_file_lock(self.store.root, name):
+            yield
 
     def _admission_lock(self, user_id: str):
         # Admission limits are per user, so independent accounts can render in
