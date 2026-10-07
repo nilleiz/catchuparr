@@ -49,13 +49,13 @@ def run():
         docker("exec", "--workdir", "/tmp", "-e", "PYTHONPATH=/data/plugins:/tmp",
                name, "/dispatcharrpy/bin/python", "-m", "unittest",
                "tests.test_engine_recorder", "tests.test_engine_playlist",
-               "tests.test_engine_store", "-q")
+               "tests.test_engine_store", "-q", timeout=120)
         with (ROOT / "scripts/aio_integration_probe.py").open("rb") as script:
             docker("exec", "-i", name, "/dispatcharrpy/bin/python", "-c",
                    "import os,runpy,sys; from pathlib import Path; "
                    "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
                    "sys.argv=['manage.py','shell']; runpy.run_path('/app/manage.py',run_name='__main__')",
-                   stdin=script)
+                   stdin=script, timeout=120)
     finally:
         subprocess.run(["docker", "rm", "-f", "-v", name],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
