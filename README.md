@@ -18,7 +18,7 @@ behavior is not a guarantee of automatic continuation in other players.
 
 Repeat player tests after upgrades; native XC player validation is separate.
 
-See [installation and development](docs/development.md) and
+See the [release roadmap](docs/roadmap.md), [installation and development](docs/development.md) and
 [validation status](docs/validation.md). The M3U/HLS milestone is complete in
 [0.1.4](https://github.com/nilleiz/catchuparr/releases/tag/v0.1.4); XC player
 validation remains open.
