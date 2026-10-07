@@ -98,3 +98,25 @@ The plugin M3U/XMLTV endpoint and direct XC JSON are the two primary output
 paths. Native `/get.php` playlist annotation is tested separately; its core
 `/xmltv.php` guide has not been extended to restore local archive history.
 Historical guide visibility with that particular pairing remains unverified.
+
+## TiviMate seek regression (2026-10-07)
+
+The user confirmed that first start-over of the current programme works, but
+bar seeks can land minutes away from the selected point. Sanitized Dev access
+records show TiviMate 5.3.3 changes `{utc}` on each seek while leaving the
+original programme's `{duration}` at 2700 seconds. For a programme ending at
+16:00 UTC, one later request started at 15:47 UTC; the resulting 45-minute
+window contained 58 segments from the next programme. This is a reproducible
+server-side programme-boundary error. Version 0.1.2 bounds every M3U seek by
+its actual EPG programme, including historical programmes restored from the
+local XMLTV snapshots. A missing programme still returns 404. The sanitized
+archive trace now uses WARNING so it appears in the Dev AIO logs when enabled.
+
+The inspected 1026 indexed segments were continuous, with durations from 4.8
+to 7.02 seconds. HLS EVENT playlists grow only after the player reads the
+programme tail; a persisted terminal playlist never loses ENDLIST. The fixed
+60-second target remains because FFmpeg can emit a 16-second segment when the
+next keyframe is delayed. It may delay playlist reloads at a programme
+boundary. Synthetic tests on 0.31.0 and 0.32.0 verify the server behavior;
+the Shield must still confirm that seeks land within two segments and that
+playback crosses the programme boundary naturally before publication.

@@ -74,6 +74,8 @@ def probe():
     channel = Channel.objects.create(name="Synthetic", channel_number=1, user_level=0)
     private_channel = Channel.objects.create(name="Private", channel_number=2, user_level=10)
     closed_channel = Channel.objects.create(name="Closed minute", channel_number=3, user_level=0)
+    no_guide_channel = Channel.objects.create(name="Missing guide", channel_number=4, user_level=0)
+    long_segment_channel = Channel.objects.create(name="Long GOP", channel_number=5, user_level=0)
     root = Path("/data/ci-archive")
     root.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(root / "archive.sqlite3") as database:
@@ -83,7 +85,9 @@ def probe():
         )""")
     PluginConfig.objects.create(
         key="catchuparr", name="Catchuparr", enabled=True, ever_enabled=True,
-        settings={"channel_uuids": f"{channel.uuid},{closed_channel.uuid}", "archive_root": str(root),
+        settings={"channel_uuids": f"{channel.uuid},{closed_channel.uuid},{no_guide_channel.uuid},"
+                  f"{long_segment_channel.uuid}",
+                  "archive_root": str(root),
                   "retention_hours": 1, "max_storage_gib": 1},
     )
     runtime.bootstrap()
@@ -104,6 +108,28 @@ def probe():
     source.write_bytes((b"\x47" + bytes([1]) * 187) * 2)
     store.add_segment(str(channel.uuid), source, start + timedelta(seconds=6),
                       start + timedelta(seconds=12))
+    live_guide = EPGData.objects.create(name="Synthetic playback guide", tvg_id="synthetic")
+    channel.epg_data = live_guide
+    channel.save(update_fields=["epg_data"])
+    ProgramData.objects.create(epg=live_guide, title="Synthetic current",
+                               start_time=start, end_time=start + timedelta(seconds=12))
+    ProgramData.objects.create(epg=live_guide, title="Synthetic next",
+                               start_time=start + timedelta(seconds=12),
+                               end_time=start + timedelta(seconds=72))
+    source.write_bytes(b"\x47" + bytes([3]) * 187)
+    store.add_segment(str(no_guide_channel.uuid), source, start,
+                      start + timedelta(seconds=6))
+    long_guide = EPGData.objects.create(name="Long segment guide", tvg_id="long-gop")
+    long_segment_channel.epg_data = long_guide
+    long_segment_channel.save(update_fields=["epg_data"])
+    long_start = start - timedelta(minutes=2)
+    ProgramData.objects.create(epg=long_guide, title="Long segment",
+                               start_time=long_start,
+                               end_time=long_start + timedelta(seconds=16))
+    source.write_bytes(b"\x47" + bytes([4]) * 187)
+    store.add_segment(str(long_segment_channel.uuid), source, long_start,
+                      long_start + timedelta(seconds=16))
+    source.write_bytes(b"\x47" + bytes([3]) * 187)
     closed_start = start - timedelta(minutes=3)
     guide = EPGData.objects.create(name="Closed synthetic guide", tvg_id="closed-minute")
     closed_channel.epg_data = guide
@@ -146,12 +172,47 @@ def probe():
     require(str(channel.uuid) in text and str(private_channel.uuid) not in text)
     params = {"access_token": token, "channel_id": str(channel.uuid),
               "utc": str(start.timestamp()), "duration": "12"}
-    archive = views.archive_view(request("/catchuparr/archive", params))
-    require(archive.status_code == 200, f"Archive status {archive.status_code}")
-    require(b"#EXT-X-ENDLIST" in archive.content)
-    require(b"#EXTINF" in archive.content)
     from urllib.parse import parse_qs, urlsplit
 
+    missing_guide = views.archive_view(request(
+        "/catchuparr/archive", dict(params, channel_id=str(no_guide_channel.uuid))
+    ))
+    require(missing_guide.status_code == 404,
+            "Selected archive channel without EPG must not invent a programme window")
+    store.save_program_snapshot(
+        str(no_guide_channel.uuid), start, start + timedelta(seconds=6),
+        "Archived before guide refresh",
+    )
+    restored_history = views.archive_view(request(
+        "/catchuparr/archive",
+        dict(params, channel_id=str(no_guide_channel.uuid), duration="6"),
+    ))
+    require(restored_history.status_code == 200
+            and restored_history.content.count(b"#EXTINF:") == 1,
+            "Historical snapshot advertised in XMLTV must remain playable")
+    history_url = next(line for line in restored_history.content.decode().splitlines()
+                       if line and not line.startswith("#"))
+    history_lease = parse_qs(urlsplit(history_url).query)["lease"][0]
+    history_service = views._archive_service(request("/catchuparr/archive", params), user,
+                                             runtime.load_config())
+    require(history_service.end_session(token, str(no_guide_channel.uuid), history_lease))
+    long_segment = views.archive_view(request(
+        "/catchuparr/archive",
+        dict(params, channel_id=str(long_segment_channel.uuid),
+             utc=str(int(long_start.timestamp())), duration="16"),
+    ))
+    require(long_segment.status_code == 200,
+            "A delayed 16-second keyframe must not make HLS return 503")
+    long_segment_url = next(line for line in long_segment.content.decode().splitlines()
+                            if line and not line.startswith("#"))
+    long_lease = parse_qs(urlsplit(long_segment_url).query)["lease"][0]
+    service = views._archive_service(request("/catchuparr/archive", params), user,
+                                     runtime.load_config())
+    require(service.end_session(token, str(long_segment_channel.uuid), long_lease))
+    archive = views.archive_view(request("/catchuparr/archive", params))
+    require(archive.status_code == 200, f"Archive status {archive.status_code}")
+    require(archive.content.count(b"#EXTINF:") == 2,
+            "Initial programme must exclude the next programme's segment")
     segment_url = next(line for line in archive.content.decode().splitlines()
                        if line and not line.startswith("#"))
     parts = urlsplit(segment_url)
@@ -160,9 +221,35 @@ def probe():
     ranged = views.segment_view(request(parts.path, query, HTTP_RANGE="bytes=0-"),
                                 path_parts[-2], path_parts[-1])
     require(ranged.status_code == 206 and ranged["Content-Range"].startswith("bytes 0-"))
-    service = views._archive_service(request("/catchuparr/archive", params), user,
-                                     runtime.load_config())
+    tail_url = [line for line in archive.content.decode().splitlines()
+                if line and not line.startswith("#")][-1]
+    tail_parts = urlsplit(tail_url)
+    tail_query = {key: values[0] for key, values in parse_qs(tail_parts.query).items()}
+    tail_path = tail_parts.path.rstrip("/").split("/")
+    tail = views.segment_view(request(tail_parts.path, tail_query, HTTP_RANGE="bytes=0-"),
+                              tail_path[-2], tail_path[-1])
+    require(tail.status_code == 206 and len(tail.content) == 376,
+            "Full Range GET of the published tail must count as playback progress")
+    waiting = views.archive_view(request("/catchuparr/archive", params))
+    require(waiting.status_code == 200 and waiting.content == archive.content,
+            "Missing next segment must keep the EVENT manifest open and unchanged")
+    store.add_segment(str(channel.uuid), source, start + timedelta(seconds=12),
+                      start + timedelta(seconds=18))
+    continued = views.archive_view(request("/catchuparr/archive", params))
+    require(continued.status_code == 200 and continued.content.count(b"#EXTINF:") == 3,
+            "Next indexed programme must append after a completed tail GET")
+    require(continued.content.startswith(archive.content),
+            "Reload must preserve the exact published EVENT prefix")
     require(service.end_session(token, str(channel.uuid), query["lease"]))
+    seek_params = dict(params, utc=str(int(start.timestamp()) + 6))
+    seek = views.archive_view(request("/catchuparr/archive", seek_params))
+    require(seek.status_code == 200, f"HLS seek status {seek.status_code}")
+    require(seek.content.count(b"#EXTINF:") == 1,
+            "Seek with unchanged programme duration must stop at EPG end")
+    seek_segment = next(line for line in seek.content.decode().splitlines()
+                        if line and not line.startswith("#"))
+    seek_lease = parse_qs(urlsplit(seek_segment).query)["lease"][0]
+    require(service.end_session(token, str(channel.uuid), seek_lease))
 
     xc_playlist = output.generate_m3u(request("/get.php", xc_params), user=user)
     require(xc_playlist.status_code == 200)
