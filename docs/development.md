@@ -30,6 +30,16 @@ pass the AIO integration checks and a separate TiviMate test before being
 described as player-validated. Local availability is never persisted into
 Dispatcharr's provider-derived channel catch-up fields.
 
+On each M3U seek, the endpoint resolves the requested UTC instant to the
+effective Dispatcharr guide programme. For older entries removed by an EPG
+refresh, it uses a locally saved programme snapshot only when that entire
+historical programme has archive coverage, matching the plugin XMLTV export.
+An unknown programme returns 404. The initial HLS playlist stops at that
+programme's end even if TiviMate sends its original full duration after a
+seek. Reading the published tail unlocks only the adjacent next programme;
+reloads append newly indexed segments. The playlist target stays at 60 seconds
+because stream-copy segmentation can have delayed keyframes.
+
 Local XC windows use the exact positive duration hint in minutes. With no
 usable hint, the actual EPG programme end determines the remaining window;
 without reliable EPG metadata, playback delegates to the provider. Dispatcharr's
@@ -81,9 +91,10 @@ Never mount production directories into Dev. Keep host-specific names, addresses
 
 For a Dev player trace, set `CATCHUPARR_TRACE_REQUESTS=1` in the private Dev
 Compose environment and recreate only the Dev AIO. The plugin then logs the
-archive method, UTC start, duration and response status, plus each segment's
-method, numeric Range and status. It does not log bearer tokens or leases in
-these trace lines. Collect only lines beginning `Catchuparr request`, keep
+archive UTC start, duration, EPG end, first/last segment times and response
+status, plus each segment's method, numeric Range and status. It does not log
+bearer tokens or leases in these trace lines. Collect only lines beginning
+`Catchuparr archive` or `Catchuparr request`, keep
 them private, and set the flag back to `0` after the test. Do not publish raw
 web-server access logs because URL query strings may contain bearer tokens.
 

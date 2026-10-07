@@ -131,19 +131,58 @@ def _trace_range(value: str | None) -> str:
     return "other"
 
 
-def _trace_archive_request(request, channel: str, start: float, duration: int, status: int):
+def _trace_archive_request(request, start: float, duration: int, epg_end, response):
     if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
-        logger.info(
-            "Catchuparr request route=archive method=%s channel=%s utc=%.3f duration=%d status=%d",
-            request.method, _trace_component(channel), start, duration, status,
+        first_start, last_end = _playlist_segment_bounds(response.body)
+        logger.warning(
+            "Catchuparr archive utc=%.3f duration=%d epg_end=%.3f "
+            "first_segment=%.3f last_segment=%.3f status=%d",
+            start,
+            duration,
+            float(epg_end) if epg_end is not None else 0.0,
+            first_start,
+            last_end,
+            response.status,
         )
+
+
+def _playlist_segment_bounds(body: bytes) -> tuple[float, float]:
+    starts = []
+    pending_start = None
+    pending_duration = 0.0
+    try:
+        lines = body.decode("utf-8").splitlines()
+    except (AttributeError, UnicodeDecodeError):
+        return 0.0, 0.0
+    for line in lines:
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            try:
+                parsed = datetime.fromisoformat(line.split(":", 1)[1].replace("Z", "+00:00"))
+                pending_start = parsed.timestamp()
+            except (TypeError, ValueError):
+                pending_start = None
+        elif line.startswith("#EXTINF:"):
+            try:
+                pending_duration = float(line.split(":", 1)[1].split(",", 1)[0])
+            except (TypeError, ValueError):
+                pending_duration = 0.0
+        elif line and not line.startswith("#") and pending_start is not None:
+            starts.append((pending_start, pending_start + pending_duration))
+            pending_start = None
+            pending_duration = 0.0
+    if not starts:
+        return 0.0, 0.0
+    return starts[0][0], starts[-1][1]
 
 
 def _trace_segment_request(request, channel: str, segment: str, status: int):
     if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
-        logger.info(
+        method = str(getattr(request, "method", "")).upper()
+        if method not in {"GET", "HEAD"}:
+            method = "OTHER"
+        logger.warning(
             "Catchuparr request route=segment method=%s channel=%s segment=%s range=%s status=%d",
-            request.method, _trace_component(channel), _trace_component(segment),
+            method, _trace_component(str(channel)), _trace_component(str(segment)),
             _trace_range(request.headers.get("Range")), status,
         )
 
@@ -341,13 +380,162 @@ def archive_view(request):
     if start_epoch > now_epoch or start_epoch + duration_seconds < now_epoch - config.retention_hours * 3600:
         return _no_cache(HttpResponse("No archived programme", status=404))
     service = _archive_service(request, user, config)
-    end_epoch = start_epoch + duration_seconds
+    requested_end_epoch = start_epoch + duration_seconds
+    programme_end_epoch = None
+    continuation_end_epoch = None
+    authorized = (
+        service.authorize_user_channel(str(user.id), channel)
+        and service.catchup_enabled(str(user.id), channel)
+    )
+    if authorized:
+        programme_end_epoch, next_programme_end_epoch = _archive_epg_bounds(
+            channel, start_epoch, service.store
+        )
+        if programme_end_epoch is None:
+            return _no_cache(HttpResponse("No matching EPG programme", status=404))
+    else:
+        next_programme_end_epoch = None
+    end_epoch, continuation_end_epoch = _archive_playback_window(
+        start_epoch,
+        duration_seconds,
+        programme_end_epoch,
+        next_programme_end_epoch if programme_end_epoch is not None else None,
+    )
+    final_end_epoch = continuation_end_epoch or end_epoch
     response = service.playlist(
         token, channel, start_epoch, end_epoch,
-        live=_archive_window_live(service, str(user.id), channel, end_epoch, now_epoch),
+        live=_archive_window_live(
+            service, str(user.id), channel, final_end_epoch, now_epoch
+        ),
+        request_identity_end=requested_end_epoch,
+        programme_end_utc=programme_end_epoch,
+        continuation_end_utc=continuation_end_epoch,
     )
-    _trace_archive_request(request, channel, start_epoch, duration_seconds, response.status)
+    _trace_archive_request(
+        request, start_epoch, duration_seconds, programme_end_epoch, response
+    )
     return _to_django_response(response, request.method)
+
+
+def _archive_epg_bounds(channel_id: str, start_epoch: float, store=None):
+    """Return current and next EPG programme ends for a local channel seek."""
+    try:
+        from apps.channels.models import Channel
+
+        channel = Channel.objects.filter(uuid=str(channel_id)).select_related(
+            "epg_data"
+        ).first()
+        if channel is None:
+            return None, None
+        if hasattr(channel, "effective_epg_data_obj"):
+            epg_data = channel.effective_epg_data_obj
+        else:
+            epg_data = getattr(channel, "epg_data", None)
+        programmes = getattr(epg_data, "programs", None)
+        if programmes is not None:
+            requested_at = datetime.fromtimestamp(start_epoch, timezone.utc)
+            current = programmes.filter(
+                start_time__lte=requested_at, end_time__gt=requested_at
+            ).order_by("-start_time", "end_time").first()
+            if current is not None:
+                current_end = _epg_epoch(current.end_time)
+                if current_end is not None and current_end > start_epoch:
+                    current_end_dt = datetime.fromtimestamp(current_end, timezone.utc)
+                    following = programmes.filter(
+                        start_time__lte=current_end_dt, end_time__gt=current_end_dt
+                    ).order_by("-start_time", "end_time").first()
+                    next_end = _epg_epoch(following.end_time) if following is not None else None
+                    if next_end is not None and next_end <= current_end:
+                        next_end = None
+                    return current_end, next_end
+    except Exception:
+        logger.exception("Could not resolve EPG programme boundary for archive seek")
+    return _archive_snapshot_bounds(store, channel_id, start_epoch)
+
+
+def _archive_snapshot_bounds(store, channel_id: str, start_epoch: float):
+    """Resolve an archived guide entry when Dispatcharr has replaced its EPG rows."""
+    if store is None:
+        return None, None
+    try:
+        # The XMLTV endpoint advertises only complete, historical snapshots.
+        # Apply the same coverage rule before accepting one for playback.
+        matches = store.program_snapshots(channel_id, start_epoch, start_epoch + 0.001)
+        matches = [
+            row for row in matches
+            if row["start_utc"].timestamp() <= start_epoch < row["end_utc"].timestamp()
+            and row["end_utc"].timestamp() < datetime.now(timezone.utc).timestamp()
+            and store.coverage(
+                channel_id, row["start_utc"], row["end_utc"]
+            ).complete
+        ]
+        if not matches:
+            return None, None
+        current = max(matches, key=lambda row: (
+            row["start_utc"], row["captured_at"]
+        ))
+        current_end = current["end_utc"].timestamp()
+        following = store.program_snapshots(
+            channel_id, current_end, current_end + 0.001
+        )
+        next_ends = [
+            row["end_utc"].timestamp() for row in following
+            if row["start_utc"].timestamp() <= current_end < row["end_utc"].timestamp()
+        ]
+        return current_end, min(next_ends) if next_ends else None
+    except Exception:
+        logger.exception("Could not resolve stored EPG boundary for archive seek")
+        return None, None
+
+
+def _archive_playback_window(
+    start_epoch: float,
+    duration_seconds: int,
+    programme_end_epoch: float | None,
+    next_programme_end_epoch: float | None,
+) -> tuple[float, float | None]:
+    """Bound a shifted TiviMate window to one EPG programme at a time."""
+    requested_end = start_epoch + duration_seconds
+    if programme_end_epoch is None or programme_end_epoch <= start_epoch:
+        return requested_end, None
+    initial_end = min(requested_end, programme_end_epoch)
+    if next_programme_end_epoch is None:
+        return initial_end, None
+    if requested_end < programme_end_epoch and not math.isclose(
+        requested_end, programme_end_epoch, rel_tol=0.0, abs_tol=1.0
+    ):
+        return initial_end, None
+    if math.isclose(requested_end, programme_end_epoch, rel_tol=0.0, abs_tol=1.0):
+        continuation_end = min(
+            next_programme_end_epoch,
+            start_epoch + 24 * 60 * 60,
+        )
+        return initial_end, continuation_end if continuation_end > programme_end_epoch else None
+    continuation_end = min(
+        requested_end,
+        next_programme_end_epoch,
+        start_epoch + 24 * 60 * 60,
+    )
+    if continuation_end <= programme_end_epoch:
+        return initial_end, None
+    return initial_end, continuation_end
+
+
+def _epg_epoch(value):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.timestamp()
 
 
 def _archive_window_live(service, user_id, channel_id, end_epoch, now_epoch):
