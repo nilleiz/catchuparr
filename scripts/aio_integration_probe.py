@@ -12,6 +12,11 @@ from django.test import RequestFactory
 from django.utils import timezone
 
 
+def require(condition, message="Integration check failed"):
+    if not condition:
+        raise RuntimeError(message)
+
+
 def probe():
     if os.environ.get("CATCHUPARR_INTEGRATION_TEST") != "1":
         raise RuntimeError("This probe requires a disposable integration container")
@@ -29,9 +34,9 @@ def probe():
     from catchuparr.security import AccessTokenStore
 
     # Refuse restored Dev/production databases, even if the flag was misapplied.
-    assert not Channel.objects.exists(), "Integration database must have no channels"
-    assert not User.objects.exists(), "Integration database must have no users"
-    assert is_supported_dispatcharr_version(__version__)
+    require(not Channel.objects.exists(), "Integration database must have no channels")
+    require(not User.objects.exists(), "Integration database must have no users")
+    require(is_supported_dispatcharr_version(__version__), "Unsupported Dispatcharr version")
     expected = {
         output._xc_channel_entry: (
             "channel", "channel_num_map", "_get_default_group_id",
@@ -44,7 +49,8 @@ def probe():
         ),
     }
     for function, parameters in expected.items():
-        assert tuple(inspect.signature(function).parameters) == parameters
+        require(tuple(inspect.signature(function).parameters) == parameters,
+                f"Core signature changed: {function.__name__}")
 
     # Stop only this disposable container's Beat before enabling fixture jobs.
     for proc in Path("/proc").iterdir():
@@ -70,11 +76,11 @@ def probe():
     runtime.bootstrap()
     from django.urls import resolve
 
-    assert resolve("/catchuparr/m3u").url_name == "catchuparr-m3u"
+    require(resolve("/catchuparr/m3u").url_name == "catchuparr-m3u")
     import dispatcharr.urls
 
-    assert sum(getattr(item, "name", "") == "catchuparr-m3u"
-               for item in dispatcharr.urls.urlpatterns) == 1
+    require(sum(getattr(item, "name", "") == "catchuparr-m3u"
+                for item in dispatcharr.urls.urlpatterns) == 1)
 
     store = ArchiveStore(root)
     source = root / "fixture.ts"
@@ -90,19 +96,19 @@ def probe():
     def request(path, params=None, **headers):
         return factory.get(path, params or {}, HTTP_HOST="localhost", **headers)
 
-    assert views.m3u_view(request("/catchuparr/m3u")).status_code == 401
+    require(views.m3u_view(request("/catchuparr/m3u")).status_code == 401)
     playlist = views.m3u_view(request("/catchuparr/m3u", {"access_token": token}))
-    assert playlist.status_code == 200
+    require(playlist.status_code == 200, f"Playlist status {playlist.status_code}")
     text = playlist.content.decode()
-    assert 'catchup-timezone="UTC"' in text
-    assert "duration={duration}" in text
-    assert str(channel.uuid) in text and str(private_channel.uuid) not in text
+    require('catchup-timezone="UTC"' in text)
+    require("duration={duration}" in text)
+    require(str(channel.uuid) in text and str(private_channel.uuid) not in text)
     params = {"access_token": token, "channel_id": str(channel.uuid),
               "utc": str(start.timestamp()), "duration": "12"}
     archive = views.archive_view(request("/catchuparr/archive", params))
-    assert archive.status_code == 200, archive.status_code
-    assert b"#EXT-X-ENDLIST" in archive.content
-    assert b"#EXTINF" in archive.content
+    require(archive.status_code == 200, f"Archive status {archive.status_code}")
+    require(b"#EXT-X-ENDLIST" in archive.content)
+    require(b"#EXTINF" in archive.content)
     from urllib.parse import parse_qs, urlsplit
 
     segment_url = next(line for line in archive.content.decode().splitlines()
@@ -112,12 +118,12 @@ def probe():
     path_parts = parts.path.rstrip("/").split("/")
     ranged = views.segment_view(request(parts.path, query, HTTP_RANGE="bytes=0-"),
                                 path_parts[-2], path_parts[-1])
-    assert ranged.status_code == 206 and ranged["Content-Range"].startswith("bytes 0-")
+    require(ranged.status_code == 206 and ranged["Content-Range"].startswith("bytes 0-"))
     user.custom_properties = {"catchup_enabled": False}
     user.save(update_fields=["custom_properties"])
     cache.clear()
     disabled = views.archive_view(request("/catchuparr/archive", params))
-    assert disabled.status_code in (401, 403)
+    require(disabled.status_code in (401, 403))
     runtime.shutdown()
     print(f"AIO integration passed: Dispatcharr {__version__}")
 
