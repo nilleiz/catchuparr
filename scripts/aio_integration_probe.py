@@ -24,6 +24,7 @@ def probe():
     sys.path.insert(0, "/data/plugins")
     from apps.accounts.models import User
     from apps.channels.models import Channel
+    from apps.epg.models import EPGData, ProgramData
     from apps.output import views as output
     from apps.plugins.models import PluginConfig
     from apps.timeshift import views as timeshift
@@ -71,10 +72,11 @@ def probe():
     )
     channel = Channel.objects.create(name="Synthetic", channel_number=1, user_level=0)
     private_channel = Channel.objects.create(name="Private", channel_number=2, user_level=10)
+    closed_channel = Channel.objects.create(name="Closed minute", channel_number=3, user_level=0)
     root = Path("/data/ci-archive")
     PluginConfig.objects.create(
         key="catchuparr", name="Catchuparr", enabled=True, ever_enabled=True,
-        settings={"channel_uuids": str(channel.uuid), "archive_root": str(root),
+        settings={"channel_uuids": f"{channel.uuid},{closed_channel.uuid}", "archive_root": str(root),
                   "retention_hours": 1, "max_storage_gib": 1},
     )
     runtime.bootstrap()
@@ -95,6 +97,17 @@ def probe():
     source.write_bytes((b"\x47" + bytes([1]) * 187) * 2)
     store.add_segment(str(channel.uuid), source, start + timedelta(seconds=6),
                       start + timedelta(seconds=12))
+    closed_start = start - timedelta(minutes=3)
+    guide = EPGData.objects.create(name="Closed synthetic guide", tvg_id="closed-minute")
+    closed_channel.epg_data = guide
+    closed_channel.save(update_fields=["epg_data"])
+    ProgramData.objects.create(epg=guide, title="Closed minute", start_time=closed_start,
+                               end_time=closed_start + timedelta(minutes=1))
+    source.write_bytes(b"\x47" + bytes([2]) * 187)
+    for offset in range(0, 60, 10):
+        store.add_segment(str(closed_channel.uuid), source,
+                          closed_start + timedelta(seconds=offset),
+                          closed_start + timedelta(seconds=offset + 10))
     token = AccessTokenStore(root).create(str(user.id))
     factory = RequestFactory()
 
@@ -138,8 +151,13 @@ def probe():
     time_key = "utc" if __version__ == "0.32.0" else "start"
     require(time_key + "={utc}" in xc_text)
 
-    def xc_playback(start_epoch):
-        selected = dict(xc_params, **{time_key: str(int(start_epoch))})
+    def xc_playback(start_epoch, stream_id=channel.id, duration="1"):
+        selected = dict(xc_params, stream=str(stream_id),
+                        **{time_key: str(int(start_epoch))})
+        if duration is None:
+            selected.pop("duration")
+        else:
+            selected["duration"] = duration
         result = timeshift.timeshift_proxy_query(request(
             "/streaming/timeshift.php", selected, HTTP_RANGE="bytes=0-187",
             HTTP_USER_AGENT="Catchuparr synthetic integration",
@@ -153,6 +171,12 @@ def probe():
     require(xc_playback(start.timestamp()) == b"\x47" + bytes(187))
     require(xc_playback((start + timedelta(seconds=6)).timestamp())
             == b"\x47" + bytes([1]) * 187, "Timestamp seek must reset byte origin")
+    require(xc_playback(closed_start.timestamp(), closed_channel.id)
+            == b"\x47" + bytes([2]) * 187,
+            "Completed minute must not require five extra minutes of archive")
+    require(xc_playback(closed_start.timestamp(), closed_channel.id, duration=None)
+            == b"\x47" + bytes([2]) * 187,
+            "Missing duration must use the actual EPG end from core helpers")
     bad_credentials = dict(xc_params, password="invalid", **{time_key: str(int(start.timestamp()))})
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", bad_credentials,
