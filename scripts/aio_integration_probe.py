@@ -19,6 +19,113 @@ def require(condition, message="Integration check failed"):
         raise RuntimeError(message)
 
 
+def probe_source_configuration(channel, root):
+    """Exercise real ORM catalogs, published settings, and native Redis counters."""
+    from apps.channels.models import ChannelStream, Stream
+    from apps.m3u.connection_pool import (
+        profile_connections_key,
+        profile_credential_release_key,
+        release_profile_slot,
+        reserve_profile_slot,
+    )
+    from apps.m3u.models import M3UAccount, M3UAccountProfile
+    from apps.proxy.live_proxy.server import ProxyServer
+    from dispatcharr.utils import get_client_ip
+
+    from catchuparr.adapters.recorder_proxy import (
+        _CredentialMarkerRedisFacade,
+        core_api_supported,
+    )
+    from catchuparr.configuration import (
+        apply_configuration,
+        load_active_configuration,
+        source_catalog,
+    )
+    from catchuparr.recorder_proxy import ranked_source_candidates
+
+    require(callable(get_client_ip))
+    require(core_api_supported(), "Real source proxy API must pass its version gate")
+    first = M3UAccount.objects.create(name="Synthetic source A", max_streams=3)
+    second = M3UAccount.objects.create(name="Synthetic source B", max_streams=3)
+    source_a = Stream.objects.create(
+        name="Source A", url="http://127.0.0.1:1/a.ts", m3u_account=first,
+    )
+    source_b = Stream.objects.create(
+        name="Source B", url="http://127.0.0.1:1/b.ts", m3u_account=second,
+    )
+    Stream.objects.create(
+        name="Unassigned source", url="http://127.0.0.1:1/unused.ts", m3u_account=second,
+    )
+    ChannelStream.objects.create(channel=channel, stream=source_a, order=0)
+    ChannelStream.objects.create(channel=channel, stream=source_b, order=1)
+    catalog = source_catalog()
+    require([row["id"] for row in catalog.streams_by_channel[str(channel.uuid)]]
+            == [str(source_a.id), str(source_b.id)], "Catalog must preserve assigned order")
+    settings = {
+        "channel_uuids": str(channel.uuid), "archive_root": str(root),
+        "retention_hours": 1, "max_storage_gib": 1,
+        "source_rules": '* | mode=include-only | m3u="Synthetic source B"',
+    }
+    active_path = root / "synthetic-active-settings.json"
+    apply_configuration(settings, active_path=active_path)
+    active = load_active_configuration(active_path)
+    require(set(active["source_policies"]) == {str(channel.uuid)},
+            "Wildcard must persist policies only for enabled archive channels")
+    require([row["id"] for row in ranked_source_candidates(str(channel.uuid), active)]
+            == [str(source_b.id)], "Include policy must reject assigned source A")
+    previous = active_path.read_bytes()
+    invalid = dict(settings, source_rules='* | mode=include-only | m3u="Missing source"')
+    try:
+        apply_configuration(invalid, active_path=active_path)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("Unknown source must fail Apply")
+    require(active_path.read_bytes() == previous, "Rejected Apply must preserve active snapshot")
+    apply_configuration(dict(settings, source_rules=""), active_path=active_path)
+    require(ranked_source_candidates(str(channel.uuid), load_active_configuration(active_path))
+            is None, "Cleared rules must restore the shared channel route")
+
+    # Native release implementations differ between .31 and .32. Seed a shared
+    # credential ledger to check each private marker against the real helpers,
+    # including .32 WATCH/pipeline operations, in both teardown orders.
+    redis_client = ProxyServer.get_instance().redis_client
+    require(redis_client is not None, "Source tests require disposable Redis")
+    profile = M3UAccountProfile.objects.create(
+        m3u_account=first, name="Synthetic capacity", max_streams=3,
+        is_active=True, search_pattern="", replace_pattern="",
+    )
+    profile_key = profile_connections_key(profile.id)
+    marker_key = profile_credential_release_key(profile.id)
+    credential_key = "catchuparr:ci:synthetic-credential-count"
+    for order in ((0, 1), (1, 0)):
+        facades = [
+            _CredentialMarkerRedisFacade(redis_client, profile.id, uuid.uuid4().hex)
+            for _ in range(2)
+        ]
+        require(reserve_profile_slot(profile, redis_client)[0], "Native slot must reserve")
+        for facade in facades:
+            require(reserve_profile_slot(profile, facade)[0], "Archive slot must reserve")
+            facade.set(marker_key, credential_key)
+        redis_client.set(marker_key, credential_key)
+        redis_client.set(credential_key, 3)
+        require(not reserve_profile_slot(profile, redis_client)[0],
+                "Archive must respect native profile capacity")
+        for index, slot in enumerate(order):
+            release_profile_slot(profile.id, facades[slot])
+            require(int(redis_client.get(profile_key) or 0) == 2 - index,
+                    "Archive teardown must release precisely one profile slot")
+            require(int(redis_client.get(credential_key) or 0) == 2 - index,
+                    "Archive teardown must release precisely one credential slot")
+            require(redis_client.get(marker_key) is not None,
+                    "Archive teardown must preserve the native live release marker")
+        release_profile_slot(profile.id, redis_client)
+        require(int(redis_client.get(profile_key) or 0) == 0)
+        require(int(redis_client.get(credential_key) or 0) == 0)
+    redis_client.delete(credential_key)
+    print("AIO source catalog, atomic Apply, policy ranking and native pool checks passed")
+
+
 def probe():
     if os.environ.get("CATCHUPARR_INTEGRATION_TEST") != "1":
         raise RuntimeError("This probe requires a disposable integration container")
@@ -310,6 +417,7 @@ def probe():
         "/streaming/timeshift.php", disabled_params,
     )).status_code == 403)
     runtime.shutdown()
+    probe_source_configuration(channel, root)
     print(f"AIO integration passed: Dispatcharr {__version__}")
 
 
