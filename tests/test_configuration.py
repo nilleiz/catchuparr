@@ -26,6 +26,11 @@ class Policy:
     mode: str
     account_ids: frozenset[str]
     priorities: tuple[tuple[str, int], ...] = ()
+    known_account_ids: frozenset[str] = frozenset()
+
+
+CHANNEL_1 = "00000000-0000-0000-0000-000000000001"
+CHANNEL_2 = "00000000-0000-0000-0000-000000000002"
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -34,7 +39,7 @@ class ConfigurationTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.active_path = self.root / "outside-plugin" / ".catchuparr-active-settings.json"
         self.settings = {
-            "channel_uuids": "",
+            "channel_uuids": CHANNEL_1,
             "archive_root": str(self.root),
             "retention_hours": 24,
             "max_storage_gib": 20,
@@ -42,12 +47,12 @@ class ConfigurationTests(unittest.TestCase):
         }
         self.catalog = SourceCatalog(
             channels=(
-                {"uuid": "channel-1", "number": "7", "name": "News", "group": "Local"},
-                {"uuid": "channel-2", "number": "8", "name": "Sports", "group": "Local"},
+                {"uuid": CHANNEL_1, "number": "7", "name": "News", "group": "Local"},
+                {"uuid": CHANNEL_2, "number": "8", "name": "Sports", "group": "Local"},
             ),
             accounts=({"id": "12", "name": "Provider"},),
             streams_by_channel={
-                "channel-1": ({"id": "44", "account_id": "12", "order": 0},)
+                CHANNEL_1: ({"id": "44", "account_id": "12", "order": 0},)
             },
         )
 
@@ -61,8 +66,12 @@ class ConfigurationTests(unittest.TestCase):
             if failing:
                 raise ValueError("unknown source selector")
             self.assertEqual("rule text", text)
-            self.assertEqual("channel-1", channels[0]["uuid"])
-            return {"channel-1": Policy("fallback", frozenset({"12"}), (("12", 0),))}
+            self.assertEqual(CHANNEL_1, channels[0]["uuid"])
+            return {
+                CHANNEL_1: Policy(
+                    "include-only", frozenset({"12"}), (), frozenset({"12"})
+                )
+            }
 
         module.compile_source_rules = compile_rules
         module.rank_candidates = lambda policy, candidates: list(candidates)
@@ -88,7 +97,7 @@ class ConfigurationTests(unittest.TestCase):
 
         active = load_active_configuration(self.active_path)
         self.assertTrue(result["applied"])
-        self.assertEqual(["12"], active["source_policies"]["channel-1"]["account_ids"])
+        self.assertEqual(["12"], active["source_policies"][CHANNEL_1]["account_ids"])
         serialized = self.active_path.read_text()
         self.assertNotIn("Provider", serialized)
         self.assertNotIn("url", serialized.lower())
@@ -103,6 +112,82 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown source selector"):
                 apply_configuration(self.settings, self.catalog, self.active_path)
         self.assertEqual(original, self.active_path.read_bytes())
+
+    def test_real_compiler_applies_assigned_source_policy_and_roundtrips_ids(self):
+        settings = dict(self.settings)
+        settings["source_rules"] = 'number:7 | mode=include-only | m3u="Provider"'
+        applied = apply_configuration(settings, self.catalog, self.active_path)
+        active = load_active_configuration(self.active_path)
+
+        self.assertEqual(1, applied["source_policy_count"])
+        self.assertEqual(
+            {
+                "mode": "include-only",
+                "account_ids": ["12"],
+                "priorities": [],
+                "known_account_ids": ["12"],
+            },
+            active["source_policies"][CHANNEL_1],
+        )
+
+    def test_real_compiler_treats_blank_rules_as_no_overrides(self):
+        settings = dict(self.settings)
+        settings["source_rules"] = "  \n"
+        result = validate_configuration(settings, self.catalog)
+        apply_configuration(settings, self.catalog, self.active_path)
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(0, result["source_policy_count"])
+        self.assertEqual({}, load_active_configuration(self.active_path)["source_policies"])
+
+    def test_numeric_form_settings_are_canonicalized_in_the_active_snapshot(self):
+        settings = dict(self.settings)
+        settings.update({
+            "retention_hours": "36",
+            "max_storage_gib": "10",
+            "playback_user_id": "",
+            "source_rules": "",
+        })
+
+        apply_configuration(settings, self.catalog, self.active_path)
+        active = load_active_configuration(self.active_path)
+
+        self.assertEqual(36, active["retention_hours"])
+        self.assertEqual(10, active["max_storage_gib"])
+        self.assertNotIn("playback_user_id", active)
+
+    def test_malformed_active_source_policy_fails_closed(self):
+        self.active_path.parent.mkdir(parents=True, exist_ok=True)
+        malformed_policies = (
+            {
+                "mode": "include-all",
+                "account_ids": ["12"],
+                "priorities": [],
+                "known_account_ids": ["12"],
+            },
+            {
+                "mode": "priority",
+                "account_ids": [],
+                "priorities": [["12", "high"]],
+                "known_account_ids": ["12"],
+            },
+            {
+                "mode": "include-only",
+                "account_ids": "12",
+                "priorities": [],
+                "known_account_ids": ["12"],
+            },
+        )
+        for policy in malformed_policies:
+            with self.subTest(policy=policy):
+                document = {
+                    "version": configuration.ACTIVE_CONFIG_VERSION,
+                    "settings": dict(self.settings),
+                    "source_policies": {CHANNEL_1: policy},
+                }
+                self.active_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_active_configuration(self.active_path)
 
     def test_corrupt_active_snapshot_fails_closed_without_using_draft(self):
         self.active_path.parent.mkdir(parents=True)
@@ -123,7 +208,7 @@ class ConfigurationTests(unittest.TestCase):
             active = load_active_configuration()
         self.assertTrue(state_path.is_file())
         self.assertEqual(str(self.root), active["archive_root"])
-        self.assertEqual({"channel-1"}, set(active["source_policies"]))
+        self.assertEqual({CHANNEL_1}, set(active["source_policies"]))
 
     def test_atomic_snapshot_reads_remain_valid_during_apply(self):
         with patch.dict(sys.modules, {"catchuparr.source_rules": self._source_rules_stub()}):
@@ -145,7 +230,7 @@ class ConfigurationTests(unittest.TestCase):
             for _ in range(80):
                 try:
                     current = load_active_configuration(self.active_path)
-                    self.assertEqual({"channel-1"}, set(current["source_policies"]))
+                    self.assertEqual({CHANNEL_1}, set(current["source_policies"]))
                 except Exception as exc:
                     failures.append(exc)
                     break

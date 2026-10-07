@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -111,8 +112,13 @@ def compile_draft(
     catalog = catalog or source_catalog()
     from .source_rules import compile_source_rules, rank_candidates
 
-    policies = compile_source_rules(
-        str(settings.get("source_rules") or ""), catalog.channels, catalog.accounts
+    raw_rules = settings.get("source_rules")
+    if raw_rules is not None and not isinstance(raw_rules, str):
+        raise ValueError("source_rules must be text")
+    rules_text = (raw_rules or "").strip()
+    policies = (
+        compile_source_rules(rules_text, catalog.channels, catalog.accounts)
+        if rules_text else {}
     )
     encoded: dict[str, dict[str, Any]] = {}
     previews: list[dict[str, Any]] = []
@@ -127,6 +133,7 @@ def compile_draft(
             "mode": str(policy.mode),
             "account_ids": account_ids,
             "priorities": priorities,
+            "known_account_ids": sorted(str(value) for value in policy.known_account_ids),
         }
         stream_dtos = catalog.streams_by_channel.get(str(channel_uuid), ())
         ranked = rank_candidates(policy, stream_dtos)
@@ -193,11 +200,29 @@ def active_settings_path() -> Path:
 
 def _applicable_settings(settings: dict) -> dict[str, Any]:
     """Persist only known non-secret runtime and plugin action settings."""
-    keys = (
-        "channel_uuids", "archive_root", "retention_hours",
-        "max_storage_gib", "source_rules", "playback_user_id",
-    )
-    return {key: settings[key] for key in keys if key in settings}
+    parsed = parse_settings(settings)
+    applicable: dict[str, Any] = {
+        "channel_uuids": "\n".join(parsed.channel_uuids),
+        "archive_root": str(parsed.archive_root),
+        "retention_hours": parsed.retention_hours,
+        "max_storage_gib": parsed.max_storage_bytes // 1024**3,
+    }
+    if "source_rules" in settings:
+        raw_rules = settings["source_rules"]
+        if raw_rules is not None and not isinstance(raw_rules, str):
+            raise ValueError("source_rules must be text")
+        applicable["source_rules"] = raw_rules or ""
+    raw_user_id = settings.get("playback_user_id")
+    if isinstance(raw_user_id, bool):
+        raise ValueError("playback_user_id must be a positive user ID")
+    if raw_user_id not in (None, "", 0, "0"):
+        if not isinstance(raw_user_id, (int, str)) or not str(raw_user_id).isdigit():
+            raise ValueError("playback_user_id must be a positive user ID")
+        user_id = int(raw_user_id)
+        if user_id <= 0:
+            raise ValueError("playback_user_id must be a positive user ID")
+        applicable["playback_user_id"] = user_id
+    return applicable
 
 
 def load_active_configuration(active_path: Path | None = None) -> dict[str, Any] | None:
@@ -206,15 +231,129 @@ def load_active_configuration(active_path: Path | None = None) -> dict[str, Any]
     try:
         with _config_lock(path, exclusive=False):
             data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or set(data) != {"version", "settings", "source_policies"}:
+            raise ValueError("Active Catchuparr configuration is invalid")
         if (
-            data.get("version") != ACTIVE_CONFIG_VERSION
+            type(data.get("version")) is not int
+            or data.get("version") != ACTIVE_CONFIG_VERSION
             or not isinstance(data.get("source_policies"), dict)
             or not isinstance(data.get("settings"), dict)
         ):
             raise ValueError("Active Catchuparr configuration is invalid")
+        _validate_active_document(data)
         return {**data["settings"], "source_policies": data["source_policies"]}
     except FileNotFoundError:
         return None
+
+
+def _validate_active_document(data: dict[str, Any]) -> None:
+    """Reject malformed persisted policy data before any recorder can use it."""
+    from .runtime import parse_settings
+
+    settings = data["settings"]
+    allowed_settings = {
+        "channel_uuids", "archive_root", "retention_hours", "max_storage_gib",
+        "source_rules", "playback_user_id",
+    }
+    if set(settings) - allowed_settings:
+        raise ValueError("Active Catchuparr settings contain unknown fields")
+    if "channel_uuids" in settings and not isinstance(settings["channel_uuids"], str):
+        raise ValueError("Active Catchuparr channel IDs are invalid")
+    if "source_rules" in settings and not isinstance(settings["source_rules"], str):
+        raise ValueError("Active Catchuparr source rules are invalid")
+    for field_name, minimum, maximum in (
+        ("retention_hours", 1, 720), ("max_storage_gib", 1, 10240)
+    ):
+        if field_name in settings:
+            value = settings[field_name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, str))
+                or not str(value).isdigit()
+                or not minimum <= int(value) <= maximum
+            ):
+                raise ValueError(f"Active Catchuparr {field_name} is invalid")
+    if "playback_user_id" in settings:
+        user_id = settings["playback_user_id"]
+        if isinstance(user_id, bool):
+            raise ValueError("Active Catchuparr playback user ID is invalid")
+        if user_id not in (None, "", 0, "0") and (
+            not isinstance(user_id, (int, str))
+            or not str(user_id).isdigit()
+            or int(user_id) <= 0
+        ):
+            raise ValueError("Active Catchuparr playback user ID is invalid")
+    parsed = parse_settings(settings)
+    channels = set(parsed.channel_uuids)
+    policies = data["source_policies"]
+    allowed_modes = {"include-only", "exclude-only", "priority", "unchanged"}
+    for raw_channel, policy in policies.items():
+        try:
+            channel_uuid = str(uuid.UUID(str(raw_channel)))
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("Active Catchuparr source policy has an invalid channel ID") from None
+        if channel_uuid != str(raw_channel) or channel_uuid not in channels:
+            raise ValueError("Active Catchuparr source policy channel is not configured")
+        if not isinstance(policy, dict):
+            raise ValueError("Active Catchuparr source policy is invalid")
+        expected_keys = {"mode", "account_ids", "priorities"}
+        if "known_account_ids" in policy:
+            expected_keys.add("known_account_ids")
+        if set(policy) != expected_keys:
+            raise ValueError("Active Catchuparr source policy fields are invalid")
+        mode = policy.get("mode")
+        if mode not in allowed_modes:
+            raise ValueError("Active Catchuparr source policy mode is invalid")
+        account_ids = _validate_account_id_list(policy.get("account_ids"), "account IDs")
+        if mode in {"include-only", "exclude-only"} and not account_ids:
+            raise ValueError("Active source selection policy has no accounts")
+        known_ids = None
+        if "known_account_ids" in policy:
+            known_ids = _validate_account_id_list(
+                policy["known_account_ids"], "known account IDs"
+            )
+            if not set(account_ids) <= set(known_ids):
+                raise ValueError("Active Catchuparr source policy references an unknown account")
+        priorities = policy.get("priorities")
+        if not isinstance(priorities, list):
+            raise ValueError("Active Catchuparr source priorities are invalid")
+        priority_ids: set[str] = set()
+        for pair in priorities:
+            if (
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or isinstance(pair[1], bool)
+                or not isinstance(pair[1], int)
+            ):
+                raise ValueError("Active Catchuparr source priority is invalid")
+            account_id = _validate_account_id(pair[0], "priority account ID")
+            if account_id in priority_ids or (
+                known_ids is not None and account_id not in set(known_ids)
+            ):
+                raise ValueError("Active Catchuparr source priority account is invalid")
+            priority_ids.add(account_id)
+        if mode != "priority" and priorities:
+            raise ValueError("Active Catchuparr priorities require priority mode")
+        if mode == "unchanged" and (account_ids or priorities):
+            raise ValueError("Active unchanged source policy cannot select accounts")
+
+
+def _validate_account_id_list(values, field_name: str) -> list[str]:
+    if not isinstance(values, list):
+        raise ValueError(f"Active Catchuparr {field_name} are invalid")
+    result = [_validate_account_id(value, field_name) for value in values]
+    if len(set(result)) != len(result):
+        raise ValueError(f"Active Catchuparr {field_name} contain duplicates")
+    return result
+
+
+def _validate_account_id(value, field_name: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"Active Catchuparr {field_name} are invalid")
+    text = str(value)
+    if not text.isdigit() or int(text) <= 0:
+        raise ValueError(f"Active Catchuparr {field_name} are invalid")
+    return text
 
 
 def _atomic_json_replace(path: Path, value: dict[str, Any]) -> None:
