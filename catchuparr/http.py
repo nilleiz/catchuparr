@@ -206,22 +206,53 @@ def ensure_http_playback_sessions(
                 "ON http_playback_sessions(device_key) "
                 "WHERE device_key IS NOT NULL AND grace_until IS NULL"
             )
-            # Sessions created by the previous implementation may already
-            # contain segments from the next programme. Invalidate those
-            # manifests on upgrade so their old segment URLs cannot keep
-            # serving the extended range.
-            continued = [
-                str(row[0])
-                for row in db.execute(
-                    "SELECT lease_id FROM http_playback_sessions "
-                    "WHERE continuation_reached=1 OR "
-                    "(programme_end_utc IS NOT NULL AND end_utc>programme_end_utc)"
-                )
-            ]
-            db.executemany(
-                "DELETE FROM http_playback_sessions WHERE lease_id=?",
-                [(lease_id,) for lease_id in continued],
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS http_playback_schema_migrations "
+                "(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)"
             )
+            migrated = db.execute(
+                "SELECT 1 FROM http_playback_schema_migrations WHERE version=1"
+            ).fetchone()
+            if migrated is None:
+                # On the one-time upgrade, invalidate sessions that may have
+                # exposed the next programme through an expanded lease or a
+                # crossing segment already stored in their manifest.
+                db.execute("BEGIN IMMEDIATE")
+                continued = []
+                for row in db.execute(
+                    "SELECT lease_id,end_utc,programme_end_utc,continuation_reached,"
+                    "manifest_json FROM http_playback_sessions"
+                ):
+                    boundary = row["programme_end_utc"]
+                    invalid = bool(row["continuation_reached"])
+                    if boundary is not None:
+                        invalid = invalid or float(row["end_utc"]) > float(boundary)
+                        try:
+                            manifest = json.loads(row["manifest_json"] or "[]")
+                        except (TypeError, ValueError):
+                            manifest = None
+                        if not isinstance(manifest, list):
+                            invalid = True
+                        else:
+                            for segment in manifest:
+                                try:
+                                    invalid = invalid or float(segment[2]) > float(boundary)
+                                except (IndexError, OverflowError, TypeError, ValueError):
+                                    invalid = True
+                                if invalid:
+                                    break
+                    if invalid:
+                        continued.append(str(row["lease_id"]))
+                db.executemany(
+                    "DELETE FROM http_playback_sessions WHERE lease_id=?",
+                    [(lease_id,) for lease_id in continued],
+                )
+                db.execute(
+                    "INSERT INTO http_playback_schema_migrations(version,applied_at) "
+                    "VALUES(1,?)",
+                    (now,),
+                )
+                db.execute("COMMIT")
             legacy = [
                 (
                     str(row["lease_id"]),
@@ -535,7 +566,7 @@ class ArchiveHTTPService:
         with self._session_lock(user_id):
             with closing(self._connect()) as db:
                 row = db.execute(
-                    "SELECT start_utc,end_utc,grace_until "
+                    "SELECT start_utc,end_utc,grace_until,programme_end_utc "
                     "FROM http_playback_sessions "
                     "WHERE lease_id=? AND user_id=? AND channel_id=? "
                     "AND (device_key=? OR (device_key IS NULL AND grace_until IS NOT NULL)) "
@@ -547,6 +578,10 @@ class ArchiveHTTPService:
             if (
                 segment.end_utc.timestamp() <= float(row["start_utc"])
                 or segment.start_utc.timestamp() >= float(row["end_utc"])
+                or (
+                    row["programme_end_utc"] is not None
+                    and segment.end_utc.timestamp() > float(row["programme_end_utc"])
+                )
             ):
                 return False
             grace_until = row["grace_until"]
@@ -831,6 +866,7 @@ class ArchiveHTTPService:
                 state["manifest_json"] if state is not None else "[]",
                 segments,
                 allow_append=not terminal,
+                programme_end=programme_end,
             )
         except _PermissionDenied:
             return _error(403, "stream limit exceeded")
@@ -903,7 +939,13 @@ class ArchiveHTTPService:
             ).fetchone()
 
     def _manifest_segments(
-        self, channel_id: str, manifest_json: str, candidates, *, allow_append: bool = True
+        self,
+        channel_id: str,
+        manifest_json: str,
+        candidates,
+        *,
+        allow_append: bool = True,
+        programme_end: float | None = None,
     ):
         try:
             stored = json.loads(manifest_json or "[]")
@@ -924,6 +966,8 @@ class ArchiveHTTPService:
                 raise sqlite3.DatabaseError("invalid persisted HLS manifest range") from exc
             if end <= start or not isinstance(segment_id, str):
                 raise sqlite3.DatabaseError("invalid persisted HLS manifest range")
+            if programme_end is not None and end.timestamp() > programme_end:
+                continue
             relative_path = Path(str(relative_path))
             if relative_path.is_absolute() or ".." in relative_path.parts:
                 raise sqlite3.DatabaseError("invalid persisted HLS manifest path")
@@ -944,6 +988,8 @@ class ArchiveHTTPService:
                 continue
             candidate_start = candidate.start_utc.timestamp()
             candidate_end = candidate.end_utc.timestamp()
+            if programme_end is not None and candidate_end > programme_end:
+                continue
             if high_water is not None and candidate_start < high_water:
                 # EVENT playlists are append-only; a late segment may not be
                 # inserted before the already published high-water mark.

@@ -284,8 +284,11 @@ class ViewBoundaryTests(unittest.TestCase):
         }), patch("catchuparr.views._authenticate", return_value=(
             SimpleNamespace(id="viewer"), SimpleNamespace(retention_hours=48), "token"
         )), patch("catchuparr.views._archive_service", return_value=service), patch(
+            "catchuparr.views._archive_epg_bounds",
+            return_value=(end.timestamp(), end.timestamp() + 2700),
+        ), patch(
             "catchuparr.views._archive_window_live", return_value=False
-        ), patch("catchuparr.views._to_django_response", return_value=FakeResponse(
+        ) as live_check, patch("catchuparr.views._to_django_response", return_value=FakeResponse(
             status=200
         )):
             response = archive_view(request)
@@ -293,6 +296,7 @@ class ViewBoundaryTests(unittest.TestCase):
         self.assertEqual(service.playlist.call_args.args[2:4], (
             start.timestamp(), end.timestamp()
         ))
+        self.assertEqual(live_check.call_args.args[3], end.timestamp())
 
     def test_full_length_initial_programme_can_continue_after_boundary(self):
         start = datetime(2026, 10, 7, 15, 15, tzinfo=timezone.utc).timestamp()

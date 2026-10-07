@@ -222,6 +222,11 @@ class ArchiveHTTPTests(unittest.TestCase):
         )
         boundary = add_segment(
             "seek-boundary",
+            programme_end - timedelta(seconds=6),
+            programme_end,
+        )
+        crossing = add_segment(
+            "crossing-program-boundary",
             programme_end - timedelta(seconds=1),
             programme_end + timedelta(seconds=5),
         )
@@ -250,6 +255,7 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertTrue(initial_text.endswith("#EXT-X-ENDLIST\n"))
         self.assertIn("#EXT-X-START:TIME-OFFSET=2.000", initial_text)
         self.assertNotIn("next-program", initial_text)
+        self.assertNotIn(crossing.id, initial_text)
         initial_lines = initial_text.splitlines()
         first_uri = next(line for line in initial_lines if "seek-first" in line)
         lease_id = first_uri.split("&lease=", 1)[1]
@@ -265,6 +271,10 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(self.service.segment(
             self.token, "news", boundary.id, lease_id, range_header="bytes=0-"
         ).status, 206)
+        self.assertEqual(
+            self.service.segment(self.token, "news", crossing.id, lease_id).status,
+            403,
+        )
         self.assertEqual(reload().body.decode(), initial_text)
         self.assertEqual(
             self.archive.leases[lease_id]["end"], programme_end.timestamp()
@@ -285,6 +295,7 @@ class ArchiveHTTPTests(unittest.TestCase):
                 "continuation_reached=1 WHERE lease_id=?",
                 (extended_end, self.start.timestamp() + 6, lease_id),
             )
+            db.execute("DELETE FROM http_playback_schema_migrations WHERE version=1")
         self.archive.extend_playback(lease_id, extended_end, ttl_seconds=300)
 
         self.service = ArchiveHTTPService(
@@ -304,6 +315,32 @@ class ArchiveHTTPTests(unittest.TestCase):
             self.service.segment(self.token, "news", "seg-A", lease_id).status,
             403,
         )
+
+    def test_upgrade_invalidates_manifest_with_cross_boundary_segment(self):
+        response = self._playlist()
+        lease_id = response.body.decode().split("&lease=", 1)[1].splitlines()[0]
+        programme_end = (self.start + timedelta(seconds=5)).timestamp()
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            db.execute(
+                "UPDATE http_playback_sessions SET end_utc=?,programme_end_utc=?,"
+                "continuation_reached=0 WHERE lease_id=?",
+                (programme_end, programme_end, lease_id),
+            )
+            db.execute("DELETE FROM http_playback_schema_migrations WHERE version=1")
+
+        self.service = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
+        )
+
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            self.assertIsNone(db.execute(
+                "SELECT lease_id FROM http_playback_sessions WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone())
+        self.assertNotIn(lease_id, self.archive.leases)
 
     def test_event_closure_preserves_segment_urls_and_lease(self):
         self.service.playlist_builder = None
