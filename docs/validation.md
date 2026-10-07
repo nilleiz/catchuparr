@@ -124,3 +124,14 @@ boundaries remains disabled. The fixed 60-second target remains because FFmpeg
 can emit a 16-second segment when the next keyframe is delayed. TiviMate must
 still confirm that start-over and seeks land within two segments. A separate
 mechanism and player test are needed for automatic cross-programme playback.
+
+For the next Shield test, use the unchanged private M3U/XMLTV URLs and refresh
+both exports. Choose programmes whose full start is still inside the available
+archive. Start three programmes in chronological order, note the first visible
+content, then repeat the same starts. For one programme, seek forwards and
+backwards at least three times and pause/resume. Record the selected time and
+visible time; an error greater than two archived segments fails acceptance.
+The server trace must show HTTP 200 for the requested programme and segments
+within that programme. A 404 indicates unavailable material and must not be
+counted as a successful start-over. Test automatic continuation separately
+after its replacement mechanism is implemented.
