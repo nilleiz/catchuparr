@@ -13,6 +13,13 @@
       "help_text": "Only selected channels are recorded."
     },
     {
+      "id": "source_rules",
+      "label": "Live source rules",
+      "type": "text",
+      "default": "",
+      "help_text": "Choose assigned M3U sources by channel number, name, or group. Rules are drafts until Apply configuration succeeds."
+    },
+    {
       "id": "archive_root",
       "label": "Archive path",
       "type": "string",
@@ -40,8 +47,30 @@
     }
   ],
   "actions": [
-    {"id": "status", "label": "Archive status", "button_label": "Show status"},
-    {"id": "reconcile", "label": "Reconcile recorders", "button_label": "Reconcile"},
-    {"id": "create_access_token", "label": "Create M3U access token", "button_label": "Create token"}
+    {
+      "id": "status",
+      "label": "Archive status",
+      "button_label": "Show status"
+    },
+    {
+      "id": "reconcile",
+      "label": "Reconcile recorders",
+      "button_label": "Reconcile"
+    },
+    {
+      "id": "create_access_token",
+      "label": "Create M3U access token",
+      "button_label": "Create token"
+    },
+    {
+      "id": "validate_configuration",
+      "label": "Validate source rules",
+      "button_label": "Validate"
+    },
+    {
+      "id": "apply_configuration",
+      "label": "Apply source rules",
+      "button_label": "Apply configuration"
+    }
   ]
 }
