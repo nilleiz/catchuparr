@@ -96,7 +96,12 @@ Never mount production directories into Dev. Keep host-specific names, addresses
 7. For a real player test, bind `DEV_BIND_IP` to the Dev host's LAN address and recreate only the Dev AIO. A fixed Shield TV address is optional; the M3U, XMLTV and archive routes authenticate with a separate, revocable token for that test device. Keep URLs containing the token in a private file outside the repository. Verify that an unauthenticated LAN request is rejected before importing the M3U and XMLTV URLs in TiviMate. Capture the installed TiviMate version/device. Test XC and M3U/XMLTV separately: archive icon, live start-over, repeated seeks, pause/resume, programme boundary, service restart, retention and rollback. Record HTTP method, URL template, time arguments, Range headers and response codes without logging credentials.
 
 For a Dev player trace, set `CATCHUPARR_TRACE_REQUESTS=1` in the private Dev
-Compose environment and recreate only the Dev AIO. The plugin then logs the
+Compose environment. AIO 0.32.0 starts web workers through `su -`, which strips
+custom environment variables. For that image, create an empty private marker
+`/data/plugins/catchuparr/.trace-requests` inside Dev after plugin installation;
+this enables the same sanitized traces without changing Dispatcharr core files.
+Remove the marker after the player test; imports may remove it, so recreate it
+only when another diagnostic test is intended. The plugin then logs the
 archive UTC start, duration, EPG end, first/last segment times and response
 status, plus each segment's method, numeric Range and status. It does not log
 bearer tokens or leases in these trace lines. Collect only lines beginning

@@ -135,3 +135,19 @@ The server trace must show HTTP 200 for the requested programme and segments
 within that programme. A 404 indicates unavailable material and must not be
 counted as a successful start-over. Test automatic continuation separately
 after its replacement mechanism is implemented.
+
+PR #7 passed all three CI jobs and disposable AIO probes on both supported
+versions, and was merged. Isolated Dev 0.32.0 loaded 0.1.3; authenticated M3U,
+XMLTV and programme-bounded HLS returned 200, a partial segment Range returned
+206, and anonymous access returned 401. The cold Dev backup remains private.
+Dev retention is now four hours with a 10-GiB quota; previously deleted material
+cannot be restored by increasing the limits.
+
+The Dev restart also exposed an independent recorder integration bug: the
+task did not pass the durable archive fence into the existing Redis lease
+implementation. Redis reset its counter on AIO restart and the archive rejected
+the lower token. A safe counter-floor recovery resumed indexing; version 0.1.4
+wires the durable fence into task acquisition and releases leases on setup
+failure. The AIO web launcher also strips custom environment variables, so a
+private trace marker is required to enable sanitized web diagnostics there.
+Shield validation is still pending.
