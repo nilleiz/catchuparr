@@ -19,6 +19,7 @@ def run():
 
     try:
         docker("run", "-d", "--name", name, "--network", "none",
+               "--mount", "type=volume,destination=/data",
                "-e", "DISPATCHARR_ENV=aio", "-e", "CATCHUPARR_INTEGRATION_TEST=1",
                args.image, stdout=subprocess.DEVNULL)
         deadline = time.monotonic() + 240
@@ -30,14 +31,22 @@ def run():
             )
             if ready.returncode == 0:
                 break
+            state = subprocess.check_output(
+                ["docker", "inspect", name, "--format", "{{.State.Status}}"], text=True,
+            ).strip()
+            if state not in {"running", "created"}:
+                raise RuntimeError(f"Disposable AIO stopped during startup: {state}")
             if time.monotonic() >= deadline:
                 raise RuntimeError("Disposable AIO did not become ready within 240 seconds")
             time.sleep(3)
         docker("cp", str(ROOT / "catchuparr"), f"{name}:/data/plugins/catchuparr")
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
         with (ROOT / "scripts/aio_integration_probe.py").open("rb") as script:
-            docker("exec", "-i", name, "/dispatcharrpy/bin/python", "/app/manage.py",
-                   "shell", stdin=script)
+            docker("exec", "-i", name, "/dispatcharrpy/bin/python", "-c",
+                   "import os,runpy,sys; from pathlib import Path; "
+                   "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
+                   "sys.argv=['manage.py','shell']; runpy.run_path('/app/manage.py',run_name='__main__')",
+                   stdin=script)
     finally:
         subprocess.run(["docker", "rm", "-f", "-v", name],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
