@@ -21,6 +21,13 @@ class HLSPlaylistTests(unittest.TestCase):
         self.assertNotIn("#EXT-X-ENDLIST", text)
         self.assertIn("/archive/a", text)
 
+    def test_start_offset_is_rendered_and_validated(self):
+        text = build_hls_playlist(self.segments, live=False, start_offset=3.25)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=3.250", text)
+        self.assertLess(text.index("#EXT-X-START"), text.index("#EXTINF:"))
+        with self.assertRaisesRegex(ValueError, "start_offset"):
+            build_hls_playlist(self.segments, live=False, start_offset=-1)
+
     def test_finished_event_playlist_closes_and_rejects_newlines_in_uri(self):
         text = build_hls_playlist(self.segments, live=False)
         self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", text)
