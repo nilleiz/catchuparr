@@ -86,6 +86,13 @@ Both versions passed that fixture with an explicit duration and with the real
 EPG helper supplying the end. A subsequent Dev XC-first request exposed a
 legacy HLS-session schema that had not yet been migrated; the integration
 fixture now starts from that schema and exercises XC before HLS.
+The completed fix passed 136 local tests, Ruff, compileall, package build and
+both pinned AIO probes (including the bundled FFmpeg tests). Independent review
+also verified that malformed session schemas reject admission and clean up the
+pending admission row. After reinstalling and restarting the Dev AIO, an actual
+historical one-minute request returned HTTP 206 with the requested 188 TS bytes
+and `Content-Range: bytes 0-187/...`. No duration-padding or legacy-schema
+workaround was needed for that request.
 
 The plugin M3U/XMLTV endpoint and direct XC JSON are the two primary output
 paths. Native `/get.php` playlist annotation is tested separately; its core
