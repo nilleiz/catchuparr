@@ -116,8 +116,51 @@ class _CredentialMarkerRedisFacade:
     def delete(self, *keys):
         return self._redis.delete(*(self._key(key) for key in keys))
 
+    def pipeline(self, *args, **kwargs):
+        return _CredentialMarkerPipelineFacade(
+            self._redis.pipeline(*args, **kwargs), self
+        )
+
     def __getattr__(self, name):
         return getattr(self._redis, name)
+
+
+class _CredentialMarkerPipelineFacade:
+    """Remap profile release marker keys used inside core Redis transactions."""
+
+    def __init__(self, pipeline, redis_facade: _CredentialMarkerRedisFacade):
+        self._pipeline = pipeline
+        self._redis_facade = redis_facade
+
+    def __enter__(self):
+        entered = self._pipeline.__enter__()
+        if entered is not None:
+            self._pipeline = entered
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._pipeline.__exit__(exc_type, exc_value, traceback)
+
+    def watch(self, *keys):
+        return self._pipeline.watch(*(self._redis_facade._key(key) for key in keys))
+
+    def get(self, key):
+        return self._pipeline.get(self._redis_facade._key(key))
+
+    def delete(self, *keys):
+        remapped = []
+        for key in keys:
+            remapped_key = self._redis_facade._key(key)
+            remapped.append(remapped_key)
+            if remapped_key != key:
+                # Dispatcharr 0.32 keeps its shared marker while profile slots
+                # remain. Its helper calls delete only for the final slot, so
+                # remove the now-stale shared marker together with our marker.
+                remapped.append(key)
+        return self._pipeline.delete(*remapped)
+
+    def __getattr__(self, name):
+        return getattr(self._pipeline, name)
 
 
 def _release_worker_reservation(redis_client, worker_id: str) -> bool:
@@ -141,6 +184,7 @@ def _release_worker_reservation(redis_client, worker_id: str) -> bool:
             int(profile_id),
             _CredentialMarkerRedisFacade(redis_client, int(profile_id), reservation_id),
         )
+        redis_client.delete(reservation_credential_marker_key(reservation_id))
     except Exception:
         # Do not retry a partially applied core release: its helper is not
         # reservation-ID aware. Leaving a capacity leak is safer than stealing
@@ -209,6 +253,7 @@ def core_api_supported() -> bool:
         from apps.proxy.live_proxy.services.channel_service import ChannelService
         from apps.proxy.live_proxy.url_utils import _resolve_live_stream_url
         from apps.proxy.live_proxy.views import _channel_setup_needed
+        from dispatcharr.utils import get_client_ip
 
         required = (
             (reserve_profile_slot, {"profile", "redis_client"}),
@@ -236,7 +281,8 @@ def core_api_supported() -> bool:
             (ProxyServer.initialize_channel, {"self", "url", "channel_id", "user_agent", "transcode", "stream_id"}),
             (ChannelService.is_channel_unavailable_for_new_clients, {"channel_id"}),
             (ChannelService.stop_channel, {"channel_id"}),
-            (_resolve_live_stream_url, {"stream", "account", "profile"}),
+            (_resolve_live_stream_url, {"stream", "m3u_account", "m3u_profile"}),
+            (get_client_ip, {"request"}),
             (_channel_setup_needed, {"proxy_server", "channel_id"}),
             (input_manager.get_alternate_streams, {"channel_id"}),
             (RedisKeys.channel_metadata, {"channel_id"}),
@@ -313,12 +359,12 @@ def install_proxyserver_cleanup_hook() -> bool:
         logger.error("Recorder source overrides disabled: Dispatcharr proxy API signature is unverified")
         return False
     try:
-        from apps.proxy.live_proxy import urls as live_urls
-        from apps.proxy.live_proxy import url_utils
-        from apps.proxy.live_proxy.input import manager as input_manager
         from apps.proxy.live_proxy import server as live_server
-        from apps.proxy.live_proxy.services import channel_service
+        from apps.proxy.live_proxy import url_utils
+        from apps.proxy.live_proxy import urls as live_urls
+        from apps.proxy.live_proxy.input import manager as input_manager
         from apps.proxy.live_proxy.server import ProxyServer
+        from apps.proxy.live_proxy.services import channel_service
         from django.http import HttpResponseNotFound
     except Exception:
         logger.exception("Recorder source override guards could not be installed")
@@ -392,11 +438,11 @@ def uninstall_proxyserver_cleanup_hook() -> bool:
         return False
     try:
         from apps.proxy.live_proxy import server as live_server
-        from apps.proxy.live_proxy import urls as live_urls
         from apps.proxy.live_proxy import url_utils
+        from apps.proxy.live_proxy import urls as live_urls
         from apps.proxy.live_proxy.input import manager as input_manager
-        from apps.proxy.live_proxy.services import channel_service
         from apps.proxy.live_proxy.server import ProxyServer
+        from apps.proxy.live_proxy.services import channel_service
 
         original = getattr(ProxyServer, "_catchuparr_original_release_stream_resources", None)
         if original is not None:
@@ -633,15 +679,14 @@ def _resolve_source_details(source, profile):
 
 def open_managed_source(request, worker_id: str, capability_record: dict[str, Any]):
     """Initialize/attach to one private proxy worker and stream native TS bytes."""
-    from django.http import HttpResponse, StreamingHttpResponse
-    from django.db import close_old_connections
-
     from apps.proxy.live_proxy import views as core_views
     from apps.proxy.live_proxy.constants import ChannelState
     from apps.proxy.live_proxy.output.ts.generator import create_stream_generator
     from apps.proxy.live_proxy.server import ProxyServer
     from apps.proxy.live_proxy.services.channel_service import ChannelService
-    from apps.proxy.live_proxy.utils import get_client_ip
+    from dispatcharr.utils import get_client_ip
+    from django.db import close_old_connections
+    from django.http import HttpResponse, StreamingHttpResponse
 
     proxy_server = ProxyServer.get_instance()
     redis_client = getattr(proxy_server, "redis_client", None)

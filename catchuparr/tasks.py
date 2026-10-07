@@ -95,11 +95,11 @@ def record_channel(channel_uuid: str):
     from apps.channels.tasks import get_dvr_stream_base_url
     from core.utils import RedisClient
 
+    from .adapters.recorder_proxy import core_api_supported, install_proxyserver_cleanup_hook
+    from .configuration import load_active_configuration
     from .engine.leases import RedisRecorderLease
     from .engine.recorder import FFmpegCopyRecorder
     from .engine.store import ArchiveStore
-    from .runtime import load_config, require_supported_version
-    from .configuration import load_active_configuration
     from .recorder_proxy import (
         candidate_is_current,
         configuration_generation,
@@ -107,7 +107,7 @@ def record_channel(channel_uuid: str):
         ranked_source_candidates,
         stop_recorder_attempt,
     )
-    from .adapters.recorder_proxy import core_api_supported, install_proxyserver_cleanup_hook
+    from .runtime import load_config, require_supported_version
 
     require_supported_version()
     redis = RedisClient.get_client()

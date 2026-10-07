@@ -236,31 +236,37 @@ def _resolve_channels(rule: _Rule, channels: list[dict[str, Any]]) -> set[str]:
     if rule.is_global:
         return {str(channel["uuid"]) for channel in channels}
     if rule.selector_kind == "number":
+        numbered_channels = []
+        for channel in channels:
+            raw_number = channel.get("number")
+            if raw_number is None or (isinstance(raw_number, str) and not raw_number.strip()):
+                continue
+            number = _channel_number(raw_number, str(channel["uuid"]))
+            numbered_channels.append((channel, number))
         result: set[str] = set()
         for token in rule.selector_values:
             if ".." in token:
                 low_text, high_text = token.split("..", 1)
                 low, high = Decimal(low_text), Decimal(high_text)
                 matches = [
-                    channel
-                    for channel in channels
-                    if low <= _channel_number(channel.get("number"), str(channel["uuid"])) <= high
+                    (channel, number)
+                    for channel, number in numbered_channels
+                    if low <= number <= high
                 ]
                 if not matches:
                     raise SourceRuleError(f"number range {low}..{high} matches no channels")
                 by_number: dict[Decimal, list[str]] = {}
-                for channel in matches:
-                    number = _channel_number(channel.get("number"), str(channel["uuid"]))
+                for channel, number in matches:
                     by_number.setdefault(number, []).append(str(channel["uuid"]))
                 if any(len(uuids) > 1 for uuids in by_number.values()):
                     raise SourceRuleError(f"number range {low}..{high} is ambiguous")
-                result.update(str(channel["uuid"]) for channel in matches)
+                result.update(str(channel["uuid"]) for channel, _number in matches)
             else:
                 wanted = Decimal(token)
                 matches = [
                     channel
-                    for channel in channels
-                    if _channel_number(channel.get("number"), str(channel["uuid"])) == wanted
+                    for channel, number in numbered_channels
+                    if number == wanted
                 ]
                 if not matches:
                     raise SourceRuleError(f"channel number {wanted} matches no channels")
