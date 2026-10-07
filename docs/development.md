@@ -30,6 +30,13 @@ pass the AIO integration checks and a separate TiviMate test before being
 described as player-validated. Local availability is never persisted into
 Dispatcharr's provider-derived channel catch-up fields.
 
+Local XC windows use the exact positive duration hint in minutes. With no
+usable hint, the actual EPG programme end determines the remaining window;
+without reliable EPG metadata, playback delegates to the provider. Dispatcharr's
+extra provider duration padding is never required for local archive coverage.
+Use the plugin XMLTV endpoint with the plugin M3U export. Native XC M3U tags
+do not extend the core XMLTV endpoint's historical guide.
+
 ## Upgrading the isolated AIO to 0.32.0
 
 Use `ghcr.io/dispatcharr/dispatcharr@sha256:b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`

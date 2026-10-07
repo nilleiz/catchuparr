@@ -76,3 +76,14 @@ The user will repeat the Shield/TiviMate tests later. The earlier successful
 0.31.0 player results do not establish 0.32.0 or XC player compatibility. A
 stable release remains gated on those real-player checks; CI plugin ZIPs are
 development artifacts.
+
+An additional historical Dev request exposed Dispatcharr's five-minute provider
+duration padding crossing a later archive gap. Local playback must use the
+exact requested minute interval, or the actual EPG end when no valid duration
+is supplied. Provider playback retains Dispatcharr's duration handling. A
+completed-minute fixture in both AIO integration jobs covers this regression.
+
+The plugin M3U/XMLTV endpoint and direct XC JSON are the two primary output
+paths. Native `/get.php` playlist annotation is tested separately; its core
+`/xmltv.php` guide has not been extended to restore local archive history.
+Historical guide visibility with that particular pairing remains unverified.
