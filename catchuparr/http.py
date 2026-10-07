@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import logging
 import mimetypes
 import re
 import sqlite3
 import time
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -58,6 +59,20 @@ class _LeaseAcquisition:
     lease_id: str
     reused: bool
     previous_lease_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _PlaylistSegment:
+    id: str
+    channel_id: str
+    path: Path
+    start_utc: datetime
+    end_utc: datetime
+    discontinuity: bool
+
+    @property
+    def duration(self) -> float:
+        return (self.end_utc - self.start_utc).total_seconds()
 
 
 SESSION_REPLACEMENT_GRACE_SECONDS = 30.0
@@ -148,7 +163,13 @@ def ensure_http_playback_sessions(
                     start_utc REAL NOT NULL,
                     end_utc REAL NOT NULL,
                     expires_at REAL NOT NULL,
-                    grace_until REAL
+                    grace_until REAL,
+                    programme_end_utc REAL,
+                    continuation_end_utc REAL,
+                    continuation_reached INTEGER NOT NULL DEFAULT 0,
+                    boundary_reached INTEGER NOT NULL DEFAULT 0,
+                    terminal INTEGER NOT NULL DEFAULT 0,
+                    manifest_json TEXT NOT NULL DEFAULT '[]'
                 )"""
             )
             columns = {
@@ -160,6 +181,12 @@ def ensure_http_playback_sessions(
                 ("request_key", "TEXT"),
                 ("device_key", "TEXT"),
                 ("grace_until", "REAL"),
+                ("programme_end_utc", "REAL"),
+                ("continuation_end_utc", "REAL"),
+                ("continuation_reached", "INTEGER NOT NULL DEFAULT 0"),
+                ("boundary_reached", "INTEGER NOT NULL DEFAULT 0"),
+                ("terminal", "INTEGER NOT NULL DEFAULT 0"),
+                ("manifest_json", "TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if name not in columns:
                     db.execute(
@@ -364,11 +391,16 @@ class ArchiveHTTPService:
         device_key: str,
         start: float,
         end: float,
+        manifest_json: str,
+        programme_end: float | None,
+        continuation_end: float | None,
+        terminal: bool,
     ) -> bool:
         """Commit a rendered playlist without blocking segment reads during render."""
         with self._session_lock(user_id):
             return self._commit_acquisition_locked(
-                acquisition, user_id, channel_id, request_key, device_key, start, end
+                acquisition, user_id, channel_id, request_key, device_key, start, end,
+                manifest_json, programme_end, continuation_end, terminal,
             )
 
     def _commit_acquisition_locked(
@@ -380,6 +412,10 @@ class ArchiveHTTPService:
         device_key: str,
         start: float,
         end: float,
+        manifest_json: str,
+        programme_end: float | None,
+        continuation_end: float | None,
+        terminal: bool,
     ) -> bool:
         now = self.clock()
         if acquisition.reused:
@@ -391,9 +427,16 @@ class ArchiveHTTPService:
                 return False
             with closing(self._connect()) as db:
                 db.execute(
-                    "UPDATE http_playback_sessions SET end_utc=MAX(end_utc,?),expires_at=? "
+                    "UPDATE http_playback_sessions SET end_utc=MAX(end_utc,?),expires_at=?,"
+                    "manifest_json=CASE WHEN terminal=1 THEN manifest_json ELSE ? END,"
+                    "terminal=MAX(terminal,?),"
+                    "programme_end_utc=COALESCE(programme_end_utc,?),"
+                    "continuation_end_utc=COALESCE(continuation_end_utc,?) "
                     "WHERE lease_id=?",
-                    (end, now + self.lease_ttl_seconds, acquisition.lease_id),
+                    (
+                        end, now + self.lease_ttl_seconds, manifest_json, int(terminal),
+                        programme_end, continuation_end, acquisition.lease_id,
+                    ),
                 )
             return True
 
@@ -413,11 +456,14 @@ class ArchiveHTTPService:
                     )
                 db.execute(
                     "INSERT INTO http_playback_sessions "
-                    "(lease_id,user_id,channel_id,request_key,device_key,start_utc,end_utc,expires_at,grace_until) "
-                    "VALUES(?,?,?,?,?,?,?,?,NULL)",
+                    "(lease_id,user_id,channel_id,request_key,device_key,start_utc,end_utc,"
+                    "expires_at,grace_until,programme_end_utc,continuation_end_utc,"
+                    "continuation_reached,manifest_json,terminal) "
+                    "VALUES(?,?,?,?,?,?,?,?,NULL,?,?,0,?,?)",
                     (
                         acquisition.lease_id, user_id, channel_id,
                         request_key, device_key, start, end, now + self.lease_ttl_seconds,
+                        programme_end, continuation_end, manifest_json, int(terminal),
                     ),
                 )
                 db.execute("COMMIT")
@@ -496,6 +542,164 @@ class ArchiveHTTPService:
                 )
             return True
 
+    def _mark_continuation_boundary(
+        self, user_id: str, channel_id: str, lease_id: str, device_key: str, segment
+    ) -> bool:
+        """Persist playback at the EPG edge, even before the next segment exists."""
+        segment_start = segment.start_utc.timestamp()
+        segment_end = segment.end_utc.timestamp()
+        with self._session_lock(user_id):
+            candidate = self._continuation_boundary_row(
+                user_id, channel_id, lease_id, device_key
+            )
+        if not self._is_continuation_boundary_candidate(
+            candidate, segment_start, segment_end, segment.id
+        ):
+            return False
+        # Match the same lock order used by playlist reloads.
+        with self._admission_lock(user_id):
+            with self._session_lock(user_id):
+                row = self._continuation_boundary_row(
+                    user_id, channel_id, lease_id, device_key
+                )
+                if not self._is_continuation_boundary_candidate(
+                    row, segment_start, segment_end, segment.id
+                ):
+                    return False
+                if not row["boundary_reached"]:
+                    with closing(self._connect()) as db:
+                        db.execute(
+                            "UPDATE http_playback_sessions SET boundary_reached=1 "
+                            "WHERE lease_id=? AND user_id=? AND channel_id=? "
+                            "AND device_key=? AND expires_at>?",
+                            (lease_id, user_id, channel_id, device_key, self.clock()),
+                        )
+            # If continuation media is already indexed, unlock it now. Otherwise
+            # the persisted boundary flag lets a later playlist reload unlock it.
+            return self._unlock_continuation_locked(
+                user_id, channel_id, lease_id, device_key
+            )
+
+    def _continuation_boundary_row(self, user_id, channel_id, lease_id, device_key):
+        with closing(self._connect()) as db:
+            return db.execute(
+                "SELECT programme_end_utc,continuation_end_utc,boundary_reached,"
+                "continuation_reached,terminal,manifest_json FROM http_playback_sessions "
+                "WHERE lease_id=? AND user_id=? AND channel_id=? "
+                "AND device_key=? AND expires_at>?",
+                (lease_id, user_id, channel_id, device_key, self.clock()),
+            ).fetchone()
+
+    @staticmethod
+    def _is_continuation_boundary_candidate(row, segment_start, segment_end, segment_id):
+        if row is None or row["terminal"]:
+            return False
+        boundary = row["programme_end_utc"]
+        continuation_end = row["continuation_end_utc"]
+        return bool(
+            boundary is not None
+            and continuation_end is not None
+            and float(continuation_end) > float(boundary)
+            and segment_start < float(boundary)
+            and segment_end >= float(boundary) - TIMELINE_GAP_TOLERANCE_SECONDS
+            and ArchiveHTTPService._is_manifest_tail(row["manifest_json"], segment_id)
+        )
+
+    def _unlock_continuation_locked(
+        self, user_id: str, channel_id: str, lease_id: str, device_key: str
+    ) -> bool:
+        """Unlock indexed continuation after the caller has observed the boundary.
+
+        The caller holds the per-user admission lock. The boundary flag is
+        deliberately persisted separately so a reload can retry after an
+        archive segment arrives later.
+        """
+        with self._session_lock(user_id):
+            with closing(self._connect()) as db:
+                row = db.execute(
+                    "SELECT start_utc,end_utc,programme_end_utc,continuation_end_utc,"
+                    "boundary_reached,continuation_reached,terminal,manifest_json "
+                    "FROM http_playback_sessions WHERE lease_id=? AND user_id=? "
+                    "AND channel_id=? AND device_key=? AND expires_at>?",
+                    (lease_id, user_id, channel_id, device_key, self.clock()),
+                ).fetchone()
+            if (
+                row is None
+                or row["terminal"]
+                or not row["boundary_reached"]
+                or row["continuation_reached"]
+                or row["programme_end_utc"] is None
+                or row["continuation_end_utc"] is None
+                or float(row["continuation_end_utc"]) <= float(row["programme_end_utc"])
+            ):
+                return False
+            manifest = self._manifest_segments(channel_id, row["manifest_json"], [])
+            if not manifest:
+                return False
+            tail = manifest[-1]
+            boundary = float(row["programme_end_utc"])
+            continuation_end = min(
+                float(row["continuation_end_utc"]),
+                float(row["start_utc"]) + 24 * 60 * 60,
+                boundary + 24 * 60 * 60,
+            )
+            if (
+                tail.start_utc.timestamp() >= boundary
+                or tail.end_utc.timestamp() < boundary - TIMELINE_GAP_TOLERANCE_SECONDS
+                or continuation_end <= boundary
+                or not self._has_contiguous_continuation(
+                    channel_id, tail, continuation_end
+                )
+                or not self.store.extend_playback(
+                    lease_id,
+                    continuation_end,
+                    ttl_seconds=self.lease_ttl_seconds,
+                )
+            ):
+                return False
+            now = self.clock()
+            with closing(self._connect()) as db:
+                cursor = db.execute(
+                    "UPDATE http_playback_sessions SET "
+                    "end_utc=MAX(end_utc,?),continuation_reached=1,expires_at=? "
+                    "WHERE lease_id=? AND user_id=? AND channel_id=? AND device_key=? "
+                    "AND boundary_reached=1 AND continuation_reached=0 AND terminal=0",
+                    (
+                        continuation_end, now + self.lease_ttl_seconds,
+                        lease_id, user_id, channel_id, device_key,
+                    ),
+                )
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _is_manifest_tail(manifest_json: str, segment_id: str) -> bool:
+        try:
+            manifest = json.loads(manifest_json or "[]")
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            isinstance(manifest, list)
+            and manifest
+            and isinstance(manifest[-1], list)
+            and manifest[-1]
+            and manifest[-1][0] == segment_id
+        )
+
+    def _has_contiguous_continuation(self, channel_id: str, segment, end: float) -> bool:
+        """Require indexed media immediately after the published tail before extending."""
+        try:
+            tail_end = segment.end_utc.timestamp()
+            following = self.store.segments(channel_id, tail_end, end)
+        except (OSError, RuntimeError, sqlite3.Error):
+            logger.exception("Could not verify archived media after programme boundary")
+            return False
+        for item in following:
+            item_start = item.start_utc.timestamp()
+            if item_start < tail_end:
+                continue
+            return item_start <= tail_end + TIMELINE_GAP_TOLERANCE_SECONDS
+        return False
+
     def playlist(
         self,
         token: str | None,
@@ -504,6 +708,9 @@ class ArchiveHTTPService:
         end_utc: datetime | str | int | float,
         *,
         live: bool = False,
+        request_identity_end: datetime | str | int | float | None = None,
+        programme_end_utc: datetime | str | int | float | None = None,
+        continuation_end_utc: datetime | str | int | float | None = None,
     ) -> HTTPResponse:
         """Render an authenticated playlist for indexed segments in a range.
 
@@ -516,6 +723,28 @@ class ArchiveHTTPService:
             start, end = _epoch(start_utc), _epoch(end_utc)
             if end <= start:
                 return _error(400, "invalid playback range")
+            identity_end = (
+                end if request_identity_end is None else _epoch(request_identity_end)
+            )
+            programme_end = (
+                None if programme_end_utc is None else _epoch(programme_end_utc)
+            )
+            continuation_end = (
+                None if continuation_end_utc is None else _epoch(continuation_end_utc)
+            )
+            if not start < identity_end <= start + 24 * 60 * 60:
+                return _error(400, "invalid playback identity range")
+            if programme_end is not None and programme_end <= start:
+                programme_end = None
+            if (
+                continuation_end is not None
+                and (
+                    programme_end is None
+                    or continuation_end <= programme_end
+                    or continuation_end > start + 24 * 60 * 60
+                )
+            ):
+                continuation_end = None
         except (TypeError, ValueError, OverflowError):
             return _error(400, "invalid playback range")
         try:
@@ -526,11 +755,12 @@ class ArchiveHTTPService:
             return _error(401, "unauthorized")
         device_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
         request_key = hashlib.sha256(
-            f"{device_key}\0{channel_id}\0{start:.6f}\0{end:.6f}".encode()
+            f"{device_key}\0{channel_id}\0{start:.6f}\0{identity_end:.6f}".encode()
         ).hexdigest()
         with self._admission_lock(user_id):
             return self._playlist_locked(
-                token, user_id, channel_id, start, end, request_key, device_key, live
+                token, user_id, channel_id, start, end, request_key, device_key, live,
+                programme_end, continuation_end,
             )
 
     def _playlist_locked(
@@ -543,6 +773,8 @@ class ArchiveHTTPService:
         request_key: str,
         device_key: str,
         live: bool,
+        requested_programme_end: float | None,
+        requested_continuation_end: float | None,
     ) -> HTTPResponse:
         acquisition = None
         try:
@@ -552,7 +784,50 @@ class ArchiveHTTPService:
                 user_id, channel_id, start, end, request_key, device_key
             )
             lease_id = acquisition.lease_id
-            segments = self.store.segments(channel_id, start, end)
+            state = self._session_state(lease_id)
+            if (
+                state is not None
+                and state["boundary_reached"]
+                and not state["continuation_reached"]
+                and not state["terminal"]
+            ):
+                self._unlock_continuation_locked(
+                    user_id, channel_id, lease_id, device_key
+                )
+                state = self._session_state(lease_id)
+            programme_end = (
+                state["programme_end_utc"]
+                if state is not None and state["programme_end_utc"] is not None
+                else requested_programme_end
+            )
+            continuation_end = (
+                state["continuation_end_utc"]
+                if state is not None and state["continuation_end_utc"] is not None
+                else requested_continuation_end
+            )
+            continuation_reached = bool(
+                state is not None and state["continuation_reached"]
+            )
+            effective_end = end
+            if continuation_reached and state is not None:
+                effective_end = max(effective_end, float(state["end_utc"]))
+            pending_continuation = bool(
+                programme_end is not None
+                and continuation_end is not None
+                and continuation_end > programme_end
+                and not continuation_reached
+            )
+            terminal = bool(state is not None and state["terminal"])
+            effective_live = bool(live or pending_continuation)
+            if terminal:
+                effective_live = False
+            segments = self.store.segments(channel_id, start, effective_end)
+            manifest = self._manifest_segments(
+                channel_id,
+                state["manifest_json"] if state is not None else "[]",
+                segments,
+                allow_append=not terminal,
+            )
         except _PermissionDenied:
             return _error(403, "stream limit exceeded")
         except (TypeError, ValueError):
@@ -563,20 +838,9 @@ class ArchiveHTTPService:
             if acquisition is not None:
                 self._rollback_acquisition(acquisition)
             return _error(503, "archive temporarily unavailable")
-        if not segments:
+        if not manifest:
             self._rollback_acquisition(acquisition)
             return _error(404, "no archived segments in requested range")
-
-        ordered = sorted(segments, key=lambda item: (item.start_utc, item.id))
-        marked = []
-        previous_end = None
-        for segment in ordered:
-            has_gap = (
-                previous_end is not None
-                and segment.start_utc.timestamp() > previous_end + TIMELINE_GAP_TOLERANCE_SECONDS
-            )
-            marked.append(replace(segment, discontinuity=segment.discontinuity or has_gap))
-            previous_end = max(previous_end or segment.end_utc.timestamp(), segment.end_utc.timestamp())
         try:
             root = self.base_path
             channel_component = quote(str(channel_id), safe="")
@@ -588,13 +852,18 @@ class ArchiveHTTPService:
                     f"?token={quote(token, safe='')}&lease={quote(lease_id, safe='')}"
                 )
 
-            body = self._make_playlist(marked, live=bool(live), uri_for=uri_for).encode("utf-8")
+            body = self._make_playlist(
+                manifest, live=effective_live, uri_for=uri_for
+            ).encode("utf-8")
+            manifest_json = self._serialize_manifest(manifest)
         except (OSError, RuntimeError, ValueError):
             self._rollback_acquisition(acquisition)
             return _error(503, "archive temporarily unavailable")
         try:
             committed = self._commit_acquisition(
-                acquisition, user_id, channel_id, request_key, device_key, start, end
+                acquisition, user_id, channel_id, request_key, device_key, start,
+                effective_end, manifest_json, programme_end, continuation_end,
+                terminal=not effective_live,
             )
         except (OSError, RuntimeError, sqlite3.Error):
             self._rollback_acquisition(acquisition)
@@ -612,6 +881,92 @@ class ArchiveHTTPService:
             },
             body,
         )
+
+    def _session_state(self, lease_id: str):
+        with closing(self._connect()) as db:
+            return db.execute(
+                "SELECT end_utc,programme_end_utc,continuation_end_utc,"
+                "continuation_reached,boundary_reached,terminal,manifest_json "
+                "FROM http_playback_sessions "
+                "WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+
+    def _manifest_segments(
+        self, channel_id: str, manifest_json: str, candidates, *, allow_append: bool = True
+    ):
+        try:
+            stored = json.loads(manifest_json or "[]")
+        except (TypeError, ValueError) as exc:
+            raise sqlite3.DatabaseError("invalid persisted HLS manifest") from exc
+        if not isinstance(stored, list):
+            raise sqlite3.DatabaseError("invalid persisted HLS manifest")
+        manifest = []
+        known_ids = set()
+        for row in stored:
+            if not isinstance(row, list) or len(row) != 5:
+                raise sqlite3.DatabaseError("invalid persisted HLS manifest row")
+            segment_id, start, end, discontinuity, relative_path = row
+            try:
+                start = datetime.fromtimestamp(float(start), tz=timezone.utc)
+                end = datetime.fromtimestamp(float(end), tz=timezone.utc)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise sqlite3.DatabaseError("invalid persisted HLS manifest range") from exc
+            if end <= start or not isinstance(segment_id, str):
+                raise sqlite3.DatabaseError("invalid persisted HLS manifest range")
+            relative_path = Path(str(relative_path))
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise sqlite3.DatabaseError("invalid persisted HLS manifest path")
+            manifest.append(_PlaylistSegment(
+                segment_id, channel_id, Path(self.store.root) / relative_path,
+                start, end, bool(discontinuity),
+            ))
+            known_ids.add(segment_id)
+
+        if not allow_append:
+            return manifest
+
+        high_water = max(
+            (segment.end_utc.timestamp() for segment in manifest), default=None
+        )
+        for candidate in sorted(candidates, key=lambda item: (item.start_utc, item.id)):
+            if candidate.id in known_ids:
+                continue
+            candidate_start = candidate.start_utc.timestamp()
+            candidate_end = candidate.end_utc.timestamp()
+            if high_water is not None and candidate_start < high_water:
+                # EVENT playlists are append-only; a late segment may not be
+                # inserted before the already published high-water mark.
+                continue
+            has_gap = (
+                high_water is not None
+                and candidate_start > high_water + TIMELINE_GAP_TOLERANCE_SECONDS
+            )
+            manifest.append(_PlaylistSegment(
+                candidate.id,
+                channel_id,
+                candidate.path,
+                candidate.start_utc,
+                candidate.end_utc,
+                bool(candidate.discontinuity or has_gap),
+            ))
+            known_ids.add(candidate.id)
+            high_water = max(high_water or candidate_end, candidate_end)
+        return manifest
+
+    def _serialize_manifest(self, segments) -> str:
+        records = []
+        root = Path(self.store.root).resolve()
+        for segment in segments:
+            relative_path = Path(segment.path).resolve(strict=False).relative_to(root)
+            records.append([
+                segment.id,
+                segment.start_utc.timestamp(),
+                segment.end_utc.timestamp(),
+                bool(segment.discontinuity),
+                relative_path.as_posix(),
+            ])
+        return json.dumps(records, separators=(",", ":"))
 
     def segment(
         self,
@@ -689,6 +1044,19 @@ class ArchiveHTTPService:
             # Files are immutable after publication; a short read indicates a
             # concurrent storage fault and should not be presented as complete.
             return _error(503, "segment changed during read")
+        full_get = method == "GET" and (
+            selected is None or (selected.start == 0 and selected.end == size - 1)
+        )
+        if full_get:
+            try:
+                self._mark_continuation_boundary(
+                    user_id, channel_id, lease_id, device_key, segment
+                )
+            except Exception:
+                # The segment was already read successfully. A boundary
+                # bookkeeping failure must not turn that media response into
+                # an error; it simply leaves the EVENT range closed.
+                logger.exception("Could not advance archive programme boundary")
         return HTTPResponse(status, headers, body)
 
     def end_session(self, token: str | None, channel_id: str, lease_id: str) -> bool:

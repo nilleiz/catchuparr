@@ -42,6 +42,23 @@ class HLSPlaylistTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fixed HLS target"):
             build_hls_playlist([too_long], live=True, target_duration=45)
 
+    def test_default_target_covers_long_stream_copy_segments(self):
+        long_gop = Segment(
+            "sixteen-seconds", "ch", Path("sixteen.ts"), self.segments[-1].end_utc,
+            self.segments[-1].end_utc + timedelta(seconds=16),
+        )
+        first = build_hls_playlist(self.segments, live=True)
+        reloaded = build_hls_playlist([*self.segments, long_gop], live=True)
+        self.assertIn("#EXT-X-TARGETDURATION:60", first)
+        self.assertIn("#EXT-X-TARGETDURATION:60", reloaded)
+        self.assertIn("sixteen.ts", reloaded)
+        too_long = Segment(
+            "sixty-one-seconds", "ch", Path("sixty-one.ts"), self.segments[-1].end_utc,
+            self.segments[-1].end_utc + timedelta(seconds=61),
+        )
+        with self.assertRaisesRegex(ValueError, "fixed HLS target"):
+            build_hls_playlist([too_long], live=True)
+
 
 if __name__ == "__main__":
     unittest.main()

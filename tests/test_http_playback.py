@@ -199,6 +199,148 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(len(self.archive.leases), 1)
         self.assertEqual(self.service.segment(self.token, "news", "seg-A", first_lease).status, 200)
 
+    def test_seek_playlist_persists_boundary_then_unlocks_on_reload(self):
+        self.service.playlist_builder = None
+        programme_start = self.start + timedelta(hours=15, minutes=15)
+        programme_end = programme_start + timedelta(minutes=45)
+        following_end = programme_end + timedelta(minutes=45)
+        seek_start = programme_start + timedelta(minutes=29)
+        requested_end = seek_start + timedelta(seconds=2700)
+
+        def add_segment(segment_id, start, end):
+            path = self.root / f"{segment_id}.ts"
+            path.write_bytes(b"0123456789")
+            item = Segment(segment_id, "news", path, start, end)
+            self.archive.items.append(item)
+            return item
+
+        first = add_segment(
+            "seek-first", seek_start, seek_start + timedelta(seconds=6)
+        )
+        boundary = add_segment(
+            "seek-boundary",
+            programme_end - timedelta(seconds=1),
+            programme_end + timedelta(seconds=5),
+        )
+        next_one = add_segment(
+            "seek-next-one",
+            programme_end + timedelta(seconds=5),
+            programme_end + timedelta(seconds=11),
+        )
+        next_two = add_segment(
+            "seek-next-two",
+            programme_end + timedelta(seconds=11),
+            programme_end + timedelta(seconds=17),
+        )
+        add_segment(
+            "seek-beyond-target",
+            requested_end + timedelta(seconds=1),
+            requested_end + timedelta(seconds=7),
+        )
+
+        def reload(*, live):
+            return self.service.playlist(
+                self.token,
+                "news",
+                seek_start,
+                programme_end,
+                live=live,
+                request_identity_end=requested_end,
+                programme_end_utc=programme_end,
+                continuation_end_utc=min(requested_end, following_end),
+            )
+
+        initial = reload(live=False)
+        initial_text = initial.body.decode()
+        self.assertEqual(initial.status, 200)
+        self.assertEqual(initial_text.count("#EXTINF:"), 2)
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", initial_text)
+        self.assertNotIn("#EXT-X-ENDLIST", initial_text)
+        self.assertNotIn("seek-next-one", initial_text)
+        initial_lines = initial_text.splitlines()
+        first_uri = next(line for line in initial_lines if "seek-first" in line)
+        lease_id = first_uri.split("&lease=", 1)[1]
+
+        # A newly indexed segment before the published high-water mark and a
+        # retained-away old row must not alter the EVENT playlist prefix.
+        add_segment(
+            "seek-late-before-watermark",
+            programme_end - timedelta(seconds=9),
+            programme_end - timedelta(seconds=3),
+        )
+        self.archive.items.remove(first)
+        self.assertEqual(self.service.segment(
+            self.token, "news", boundary.id, lease_id, method="HEAD"
+        ).status, 200)
+        after_head = reload(live=False)
+        self.assertEqual(after_head.body.decode(), initial_text)
+        self.assertNotIn("#EXT-X-ENDLIST", after_head.body.decode())
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT boundary_reached FROM http_playback_sessions WHERE lease_id=?",
+                    (lease_id,),
+                ).fetchone()[0],
+                0,
+            )
+
+        self.assertEqual(self.service.segment(
+            self.token, "news", boundary.id, lease_id, range_header="bytes=99-"
+        ).status, 416)
+        self.assertEqual(self.service.segment(
+            self.token, "news", boundary.id, lease_id, range_header="bytes=0-3"
+        ).status, 206)
+        after_error = reload(live=False)
+        self.assertEqual(after_error.body.decode(), initial_text)
+
+        # A successful boundary read still cannot extend into an archive gap.
+        self.archive.items.remove(next_one)
+        self.archive.items.remove(next_two)
+        self.assertEqual(self.service.segment(
+            self.token, "news", boundary.id, lease_id, range_header="bytes=0-"
+        ).status, 206)
+        after_gap = reload(live=False)
+        self.assertEqual(after_gap.body.decode(), initial_text)
+        self.assertEqual(
+            self.archive.leases[lease_id]["end"], programme_end.timestamp()
+        )
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            row = db.execute(
+                "SELECT boundary_reached,continuation_reached "
+                "FROM http_playback_sessions WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+        self.assertEqual(row, (1, 0))
+
+        # A fresh service process remembers the boundary and unlocks the
+        # continuation when a later reload sees its first contiguous segment.
+        self.service = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
+        )
+        self.archive.items.extend((next_one, next_two))
+        final = reload(live=False)
+        final_text = final.body.decode()
+        final_lines = final_text.splitlines()
+        self.assertEqual(final.status, 200)
+        self.assertEqual(final_lines[:len(initial_lines)], initial_lines)
+        self.assertEqual(final_text.count("#EXTINF:"), 4)
+        self.assertEqual(final_text.count("seek-next-one"), 1)
+        self.assertEqual(final_text.count("seek-next-two"), 1)
+        self.assertNotIn("seek-beyond-target", final_text)
+        self.assertEqual(final_text.count("#EXT-X-ENDLIST"), 1)
+        self.assertEqual(
+            self.archive.leases[lease_id]["end"], requested_end.timestamp()
+        )
+        self.assertEqual(len(self.archive.leases), 1)
+        self.assertEqual(
+            self.service.segment(self.token, "news", boundary.id, lease_id).status,
+            200,
+        )
+        self.assertEqual(reload(live=False).body.decode(), final_text)
+
     def test_event_closure_preserves_segment_urls_and_lease(self):
         self.service.playlist_builder = None
         end = self.start + timedelta(minutes=30)
@@ -208,6 +350,29 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(closed.status, 200)
         self.assertEqual(closed.body, growing.body + b"#EXT-X-ENDLIST\n")
         self.assertEqual(len(self.archive.leases), 1)
+
+        later_path = self.root / "later.ts"
+        later_path.write_bytes(b"later media")
+        later = Segment(
+            "seg-later", "news", later_path,
+            self.start + timedelta(seconds=6), self.start + timedelta(seconds=12),
+        )
+        self.archive.items.append(later)
+        self.assertEqual(
+            self.service.playlist(self.token, "news", self.start, end, live=True).body,
+            closed.body,
+        )
+        self.archive.items.remove(self.segment_item)
+        restarted = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
+        )
+        self.assertEqual(
+            restarted.playlist(self.token, "news", self.start, end, live=True).body,
+            closed.body,
+        )
 
     def test_muxer_offset_does_not_emit_discontinuity_but_real_gap_does(self):
         self.service.playlist_builder = None
