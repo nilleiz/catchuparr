@@ -174,6 +174,13 @@ def probe():
               "utc": str(start.timestamp()), "duration": "12"}
     from urllib.parse import parse_qs, urlsplit
 
+    expired = views.archive_view(request(
+        "/catchuparr/archive",
+        dict(params, utc=str((start - timedelta(hours=2)).timestamp())),
+    ))
+    require(expired.status_code == 404,
+            "Expired start-over must not substitute a later programme")
+
     missing_guide = views.archive_view(request(
         "/catchuparr/archive", dict(params, channel_id=str(no_guide_channel.uuid))
     ))
@@ -213,6 +220,8 @@ def probe():
     require(archive.status_code == 200, f"Archive status {archive.status_code}")
     require(archive.content.count(b"#EXTINF:") == 2,
             "Initial programme must exclude the next programme's segment")
+    require(b"#EXT-X-START:TIME-OFFSET=" in archive.content,
+            "Start-over playlist must mark the requested playback origin")
     segment_url = next(line for line in archive.content.decode().splitlines()
                        if line and not line.startswith("#"))
     parts = urlsplit(segment_url)
@@ -229,17 +238,15 @@ def probe():
     tail = views.segment_view(request(tail_parts.path, tail_query, HTTP_RANGE="bytes=0-"),
                               tail_path[-2], tail_path[-1])
     require(tail.status_code == 206 and len(tail.content) == 376,
-            "Full Range GET of the published tail must count as playback progress")
+            "Full Range GET of the published tail must remain readable")
     waiting = views.archive_view(request("/catchuparr/archive", params))
     require(waiting.status_code == 200 and waiting.content == archive.content,
-            "Missing next segment must keep the EVENT manifest open and unchanged")
+            "Tail prefetch must not alter the programme playlist")
     store.add_segment(str(channel.uuid), source, start + timedelta(seconds=12),
                       start + timedelta(seconds=18))
-    continued = views.archive_view(request("/catchuparr/archive", params))
-    require(continued.status_code == 200 and continued.content.count(b"#EXTINF:") == 3,
-            "Next indexed programme must append after a completed tail GET")
-    require(continued.content.startswith(archive.content),
-            "Reload must preserve the exact published EVENT prefix")
+    bounded = views.archive_view(request("/catchuparr/archive", params))
+    require(bounded.status_code == 200 and bounded.content == archive.content,
+            "Prefetch and a newly indexed next programme must not extend this session")
     require(service.end_session(token, str(channel.uuid), query["lease"]))
     seek_params = dict(params, utc=str(int(start.timestamp()) + 6))
     seek = views.archive_view(request("/catchuparr/archive", seek_params))

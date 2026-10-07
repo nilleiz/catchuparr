@@ -79,8 +79,10 @@ class FakeArchive:
         self.leases.pop(lease_id, None)
 
 
-def _builder(segments, *, live, uri_for):
+def _builder(segments, *, live, uri_for, start_offset=None):
     lines = ["#EXTM3U", "#EXT-X-PLAYLIST-TYPE:" + ("EVENT" if live else "VOD")]
+    if start_offset is not None:
+        lines.append(f"#EXT-X-START:TIME-OFFSET={start_offset:.3f}")
     for item in segments:
         lines.extend([f"#EXTINF:{item.duration:.3f},", uri_for(item)])
     if not live:
@@ -199,11 +201,10 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(len(self.archive.leases), 1)
         self.assertEqual(self.service.segment(self.token, "news", "seg-A", first_lease).status, 200)
 
-    def test_seek_playlist_persists_boundary_then_unlocks_on_reload(self):
+    def test_seek_playlist_stays_within_program_after_tail_get_or_range(self):
         self.service.playlist_builder = None
         programme_start = self.start + timedelta(hours=15, minutes=15)
         programme_end = programme_start + timedelta(minutes=45)
-        following_end = programme_end + timedelta(minutes=45)
         seek_start = programme_start + timedelta(minutes=29)
         requested_end = seek_start + timedelta(seconds=2700)
 
@@ -214,132 +215,132 @@ class ArchiveHTTPTests(unittest.TestCase):
             self.archive.items.append(item)
             return item
 
-        first = add_segment(
-            "seek-first", seek_start, seek_start + timedelta(seconds=6)
+        add_segment(
+            "seek-first",
+            seek_start - timedelta(seconds=2),
+            seek_start + timedelta(seconds=4),
         )
         boundary = add_segment(
             "seek-boundary",
+            programme_end - timedelta(seconds=6),
+            programme_end,
+        )
+        crossing = add_segment(
+            "crossing-program-boundary",
             programme_end - timedelta(seconds=1),
             programme_end + timedelta(seconds=5),
         )
-        next_one = add_segment(
-            "seek-next-one",
-            programme_end + timedelta(seconds=5),
+        next_program = add_segment(
+            "next-program", programme_end + timedelta(seconds=5),
             programme_end + timedelta(seconds=11),
-        )
-        next_two = add_segment(
-            "seek-next-two",
-            programme_end + timedelta(seconds=11),
-            programme_end + timedelta(seconds=17),
-        )
-        add_segment(
-            "seek-beyond-target",
-            requested_end + timedelta(seconds=1),
-            requested_end + timedelta(seconds=7),
         )
 
-        def reload(*, live):
+        def reload():
             return self.service.playlist(
                 self.token,
                 "news",
                 seek_start,
-                programme_end,
-                live=live,
+                requested_end,
+                live=False,
                 request_identity_end=requested_end,
                 programme_end_utc=programme_end,
-                continuation_end_utc=min(requested_end, following_end),
+                continuation_end_utc=requested_end,
             )
 
-        initial = reload(live=False)
+        initial = reload()
         initial_text = initial.body.decode()
         self.assertEqual(initial.status, 200)
         self.assertEqual(initial_text.count("#EXTINF:"), 2)
         self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", initial_text)
-        self.assertNotIn("#EXT-X-ENDLIST", initial_text)
-        self.assertNotIn("seek-next-one", initial_text)
+        self.assertTrue(initial_text.endswith("#EXT-X-ENDLIST\n"))
+        self.assertIn("#EXT-X-START:TIME-OFFSET=2.000", initial_text)
+        self.assertNotIn("next-program", initial_text)
+        self.assertNotIn(crossing.id, initial_text)
         initial_lines = initial_text.splitlines()
         first_uri = next(line for line in initial_lines if "seek-first" in line)
         lease_id = first_uri.split("&lease=", 1)[1]
 
-        # A newly indexed segment before the published high-water mark and a
-        # retained-away old row must not alter the EVENT playlist prefix.
-        add_segment(
-            "seek-late-before-watermark",
-            programme_end - timedelta(seconds=9),
-            programme_end - timedelta(seconds=3),
-        )
-        self.archive.items.remove(first)
+        # Loading the complete tail, including a full byte range, cannot
+        # extend the session beyond the selected EPG programme.
+        self.assertEqual(self.service.segment(
+            self.token, "news", boundary.id, lease_id
+        ).status, 200)
         self.assertEqual(self.service.segment(
             self.token, "news", boundary.id, lease_id, method="HEAD"
         ).status, 200)
-        after_head = reload(live=False)
-        self.assertEqual(after_head.body.decode(), initial_text)
-        self.assertNotIn("#EXT-X-ENDLIST", after_head.body.decode())
-        with sqlite3.connect(self.root / "archive.sqlite3") as db:
-            self.assertEqual(
-                db.execute(
-                    "SELECT boundary_reached FROM http_playback_sessions WHERE lease_id=?",
-                    (lease_id,),
-                ).fetchone()[0],
-                0,
-            )
-
-        self.assertEqual(self.service.segment(
-            self.token, "news", boundary.id, lease_id, range_header="bytes=99-"
-        ).status, 416)
-        self.assertEqual(self.service.segment(
-            self.token, "news", boundary.id, lease_id, range_header="bytes=0-3"
-        ).status, 206)
-        after_error = reload(live=False)
-        self.assertEqual(after_error.body.decode(), initial_text)
-
-        # A successful boundary read still cannot extend into an archive gap.
-        self.archive.items.remove(next_one)
-        self.archive.items.remove(next_two)
         self.assertEqual(self.service.segment(
             self.token, "news", boundary.id, lease_id, range_header="bytes=0-"
         ).status, 206)
-        after_gap = reload(live=False)
-        self.assertEqual(after_gap.body.decode(), initial_text)
+        self.assertEqual(
+            self.service.segment(self.token, "news", crossing.id, lease_id).status,
+            403,
+        )
+        self.assertEqual(reload().body.decode(), initial_text)
         self.assertEqual(
             self.archive.leases[lease_id]["end"], programme_end.timestamp()
         )
-        with sqlite3.connect(self.root / "archive.sqlite3") as db:
-            row = db.execute(
-                "SELECT boundary_reached,continuation_reached "
-                "FROM http_playback_sessions WHERE lease_id=?",
-                (lease_id,),
-            ).fetchone()
-        self.assertEqual(row, (1, 0))
+        self.assertNotIn(next_program.id, reload().body.decode())
+        self.assertEqual(
+            self.service.segment(self.token, "news", next_program.id, lease_id).status,
+            403,
+        )
 
-        # A fresh service process remembers the boundary and unlocks the
-        # continuation when a later reload sees its first contiguous segment.
+    def test_upgrade_invalidates_sessions_that_already_crossed_program_boundary(self):
+        response = self._playlist()
+        lease_id = response.body.decode().split("&lease=", 1)[1].splitlines()[0]
+        extended_end = (self.start + timedelta(seconds=30)).timestamp()
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            db.execute(
+                "UPDATE http_playback_sessions SET end_utc=?,programme_end_utc=?,"
+                "continuation_reached=1 WHERE lease_id=?",
+                (extended_end, self.start.timestamp() + 6, lease_id),
+            )
+            db.execute("DELETE FROM http_playback_schema_migrations WHERE version=1")
+        self.archive.extend_playback(lease_id, extended_end, ttl_seconds=300)
+
         self.service = ArchiveHTTPService(
             self.archive,
             self.tokens,
             authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
             catchup_enabled=lambda *_: True,
         )
-        self.archive.items.extend((next_one, next_two))
-        final = reload(live=False)
-        final_text = final.body.decode()
-        final_lines = final_text.splitlines()
-        self.assertEqual(final.status, 200)
-        self.assertEqual(final_lines[:len(initial_lines)], initial_lines)
-        self.assertEqual(final_text.count("#EXTINF:"), 4)
-        self.assertEqual(final_text.count("seek-next-one"), 1)
-        self.assertEqual(final_text.count("seek-next-two"), 1)
-        self.assertNotIn("seek-beyond-target", final_text)
-        self.assertEqual(final_text.count("#EXT-X-ENDLIST"), 1)
+
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            self.assertIsNone(db.execute(
+                "SELECT lease_id FROM http_playback_sessions WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone())
+        self.assertNotIn(lease_id, self.archive.leases)
         self.assertEqual(
-            self.archive.leases[lease_id]["end"], requested_end.timestamp()
+            self.service.segment(self.token, "news", "seg-A", lease_id).status,
+            403,
         )
-        self.assertEqual(len(self.archive.leases), 1)
-        self.assertEqual(
-            self.service.segment(self.token, "news", boundary.id, lease_id).status,
-            200,
+
+    def test_upgrade_invalidates_manifest_with_cross_boundary_segment(self):
+        response = self._playlist()
+        lease_id = response.body.decode().split("&lease=", 1)[1].splitlines()[0]
+        programme_end = (self.start + timedelta(seconds=5)).timestamp()
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            db.execute(
+                "UPDATE http_playback_sessions SET end_utc=?,programme_end_utc=?,"
+                "continuation_reached=0 WHERE lease_id=?",
+                (programme_end, programme_end, lease_id),
+            )
+            db.execute("DELETE FROM http_playback_schema_migrations WHERE version=1")
+
+        self.service = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
         )
-        self.assertEqual(reload(live=False).body.decode(), final_text)
+
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            self.assertIsNone(db.execute(
+                "SELECT lease_id FROM http_playback_sessions WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone())
+        self.assertNotIn(lease_id, self.archive.leases)
 
     def test_event_closure_preserves_segment_urls_and_lease(self):
         self.service.playlist_builder = None
@@ -631,13 +632,15 @@ class ArchiveHTTPTests(unittest.TestCase):
         first_results = []
         later_results = []
 
-        def render(segments, *, live, uri_for):
+        def render(segments, *, live, uri_for, start_offset=None):
             if not entered.is_set():
                 entered.set()
                 if not release.wait(timeout=5):
                     raise RuntimeError("test did not release the first switch")
                 raise RuntimeError("first replacement render failed")
-            return _builder(segments, live=live, uri_for=uri_for)
+            return _builder(
+                segments, live=live, uri_for=uri_for, start_offset=start_offset
+            )
 
         self.service.playlist_builder = render
         end = self.start + timedelta(seconds=10)
@@ -690,13 +693,15 @@ class ArchiveHTTPTests(unittest.TestCase):
         results = []
         second_results = []
 
-        def render(segments, *, live, uri_for):
+        def render(segments, *, live, uri_for, start_offset=None):
             if not entered.is_set():
                 entered.set()
                 if not release.wait(timeout=5):
                     raise RuntimeError("test did not release the first render")
                 raise RuntimeError("initial render failed")
-            return _builder(segments, live=live, uri_for=uri_for)
+            return _builder(
+                segments, live=live, uri_for=uri_for, start_offset=start_offset
+            )
 
         self.service.playlist_builder = render
         worker = threading.Thread(target=lambda: results.append(self._playlist().status))
