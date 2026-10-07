@@ -22,8 +22,8 @@ The inspected compatibility targets are Dispatcharr v0.31.0 and v0.32.0. Unknown
 Create a separate archive access token for each playback device. Session identity is scoped to the credential, not proof of physical device identity: copying a playlist to another player shares its slot. Playlist reloads for the same programme reuse its session; switching programmes replaces that credential's session while preserving its previous segment URLs for a 30-second grace period.
 
 The authenticated M3U/XMLTV endpoint provides HLS archive playback. Its
-playlist loads and first start-over were observed on TiviMate 5.3.3/Shield TV;
-accurate seeks remain under player validation. The plugin endpoint uses `{utc}`
+start-over, forward/backward seeks and pause/resume were confirmed on
+TiviMate 5.3.3/Shield TV with Dispatcharr 0.32.0. The plugin endpoint uses `{utc}`
 epoch seconds and `{duration}` seconds;
 Dispatcharr's native XC timeshift endpoint uses `{duration:60}` minutes. Keep
 those contracts separate. UTC metadata is attached only to locally annotated
@@ -39,9 +39,12 @@ historical programme has archive coverage, matching the plugin XMLTV export.
 An unknown programme returns 404. The initial HLS playlist stops at that
 programme's end even if TiviMate sends its original full duration after a
 seek. HLS reloads may append newly indexed segments within that programme.
-Fetching or prefetching its tail cannot unlock the next programme. Automatic
-cross-programme continuation is temporarily disabled pending a separate Shield
-test. A segment crossing the programme's end is omitted rather than serving
+Fetching or prefetching its tail cannot unlock the next programme. TiviMate
+5.3.3 on Shield TV was observed automatically requesting a new archive window
+at a programme boundary, allowing Tagesthemen to continue into Maischberger.
+Server-side extension of the old playlist stays disabled; other clients need
+their own continuation test. A segment crossing the programme's end is omitted
+rather than serving
 content from the next programme; playback may therefore end one segment early.
 The playlist target stays at 60 seconds because stream-copy segmentation
 can have delayed keyframes.
@@ -108,6 +111,12 @@ bearer tokens or leases in these trace lines. Collect only lines beginning
 `Catchuparr archive` or `Catchuparr request`, keep
 them private, and set the flag back to `0` after the test. Do not publish raw
 web-server access logs because URL query strings may contain bearer tokens.
+
+Release assets include the installable ZIP and `SHA256SUMS`. Download both
+from the tagged GitHub release and run `sha256sum -c SHA256SUMS` in the download
+directory before importing. Retain the previous package and private cold Dev
+data/archive backup for rollback. A release does not authorize a production
+deployment.
 
 The current Dev instance was prepared from a consistent custom-format `pg_dump` before this API preference was clarified. For a future rebuild, the verified Dispatcharr ZIP and API flow above is the default. If no compatible ZIP exists, use `pg_dump -Fc`, verify it with `pg_restore -l` in a networkless container, restore into an isolated temporary PostgreSQL 17 container, apply `scrub.sql`, stop it, and copy only its cold cluster into the AIO Dev `/data/db` path (UID/GID 1000). A cold cluster prepared under a different glibc version may need `REINDEX DATABASE` for each copied database, followed by `ALTER DATABASE ... REFRESH COLLATION VERSION` inside the AIO image. Never mount a production database directory into Dev.
 
