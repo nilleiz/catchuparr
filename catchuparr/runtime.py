@@ -87,6 +87,14 @@ def bootstrap() -> None:
             install_routes()
         except Exception:
             logger.exception("Catchuparr route installation failed")
+        try:
+            from .xc_runtime import install_xc_integration
+
+            result = install_xc_integration()
+            if not result.installed:
+                logger.warning("Catchuparr XC hooks were not installed: %s", result.reason)
+        except Exception:
+            logger.exception("Catchuparr XC hook installation failed")
     try:
         _ensure_schedule()
     except Exception:
@@ -117,6 +125,14 @@ def _ensure_schedule() -> None:
 
 
 def shutdown() -> None:
+    try:
+        from .xc_runtime import uninstall_xc_integration
+
+        result = uninstall_xc_integration()
+        if not result.installed:
+            logger.warning("Catchuparr XC hooks were not removed: %s", result.reason)
+    except Exception:
+        logger.exception("Failed to remove Catchuparr XC hooks")
     try:
         from django_celery_beat.models import PeriodicTask
 

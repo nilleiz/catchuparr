@@ -24,8 +24,9 @@ class Response:
 
 
 class Request:
-    def __init__(self, stream_id="8"):
-        self.GET = {"stream_id": stream_id}
+    def __init__(self, stream_id="8", *, get=None, method="GET"):
+        self.GET = dict(get or {"stream_id": stream_id})
+        self.method = method
 
 
 class Channel:
@@ -34,7 +35,11 @@ class Channel:
 
 
 def modules():
-    calls = {"entry": 0, "epg": 0, "serve": 0, "epg_lookbacks": [], "programmes": None}
+    calls = {
+        "entry": 0, "epg": 0, "serve": 0, "m3u": 0,
+        "epg_lookbacks": [], "programmes": None,
+        "m3u_content": "#EXTM3U\n",
+    }
 
     def _xc_channel_entry(channel, channel_num_map, _get_default_group_id,
                           _logo_url_prefix, _logo_url_suffix, *, catchup_allowed=True):
@@ -55,9 +60,15 @@ def modules():
         calls["serve"] += 1
         return Response("provider")
 
+    def generate_m3u(request, profile_name=None, user=None):
+        calls["m3u"] += 1
+        return Response(calls["m3u_content"])
+
     output = types.SimpleNamespace(
         _xc_channel_entry=_xc_channel_entry,
         xc_get_epg=xc_get_epg,
+        generate_m3u=generate_m3u,
+        build_absolute_uri_with_port=lambda request, path: "https://dispatcharr.test" + path,
         is_catchup_enabled=lambda user: user.get("catchup", True),
         HttpResponse=Response,
         HttpResponseForbidden=lambda message: Response(message, 403),
@@ -117,6 +128,18 @@ class XCHookInstallTests(unittest.TestCase):
         self.assertTrue(first.installed)
         self.assertTrue(second.installed)
         self.assertIs(output._xc_channel_entry, wrapper)
+
+    def test_032_m3u_hook_signature_is_guarded_without_partial_install(self):
+        output, timeshift, _ = modules()
+        original_entry = output._xc_channel_entry
+        output.generate_m3u = lambda request, user=None: Response("#EXTM3U\n")
+
+        result = install_xc_hooks(
+            output, timeshift, dispatcharr_version="0.32.0", callbacks=XCCallbacks(),
+        )
+
+        self.assertFalse(result.installed)
+        self.assertIs(output._xc_channel_entry, original_entry)
 
 
 class XCHookBehaviorTests(unittest.TestCase):
@@ -225,7 +248,99 @@ class XCHookBehaviorTests(unittest.TestCase):
         self.assertTrue(removed.installed)
         self.assertEqual((output._xc_channel_entry, output.xc_get_epg, timeshift._serve_catchup), originals)
 
-    def test_running_programme_archive_flag_uses_coverage_through_now(self):
+    def test_032_m3u_adds_local_template_after_core_filtering_and_preserves_provider_values(self):
+        output, timeshift, calls = modules()
+        provider_source = "https://provider.example/timeshift?start={utc}"
+        calls["m3u_content"] = (
+            "#EXTM3U\n"
+            '#EXTINF:-1 tvg-name="Provider" catchup="default" catchup-days="1" '
+            f'catchup-source="{provider_source}",Provider\n'
+            "https://dispatcharr.test/live/viewer/secret/8\n"
+            '#EXTINF:-1 tvg-name="Local",Local\n'
+            "https://dispatcharr.test/live/viewer/secret/9\n"
+            '#EXTINF:-1 tvg-name="Unselected",Unselected\n'
+            "https://dispatcharr.test/live/viewer/secret/10\n"
+        )
+        callbacks = XCCallbacks(
+            authorize_xc_m3u=lambda request, user: True,
+            m3u_channel_archive_days=lambda user: {"8": 5, "9": 5},
+        )
+        self.assertTrue(install_xc_hooks(
+            output, timeshift, dispatcharr_version="0.32.0", callbacks=callbacks,
+        ).installed)
+        request = Request(get={
+            "username": "viewer", "password": "secret", "direct": "false",
+        })
+        user = {"catchup": True}
+
+        response = output.generate_m3u(request, user=user)
+        content = response.content
+
+        self.assertIn(f'catchup-days="5" catchup-source="{provider_source}"', content)
+        self.assertIn(
+            'catchup="default" catchup-source="https://dispatcharr.test/streaming/'
+            'timeshift.php?username=viewer&password=secret&stream=9&utc={utc}'
+            '&duration={duration:60}" catchup-days="5"',
+            content,
+        )
+        self.assertIn(
+            '#EXTINF:-1 tvg-name="Unselected",Unselected\n'
+            "https://dispatcharr.test/live/viewer/secret/10\n",
+            content,
+        )
+        repeated = output.generate_m3u(request, user=user)
+        self.assertEqual(repeated.content, content)
+        self.assertEqual(content.count('catchup-source="'), 2)
+        self.assertEqual(calls["m3u"], 2)
+
+    def test_032_m3u_hook_skips_direct_and_unauthorized_requests(self):
+        output, timeshift, calls = modules()
+        authorization_calls = []
+        callbacks = XCCallbacks(
+            authorize_xc_m3u=lambda request, user: authorization_calls.append(True) or False,
+            m3u_channel_archive_days=lambda user: {"8": 5},
+        )
+        self.assertTrue(install_xc_hooks(
+            output, timeshift, dispatcharr_version="0.32.0", callbacks=callbacks,
+        ).installed)
+        user = {"catchup": True}
+        direct = output.generate_m3u(Request(get={
+            "username": "viewer", "password": "secret", "direct": "true",
+        }), user=user)
+        denied = output.generate_m3u(Request(get={
+            "username": "viewer", "password": "secret",
+        }), user=user)
+
+        self.assertEqual(direct.content, "#EXTM3U\n")
+        self.assertEqual(denied.content, "#EXTM3U\n")
+        self.assertEqual(authorization_calls, [True])
+        self.assertEqual(calls["m3u"], 2)
+
+    def test_031_native_m3u_uses_core_start_query_alias(self):
+        output, timeshift, calls = modules()
+        calls["m3u_content"] = (
+            "#EXTM3U\n#EXTINF:-1,Local\n"
+            "https://dispatcharr.test/live/viewer/secret/8\n"
+        )
+        callbacks = XCCallbacks(
+            authorize_xc_m3u=lambda request, user: True,
+            m3u_channel_archive_days=lambda user: {"8": 3},
+        )
+        self.assertTrue(install_xc_hooks(
+            output, timeshift, dispatcharr_version="0.31.0", callbacks=callbacks,
+        ).installed)
+
+        response = output.generate_m3u(Request(get={
+            "username": "viewer", "password": "secret", "direct": "false",
+        }), user={"catchup": True})
+
+        self.assertIn(
+            'catchup-source="https://dispatcharr.test/streaming/timeshift.php?'
+            'username=viewer&password=secret&stream=8&start={utc}&duration={duration:60}"',
+            response.content,
+        )
+
+    def test_running_programme_availability_receives_full_programme_window(self):
         checked = []
         output, _, calls = self.install(XCCallbacks(
             channel_uuid_for_epg_id=lambda channel_id, user: "channel-8-uuid",
@@ -240,12 +355,26 @@ class XCHookBehaviorTests(unittest.TestCase):
         result = output.xc_get_epg(Request(), {"catchup": True})
         self.assertEqual(result["epg_listings"][0]["has_archive"], 1)
         self.assertEqual(checked[0][0], start)
-        self.assertLessEqual(checked[0][1], datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
-        self.assertLess(checked[0][1], future_end)
+        self.assertEqual(checked[0][1], future_end)
 
     def test_provider_path_is_preserved_when_local_programme_missing(self):
         _, timeshift, calls = self.install(XCCallbacks(playback_available=lambda *args: False))
         response = timeshift._serve_catchup(Request(), {"catchup": True}, Channel(), "2026-01-01:10-00")
+        self.assertEqual(response.content, "provider")
+        self.assertEqual(calls["serve"], 1)
+
+    def test_non_xc_catchup_route_stays_on_core_path(self):
+        _, timeshift, calls = self.install(XCCallbacks(
+            local_playback_supported=lambda *args: False,
+            playback_available=lambda *args: True,
+            authorize_local_playback=lambda *args: True,
+            serve_local_playback=lambda *args: Response("local"),
+        ))
+
+        response = timeshift._serve_catchup(
+            Request(), {"catchup": True}, Channel(), "2026-01-01:10-00",
+        )
+
         self.assertEqual(response.content, "provider")
         self.assertEqual(calls["serve"], 1)
 
