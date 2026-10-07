@@ -82,6 +82,10 @@ duration padding crossing a later archive gap. Local playback must use the
 exact requested minute interval, or the actual EPG end when no valid duration
 is supplied. Provider playback retains Dispatcharr's duration handling. A
 completed-minute fixture in both AIO integration jobs covers this regression.
+Both versions passed that fixture with an explicit duration and with the real
+EPG helper supplying the end. A subsequent Dev XC-first request exposed a
+legacy HLS-session schema that had not yet been migrated; the integration
+fixture now starts from that schema and exercises XC before HLS.
 
 The plugin M3U/XMLTV endpoint and direct XC JSON are the two primary output
 paths. Native `/get.php` playlist annotation is tested separately; its core

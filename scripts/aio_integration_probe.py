@@ -3,6 +3,7 @@
 import inspect
 import os
 import signal
+import sqlite3
 import sys
 import uuid
 from datetime import timedelta
@@ -74,6 +75,12 @@ def probe():
     private_channel = Channel.objects.create(name="Private", channel_number=2, user_level=10)
     closed_channel = Channel.objects.create(name="Closed minute", channel_number=3, user_level=0)
     root = Path("/data/ci-archive")
+    root.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(root / "archive.sqlite3") as database:
+        database.execute("""CREATE TABLE http_playback_sessions (
+            lease_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+            start_utc REAL NOT NULL, end_utc REAL NOT NULL, expires_at REAL NOT NULL
+        )""")
     PluginConfig.objects.create(
         key="catchuparr", name="Catchuparr", enabled=True, ever_enabled=True,
         settings={"channel_uuids": f"{channel.uuid},{closed_channel.uuid}", "archive_root": str(root),
@@ -114,6 +121,22 @@ def probe():
     def request(path, params=None, **headers):
         return factory.get(path, params or {}, HTTP_HOST="localhost", **headers)
 
+    time_key = "utc" if __version__ == "0.32.0" else "start"
+    xc_params = {"username": user.username, "password": xc_password,
+                 "stream": str(channel.id), "duration": "1"}
+    first_xc = timeshift.timeshift_proxy_query(request(
+        "/streaming/timeshift.php",
+        dict(xc_params, stream=str(closed_channel.id),
+             **{time_key: str(int(closed_start.timestamp()))}),
+        HTTP_RANGE="bytes=0-187", HTTP_USER_AGENT="Catchuparr synthetic integration",
+    ))
+    require(first_xc.status_code == 206,
+            f"XC before first HLS request must migrate legacy sessions: {first_xc.status_code}")
+    try:
+        require(b"".join(first_xc.streaming_content) == b"\x47" + bytes([2]) * 187)
+    finally:
+        first_xc.close()
+
     require(views.m3u_view(request("/catchuparr/m3u")).status_code == 401)
     playlist = views.m3u_view(request("/catchuparr/m3u", {"access_token": token}))
     require(playlist.status_code == 200, f"Playlist status {playlist.status_code}")
@@ -141,14 +164,11 @@ def probe():
                                      runtime.load_config())
     require(service.end_session(token, str(channel.uuid), query["lease"]))
 
-    xc_params = {"username": user.username, "password": xc_password,
-                 "stream": str(channel.id), "duration": "1"}
     xc_playlist = output.generate_m3u(request("/get.php", xc_params), user=user)
     require(xc_playlist.status_code == 200)
     xc_text = xc_playlist.content.decode()
     require('catchup="default"' in xc_text)
     require("duration={duration:60}" in xc_text)
-    time_key = "utc" if __version__ == "0.32.0" else "start"
     require(time_key + "={utc}" in xc_text)
 
     def xc_playback(start_epoch, stream_id=channel.id, duration="1"):
