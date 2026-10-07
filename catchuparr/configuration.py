@@ -108,7 +108,8 @@ def compile_draft(
     settings: dict, catalog: SourceCatalog | None = None
 ) -> tuple[dict[str, Any], SourceCatalog, list[dict[str, Any]]]:
     """Validate base fields and compile editable source rules into stable IDs."""
-    parse_settings(settings)
+    parsed_settings = parse_settings(settings)
+    selected_channels = set(parsed_settings.channel_uuids)
     catalog = catalog or source_catalog()
     from .source_rules import compile_source_rules, rank_candidates
 
@@ -123,6 +124,8 @@ def compile_draft(
     encoded: dict[str, dict[str, Any]] = {}
     previews: list[dict[str, Any]] = []
     for channel_uuid, policy in sorted(policies.items()):
+        if channel_uuid not in selected_channels:
+            continue
         # Save only IDs and rule order. Names are refreshed from the current
         # Dispatcharr catalog on the next Apply and never control runtime access.
         account_ids = sorted(str(value) for value in policy.account_ids)
@@ -177,7 +180,6 @@ def apply_configuration(
     active_path: Path | None = None,
 ) -> dict[str, Any]:
     """Compile fully before atomically replacing the active source config."""
-    parse_settings(settings)
     active, _, previews = compile_draft(settings, catalog)
     path = Path(active_path) if active_path is not None else active_settings_path()
     document = {
@@ -185,6 +187,7 @@ def apply_configuration(
         "settings": _applicable_settings(settings),
         "source_policies": active["source_policies"],
     }
+    _validate_active_document(document)
     _atomic_json_replace(path, document)
     return {
         "applied": True,

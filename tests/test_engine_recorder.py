@@ -4,9 +4,9 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from catchuparr.engine import ArchiveStore
 from catchuparr.engine.recorder import (
@@ -129,6 +129,60 @@ class RecorderTests(unittest.TestCase):
 
         self.assertEqual("exited", result.status)
         self.assertEqual(1, result.useful_segments)
+        self.assertEqual(1, len(self.store.segments("ch1")))
+
+    def test_candidate_stop_terminates_ffmpeg_before_indexing_final_segment(self):
+        events = []
+
+        class TerminatedProcess:
+            def __init__(self, command, **_kwargs):
+                self.command = command
+                self.return_code = None
+                self.killed = False
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self):
+                events.append("terminate")
+
+            def wait(self, timeout=None):
+                self.assert_terminated()
+                events.append("wait")
+                output_path = Path(self.command[-1])
+                listing = Path(self.command[self.command.index("-segment_list") + 1])
+                output_path.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                listing.write_text(f"{output_path.name},0,6\n", encoding="utf-8")
+                self.return_code = -15
+                return self.return_code
+
+            def assert_terminated(self):
+                if not events or events[-1] != "terminate":
+                    raise AssertionError("FFmpeg wait happened before SIGTERM")
+
+            def kill(self):
+                self.killed = True
+                events.append("kill")
+
+        recorder = FFmpegCopyRecorder(
+            self.store,
+            "ch1",
+            "http://dispatcharr/catchuparr/recorder/ch1",
+            self.root / "candidate-stop-work",
+            require_media_progress=True,
+        )
+        stop_event = threading.Event()
+        stop_event.set()
+        with patch("catchuparr.engine.recorder.subprocess.Popen", TerminatedProcess):
+            result = recorder.run_candidate(stop_event)
+
+        self.assertEqual("stopped", result.status)
+        self.assertEqual(-15, result.return_code)
+        self.assertEqual(1, result.useful_segments)
+        self.assertEqual(["terminate", "wait"], events)
         self.assertEqual(1, len(self.store.segments("ch1")))
 
     def test_completed_csv_rows_are_indexed_only_after_file_exists(self):

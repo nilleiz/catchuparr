@@ -140,6 +140,40 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(0, result["source_policy_count"])
         self.assertEqual({}, load_active_configuration(self.active_path)["source_policies"])
 
+    def test_real_compiler_limits_wildcard_policies_to_configured_channels(self):
+        settings = dict(self.settings)
+        settings["source_rules"] = '* | mode=include-only | m3u="Provider"'
+
+        preview = validate_configuration(settings, self.catalog)
+        applied = apply_configuration(settings, self.catalog, self.active_path)
+        active = load_active_configuration(self.active_path)
+
+        self.assertEqual([CHANNEL_1], [item["channel_uuid"] for item in preview["channels"]])
+        self.assertEqual(1, applied["source_policy_count"])
+        self.assertEqual({CHANNEL_1}, set(active["source_policies"]))
+
+    def test_invalid_compiled_snapshot_preserves_previous_active_file(self):
+        settings = dict(self.settings)
+        settings["source_rules"] = ""
+        apply_configuration(settings, self.catalog, self.active_path)
+        original = self.active_path.read_bytes()
+        invalid_policy = {
+            "mode": "unchanged",
+            "account_ids": [],
+            "priorities": [],
+            "known_account_ids": ["12"],
+        }
+
+        with patch.object(
+            configuration,
+            "compile_draft",
+            return_value=({"source_policies": {CHANNEL_2: invalid_policy}}, self.catalog, []),
+        ):
+            with self.assertRaisesRegex(ValueError, "channel is not configured"):
+                apply_configuration(settings, self.catalog, self.active_path)
+
+        self.assertEqual(original, self.active_path.read_bytes())
+
     def test_numeric_form_settings_are_canonicalized_in_the_active_snapshot(self):
         settings = dict(self.settings)
         settings.update({
