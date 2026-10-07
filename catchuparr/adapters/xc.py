@@ -323,12 +323,12 @@ def install_xc_hooks(
             logger.exception("Catchuparr local playback authorization failed")
             return _service_unavailable(timeshift_views, "Local catch-up authorization failed")
         if _is_response(authorization):
-            return authorization
+            return finalize_dispatcharr_response(timeshift_views, authorization)
         if authorization is not True:
             return _forbidden(timeshift_views, "Local catch-up access denied")
         try:
             return callbacks.serve_local_playback(
-                request, user, channel, timestamp, client_duration_hint,
+                request, user, channel, timestamp, client_duration_hint
             )
         except Exception:
             logger.exception("Catchuparr local playback failed")
@@ -603,15 +603,36 @@ def _catchup_enabled(module: Any, user: Any) -> bool:
 def _service_unavailable(module: Any, message: str) -> Any:
     response_type = getattr(module, "HttpResponse", None)
     if response_type is not None:
-        return response_type(message, status=503)
+        return finalize_dispatcharr_response(module, response_type(message, status=503))
     return _FallbackResponse(message, 503)
 
 
 def _forbidden(module: Any, message: str) -> Any:
     response_type = getattr(module, "HttpResponseForbidden", None)
     if response_type is not None:
-        return response_type(message)
+        return finalize_dispatcharr_response(module, response_type(message))
     return _FallbackResponse(message, 403)
+
+
+def finalize_dispatcharr_response(module: Any, response: Any) -> Any:
+    """Close request-scoped Django DB connections before returning playback."""
+    if response is None:
+        return None
+    finalizer = getattr(module, "_finalize_timeshift_response", None)
+    if finalizer is None:
+        return response
+    try:
+        finalized = finalizer(response)
+        return finalized if finalized is not None else response
+    except Exception:
+        logger.exception("Dispatcharr could not finalize the local XC response")
+        try:
+            from django.db import close_old_connections
+
+            close_old_connections()
+        except Exception:
+            logger.exception("Could not close Django connections after XC playback")
+        return response
 
 
 class _FallbackResponse:
