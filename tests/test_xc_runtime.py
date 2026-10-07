@@ -13,10 +13,11 @@ from catchuparr.engine.playlist import build_hls_playlist
 from catchuparr.engine.store import ArchiveStore
 from catchuparr.http import ArchiveHTTPService
 from catchuparr.security import TokenStore
-from catchuparr.ts_http import ArchiveTSPlaybackService
+from catchuparr.ts_http import ArchiveTSPlaybackService, StreamingTSHTTPResponse
 from catchuparr.xc_runtime import (
     _active_hls_session_count,
     _make_callbacks,
+    _to_django_response,
     _xc_session_keys,
     active_ts_session_count,
 )
@@ -36,6 +37,33 @@ class _CoverageStore:
 
 
 class XCRuntimeTests(unittest.TestCase):
+    def test_streaming_local_response_runs_core_db_connection_finalizer(self):
+        class FakeStreamingHttpResponse(dict):
+            def __init__(self, streaming_content, *, status):
+                super().__init__()
+                self.streaming_content = streaming_content
+                self.status_code = status
+
+        finalized = []
+        django = types.ModuleType("django")
+        django.__path__ = []
+        django_http = types.ModuleType("django.http")
+        django_http.StreamingHttpResponse = FakeStreamingHttpResponse
+        core = SimpleNamespace(
+            HttpResponse=lambda content, status: SimpleNamespace(content=content, status_code=status),
+            _finalize_timeshift_response=lambda response: finalized.append(response) or response,
+        )
+        value = StreamingTSHTTPResponse(
+            200, {"Content-Length": "1"}, (chunk for chunk in (b"x",)), "lease-id"
+        )
+
+        with patch.dict("sys.modules", {"django": django, "django.http": django_http}):
+            response = _to_django_response(value, core)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Length"], "1")
+        self.assertEqual(finalized, [response])
+
     def test_combined_limit_helpers_count_live_hls_and_ts_sessions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -130,14 +158,21 @@ class XCRuntimeTests(unittest.TestCase):
             META={"HTTP_USER_AGENT": "XC Player"},
         )
         user = SimpleNamespace(id=9)
-        first = _xc_session_keys(request, user)
-        second = _xc_session_keys(request, user)
+        channel = SimpleNamespace(uuid="channel-9")
+        start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
+        first = _xc_session_keys(request, user, channel, start)
+        second = _xc_session_keys(request, user, channel, start)
+        later_programme = _xc_session_keys(
+            request, user, channel, start + timedelta(hours=25)
+        )
 
         self.assertEqual(first, second)
+        self.assertNotEqual(first[0], later_programme[0])
+        self.assertEqual(first[1], later_programme[1])
         self.assertNotIn("sensitive-password", "".join(first))
         self.assertNotIn("viewer", "".join(first))
 
-    def test_native_xc_timestamp_seek_reuses_the_limited_device_session(self):
+    def test_native_xc_programme_switch_reuses_device_but_replaces_bounded_session(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = ArchiveStore(root)
@@ -147,16 +182,18 @@ class XCRuntimeTests(unittest.TestCase):
             first_path.write_bytes(b"a" * 16)
             later_path.write_bytes(b"b" * 16)
             store.add_segment("channel-9", first_path, start, start + timedelta(seconds=6))
+            later_start = start + timedelta(hours=25)
             store.add_segment(
                 "channel-9", later_path,
-                start + timedelta(minutes=20), start + timedelta(minutes=20, seconds=6),
+                later_start, later_start + timedelta(seconds=6),
             )
             user = SimpleNamespace(id=9)
             request = SimpleNamespace(
                 GET={"username": "viewer", "password": "sensitive-password"},
                 META={"HTTP_USER_AGENT": "XC Player"},
             )
-            session_id, device_key = _xc_session_keys(request, user)
+            channel = SimpleNamespace(uuid="channel-9")
+            session_id, device_key = _xc_session_keys(request, user, channel, start)
             service = ArchiveTSPlaybackService(
                 store,
                 authorize_user_channel=lambda *_: True,
@@ -168,24 +205,41 @@ class XCRuntimeTests(unittest.TestCase):
                 "9", "channel-9", start, start + timedelta(seconds=6),
                 session_id=session_id, device_key=device_key, live=True,
             )
-            later_start = start + timedelta(minutes=20)
+            same_programme = service.stream_for_user(
+                "9", "channel-9", start, start + timedelta(seconds=6),
+                session_id=session_id, device_key=device_key, live=True,
+            )
+            later_session_id, later_device_key = _xc_session_keys(
+                request, user, channel, later_start
+            )
             later = service.stream_for_user(
                 "9", "channel-9", later_start, later_start + timedelta(seconds=6),
-                session_id=session_id, device_key=device_key, live=True,
+                session_id=later_session_id, device_key=later_device_key, live=True,
             )
 
             self.assertEqual(first.status, 200)
+            self.assertEqual(same_programme.status, 200)
             self.assertEqual(later.status, 200)
-            self.assertEqual(first.lease_id, later.lease_id)
+            self.assertEqual(first.lease_id, same_programme.lease_id)
+            self.assertNotEqual(first.lease_id, later.lease_id)
+            self.assertEqual(device_key, later_device_key)
+            self.assertEqual(active_ts_session_count(root, "9"), 2)
             first.close()
+            self.assertEqual(active_ts_session_count(root, "9"), 2)
+            same_programme.close()
+            self.assertEqual(active_ts_session_count(root, "9"), 1)
             later.close()
-            service.end_user_session("9", "channel-9", first.lease_id)
+            service.end_user_session("9", "channel-9", later.lease_id)
 
     def test_session_count_helpers_fail_closed_on_unexpected_schema_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with sqlite3.connect(root / "archive.sqlite3") as db:
                 db.execute("CREATE TABLE ts_playback_sessions (wrong_column TEXT)")
+                db.execute(
+                    "CREATE TABLE ts_playback_streams "
+                    "(id TEXT,lease_id TEXT,expires_at REAL)"
+                )
             with self.assertRaises(sqlite3.OperationalError):
                 active_ts_session_count(root, "viewer")
 

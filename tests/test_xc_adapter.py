@@ -428,6 +428,39 @@ class XCHookBehaviorTests(unittest.TestCase):
         self.assertEqual(calls["serve"], 0)
         self.assertEqual(observed, [("channel-8-uuid", None), ("channel-8-uuid", 44)])
 
+    def test_local_playback_responses_run_dispatcharr_connection_finalizer(self):
+        def fail_authorization(*_args):
+            raise RuntimeError("policy down")
+
+        scenarios = ((False, 403), (fail_authorization, 503))
+        for authorization, expected_status in scenarios:
+            with self.subTest(expected_status=expected_status):
+                finalized = []
+                output, timeshift, _ = modules()
+                timeshift._finalize_timeshift_response = (
+                    lambda response: finalized.append(response) or response
+                )
+                self.assertTrue(install_xc_hooks(
+                    output,
+                    timeshift,
+                    dispatcharr_version="0.31.0",
+                    callbacks=XCCallbacks(
+                        playback_available=lambda *args: True,
+                        authorize_local_playback=(
+                            authorization if callable(authorization)
+                            else lambda *args: authorization
+                        ),
+                        serve_local_playback=lambda *args: Response("local"),
+                    ),
+                ).installed)
+
+                response = timeshift._serve_catchup(
+                    Request(), {"catchup": True}, Channel(), "2026-01-01:10-00"
+                )
+
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(finalized, [response])
+
     def test_coverage_and_authorization_errors_fall_back_or_fail_closed(self):
         output, timeshift, calls = self.install(XCCallbacks(
             playback_available=lambda *args: (_ for _ in ()).throw(RuntimeError("index down")),

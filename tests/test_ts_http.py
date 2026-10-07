@@ -176,6 +176,36 @@ class ArchiveTSPlaybackTests(unittest.TestCase):
         )
         self.assertEqual(next_device.status, 200)
 
+    def test_same_device_head_probe_preserves_an_open_live_stream_slot(self):
+        self.add_segment("first.ts", 0, b"a" * 128_000)
+        self.service.allow_new_session = lambda _user, _channel, count: count < 1
+        first = self.service.stream_for_user(
+            "viewer", "news", self.start, self.start + timedelta(seconds=6),
+            session_id="living-room", device_key="f" * 64, live=True,
+        )
+        head = self.service.stream_for_user(
+            "viewer", "news", self.start, self.start + timedelta(seconds=6),
+            session_id="living-room", device_key="f" * 64, method="HEAD", live=True,
+        )
+        second_device = self.service.stream_for_user(
+            "viewer", "news", self.start, self.start + timedelta(seconds=6),
+            session_id="bedroom", device_key="g" * 64, method="HEAD", live=True,
+        )
+
+        self.assertEqual(first.status, 200)
+        self.assertEqual(head.status, 200)
+        self.assertEqual(second_device.status, 403)
+        with sqlite3.connect(self.store.db_path) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM ts_playback_sessions WHERE user_id='viewer' AND active=1"
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM ts_playback_streams WHERE lease_id=?",
+                (first.lease_id,),
+            ).fetchone()[0], 1)
+        first.close()
+        self.service.end_user_session("viewer", "news", first.lease_id)
+
     def test_end_session_for_another_user_keeps_stream_owner_rows(self):
         self.add_segment("first.ts", 0, b"a" * 128_000)
         response = self.service.stream_for_user(

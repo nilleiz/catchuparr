@@ -600,9 +600,11 @@ class ArchiveTSPlaybackService:
                     continue
 
                 active_sessions = int(db.execute(
-                    "SELECT COUNT(*) FROM ts_playback_sessions WHERE user_id=? AND active=1 "
-                    "AND device_key<>? AND expires_at>?",
-                    (user_id, device_key, now),
+                    "SELECT COUNT(*) FROM ts_playback_sessions s WHERE s.user_id=? "
+                    "AND s.device_key<>? AND s.expires_at>? AND (s.active=1 OR EXISTS ("
+                    "SELECT 1 FROM ts_playback_streams st WHERE st.lease_id=s.lease_id "
+                    "AND st.expires_at>?))",
+                    (user_id, device_key, now, now),
                 ).fetchone()[0])
                 pending_sessions = int(db.execute(
                     "SELECT COUNT(*) FROM ts_playback_admissions WHERE user_id=? "
@@ -763,14 +765,14 @@ class ArchiveTSPlaybackService:
                     "DELETE FROM ts_playback_streams WHERE id=? AND lease_id=?",
                     (stream_id, lease_id),
                 )
-            if not retain_live_session:
-                db.execute(
-                    "UPDATE ts_playback_sessions SET active=0 WHERE lease_id=?", (lease_id,)
-                )
             active_streams = int(db.execute(
                 "SELECT COUNT(*) FROM ts_playback_streams WHERE lease_id=? AND expires_at>?",
                 (lease_id, self.clock()),
             ).fetchone()[0])
+            if not retain_live_session and active_streams == 0:
+                db.execute(
+                    "UPDATE ts_playback_sessions SET active=0 WHERE lease_id=?", (lease_id,)
+                )
             active_session = db.execute(
                 "SELECT active FROM ts_playback_sessions WHERE lease_id=?", (lease_id,)
             ).fetchone()

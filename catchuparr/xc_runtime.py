@@ -15,7 +15,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
-from .adapters.xc import XCCallbacks, install_xc_hooks, uninstall_xc_hooks
+from .adapters.xc import (
+    XCCallbacks,
+    finalize_dispatcharr_response,
+    install_xc_hooks,
+    uninstall_xc_hooks,
+)
 from .compatibility import is_supported_dispatcharr_version
 
 logger = logging.getLogger(__name__)
@@ -72,37 +77,46 @@ def _active_session_count(
     total = 0
     with closing(sqlite3.connect(database, timeout=5)) as db:
         db.execute("PRAGMA busy_timeout=5000")
-        try:
-            if table_prefix == "http":
-                total += int(db.execute(
-                    "SELECT COUNT(*) FROM http_playback_sessions WHERE user_id=? "
-                    "AND expires_at>? AND grace_until IS NULL",
-                    (str(user_id), now),
-                ).fetchone()[0])
-            else:
-                sql = (
-                    "SELECT COUNT(*) FROM ts_playback_sessions WHERE user_id=? "
-                    "AND expires_at>? AND active=1"
-                )
-                params: tuple = (str(user_id), now)
-                if exclude_device_key is not None:
-                    sql += " AND device_key<>?"
-                    params += (exclude_device_key,)
-                total += int(db.execute(sql, params).fetchone()[0])
-        except sqlite3.OperationalError as error:
-            if "no such table" not in str(error).lower():
-                raise
+        tables = {
+            row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if table_prefix == "http":
+            if "http_playback_sessions" not in tables:
+                return 0
+            total += int(db.execute(
+                "SELECT COUNT(*) FROM http_playback_sessions WHERE user_id=? "
+                "AND expires_at>? AND grace_until IS NULL",
+                (str(user_id), now),
+            ).fetchone()[0])
+        else:
+            ts_tables = {
+                "ts_playback_sessions", "ts_playback_streams", "ts_playback_admissions"
+            }
+            present = tables.intersection(ts_tables)
+            if not present:
+                return 0
+            if present != ts_tables:
+                raise sqlite3.OperationalError("incomplete TS playback session schema")
+            sql = (
+                "SELECT COUNT(*) FROM ts_playback_sessions s WHERE s.user_id=? "
+                "AND s.expires_at>? AND (s.active=1 OR EXISTS ("
+                "SELECT 1 FROM ts_playback_streams st WHERE st.lease_id=s.lease_id "
+                "AND st.expires_at>?))"
+            )
+            params: tuple = (str(user_id), now, now)
+            if exclude_device_key is not None:
+                sql += " AND s.device_key<>?"
+                params += (exclude_device_key,)
+            total += int(db.execute(sql, params).fetchone()[0])
         if table_prefix == "ts":
             sql = "SELECT COUNT(*) FROM ts_playback_admissions WHERE user_id=? AND expires_at>?"
             params = (str(user_id), now)
             if exclude_device_key is not None:
                 sql += " AND device_key<>?"
                 params += (exclude_device_key,)
-            try:
-                total += int(db.execute(sql, params).fetchone()[0])
-            except sqlite3.OperationalError as error:
-                if "no such table" not in str(error).lower():
-                    raise
+            total += int(db.execute(sql, params).fetchone()[0])
     return total
 
 
@@ -267,7 +281,7 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
             return _service_unavailable(timeshift_views)
 
         service = _ts_service(config.archive_root, timeshift_views)
-        session_id, device_key = _xc_session_keys(request, user)
+        session_id, device_key = _xc_session_keys(request, user, channel, start)
         value = service.stream_for_user(
             user.id,
             str(channel.uuid),
@@ -472,7 +486,7 @@ def _latest_edge(store, channel_uuid):
         return None
 
 
-def _xc_session_keys(request, user):
+def _xc_session_keys(request, user, channel, start):
     query = getattr(request, "GET", {})
     provided = str(query.get("session_id") or "")
     user_agent = str(getattr(request, "META", {}).get("HTTP_USER_AGENT", ""))
@@ -481,12 +495,10 @@ def _xc_session_keys(request, user):
     fingerprint = hashlib.sha256(
         f"{user.id}\0{username}\0{password}\0{user_agent}".encode("utf-8")
     ).hexdigest()
-    if provided:
-        request_identity = hashlib.sha256(
-            f"xc-session\0{user.id}\0{provided}".encode("utf-8")
-        ).hexdigest()
-    else:
-        request_identity = fingerprint
+    start_epoch = int(start.timestamp())
+    channel_identity = str(getattr(channel, "uuid", getattr(channel, "id", "")))
+    session_material = f"xc-session\0{user.id}\0{fingerprint}\0{provided}\0{channel_identity}\0{start_epoch}"
+    request_identity = hashlib.sha256(session_material.encode("utf-8")).hexdigest()
     session_id = "xc-" + request_identity
     device_key = hashlib.sha256(f"xc-device\0{user.id}\0{fingerprint}".encode("ascii")).hexdigest()
     return session_id, device_key
@@ -582,7 +594,10 @@ def _dispatcharr_limit_allows(user, plugin_sessions: int) -> bool:
 def _service_unavailable(timeshift_views):
     response_type = getattr(timeshift_views, "HttpResponse", None)
     if response_type is not None:
-        return response_type("Local archive temporarily unavailable", status=503)
+        return finalize_dispatcharr_response(
+            timeshift_views,
+            response_type("Local archive temporarily unavailable", status=503),
+        )
     return None
 
 
@@ -590,7 +605,8 @@ def _to_django_response(value, timeshift_views):
     if value is None:
         return _service_unavailable(timeshift_views)
     if isinstance(value, (bytes, bytearray)):
-        return timeshift_views.HttpResponse(bytes(value), status=200)
+        response = timeshift_views.HttpResponse(bytes(value), status=200)
+        return finalize_dispatcharr_response(timeshift_views, response)
     from .ts_http import StreamingTSHTTPResponse
 
     if isinstance(value, StreamingTSHTTPResponse):
@@ -601,4 +617,4 @@ def _to_django_response(value, timeshift_views):
         response = timeshift_views.HttpResponse(value.body, status=value.status)
     for name, header in value.headers.items():
         response[name] = header
-    return response
+    return finalize_dispatcharr_response(timeshift_views, response)
