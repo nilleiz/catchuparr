@@ -13,6 +13,7 @@ DIST = ROOT / "dist"
 REQUIRED_MODULES = (
     "__init__.py",
     "plugin.py",
+    "compatibility.py",
     "runtime.py",
     "tasks.py",
     "views.py",
