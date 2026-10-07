@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install lint tool
+        run: python -m pip install 'ruff==0.13.3'
+      - name: Lint
+        run: ruff check .
+      - name: Compile
+        run: python -m compileall -q catchuparr scripts tests
+      - name: Unit and synthetic-stream tests
+        run: python -m unittest discover -s tests -v
+      - name: Build importable plugin
+        run: python scripts/build_plugin.py
+      - name: Check package layout
+        run: python -m unittest tests.test_package -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catchuparr-plugin
+          path: dist/catchuparr-*.zip
+          if-no-files-found: error
