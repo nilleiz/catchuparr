@@ -1,5 +1,10 @@
 # Validation status
 
+The M3U/XMLTV + HLS milestone is complete for 0.1.4 on Shield TV with TiviMate
+5.3.3 and Dispatcharr 0.32.0. See the completed milestone below for current
+evidence and limitations. Earlier sections preserve the validation history;
+XC player validation remains open.
+
 ## Automated checks
 
 Run `python3 -m unittest discover -s tests -q`,
@@ -118,14 +123,15 @@ selecting each of several programmes started the *following* programme. The
 sampled archive frames matched their indexed UTC times, so a one-programme
 index shift was not found. Tail segment reads may be player prefetches;
 allowing them to extend the HLS session into the next programme is therefore
-unsafe. Version 0.1.3 confines each session to the chosen programme and will
-be checked on Shield before release. Automatic continuation across programme
-boundaries remains disabled. The fixed 60-second target remains because FFmpeg
+unsafe. Version 0.1.3 confined each session to the chosen programme and was
+scheduled for a Shield test before release. Server-side continuation across
+programme boundaries was disabled. The fixed 60-second target remains because FFmpeg
 can emit a 16-second segment when the next keyframe is delayed. TiviMate must
-still confirm that start-over and seeks land within two segments. A separate
-mechanism and player test are needed for automatic cross-programme playback.
+still confirm that start-over and seeks land within two segments. At that stage,
+automatic cross-programme playback required a separate player test.
 
-For the next Shield test, use the unchanged private M3U/XMLTV URLs and refresh
+The planned Shield acceptance checklist was to use the unchanged private
+M3U/XMLTV URLs and refresh
 both exports. Choose programmes whose full start is still inside the available
 archive. Start three programmes in chronological order, note the first visible
 content, then repeat the same starts. For one programme, seek forwards and
@@ -134,7 +140,7 @@ visible time; an error greater than two archived segments fails acceptance.
 The server trace must show HTTP 200 for the requested programme and segments
 within that programme. A 404 indicates unavailable material and must not be
 counted as a successful start-over. Test automatic continuation separately
-after its replacement mechanism is implemented.
+using the client's actual behaviour. The completed test results follow below.
 
 PR #7 passed all three CI jobs and disposable AIO probes on both supported
 versions, and was merged. Isolated Dev 0.32.0 loaded 0.1.3; authenticated M3U,
@@ -150,4 +156,36 @@ the lower token. A safe counter-floor recovery resumed indexing; version 0.1.4
 wires the durable fence into task acquisition and releases leases on setup
 failure. The AIO web launcher also strips custom environment variables, so a
 private trace marker is required to enable sanitized web diagnostics there.
-Shield validation is still pending.
+At that point, Shield validation was still pending. The completed test follows.
+
+## M3U/HLS milestone completed: 0.1.4 (2026-10-07)
+
+On the isolated Dispatcharr 0.32.0 AIO, the user confirmed on Shield TV with
+TiviMate 5.3.3 that start-over, forward/backward seeking, pause and resume work
+as expected. No constant drift between EPG start and visible programme start
+was observed. Tagesthemen continued into Maischberger without manual input or
+a large interruption.
+
+The sanitized test trace contains 50 archive requests, all HTTP 200. No
+returned playlist extends past its EPG programme end. The first archived segment
+starts at most 5.534 seconds before the requested UTC instant. This is server
+segment alignment evidence, not an exact measurement of the displayed frame.
+The user's playback result is qualitative; the two-segment image tolerance
+was not measured with an instrumented player.
+
+At two boundaries, the server recorded a new archive request and session for
+the next programme. One request near 22:49:45 local time ended at 22:50:00;
+the subsequent request began at 22:50:03. Another boundary moved from a
+programme ending at 21:45:00 to a new request at 21:45:03. Together with the
+user's confirmation, this supports client-managed automatic continuation.
+The old EVENT playlist remains programme-bounded; tail prefetch does not
+extend it. Automatic continuation in other clients is unverified.
+
+Version 0.1.4 passed 157 local tests, Ruff, compileall, package build, independent
+review and all three CI checks, including actual pinned 0.31.0 and 0.32.0 AIOs.
+The real Dev recorder resumed after an AIO restart without manual fence repair.
+Authenticated M3U/XMLTV/HLS requests returned 200, a partial segment Range
+returned 206, anonymous access returned 401, and sanitized traces were observed.
+The M3U/XMLTV HLS milestone is complete. XC requires a separate Shield test;
+extended retention/rollback player tests and exact frame-time measurements
+remain future validation work. The production stack was not updated.
