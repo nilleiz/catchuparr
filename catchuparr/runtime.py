@@ -7,13 +7,19 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .compatibility import (
+    SUPPORTED_DISPATCHARR_VERSION as SUPPORTED_DISPATCHARR_VERSION,
+)
+from .compatibility import (
+    is_supported_dispatcharr_version,
+)
+
 logger = logging.getLogger(__name__)
 PLUGIN_KEY = "catchuparr"
 RECONCILE_TASK = "catchuparr.reconcile"
 RECONCILE_SCHEDULE = "catchuparr-recorder-reconcile"
 SNAPSHOT_TASK = "catchuparr.snapshot_epg"
 SNAPSHOT_SCHEDULE = "catchuparr-epg-snapshot"
-SUPPORTED_DISPATCHARR_VERSION = "0.31.0"
 
 
 @dataclass(frozen=True)
@@ -60,7 +66,7 @@ def require_supported_version() -> None:
         from version import __version__ as dispatcharr_version
     except ImportError as exc:
         raise RuntimeError("Catchuparr requires Dispatcharr") from exc
-    if dispatcharr_version != SUPPORTED_DISPATCHARR_VERSION:
+    if not is_supported_dispatcharr_version(dispatcharr_version):
         raise RuntimeError(f"Unsupported Dispatcharr version: {dispatcharr_version}")
 
 
@@ -141,14 +147,46 @@ def status(settings: dict) -> dict:
 
     config = parse_settings(settings)
     store = ArchiveStore(config.archive_root)
+    try:
+        from apps.channels.models import Channel
+
+        names = {
+            str(uuid): name
+            for uuid, name in Channel.objects.filter(uuid__in=config.channel_uuids).values_list(
+                "uuid", "name"
+            )
+        }
+    except Exception:
+        names = {}
+    try:
+        from core.utils import RedisClient
+
+        redis = RedisClient.get_client()
+        redis.ping()
+    except Exception:
+        redis = None
+    channels = []
+    for channel in config.channel_uuids:
+        stats = store.channel_stats(channel)
+        if redis is None:
+            recorder_running = None
+        else:
+            try:
+                recorder_running = bool(redis.exists(f"catchuparr:recorder:{channel}"))
+            except Exception:
+                recorder_running = None
+        channels.append({
+            "uuid": channel,
+            "name": names.get(channel),
+            **stats,
+            "recorder_running": recorder_running,
+        })
     return {
-        "channels": [
-            {"uuid": channel, "segments": len(store.segments(channel))}
-            for channel in config.channel_uuids
-        ],
+        "channels": channels,
         "archive_root": str(config.archive_root),
         "retention_hours": config.retention_hours,
         "max_storage_bytes": config.max_storage_bytes,
+        "indexed_storage_bytes": store.indexed_size_bytes(),
     }
 
 
