@@ -73,11 +73,18 @@ def modules():
 
 
 class XCHookInstallTests(unittest.TestCase):
-    def test_rejects_unsupported_version_without_mutating_modules(self):
+    def test_version_matrix_accepts_inspected_releases_and_rejects_unknown(self):
+        for version in ("0.31.0", "0.32.0"):
+            with self.subTest(version=version):
+                output, timeshift, _ = modules()
+                result = install_xc_hooks(
+                    output, timeshift, dispatcharr_version=version, callbacks=XCCallbacks(),
+                )
+                self.assertTrue(result.installed)
         output, timeshift, _ = modules()
         original = output._xc_channel_entry
         result = install_xc_hooks(
-            output, timeshift, dispatcharr_version="0.32.0", callbacks=XCCallbacks(),
+            output, timeshift, dispatcharr_version="0.33.0", callbacks=XCCallbacks(),
         )
         self.assertFalse(result.installed)
         self.assertIs(output._xc_channel_entry, original)
@@ -143,6 +150,25 @@ class XCHookBehaviorTests(unittest.TestCase):
         self.assertEqual(calls["epg"], 1)
         result = output.xc_get_epg(Request(), {"catchup": False})
         self.assertEqual(result["epg_listings"][0]["has_archive"], 0)
+
+    def test_epg_annotation_does_not_mutate_core_cached_result(self):
+        output, _, calls = self.install(XCCallbacks(
+            channel_uuid_for_epg_id=lambda channel_id, user: "channel-8-uuid",
+            program_available=lambda *args: True,
+        ))
+        cached_listing = {
+            "start": "2026-01-01 10:00:00",
+            "end": "2026-01-01 11:00:00",
+            "has_archive": 0,
+            "provider_metadata": {"category": "radio"},
+        }
+        calls["programmes"] = [cached_listing]
+        result = output.xc_get_epg(Request(), {"catchup": True})
+        self.assertEqual(cached_listing["has_archive"], 0)
+        self.assertEqual(result["epg_listings"][0]["has_archive"], 1)
+        self.assertIsNot(result["epg_listings"], calls["programmes"])
+        self.assertIsNot(result["epg_listings"][0], cached_listing)
+        self.assertEqual(result["epg_listings"][0]["provider_metadata"], {"category": "radio"})
 
     def test_epg_requests_local_lookback_on_a_copy_and_preserves_larger_setting(self):
         output, _, calls = self.install(XCCallbacks(

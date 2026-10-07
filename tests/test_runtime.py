@@ -1,10 +1,13 @@
+import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from catchuparr.engine.store import ArchiveStore
-from catchuparr.runtime import status
+from catchuparr.runtime import require_supported_version, status
 
 
 class RuntimeStatusTests(unittest.TestCase):
@@ -27,6 +30,18 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(1, result["channels"][0]["segments"])
         self.assertEqual(len(b"transport stream"), result["indexed_storage_bytes"])
         self.assertIn("recorder_running", result["channels"][0])
+
+    def test_runtime_version_matrix(self):
+        for version in ("0.31.0", "0.32.0"):
+            with self.subTest(version=version), patch.dict(
+                sys.modules, {"version": types.SimpleNamespace(__version__=version)}
+            ):
+                require_supported_version()
+        with patch.dict(
+            sys.modules, {"version": types.SimpleNamespace(__version__="0.33.0")}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unsupported Dispatcharr version: 0.33.0"):
+                require_supported_version()
 
 
 if __name__ == "__main__":
