@@ -26,7 +26,11 @@ def run():
         while True:
             ready = subprocess.run(
                 ["docker", "exec", name, "/dispatcharrpy/bin/python", "-c",
-                 "import socket; socket.create_connection(('127.0.0.1',9191),2).close()"],
+                 "import os,runpy,socket,sys; from pathlib import Path; "
+                 "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
+                 "sys.argv=['manage.py','migrate','--check']; "
+                 "runpy.run_path('/app/manage.py',run_name='__main__'); "
+                 "socket.create_connection(('127.0.0.1',9191),2).close()"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             if ready.returncode == 0:
