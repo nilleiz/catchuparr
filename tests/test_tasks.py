@@ -98,6 +98,104 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertNotIn("catchuparr:recorder:channel-1", redis.values)
             self.assertEqual(ArchiveStore(archive_root).recorder_fence("channel-1"), 26)
 
+    def test_override_capacity_or_start_failure_falls_through_ranked_sources(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive_root = Path(temp) / "archive"
+            redis = FakeRedis()
+            config = SimpleNamespace(channel_uuids=("channel-1",), archive_root=archive_root)
+            active = {"channel_uuids": "channel-1", "source_policies": {}}
+            attempts = []
+            stopped = []
+            source_candidates = [
+                {"id": "44", "account_id": "12"},
+                {"id": "45", "account_id": "13"},
+                {"id": "46", "account_id": "14"},
+            ]
+
+            class Attempt:
+                def __init__(self, candidate):
+                    self.worker_id = "catchuparr-r" + candidate["id"].zfill(40)
+                    self.stream_id = candidate["id"]
+                    self.input_url = "http://dispatcharr/catchuparr/recorder/channel-1"
+                    self.input_headers = {"X-Catchuparr-Recorder": "signed-capability"}
+                    self.revoked = False
+
+                def renew(self, redis_client):
+                    return True
+
+                def revoke(self, redis_client):
+                    self.revoked = True
+
+            class FakeRecorder:
+                outcomes = [
+                    RuntimeError("input startup failed"),
+                    SimpleNamespace(status="no_media", useful_segments=0, return_code=1),
+                    SimpleNamespace(status="stopped", useful_segments=0, return_code=-15),
+                ]
+
+                def __init__(self, _store, _channel, input_url, _work, **kwargs):
+                    self.input_url = input_url
+                    self.headers = kwargs["input_headers"]
+
+                def run_candidate(self, _stop_event, **_kwargs):
+                    outcome = self.outcomes.pop(0)
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+            celery = _fake_module(
+                "celery",
+                shared_task=lambda *, name: lambda function: function,
+            )
+            apps = _fake_module("apps")
+            apps_channels = _fake_module("apps.channels")
+            apps_channels_tasks = _fake_module(
+                "apps.channels.tasks",
+                get_dvr_stream_base_url=lambda: "http://dispatcharr",
+            )
+            core = _fake_module("core")
+            core_utils = _fake_module(
+                "core.utils",
+                RedisClient=SimpleNamespace(get_client=lambda: redis),
+            )
+            fake_modules = {
+                "celery": celery,
+                "apps": apps,
+                "apps.channels": apps_channels,
+                "apps.channels.tasks": apps_channels_tasks,
+                "core": core,
+                "core.utils": core_utils,
+            }
+            with patch.dict(sys.modules, fake_modules):
+                sys.modules.pop("catchuparr.tasks", None)
+                tasks = importlib.import_module("catchuparr.tasks")
+                with (
+                    patch("catchuparr.runtime.require_supported_version"),
+                    patch("catchuparr.runtime.load_config", return_value=config),
+                    patch("catchuparr.configuration.load_active_configuration", return_value=active),
+                    patch("catchuparr.recorder_proxy.ranked_source_candidates", return_value=source_candidates),
+                    patch(
+                        "catchuparr.recorder_proxy.issue_recorder_attempt",
+                        side_effect=lambda _redis, _lease, **kwargs: (
+                            attempts.append(Attempt(kwargs["candidate"])) or attempts[-1]
+                        ),
+                    ),
+                    patch(
+                        "catchuparr.recorder_proxy.stop_recorder_attempt",
+                        side_effect=lambda *_args: (stopped.append(True) or True),
+                    ),
+                    patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
+                    patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
+                    patch("catchuparr.engine.recorder.FFmpegCopyRecorder", FakeRecorder),
+                ):
+                    result = tasks.record_channel("channel-1")
+
+            self.assertEqual("stopped", result["status"])
+            self.assertEqual(["44", "45", "46"], [attempt.stream_id for attempt in attempts])
+            self.assertTrue(all(attempt.revoked for attempt in attempts))
+            self.assertEqual(3, len(stopped))
+            self.assertTrue(all(attempt.input_url.endswith("/catchuparr/recorder/channel-1") for attempt in attempts))
+
 
 if __name__ == "__main__":
     unittest.main()
