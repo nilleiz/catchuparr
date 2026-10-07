@@ -59,7 +59,18 @@ seconds-based URL template. Separate disposable AIOs passed synthetic HLS,
 authorization and Range checks for both 0.31.0 and 0.32.0. Native XC probes also
 exercise minute-based duration, integer UTC epoch values, timestamp seeks,
 channel permissions, invalid credentials and the user catch-up switch. Their
-results must be recorded after the final XC integration passes.
+checks passed in both pinned AIO images on the final implementation. Each AIO
+also passed 21 archive/playlist/recorder tests using its bundled FFmpeg, including
+two audio tracks and an unsupported private data PID. The final combined suite
+passed 131 tests, Ruff, compileall and package build. An independent review
+reproduced and verified session reuse, a 48-hour programme switch, HEAD requests
+during an open stream and second-device rejection under a one-stream limit.
+
+The final Dev package loaded all four guarded XC hooks. Authenticated playlist
+access remained successful, and the selected recorder continued indexing new
+segments after the final restart. The original bootstrap, HLS integration and
+compatibility PRs were merged only after review and green checks. The final XC
+and AIO-CI PR requires both image integration jobs and the package job to pass.
 
 The user will repeat the Shield/TiviMate tests later. The earlier successful
 0.31.0 player results do not establish 0.32.0 or XC player compatibility. A
