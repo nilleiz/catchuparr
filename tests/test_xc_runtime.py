@@ -13,9 +13,14 @@ from catchuparr.engine.playlist import build_hls_playlist
 from catchuparr.engine.store import ArchiveStore
 from catchuparr.http import ArchiveHTTPService
 from catchuparr.security import TokenStore
-from catchuparr.ts_http import ArchiveTSPlaybackService, StreamingTSHTTPResponse
+from catchuparr.ts_http import (
+    ArchiveTSPlaybackService,
+    StreamingTSHTTPResponse,
+    TSHTTPResponse,
+)
 from catchuparr.xc_runtime import (
     _active_hls_session_count,
+    _local_playback_window,
     _make_callbacks,
     _to_django_response,
     _xc_session_keys,
@@ -34,6 +39,13 @@ class _CoverageStore:
     def coverage(self, channel_uuid, start, end):
         self.covered_end = end
         return SimpleNamespace(complete=True)
+
+
+class _FakeResponse(dict):
+    def __init__(self, content=b"", status=200):
+        super().__init__()
+        self.content = content
+        self.status_code = status
 
 
 class XCRuntimeTests(unittest.TestCase):
@@ -125,7 +137,7 @@ class XCRuntimeTests(unittest.TestCase):
 
         self.assertEqual(store.covered_end, edge)
 
-    def test_current_xc_playback_uses_core_duration_and_committed_edge(self):
+    def test_current_xc_playback_clips_exact_window_to_committed_edge(self):
         now = datetime.now(timezone.utc)
         start = now - timedelta(minutes=20)
         edge = now - timedelta(seconds=5)
@@ -134,7 +146,6 @@ class XCRuntimeTests(unittest.TestCase):
         channel = SimpleNamespace(uuid=channel_uuid)
         timeshift_views = SimpleNamespace(
             parse_catchup_timestamp=lambda value: start.replace(tzinfo=None),
-            resolve_catchup_duration=lambda channel, value, client_hint=None: 65,
         )
         callbacks = _make_callbacks(SimpleNamespace(), timeshift_views)
         config = SimpleNamespace(channel_uuids=(channel_uuid,), archive_root=Path("/tmp/archive"))
@@ -151,6 +162,136 @@ class XCRuntimeTests(unittest.TestCase):
             ))
 
         self.assertEqual(store.covered_end, edge)
+
+    def test_xc_one_minute_local_window_does_not_include_provider_padding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ArchiveStore(root)
+            start = datetime.now(timezone.utc) - timedelta(days=1)
+            segment_path = root / "one-minute.ts"
+            segment_path.write_bytes(b"one minute of archived transport stream")
+            store.add_segment(
+                "channel-9", segment_path, start, start + timedelta(minutes=1)
+            )
+            channel = SimpleNamespace(uuid="channel-9")
+            timeshift_views = SimpleNamespace(
+                parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
+                resolve_catchup_duration=lambda *_args, **_kwargs: 6,
+                HttpResponse=lambda content, status=200: _FakeResponse(content, status),
+            )
+            callbacks = _make_callbacks(SimpleNamespace(), timeshift_views)
+            config = SimpleNamespace(
+                channel_uuids=("channel-9",), archive_root=root
+            )
+            user = SimpleNamespace(id=9)
+            request = SimpleNamespace(GET={}, META={}, method="GET")
+
+            class RecordingService:
+                def __init__(self):
+                    self.window = None
+
+                def stream_for_user(self, _user_id, _channel_uuid, window_start, window_end, **_kwargs):
+                    self.window = (window_start, window_end)
+                    return TSHTTPResponse(200, {"Content-Length": "1"}, b"x")
+
+            service = RecordingService()
+            with (
+                patch("catchuparr.xc_runtime._load_config", return_value=config),
+                patch("catchuparr.xc_runtime._catchup_enabled", return_value=True),
+                patch("catchuparr.xc_runtime._channel_by_uuid", return_value=channel),
+                patch("catchuparr.xc_runtime._channel_policy_allows", return_value=True),
+                patch("catchuparr.xc_runtime._archive_store", return_value=store),
+                patch("catchuparr.xc_runtime._ts_service", return_value=service),
+            ):
+                self.assertTrue(callbacks.playback_available(
+                    "channel-9", "timestamp", "1", user
+                ))
+                response = callbacks.serve_local_playback(
+                    request, user, channel, "timestamp", "1"
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(service.window[0], start)
+        self.assertEqual(service.window[1], start + timedelta(seconds=60))
+
+    def test_xc_missing_duration_uses_exact_epg_end_without_provider_padding(self):
+        programme_start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
+        start = programme_start + timedelta(minutes=15)
+        expected_end = programme_start + timedelta(minutes=60)
+        timeshift_views = SimpleNamespace(
+            parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
+        )
+        helpers = types.ModuleType("apps.timeshift.helpers")
+        helpers.MAX_DURATION_MINUTES = 480
+        helpers.get_programme_info = lambda *_args: {
+                "start_time": programme_start.isoformat(),
+                "end_time": expected_end.isoformat(),
+                "duration_secs": 3600,
+            }
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        apps_timeshift = types.ModuleType("apps.timeshift")
+        apps_timeshift.__path__ = []
+        with patch.dict("sys.modules", {
+            "apps": apps,
+            "apps.timeshift": apps_timeshift,
+            "apps.timeshift.helpers": helpers,
+        }):
+            self.assertEqual(
+                _local_playback_window(timeshift_views, object(), "timestamp", None),
+                (start, expected_end),
+            )
+
+    def test_xc_missing_duration_without_trustworthy_epg_end_is_not_local(self):
+        start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
+        timeshift_views = SimpleNamespace(
+            parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
+        )
+        helpers = types.ModuleType("apps.timeshift.helpers")
+        helpers.MAX_DURATION_MINUTES = 480
+        helpers.get_programme_info = lambda *_args: None
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        apps_timeshift = types.ModuleType("apps.timeshift")
+        apps_timeshift.__path__ = []
+        with patch.dict("sys.modules", {
+            "apps": apps,
+            "apps.timeshift": apps_timeshift,
+            "apps.timeshift.helpers": helpers,
+        }):
+            self.assertIsNone(
+                _local_playback_window(timeshift_views, object(), "timestamp", None)
+            )
+
+    def test_xc_gap_inside_requested_minute_keeps_provider_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ArchiveStore(root)
+            start = datetime.now(timezone.utc) - timedelta(days=1)
+            segment_path = root / "half-minute.ts"
+            segment_path.write_bytes(b"half a minute")
+            store.add_segment(
+                "channel-9", segment_path, start, start + timedelta(seconds=30)
+            )
+            channel = SimpleNamespace(uuid="channel-9")
+            timeshift_views = SimpleNamespace(
+                parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
+            )
+            callbacks = _make_callbacks(SimpleNamespace(), timeshift_views)
+            config = SimpleNamespace(
+                channel_uuids=("channel-9",), archive_root=root
+            )
+
+            with (
+                patch("catchuparr.xc_runtime._load_config", return_value=config),
+                patch("catchuparr.xc_runtime._catchup_enabled", return_value=True),
+                patch("catchuparr.xc_runtime._channel_by_uuid", return_value=channel),
+                patch("catchuparr.xc_runtime._channel_policy_allows", return_value=True),
+                patch("catchuparr.xc_runtime._archive_store", return_value=store),
+            ):
+                self.assertFalse(callbacks.playback_available(
+                    "channel-9", "timestamp", "1", SimpleNamespace()
+                ))
 
     def test_xc_session_keys_are_stable_and_do_not_contain_credentials(self):
         request = SimpleNamespace(
