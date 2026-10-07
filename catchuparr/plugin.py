@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class Plugin:
     name = "Catchuparr"
-    version = "0.1.3"
+    version = "0.1.4"
     description = "Local rolling catch-up archive and start-over"
     author = "nilleiz"
     help_url = "https://github.com/nilleiz/catchuparr"
