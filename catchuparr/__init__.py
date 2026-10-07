@@ -1,0 +1,1 @@
+"""Catchuparr Dispatcharr plugin package."""
