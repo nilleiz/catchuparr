@@ -6,6 +6,23 @@ on:
   pull_request:
 
 jobs:
+  aio-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['0.31.0', '0.32.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Synthetic playback in actual Dispatcharr AIO
+        run: python scripts/run_aio_integration.py --image ghcr.io/dispatcharr/dispatcharr:${{ matrix.version }}
+
   test-and-package:
     runs-on: ubuntu-latest
     permissions:

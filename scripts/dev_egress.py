@@ -147,7 +147,11 @@ def remove(subnet: str) -> None:
     if installed is None:
         raise RuntimeError("Unable to inspect DOCKER-USER chain")
     expected = _dev_jump(subnet)
-    if any(("-j" in rule and rule[rule.index("-j") + 1] == CHAIN) and rule != expected for rule in installed):
+    if any(
+        (("-j" in rule and rule[rule.index("-j") + 1] == CHAIN)
+         or ("-g" in rule and rule[rule.index("-g") + 1] == CHAIN))
+        and rule != expected for rule in installed
+    ):
         raise RuntimeError("Unexpected Dev egress jump in DOCKER-USER chain")
     for rule in installed:
         if rule == expected:

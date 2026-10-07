@@ -90,6 +90,20 @@ class EgressRulesTests(unittest.TestCase):
 
 
 class InstalledRulesTests(unittest.TestCase):
+    def test_remove_rejects_unexpected_goto_before_mutating_firewall(self):
+        installed = [
+            ["-s", "192.0.2.0/24", "-j", dev_egress.CHAIN],
+            ["-s", "198.51.100.0/24", "-g", dev_egress.CHAIN],
+        ]
+        with (
+            patch.object(dev_egress, "assert_network"),
+            patch.object(dev_egress, "chain_rules", return_value=installed),
+            patch.object(dev_egress, "command") as command,
+            self.assertRaisesRegex(RuntimeError, "Unexpected Dev egress jump"),
+        ):
+            dev_egress.remove("192.0.2.0/24")
+        command.assert_not_called()
+
     def test_installed_deny_all_rules_normalize_conntrack_and_default_reject(self):
         output = """-N CATCHUPARR_DEV_EGRESS
 -A CATCHUPARR_DEV_EGRESS -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
