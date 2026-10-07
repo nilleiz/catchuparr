@@ -21,8 +21,10 @@ The inspected compatibility targets are Dispatcharr v0.31.0 and v0.32.0. Unknown
 
 Create a separate archive access token for each playback device. Session identity is scoped to the credential, not proof of physical device identity: copying a playlist to another player shares its slot. Playlist reloads for the same programme reuse its session; switching programmes replaces that credential's session while preserving its previous segment URLs for a 30-second grace period.
 
-The validated client path is the authenticated M3U/XMLTV output with HLS archive
-playback. The plugin endpoint uses `{utc}` epoch seconds and `{duration}` seconds;
+The authenticated M3U/XMLTV endpoint provides HLS archive playback. Its
+playlist loads and first start-over were observed on TiviMate 5.3.3/Shield TV;
+accurate seeks remain under player validation. The plugin endpoint uses `{utc}`
+epoch seconds and `{duration}` seconds;
 Dispatcharr's native XC timeshift endpoint uses `{duration:60}` minutes. Keep
 those contracts separate. UTC metadata is attached only to locally annotated
 entries, so provider catch-up metadata is preserved. XC TS/Range playback must
@@ -36,9 +38,11 @@ refresh, it uses a locally saved programme snapshot only when that entire
 historical programme has archive coverage, matching the plugin XMLTV export.
 An unknown programme returns 404. The initial HLS playlist stops at that
 programme's end even if TiviMate sends its original full duration after a
-seek. Reading the published tail unlocks only the adjacent next programme;
-reloads append newly indexed segments. The playlist target stays at 60 seconds
-because stream-copy segmentation can have delayed keyframes.
+seek. HLS reloads may append newly indexed segments within that programme.
+Fetching or prefetching its tail cannot unlock the next programme. Automatic
+cross-programme continuation is temporarily disabled pending a separate Shield
+test. The playlist target stays at 60 seconds because stream-copy segmentation
+can have delayed keyframes.
 
 Local XC windows use the exact positive duration hint in minutes. With no
 usable hint, the actual EPG programme end determines the remaining window;
