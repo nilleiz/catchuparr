@@ -7,6 +7,7 @@ on:
 
 jobs:
   aio-integration:
+    name: AIO integration (${{ matrix.version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -14,14 +15,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['0.31.0', '0.32.0']
+        include:
+          - version: '0.31.0'
+            image: ghcr.io/dispatcharr/dispatcharr@sha256:f81924fa3dbfeb463b3908be7e086bf58aacbd2ba56062bfb555ee3a471acf8f
+          - version: '0.32.0'
+            image: ghcr.io/dispatcharr/dispatcharr@sha256:b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Synthetic playback in actual Dispatcharr AIO
-        run: python scripts/run_aio_integration.py --image ghcr.io/dispatcharr/dispatcharr:${{ matrix.version }}
+        run: python scripts/run_aio_integration.py --image ${{ matrix.image }}
 
   test-and-package:
     runs-on: ubuntu-latest
