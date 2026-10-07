@@ -18,6 +18,7 @@ def build_hls_playlist(
     uri_for: Callable[[Segment], str] | None = None,
     media_sequence: int = 0,
     target_duration: int = 60,
+    start_offset: float | None = None,
 ) -> str:
     """Build an EVENT playlist that can close after the capture ends.
 
@@ -32,6 +33,8 @@ def build_hls_playlist(
         raise ValueError("HLS segments must have positive duration")
     if target_duration < 1:
         raise ValueError("target_duration must be positive")
+    if start_offset is not None and (not math.isfinite(start_offset) or start_offset < 0):
+        raise ValueError("start_offset must be a finite non-negative number")
     # EXT-X-TARGETDURATION is fixed for a media playlist across reloads. Keep
     # it independent of the current EVENT contents; reject an unexpectedly
     # long GOP rather than emit a playlist with a changing/invalid target.
@@ -47,6 +50,8 @@ def build_hls_playlist(
     # crosses its end time. Changing its type from EVENT to VOD on that reload
     # would violate HLS playlist mutability rules; EVENT may add ENDLIST.
     lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+    if start_offset is not None:
+        lines.append(f"#EXT-X-START:TIME-OFFSET={start_offset:.3f}")
     for item in items:
         if item.discontinuity:
             lines.append("#EXT-X-DISCONTINUITY")

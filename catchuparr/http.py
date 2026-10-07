@@ -147,6 +147,7 @@ def ensure_http_playback_sessions(
     if replacement_grace_seconds <= 0:
         raise ValueError("replacement_grace_seconds must be positive")
     legacy = []
+    continued = []
     with _archive_file_lock(store.root, "schema"):
         now = clock()
         db_path = Path(store.root) / "archive.sqlite3"
@@ -205,6 +206,22 @@ def ensure_http_playback_sessions(
                 "ON http_playback_sessions(device_key) "
                 "WHERE device_key IS NOT NULL AND grace_until IS NULL"
             )
+            # Sessions created by the previous implementation may already
+            # contain segments from the next programme. Invalidate those
+            # manifests on upgrade so their old segment URLs cannot keep
+            # serving the extended range.
+            continued = [
+                str(row[0])
+                for row in db.execute(
+                    "SELECT lease_id FROM http_playback_sessions "
+                    "WHERE continuation_reached=1 OR "
+                    "(programme_end_utc IS NOT NULL AND end_utc>programme_end_utc)"
+                )
+            ]
+            db.executemany(
+                "DELETE FROM http_playback_sessions WHERE lease_id=?",
+                [(lease_id,) for lease_id in continued],
+            )
             legacy = [
                 (
                     str(row["lease_id"]),
@@ -224,6 +241,8 @@ def ensure_http_playback_sessions(
         ttl = max(0.001, expiry - now)
         if not store.renew_playback(lease_id, ttl_seconds=ttl):
             store.end_playback(lease_id)
+    for lease_id in continued:
+        store.end_playback(lease_id)
 
 
 class ArchiveHTTPService:
@@ -308,7 +327,10 @@ class ArchiveHTTPService:
             raise _PermissionDenied
         return user_id
 
-    def _make_playlist(self, segments: Iterable, *, live: bool, uri_for: Callable) -> str:
+    def _make_playlist(
+        self, segments: Iterable, *, live: bool, uri_for: Callable,
+        start_offset: float | None = None,
+    ) -> str:
         builder = self.playlist_builder
         if builder is None:
             # Lazy import keeps the HTTP/service module usable in lightweight
@@ -316,7 +338,9 @@ class ArchiveHTTPService:
             from .engine.playlist import build_hls_playlist
 
             builder = build_hls_playlist
-        return builder(segments, live=live, uri_for=uri_for)
+        return builder(
+            segments, live=live, uri_for=uri_for, start_offset=start_offset
+        )
 
     def _new_lease(
         self,
@@ -736,6 +760,11 @@ class ArchiveHTTPService:
                 return _error(400, "invalid playback identity range")
             if programme_end is not None and programme_end <= start:
                 programme_end = None
+            elif programme_end is not None:
+                # Keep the archive lease itself inside the selected EPG
+                # programme; clipping only the rendered playlist would still
+                # let a segment URL extend the lease into the next one.
+                end = min(end, programme_end)
             if (
                 continuation_end is not None
                 and (
@@ -785,40 +814,15 @@ class ArchiveHTTPService:
             )
             lease_id = acquisition.lease_id
             state = self._session_state(lease_id)
-            if (
-                state is not None
-                and state["boundary_reached"]
-                and not state["continuation_reached"]
-                and not state["terminal"]
-            ):
-                self._unlock_continuation_locked(
-                    user_id, channel_id, lease_id, device_key
-                )
-                state = self._session_state(lease_id)
             programme_end = (
                 state["programme_end_utc"]
                 if state is not None and state["programme_end_utc"] is not None
                 else requested_programme_end
             )
-            continuation_end = (
-                state["continuation_end_utc"]
-                if state is not None and state["continuation_end_utc"] is not None
-                else requested_continuation_end
-            )
-            continuation_reached = bool(
-                state is not None and state["continuation_reached"]
-            )
-            effective_end = end
-            if continuation_reached and state is not None:
-                effective_end = max(effective_end, float(state["end_utc"]))
-            pending_continuation = bool(
-                programme_end is not None
-                and continuation_end is not None
-                and continuation_end > programme_end
-                and not continuation_reached
-            )
+            effective_end = min(end, float(programme_end)) if programme_end is not None else end
+            continuation_end = None
             terminal = bool(state is not None and state["terminal"])
-            effective_live = bool(live or pending_continuation)
+            effective_live = bool(live)
             if terminal:
                 effective_live = False
             segments = self.store.segments(channel_id, start, effective_end)
@@ -853,7 +857,13 @@ class ArchiveHTTPService:
                 )
 
             body = self._make_playlist(
-                manifest, live=effective_live, uri_for=uri_for
+                manifest,
+                live=effective_live,
+                uri_for=uri_for,
+                start_offset=max(
+                    0.0,
+                    start - manifest[0].start_utc.timestamp(),
+                ),
             ).encode("utf-8")
             manifest_json = self._serialize_manifest(manifest)
         except (OSError, RuntimeError, ValueError):
@@ -1044,19 +1054,6 @@ class ArchiveHTTPService:
             # Files are immutable after publication; a short read indicates a
             # concurrent storage fault and should not be presented as complete.
             return _error(503, "segment changed during read")
-        full_get = method == "GET" and (
-            selected is None or (selected.start == 0 and selected.end == size - 1)
-        )
-        if full_get:
-            try:
-                self._mark_continuation_boundary(
-                    user_id, channel_id, lease_id, device_key, segment
-                )
-            except Exception:
-                # The segment was already read successfully. A boundary
-                # bookkeeping failure must not turn that media response into
-                # an error; it simply leaves the EVENT range closed.
-                logger.exception("Could not advance archive programme boundary")
         return HTTPResponse(status, headers, body)
 
     def end_session(self, token: str | None, channel_id: str, lease_id: str) -> bool:
