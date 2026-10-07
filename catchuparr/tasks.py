@@ -106,39 +106,48 @@ def record_channel(channel_uuid: str):
     config = load_config()
     if config is None or channel_uuid not in config.channel_uuids:
         return {"status": "disabled"}
-    lease = RedisRecorderLease(redis, channel_uuid, ttl_seconds=30)
+    store = ArchiveStore(config.archive_root)
+    lease = RedisRecorderLease(
+        redis, channel_uuid, ttl_seconds=30, archive_store=store
+    )
     fence = lease.acquire()
     if fence is None:
         return {"status": "already_running"}
-    store = ArchiveStore(config.archive_root)
-    store.register_recorder_fence(channel_uuid, fence)
-    stop_event = threading.Event()
-    # Dispatcharr's DVR helper accounts for modular and AIO deployments.
-    proxy_url = f"{get_dvr_stream_base_url().rstrip('/')}/proxy/ts/stream/{channel_uuid}"
-    recorder = FFmpegCopyRecorder(
-        store, channel_uuid, proxy_url, config.archive_root / "work",
-        fencing_token=fence,
-        on_error=lambda message: logger.warning("%s: %s", channel_uuid, message),
-    )
+    stop_event = None
+    monitor = None
+    try:
+        stop_event = threading.Event()
+        # Dispatcharr's DVR helper accounts for modular and AIO deployments.
+        proxy_url = f"{get_dvr_stream_base_url().rstrip('/')}/proxy/ts/stream/{channel_uuid}"
+        recorder = FFmpegCopyRecorder(
+            store, channel_uuid, proxy_url, config.archive_root / "work",
+            fencing_token=fence,
+            on_error=lambda message: logger.warning("%s: %s", channel_uuid, message),
+        )
 
-    def supervise():
-        while not stop_event.wait(10):
-            try:
-                current = load_config()
-                if current is None or channel_uuid not in current.channel_uuids or not lease.renew():
+        def supervise():
+            while not stop_event.wait(10):
+                try:
+                    current = load_config()
+                    if current is None or channel_uuid not in current.channel_uuids or not lease.renew():
+                        stop_event.set()
+                        return
+                except Exception:
+                    logger.exception("Recorder supervision failed for %s", channel_uuid)
                     stop_event.set()
                     return
-            except Exception:
-                logger.exception("Recorder supervision failed for %s", channel_uuid)
-                stop_event.set()
-                return
 
-    monitor = threading.Thread(target=supervise, name=f"catchuparr-{channel_uuid}", daemon=True)
-    monitor.start()
-    try:
+        monitor = threading.Thread(
+            target=supervise, name=f"catchuparr-{channel_uuid}", daemon=True
+        )
+        monitor.start()
         recorder.run_forever(stop_event)
     finally:
-        stop_event.set()
-        monitor.join(timeout=12)
-        lease.release()
+        try:
+            if stop_event is not None:
+                stop_event.set()
+            if monitor is not None and monitor.ident is not None:
+                monitor.join(timeout=12)
+        finally:
+            lease.release()
     return {"status": "stopped"}

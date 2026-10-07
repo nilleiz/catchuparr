@@ -50,6 +50,11 @@ class RecorderLeaseTests(unittest.TestCase):
             self.assertEqual(26, first.acquire())
             self.assertEqual(26, store.recorder_fence("ch"))
 
+            contender = RedisRecorderLease(redis, "ch", archive_store=store)
+            self.assertIsNone(contender.acquire())
+            self.assertEqual(26, store.recorder_fence("ch"))
+            self.assertTrue(first.renew())
+
             # Model a Redis restart that lost both the lease and its counter.
             redis.values.clear()
             second = RedisRecorderLease(redis, "ch", archive_store=store)
