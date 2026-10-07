@@ -17,7 +17,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..compatibility import (
-    SUPPORTED_DISPATCHARR_VERSION,
+    SUPPORTED_DISPATCHARR_VERSION as SUPPORTED_DISPATCHARR_VERSION,
+)
+from ..compatibility import (
     is_supported_dispatcharr_version,
 )
 
