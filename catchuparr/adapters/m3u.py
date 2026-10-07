@@ -1,8 +1,7 @@
 """Pure M3U/XMLTV helpers for exposing locally archived channel programmes.
 
-These functions intentionally do not assume a particular TiviMate template
-implementation. ``{utc}`` and ``{duration}`` are emitted as configured protocol
-placeholders and must be verified against the target client.
+These functions emit TiviMate's ``{utc}`` and ``{duration}`` placeholders in
+seconds, as validated with TiviMate 5.3.3.
 """
 
 from __future__ import annotations
@@ -90,6 +89,7 @@ def annotate_m3u(
         stripped = _set_extinf_attribute(stripped, "catchup", "default")
         stripped = _set_extinf_attribute(stripped, "catchup-source", source)
         stripped = _set_extinf_attribute(stripped, "catchup-days", str(catchup_days))
+        stripped = _set_extinf_attribute(stripped, "catchup-timezone", "UTC")
         output.append(stripped + ending)
     return "".join(output)
 

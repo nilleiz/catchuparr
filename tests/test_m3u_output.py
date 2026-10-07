@@ -32,12 +32,14 @@ class M3UOutputTests(unittest.TestCase):
     self.assertIn('#EXTINF:-1 tvg-id="dispatcharr.1"', result)
     self.assertIn('catchup="default"', result)
     self.assertIn('catchup-days="2"', result)
+    self.assertIn('catchup-timezone="UTC"', result)
     self.assertIn("channel_id=archive%20channel%2F1", result)
     self.assertIn("access_token=opaque%2Ftoken%2Bvalue", result)
     self.assertNotIn("credential_id=", result)
     self.assertIn("utc={utc}&duration={duration}", result)
     self.assertIn("http://dispatcharr/live/dispatcharr.1", result)
     self.assertIn('#EXTINF:-1 tvg-id="other" catchup="append",Other', result)
+    self.assertNotIn('catchup-timezone="UTC"', result.split('tvg-id="other"', 1)[1])
     self.assertTrue(result.endswith("http://dispatcharr/live/other\n"))
 
 
@@ -53,6 +55,7 @@ class M3UOutputTests(unittest.TestCase):
     self.assertEqual(result.count('catchup-days="'), 1)
     self.assertIn('catchup="default"', result)
     self.assertIn('catchup-days="1"', result)
+    self.assertEqual(result.count('catchup-timezone="UTC"'), 1)
 
 
   def test_url_template_rejects_embedded_secrets_and_keeps_placeholders(self):
@@ -61,6 +64,29 @@ class M3UOutputTests(unittest.TestCase):
     template = build_catchup_source("https://tv.example/archive", "ch", "opaque")
     self.assertIn("access_token=opaque", template)
     self.assertIn("utc={utc}&duration={duration}", template)
+
+  def test_tivimate_template_keeps_utc_and_duration_in_seconds(self):
+    source = '#EXTINF:-1 tvg-id="local",Local\n'
+    result = annotate_m3u(source, {"local": "local"}, "https://tv.example/archive", "token")
+    self.assertIn('catchup-timezone="UTC"', result)
+    self.assertIn("utc={utc}&duration={duration}", result)
+
+  def test_provider_radio_and_other_entries_keep_their_metadata(self):
+    playlist = (
+        '#EXTINF:-1 tvg-id="local" radio="false" group-title="Local",Local TV\n'
+        'http://dispatcharr/live/local\n'
+        '#EXTINF:-1 tvg-id="provider" radio="true" catchup="append" catchup-days="14" group-title="Music",Provider Radio\n'
+        'http://provider.example/radio\n'
+        '#EXTINF:-1 tvg-id="other" tvg-name="Other",Other TV\n'
+        'http://provider.example/other\n'
+    )
+    result = annotate_m3u(
+        playlist, {"local": "archive-local"}, "https://tv.example/archive", "token"
+    )
+    self.assertIn('tvg-id="local" radio="false" group-title="Local"', result)
+    self.assertIn('tvg-id="provider" radio="true" catchup="append" catchup-days="14" group-title="Music",Provider Radio', result)
+    self.assertIn('#EXTINF:-1 tvg-id="other" tvg-name="Other",Other TV', result)
+    self.assertEqual(result.count('catchup-timezone="UTC"'), 1)
 
   def test_live_proxy_uuid_can_match_when_effective_tvg_id_differs(self):
     proxy_id = "3e9e9aca-01ab-43de-9f14-323835d1ef25"
