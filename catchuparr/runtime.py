@@ -7,13 +7,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .compatibility import (
+    SUPPORTED_DISPATCHARR_VERSION,
+    is_supported_dispatcharr_version,
+)
+
 logger = logging.getLogger(__name__)
 PLUGIN_KEY = "catchuparr"
 RECONCILE_TASK = "catchuparr.reconcile"
 RECONCILE_SCHEDULE = "catchuparr-recorder-reconcile"
 SNAPSHOT_TASK = "catchuparr.snapshot_epg"
 SNAPSHOT_SCHEDULE = "catchuparr-epg-snapshot"
-SUPPORTED_DISPATCHARR_VERSION = "0.31.0"
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,7 @@ def require_supported_version() -> None:
         from version import __version__ as dispatcharr_version
     except ImportError as exc:
         raise RuntimeError("Catchuparr requires Dispatcharr") from exc
-    if dispatcharr_version != SUPPORTED_DISPATCHARR_VERSION:
+    if not is_supported_dispatcharr_version(dispatcharr_version):
         raise RuntimeError(f"Unsupported Dispatcharr version: {dispatcharr_version}")
 
 
