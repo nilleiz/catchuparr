@@ -1,8 +1,8 @@
 """Version-guarded XC compatibility hooks for inspected Dispatcharr releases.
 
 Dispatcharr does not expose public hooks for its XC serializers or catch-up
-handler. This module wraps only the three inspected functions and refuses to
-patch a changed version/signature. The local playback callback is deliberately
+handler. This module wraps only inspected functions and refuses to patch a
+changed version/signature. The local playback callback is deliberately
 separate from Dispatcharr's provider path: it must enforce Dispatcharr-equivalent
 stream limits and create/release an archive playback lease.
 """
@@ -12,9 +12,11 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+from urllib.parse import urlencode, urlsplit
 
 from ..compatibility import (
     SUPPORTED_DISPATCHARR_VERSION as SUPPORTED_DISPATCHARR_VERSION,
@@ -24,6 +26,8 @@ from ..compatibility import (
 )
 
 _HOOK_MARKER = "__catchuparr_xc_hook__"
+_MAX_M3U_BYTES = 16 * 1024 * 1024
+_MAX_M3U_LINES = 100_000
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +53,12 @@ class XCCallbacks:
     Return ``True`` to allow, ``False`` to deny, or an HTTP response to return
     directly. ``serve_local_playback`` then returns the archive HTTP response.
     Both callbacks are required before local playback is enabled.
+
+    ``authorize_xc_m3u`` confirms the request uses valid XC credentials and
+    passes Dispatcharr's XC network policy. ``m3u_channel_archive_days`` maps
+    selected local Dispatcharr channel IDs to their retention in whole days.
+    The M3U wrapper only applies that map to entries already emitted by the
+    core's authorized channel query.
     """
 
     channel_archive_days: Callable[[Any], int] | None = None
@@ -57,8 +67,11 @@ class XCCallbacks:
     epg_snapshots: Callable[[str, Any, int], list[dict[str, Any]]] | None = None
     program_available: Callable[[Any, str, str, Any], bool] | None = None
     playback_available: Callable[[Any, str, Any, Any], bool] | None = None
+    local_playback_supported: Callable[[Any, Any, Any], bool] | None = None
     authorize_local_playback: Callable[[Any, Any, Any, str, Any], Any] | None = None
     serve_local_playback: Callable[[Any, Any, Any, str, Any], Any] | None = None
+    authorize_xc_m3u: Callable[[Any, Any], bool] | None = None
+    m3u_channel_archive_days: Callable[[Any], Mapping[str, int]] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,13 +115,14 @@ def install_xc_hooks(
     if not is_supported_dispatcharr_version(dispatcharr_version):
         return HookInstallResult(False, f"unsupported Dispatcharr version: {dispatcharr_version}")
 
-    targets = (
+    targets = [
         (output_views, "_xc_channel_entry", ("channel", "channel_num_map", "_get_default_group_id",
          "_logo_url_prefix", "_logo_url_suffix", "catchup_allowed")),
         (output_views, "xc_get_epg", ("request", "user", "short")),
         (timeshift_views, "_serve_catchup", ("request", "user", "channel", "timestamp",
          "client_duration_hint")),
-    )
+    ]
+    targets.append((output_views, "generate_m3u", ("request", "profile_name", "user")))
     originals: dict[str, Callable[..., Any]] = {}
     installed_wrappers: list[Callable[..., Any]] = []
     for module, name, expected in targets:
@@ -216,20 +230,17 @@ def install_xc_hooks(
                     existing.add(key)
         # XC timestamps are emitted in UTC as YYYY-MM-DD HH:MM:SS. Keep the
         # serializer's EPG and availability decisions separate from the source
-        # provider's channel-level archive flag. For the live programme, only
-        # require coverage from its start through now; its future end is not
-        # expected to be archived yet.
+        # provider's channel-level archive flag. The runtime clips a current
+        # programme to the latest committed segment edge.
         now = datetime.now(timezone.utc)
         for listing in listings:
             try:
                 start = datetime.strptime(listing["start"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                end = datetime.strptime(listing["end"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                datetime.strptime(listing["end"], "%Y-%m-%d %H:%M:%S")
                 if start > now:
                     continue
-                coverage_end = min(end, now)
                 available = callbacks.program_available(
-                    channel_uuid, listing["start"],
-                    coverage_end.strftime("%Y-%m-%d %H:%M:%S"), user,
+                    channel_uuid, listing["start"], listing["end"], user,
                 )
             except Exception:
                 logger.exception("Catchuparr could not check XC programme coverage")
@@ -240,6 +251,16 @@ def install_xc_hooks(
 
     def serve_wrapper(request, user, channel, timestamp, client_duration_hint=None):
         callbacks = state["callbacks"]
+        if callbacks.local_playback_supported is not None:
+            try:
+                if not callbacks.local_playback_supported(request, user, channel):
+                    return originals["_serve_catchup"](
+                        request, user, channel, timestamp,
+                        client_duration_hint=client_duration_hint,
+                    )
+            except Exception:
+                logger.exception("Catchuparr could not verify the XC playback route")
+                return _service_unavailable(timeshift_views, "XC playback route validation failed")
         # Mirror the existing handler's catch-up toggle before considering local
         # storage. The caller has already performed authentication, network
         # restrictions and channel ACL checks in v0.31.0's route handlers.
@@ -313,11 +334,45 @@ def install_xc_hooks(
             logger.exception("Catchuparr local playback failed")
             return _service_unavailable(timeshift_views, "Local catch-up playback failed")
 
+    def m3u_wrapper(request, profile_name=None, user=None):
+        response = originals["generate_m3u"](request, profile_name=profile_name, user=user)
+        callbacks = state["callbacks"]
+        if not _native_xc_m3u_allowed(output_views, request, user, callbacks):
+            return response
+        if callbacks.m3u_channel_archive_days is None:
+            return response
+        try:
+            channel_days = callbacks.m3u_channel_archive_days(user)
+        except Exception:
+            logger.exception("Catchuparr could not read selected XC archive channels")
+            return response
+        if not channel_days:
+            return response
+        try:
+            base_builder = getattr(output_views, "build_absolute_uri_with_port")
+            base_url = str(base_builder(request, "")).rstrip("/")
+            username = str(request.GET.get("username") or "")
+            password = str(request.GET.get("password") or "")
+            credentials = urlencode({"username": username, "password": password})
+            timestamp_parameter = "utc" if dispatcharr_version == "0.32.0" else "start"
+            source_prefix = (
+                f"{base_url}/streaming/timeshift.php?{credentials}&stream="
+            )
+            return _annotate_native_xc_m3u(
+                response, channel_days, source_prefix, timestamp_parameter
+            )
+        except Exception:
+            # Core output remains usable if its response cannot be safely edited.
+            logger.exception("Catchuparr could not annotate the XC playlist")
+            return response
+
     wrappers = {
         "_xc_channel_entry": channel_entry_wrapper,
         "xc_get_epg": epg_wrapper,
         "_serve_catchup": serve_wrapper,
     }
+    if "generate_m3u" in originals:
+        wrappers["generate_m3u"] = m3u_wrapper
     for module, name, _expected in targets:
         wrapped = wrappers[name]
         setattr(wrapped, _HOOK_MARKER, True)
@@ -332,6 +387,7 @@ def uninstall_xc_hooks(output_views: Any, timeshift_views: Any) -> HookInstallRe
     targets = (
         (output_views, "_xc_channel_entry"),
         (output_views, "xc_get_epg"),
+        (output_views, "generate_m3u"),
         (timeshift_views, "_serve_catchup"),
     )
     restored = []
@@ -346,6 +402,164 @@ def uninstall_xc_hooks(output_views: Any, timeshift_views: Any) -> HookInstallRe
     for module, name, original in restored:
         setattr(module, name, original)
     return HookInstallResult(True, "uninstalled", tuple(name for _, name, _ in restored))
+
+
+def _native_xc_m3u_allowed(module: Any, request: Any, user: Any, callbacks: XCCallbacks) -> bool:
+    """Limit M3U changes to authenticated, non-direct XC requests."""
+    if user is None or callbacks.authorize_xc_m3u is None:
+        return False
+    if str(getattr(request, "method", "GET")).upper() != "GET":
+        return False
+    query = getattr(request, "GET", {})
+    username = str(query.get("username") or "")
+    password = str(query.get("password") or "")
+    if not username or not password or str(query.get("direct", "false")).lower() == "true":
+        return False
+    if not _catchup_enabled(module, user):
+        return False
+    try:
+        return bool(callbacks.authorize_xc_m3u(request, user))
+    except Exception:
+        logger.exception("Catchuparr could not verify XC playlist authorization")
+        return False
+
+
+def _annotate_native_xc_m3u(
+    response: Any,
+    channel_days: Mapping[str, int],
+    source_prefix: str,
+    timestamp_parameter: str,
+) -> Any:
+    """Add local catch-up templates to selected core-emitted XC entries.
+
+    The response size and line count are bounded. Existing catch-up sources
+    are preserved. Numeric provider lookback values increase only when local
+    retention is longer, and repeated calls are idempotent.
+    """
+    if getattr(response, "status_code", None) != 200 or not hasattr(response, "content"):
+        return response
+    raw = response.content
+    if isinstance(raw, str):
+        text = raw
+        raw_size = len(raw.encode("utf-8"))
+    elif isinstance(raw, bytes):
+        raw_size = len(raw)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return response
+    else:
+        return response
+    if raw_size > _MAX_M3U_BYTES or not text.lstrip("\ufeff").startswith("#EXTM3U"):
+        return response
+    lines = text.splitlines(keepends=True)
+    if len(lines) > _MAX_M3U_LINES:
+        return response
+    builder = getattr(response, "_charset", None) or "utf-8"
+    changed = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        entry = line.rstrip("\r\n")
+        if entry.startswith("#EXTINF:") and index + 1 < len(lines):
+            channel_id = _xc_channel_id_from_live_url(lines[index + 1].strip())
+            if channel_id is not None:
+                try:
+                    local_days = max(0, min(365, int(channel_days.get(channel_id, 0) or 0)))
+                except (TypeError, ValueError):
+                    local_days = 0
+                if local_days:
+                    annotated = _annotate_xc_extinf(
+                        entry, local_days, source_prefix + channel_id, timestamp_parameter
+                    )
+                    if annotated != entry:
+                        ending = line[len(entry):]
+                        lines[index] = annotated + ending
+                        changed = True
+        index += 1
+    if changed:
+        result = "".join(lines)
+        response.content = result.encode(builder) if isinstance(raw, bytes) else result
+    return response
+
+
+def _xc_channel_id_from_live_url(value: str) -> str | None:
+    try:
+        path_parts = [part for part in urlsplit(value).path.split("/") if part]
+        live_index = path_parts.index("live")
+        channel_id = path_parts[live_index + 3]
+    except (ValueError, IndexError):
+        return None
+    return channel_id if re.fullmatch(r"\d{1,12}", channel_id) else None
+
+
+def _annotate_xc_extinf(
+    line: str, local_days: int, source: str, timestamp_parameter: str
+) -> str:
+    separator = _m3u_title_comma(line)
+    if separator is None:
+        return line
+    head, tail = line[:separator], line[separator:]
+    attributes = _m3u_attributes(head)
+    if "catchup" not in attributes:
+        head = _set_m3u_attribute(head, "catchup", "default")
+    if "catchup-source" not in attributes:
+        head = _set_m3u_attribute(
+            head, "catchup-source",
+            source + f"&{timestamp_parameter}={{utc}}&duration={{duration:60}}",
+        )
+    existing_days = attributes.get("catchup-days")
+    if existing_days is None:
+        head = _set_m3u_attribute(head, "catchup-days", str(local_days))
+    else:
+        try:
+            provider_days = int(existing_days)
+        except (TypeError, ValueError):
+            provider_days = local_days
+        if provider_days < local_days:
+            head = _set_m3u_attribute(head, "catchup-days", str(local_days))
+    return head + tail
+
+
+def _m3u_title_comma(line: str) -> int | None:
+    in_quote = False
+    escaped = False
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and in_quote:
+            escaped = True
+            continue
+        if character == '"':
+            in_quote = not in_quote
+        elif character == "," and not in_quote:
+            return index
+    return None
+
+
+def _m3u_attributes(line: str) -> dict[str, str]:
+    separator = _m3u_title_comma(line)
+    header = line if separator is None else line[:separator]
+    return {
+        match.group(1): match.group(2)
+        for match in re.finditer(r'(?<!\S)([A-Za-z0-9_-]+)="([^"]*)"', header)
+    }
+
+
+def _set_m3u_attribute(line: str, name: str, value: str) -> str:
+    separator = _m3u_title_comma(line)
+    if separator is None:
+        head, tail = line, ""
+    else:
+        head, tail = line[:separator], line[separator:]
+    pattern = re.compile(rf'(?<!\S){re.escape(name)}="[^"]*"')
+    replacement = f'{name}="{value}"'
+    if pattern.search(head):
+        head = pattern.sub(replacement, head, count=1)
+    else:
+        head = head.rstrip() + " " + replacement
+    return head + tail
 
 
 def _request_with_local_lookback(request: Any, user: Any, local_days: int) -> Any:
