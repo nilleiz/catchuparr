@@ -518,11 +518,14 @@ class XCRuntimeTests(unittest.TestCase):
             hls_result = []
             ts_result = []
 
-            def blocked_builder(segments, *, live, uri_for):
+            def blocked_builder(segments, *, live, uri_for, start_offset=None):
                 builder_entered.set()
                 if not release_builder.wait(5):
                     raise TimeoutError("test did not release HLS renderer")
-                return build_hls_playlist(segments, live=live, uri_for=uri_for)
+                return build_hls_playlist(
+                    segments, live=live, uri_for=uri_for,
+                    start_offset=start_offset,
+                )
 
             hls_service = ArchiveHTTPService(
                 store,
