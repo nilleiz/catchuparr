@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .compatibility import (
-    SUPPORTED_DISPATCHARR_VERSION,
+    SUPPORTED_DISPATCHARR_VERSION as SUPPORTED_DISPATCHARR_VERSION,
+)
+from .compatibility import (
     is_supported_dispatcharr_version,
 )
 
