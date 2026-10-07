@@ -45,6 +45,11 @@ def run():
             time.sleep(3)
         docker("cp", str(ROOT / "catchuparr"), f"{name}:/data/plugins/catchuparr")
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
+        docker("cp", str(ROOT / "tests"), f"{name}:/tmp/tests")
+        docker("exec", "--workdir", "/tmp", "-e", "PYTHONPATH=/data/plugins:/tmp",
+               name, "/dispatcharrpy/bin/python", "-m", "unittest",
+               "tests.test_engine_recorder", "tests.test_engine_playlist",
+               "tests.test_engine_store", "-q")
         with (ROOT / "scripts/aio_integration_probe.py").open("rb") as script:
             docker("exec", "-i", name, "/dispatcharrpy/bin/python", "-c",
                    "import os,runpy,sys; from pathlib import Path; "
