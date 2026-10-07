@@ -13,9 +13,14 @@ from catchuparr.engine.playlist import build_hls_playlist
 from catchuparr.engine.store import ArchiveStore
 from catchuparr.http import ArchiveHTTPService
 from catchuparr.security import TokenStore
-from catchuparr.ts_http import ArchiveTSPlaybackService, StreamingTSHTTPResponse
+from catchuparr.ts_http import (
+    ArchiveTSPlaybackService,
+    StreamingTSHTTPResponse,
+    TSHTTPResponse,
+)
 from catchuparr.xc_runtime import (
     _active_hls_session_count,
+    _local_playback_window,
     _make_callbacks,
     _to_django_response,
     _xc_session_keys,
@@ -34,6 +39,13 @@ class _CoverageStore:
     def coverage(self, channel_uuid, start, end):
         self.covered_end = end
         return SimpleNamespace(complete=True)
+
+
+class _FakeResponse(dict):
+    def __init__(self, content=b"", status=200):
+        super().__init__()
+        self.content = content
+        self.status_code = status
 
 
 class XCRuntimeTests(unittest.TestCase):
@@ -104,6 +116,77 @@ class XCRuntimeTests(unittest.TestCase):
             self.assertEqual(active_ts_session_count(root, "viewer"), 2)
             self.assertEqual(_active_hls_session_count(root, "viewer"), 1)
 
+    def test_xc_first_admission_upgrades_legacy_http_sessions_and_preserves_grace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ArchiveStore(root)
+            start = datetime.now(timezone.utc) - timedelta(days=1)
+            segment_path = root / "segment.ts"
+            segment_path.write_bytes(b"legacy lease segment")
+            store.add_segment("news", segment_path, start, start + timedelta(seconds=6))
+            legacy_lease = store.begin_playback(
+                "news", start, start + timedelta(seconds=6), ttl_seconds=4 * 60 * 60
+            )
+            now = time.time()
+            previous_expiry = now + 4 * 60 * 60
+            with sqlite3.connect(store.db_path) as db:
+                db.execute(
+                    "CREATE TABLE http_playback_sessions ("
+                    "lease_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,"
+                    "channel_id TEXT NOT NULL,request_key TEXT,start_utc REAL NOT NULL,"
+                    "end_utc REAL NOT NULL,expires_at REAL NOT NULL)"
+                )
+                db.execute(
+                    "INSERT INTO http_playback_sessions VALUES(?,?,?,?,?,?,?)",
+                    (
+                        legacy_lease.id, "viewer", "news", "old-request",
+                        start.timestamp(), (start + timedelta(seconds=6)).timestamp(),
+                        previous_expiry,
+                    ),
+                )
+
+            admission_hls_counts = []
+
+            def allow_new_session(user_id, _channel_id, plugin_sessions):
+                hls_sessions = _active_hls_session_count(root, user_id)
+                admission_hls_counts.append(hls_sessions)
+                return plugin_sessions + hls_sessions < 1
+
+            service = ArchiveTSPlaybackService(
+                store,
+                authorize_user_channel=lambda *_: True,
+                catchup_enabled=lambda *_: True,
+                allow_new_session=allow_new_session,
+            )
+            response = service.stream_for_user(
+                "viewer", "news", start, start + timedelta(seconds=6),
+                session_id="xc-request", device_key="b" * 64, method="HEAD",
+            )
+
+            with sqlite3.connect(store.db_path) as db:
+                columns = {
+                    row[1] for row in db.execute(
+                        "PRAGMA table_info(http_playback_sessions)"
+                    )
+                }
+                session_expiry, grace_until = db.execute(
+                    "SELECT expires_at,grace_until FROM http_playback_sessions "
+                    "WHERE lease_id=?", (legacy_lease.id,),
+                ).fetchone()
+                lease_expiry = db.execute(
+                    "SELECT expires_at FROM playback_leases WHERE id=?",
+                    (legacy_lease.id,),
+                ).fetchone()[0]
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(admission_hls_counts, [0])
+        self.assertTrue({"request_key", "device_key", "grace_until"}.issubset(columns))
+        self.assertGreater(grace_until, now)
+        self.assertLess(grace_until, previous_expiry)
+        self.assertEqual(session_expiry, grace_until)
+        self.assertGreater(lease_expiry, now)
+        self.assertLess(lease_expiry, previous_expiry)
+
     def test_current_epg_coverage_ends_at_latest_committed_segment(self):
         now = datetime.now(timezone.utc)
         edge = now - timedelta(seconds=8)
@@ -125,7 +208,7 @@ class XCRuntimeTests(unittest.TestCase):
 
         self.assertEqual(store.covered_end, edge)
 
-    def test_current_xc_playback_uses_core_duration_and_committed_edge(self):
+    def test_current_xc_playback_clips_exact_window_to_committed_edge(self):
         now = datetime.now(timezone.utc)
         start = now - timedelta(minutes=20)
         edge = now - timedelta(seconds=5)
@@ -134,7 +217,6 @@ class XCRuntimeTests(unittest.TestCase):
         channel = SimpleNamespace(uuid=channel_uuid)
         timeshift_views = SimpleNamespace(
             parse_catchup_timestamp=lambda value: start.replace(tzinfo=None),
-            resolve_catchup_duration=lambda channel, value, client_hint=None: 65,
         )
         callbacks = _make_callbacks(SimpleNamespace(), timeshift_views)
         config = SimpleNamespace(channel_uuids=(channel_uuid,), archive_root=Path("/tmp/archive"))
@@ -151,6 +233,136 @@ class XCRuntimeTests(unittest.TestCase):
             ))
 
         self.assertEqual(store.covered_end, edge)
+
+    def test_xc_one_minute_local_window_does_not_include_provider_padding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ArchiveStore(root)
+            start = datetime.now(timezone.utc) - timedelta(days=1)
+            segment_path = root / "one-minute.ts"
+            segment_path.write_bytes(b"one minute of archived transport stream")
+            store.add_segment(
+                "channel-9", segment_path, start, start + timedelta(minutes=1)
+            )
+            channel = SimpleNamespace(uuid="channel-9")
+            timeshift_views = SimpleNamespace(
+                parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
+                resolve_catchup_duration=lambda *_args, **_kwargs: 6,
+                HttpResponse=lambda content, status=200: _FakeResponse(content, status),
+            )
+            callbacks = _make_callbacks(SimpleNamespace(), timeshift_views)
+            config = SimpleNamespace(
+                channel_uuids=("channel-9",), archive_root=root
+            )
+            user = SimpleNamespace(id=9)
+            request = SimpleNamespace(GET={}, META={}, method="GET")
+
+            class RecordingService:
+                def __init__(self):
+                    self.window = None
+
+                def stream_for_user(self, _user_id, _channel_uuid, window_start, window_end, **_kwargs):
+                    self.window = (window_start, window_end)
+                    return TSHTTPResponse(200, {"Content-Length": "1"}, b"x")
+
+            service = RecordingService()
+            with (
+                patch("catchuparr.xc_runtime._load_config", return_value=config),
+                patch("catchuparr.xc_runtime._catchup_enabled", return_value=True),
+                patch("catchuparr.xc_runtime._channel_by_uuid", return_value=channel),
+                patch("catchuparr.xc_runtime._channel_policy_allows", return_value=True),
+                patch("catchuparr.xc_runtime._archive_store", return_value=store),
+                patch("catchuparr.xc_runtime._ts_service", return_value=service),
+            ):
+                self.assertTrue(callbacks.playback_available(
+                    "channel-9", "timestamp", "1", user
+                ))
+                response = callbacks.serve_local_playback(
+                    request, user, channel, "timestamp", "1"
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(service.window[0], start)
+        self.assertEqual(service.window[1], start + timedelta(seconds=60))
+
+    def test_xc_missing_duration_uses_exact_epg_end_without_provider_padding(self):
+        programme_start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
+        start = programme_start + timedelta(minutes=15)
+        expected_end = programme_start + timedelta(minutes=60)
+        timeshift_views = SimpleNamespace(
+            parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
+        )
+        helpers = types.ModuleType("apps.timeshift.helpers")
+        helpers.MAX_DURATION_MINUTES = 480
+        helpers.get_programme_info = lambda *_args: {
+                "start_time": programme_start.isoformat(),
+                "end_time": expected_end.isoformat(),
+                "duration_secs": 3600,
+            }
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        apps_timeshift = types.ModuleType("apps.timeshift")
+        apps_timeshift.__path__ = []
+        with patch.dict("sys.modules", {
+            "apps": apps,
+            "apps.timeshift": apps_timeshift,
+            "apps.timeshift.helpers": helpers,
+        }):
+            self.assertEqual(
+                _local_playback_window(timeshift_views, object(), "timestamp", None),
+                (start, expected_end),
+            )
+
+    def test_xc_missing_duration_without_trustworthy_epg_end_is_not_local(self):
+        start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
+        timeshift_views = SimpleNamespace(
+            parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
+        )
+        helpers = types.ModuleType("apps.timeshift.helpers")
+        helpers.MAX_DURATION_MINUTES = 480
+        helpers.get_programme_info = lambda *_args: None
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        apps_timeshift = types.ModuleType("apps.timeshift")
+        apps_timeshift.__path__ = []
+        with patch.dict("sys.modules", {
+            "apps": apps,
+            "apps.timeshift": apps_timeshift,
+            "apps.timeshift.helpers": helpers,
+        }):
+            self.assertIsNone(
+                _local_playback_window(timeshift_views, object(), "timestamp", None)
+            )
+
+    def test_xc_gap_inside_requested_minute_keeps_provider_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ArchiveStore(root)
+            start = datetime.now(timezone.utc) - timedelta(days=1)
+            segment_path = root / "half-minute.ts"
+            segment_path.write_bytes(b"half a minute")
+            store.add_segment(
+                "channel-9", segment_path, start, start + timedelta(seconds=30)
+            )
+            channel = SimpleNamespace(uuid="channel-9")
+            timeshift_views = SimpleNamespace(
+                parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
+            )
+            callbacks = _make_callbacks(SimpleNamespace(), timeshift_views)
+            config = SimpleNamespace(
+                channel_uuids=("channel-9",), archive_root=root
+            )
+
+            with (
+                patch("catchuparr.xc_runtime._load_config", return_value=config),
+                patch("catchuparr.xc_runtime._catchup_enabled", return_value=True),
+                patch("catchuparr.xc_runtime._channel_by_uuid", return_value=channel),
+                patch("catchuparr.xc_runtime._channel_policy_allows", return_value=True),
+                patch("catchuparr.xc_runtime._archive_store", return_value=store),
+            ):
+                self.assertFalse(callbacks.playback_available(
+                    "channel-9", "timestamp", "1", SimpleNamespace()
+                ))
 
     def test_xc_session_keys_are_stable_and_do_not_contain_credentials(self):
         request = SimpleNamespace(
