@@ -10,7 +10,7 @@ stream tests do not establish player compatibility.
 
 ## Isolated Dispatcharr Dev stack
 
-The current Dev stack uses one Dispatcharr v0.31.0 AIO container with separate
+The current Dev stack uses one Dispatcharr v0.32.0 AIO container with separate
 data, archive, Redis, database, network and port paths. The Dev egress rule
 permits the selected Vu+ endpoint only. The copied providers, scheduled jobs,
 recording rules and integrations were disabled before testing. The selected
@@ -29,7 +29,7 @@ and 376 bytes. These HTTP checks used a token in a private request header.
 Programme change, service restart and retention behavior still need a
 real-player check. Record request methods, time arguments, Range headers,
 status codes and observed playback without recording bearer tokens. XC must
-be tested separately before its hooks are enabled.
+be tested separately before production use.
 
 On 2026-10-06, the Dev AIO was rebound from loopback to the host's LAN
 interface for the Shield test. Its mounts and restricted Vu+ egress rule were
@@ -42,3 +42,26 @@ pause and seeking all work for **Das Erste HD** with the plugin's
 `catchup="default"` and `{utc}`/`{duration}` URL template. A request trace
 and separate results for programme changes, restarts, retention and XC remain
 open validation items.
+
+## Dispatcharr 0.32.0 upgrade (2026-10-07)
+
+The isolated Dev data and archive were backed up cold before changing the image.
+Dev now uses the pinned official 0.32.0 AIO with PostgreSQL 17 and the same
+isolated mounts, port and restricted source network. Production was not updated.
+The plugin was imported through the authenticated administrator API, then Dev
+was restarted so web and workers load the same package. Only Catchuparr's two
+schedules and the selected test provider were enabled; provider EPG refreshes
+remained disabled. A recorder lease and newly indexed segments were observed.
+
+Authenticated M3U and XMLTV requests returned 200; an anonymous playlist request
+returned 401. Local entries include UTC metadata while preserving the tested
+seconds-based URL template. Separate disposable AIOs passed synthetic HLS,
+authorization and Range checks for both 0.31.0 and 0.32.0. Native XC probes also
+exercise minute-based duration, integer UTC epoch values, timestamp seeks,
+channel permissions, invalid credentials and the user catch-up switch. Their
+results must be recorded after the final XC integration passes.
+
+The user will repeat the Shield/TiviMate tests later. The earlier successful
+0.31.0 player results do not establish 0.32.0 or XC player compatibility. A
+stable release remains gated on those real-player checks; CI plugin ZIPs are
+development artifacts.
