@@ -219,10 +219,13 @@ class FFmpegCopyRecorder:
 
             if stop_event.is_set():
                 status = "stopped"
-            elif process.poll() is None and status == "exited":
-                process.terminate()
-                status = "no_media" if useful == 0 else "media_stalled"
             if process.poll() is None:
+                if status == "exited":
+                    status = "no_media" if useful == 0 else "media_stalled"
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:

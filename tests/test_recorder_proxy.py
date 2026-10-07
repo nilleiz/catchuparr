@@ -82,6 +82,47 @@ class FakeRedis:
         raise AssertionError("unexpected Redis script")
 
 
+class PipelineFakeRedis(FakeRedis):
+    def pipeline(self):
+        return FakeRedisPipeline(self)
+
+
+class FakeRedisPipeline:
+    def __init__(self, redis):
+        self.redis = redis
+        self.commands = []
+        self.watched = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def watch(self, *keys):
+        self.watched.extend(keys)
+
+    def get(self, key):
+        return self.redis.get(key)
+
+    def multi(self):
+        return None
+
+    def decr(self, key):
+        self.commands.append(("decr", key))
+
+    def delete(self, *keys):
+        self.commands.append(("delete", keys))
+
+    def execute(self):
+        for command, values in self.commands:
+            if command == "decr":
+                self.redis.decr(values)
+            elif command == "delete":
+                self.redis.delete(*values)
+        self.commands.clear()
+
+
 def _connection_pool_module():
     module = types.ModuleType("apps.m3u.connection_pool")
 
@@ -123,6 +164,34 @@ def _connection_pool_module():
     return module
 
 
+def _pipeline_connection_pool_module():
+    module = _connection_pool_module()
+
+    def release_profile_slot(profile_id, redis_client):
+        release_key = module.profile_credential_release_key(profile_id)
+        profile_key = f"profile_connections:{profile_id}"
+        with redis_client.pipeline() as pipe:
+            pipe.watch(release_key, profile_key)
+            profile_count = int(pipe.get(profile_key) or 0)
+            credential_key = pipe.get(release_key)
+            if credential_key:
+                pipe.watch(credential_key)
+                credential_count = int(pipe.get(credential_key) or 0)
+            else:
+                credential_count = 0
+            pipe.multi()
+            if credential_key and profile_count > 0 and credential_count > 0:
+                pipe.decr(credential_key)
+            if profile_count <= 1:
+                pipe.delete(release_key)
+            if profile_count > 0:
+                pipe.decr(profile_key)
+            pipe.execute()
+
+    module.release_profile_slot = release_profile_slot
+    return module
+
+
 class RecorderProxyTests(unittest.TestCase):
     def test_provider_urls_are_redacted_from_messages_and_exceptions(self):
         try:
@@ -152,10 +221,6 @@ class RecorderProxyTests(unittest.TestCase):
             _value="7:owner-secret",
             key="catchuparr:recorder:00000000-0000-0000-0000-000000000001",
         )
-        active = {
-            "channel_uuids": "00000000-0000-0000-0000-000000000001",
-            "source_policies": {},
-        }
         django = types.ModuleType("django")
         django.__path__ = []
         django_conf = types.ModuleType("django.conf")
@@ -304,6 +369,57 @@ class RecorderProxyTests(unittest.TestCase):
                 self.assertEqual(0, int(redis.get("server_group_connections:1:abc") or 0))
                 self.assertIsNone(redis.get(live_marker))
                 self.assertIsNone(redis.get(plugin_marker))
+                self.assertEqual("live-source-assignment", redis.get("channel_stream:44"))
+                self.assertEqual("live-profile-assignment", redis.get("stream_profile:44"))
+
+    def test_plugin_cleanup_remaps_032_pipeline_release_markers(self):
+        connection_pool = _pipeline_connection_pool_module()
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        m3u = types.ModuleType("apps.m3u")
+        m3u.__path__ = []
+        m3u.connection_pool = connection_pool
+        with patch.dict(sys.modules, {
+            "apps": apps,
+            "apps.m3u": m3u,
+            "apps.m3u.connection_pool": connection_pool,
+        }):
+            for release_order in (("plugin",), ("plugin", "live"), ("live", "plugin")):
+                redis = PipelineFakeRedis()
+                profile = SimpleNamespace(
+                    id=7, max_streams=3, credential_key="server_group_connections:1:abc"
+                )
+                live_reserved = plugin_reserved = False
+                if "live" in release_order:
+                    live_reserved, _, _ = connection_pool.reserve_profile_slot(profile, redis)
+                if "plugin" in release_order:
+                    reservation_id = "reservation-" + "-".join(release_order)
+                    facade = adapter._CredentialMarkerRedisFacade(redis, 7, reservation_id)
+                    plugin_reserved, _, _ = connection_pool.reserve_profile_slot(profile, facade)
+                    worker_id = adapter.make_worker_id(
+                        "channel", "44", "generation", 7, reservation_id
+                    )
+                    adapter.write_worker_record(redis, worker_id, {
+                        "reservation_state": "reserved",
+                        "state": "active",
+                        "profile_id": "7",
+                        "reservation_id": reservation_id,
+                    })
+                self.assertEqual("live" in release_order, live_reserved)
+                self.assertEqual("plugin" in release_order, plugin_reserved)
+                redis.set("channel_stream:44", "live-source-assignment")
+                redis.set("stream_profile:44", "live-profile-assignment")
+
+                for action in release_order:
+                    if action == "plugin":
+                        adapter._release_worker_reservation(redis, worker_id)
+                        self.assertFalse(adapter._release_worker_reservation(redis, worker_id))
+                    else:
+                        connection_pool.release_profile_slot(7, redis)
+
+                self.assertEqual(0, int(redis.get("profile_connections:7") or 0))
+                self.assertEqual(0, int(redis.get("server_group_connections:1:abc") or 0))
+                self.assertIsNone(redis.get(connection_pool.profile_credential_release_key(7)))
                 self.assertEqual("live-source-assignment", redis.get("channel_stream:44"))
                 self.assertEqual("live-profile-assignment", redis.get("stream_profile:44"))
 

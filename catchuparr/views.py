@@ -42,6 +42,7 @@ def install_routes() -> None:
     """Install routes before Dispatcharr's broad XC and React catch-all paths."""
     import dispatcharr.urls as root_urls
     from django.urls import clear_url_caches, path
+
     from . import recorder_proxy
     from .adapters.recorder_proxy import install_proxyserver_cleanup_hook
 
@@ -75,6 +76,7 @@ def install_routes() -> None:
 def uninstall_routes() -> None:
     import dispatcharr.urls as root_urls
     from django.urls import clear_url_caches
+
     from .adapters.recorder_proxy import (
         stop_managed_workers,
         uninstall_proxyserver_cleanup_hook,

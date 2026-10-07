@@ -47,6 +47,19 @@ class SourceRulesTests(unittest.TestCase):
 
         self.assertEqual(set(policies), {"uuid-1", "uuid-2", "uuid-3", "uuid-4"})
 
+    def test_number_rules_skip_channels_with_blank_catalog_numbers(self):
+        channels = [
+            {"uuid": "uuid-decimal", "number": "1.25", "name": "Decimal", "group": "News"},
+            {"uuid": "uuid-none", "number": None, "name": "No number", "group": "News"},
+            {"uuid": "uuid-blank", "number": "  ", "name": "Blank number", "group": "News"},
+        ]
+
+        policies = compile_source_rules(
+            "number:1.25,1.20-1.30 | mode=unchanged", channels, self.accounts
+        )
+
+        self.assertEqual(set(policies), {"uuid-decimal"})
+
     def test_priority_ranks_by_score_and_preserves_original_order_for_ties(self):
         policy = compile_source_rules(
             '* | mode=priority | priority="Vu+":100,"Waipu":50',
