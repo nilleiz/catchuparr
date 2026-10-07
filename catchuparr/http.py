@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import quote
 
+from .engine.admission import playback_admission_lock
 from .engine.store import TIMELINE_GAP_TOLERANCE_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -221,8 +222,7 @@ class ArchiveHTTPService:
     def _admission_lock(self, user_id: str):
         # Admission limits are per user, so independent accounts can render in
         # parallel. Segment renewal uses a separate, short-lived lock.
-        key = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24]
-        return self._file_lock(f"admission-{key}")
+        return playback_admission_lock(self.store.root, user_id)
 
     def _session_lock(self, user_id: str):
         key = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24]

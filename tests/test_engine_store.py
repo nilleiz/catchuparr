@@ -117,6 +117,22 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertTrue(first.path.exists())
         self.assertTrue(second.path.exists())
 
+    def test_playback_lease_can_expand_backwards_for_ts_seek(self):
+        earlier = self.add(0)
+        later = self.add(12)
+        lease = self.store.begin_playback(
+            "channel-1", later.start_utc, later.end_utc, ttl_seconds=120
+        )
+
+        self.assertTrue(self.store.extend_playback(
+            lease.id,
+            later.end_utc,
+            start_utc=earlier.start_utc,
+            ttl_seconds=120,
+        ))
+        removed = self.store.cleanup(older_than_utc=self.base + timedelta(days=1), max_bytes=0)
+        self.assertEqual([], removed)
+
     def test_expired_lease_does_not_protect_retention(self):
         seg = self.add(0)
         lease = self.store.begin_playback("channel-1", seg.start_utc, seg.end_utc, ttl_seconds=1)
