@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import math
 import os
 import re
+import secrets
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 logger = logging.getLogger(__name__)
 ARCHIVE_FINALIZATION_GRACE_SECONDS = 120
@@ -131,19 +134,69 @@ def _trace_range(value: str | None) -> str:
     return "other"
 
 
-def _trace_archive_request(request, start: float, duration: int, epg_end, response):
-    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
-        first_start, last_end = _playlist_segment_bounds(response.body)
-        logger.warning(
-            "Catchuparr archive utc=%.3f duration=%d epg_end=%.3f "
-            "first_segment=%.3f last_segment=%.3f status=%d",
-            start,
-            duration,
-            float(epg_end) if epg_end is not None else 0.0,
-            first_start,
-            last_end,
-            response.status,
-        )
+def _trace_session(lease: str | None) -> str:
+    """Use a non-redeemable, stable trace label for a random playback lease."""
+    if not isinstance(lease, str) or re.fullmatch(r"[0-9a-f]{32}", lease) is None:
+        return "none"
+    return hashlib.sha256(lease.encode("ascii")).hexdigest()[:16]
+
+
+def _playlist_trace_session(body: bytes) -> str:
+    try:
+        lines = body.decode("utf-8").splitlines()
+    except (AttributeError, UnicodeDecodeError):
+        return "none"
+    for line in lines:
+        if line and not line.startswith("#"):
+            return _trace_session(parse_qs(urlsplit(line).query).get("lease", [None])[0])
+    return "none"
+
+
+def _playlist_trace_reason(response) -> str:
+    if response.status == 200:
+        return "ok"
+    known = {
+        b"invalid playback range": "invalid_playback_range",
+        b"invalid playback identity range": "invalid_identity_range",
+        b"invalid channel": "invalid_channel",
+        b"unauthorized": "unauthorized",
+        b"forbidden": "forbidden",
+        b"stream limit exceeded": "stream_limit",
+        b"no archived segments in requested range": "missing_segments",
+        b"archive temporarily unavailable": "archive_unavailable",
+    }
+    return known.get(response.body, f"playlist_{response.status}")
+
+
+def _trace_archive_request(
+    request, start: float | None, duration: int | None, epg_end, response,
+    *, trace_id: str, reason: str, next_epg_end=None,
+):
+    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") != "1":
+        return
+    body = getattr(response, "body", getattr(response, "content", b""))
+    first_start, last_end = _playlist_segment_bounds(body)
+    method = str(getattr(request, "method", "")).upper()
+    if method not in {"GET", "HEAD"}:
+        method = "OTHER"
+    logger.warning(
+        "Catchuparr archive trace=%s method=%s channel=%s range=%s utc=%.3f "
+        "duration=%d epg_end=%.3f next_epg_end=%.3f "
+        "first_segment=%.3f last_segment=%.3f session=%s status=%d reason=%s",
+        trace_id,
+        method,
+        _trace_component(str(request.GET.get("channel_id", ""))),
+        _trace_range(request.headers.get("Range")),
+        start if start is not None else 0.0,
+        duration if duration is not None else 0,
+        float(epg_end) if epg_end is not None else 0.0,
+        float(next_epg_end) if next_epg_end is not None else 0.0,
+        first_start,
+        last_end,
+        _playlist_trace_session(body),
+        int(getattr(response, "status", getattr(response, "status_code", 500))),
+        reason,
+    )
 
 
 def _playlist_segment_bounds(body: bytes) -> tuple[float, float]:
@@ -175,15 +228,23 @@ def _playlist_segment_bounds(body: bytes) -> tuple[float, float]:
     return starts[0][0], starts[-1][1]
 
 
-def _trace_segment_request(request, channel: str, segment: str, status: int):
+def _trace_segment_request(
+    request, channel: str, segment: str, status: int, *, segment_start=None,
+    segment_end=None,
+):
     if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
         method = str(getattr(request, "method", "")).upper()
         if method not in {"GET", "HEAD"}:
             method = "OTHER"
         logger.warning(
-            "Catchuparr request route=segment method=%s channel=%s segment=%s range=%s status=%d",
+            "Catchuparr request route=segment method=%s channel=%s segment=%s "
+            "session=%s range=%s segment_start=%.3f segment_end=%.3f status=%d",
             method, _trace_component(str(channel)), _trace_component(str(segment)),
-            _trace_range(request.headers.get("Range")), status,
+            _trace_session(request.GET.get("lease")),
+            _trace_range(request.headers.get("Range")),
+            segment_start if segment_start is not None else 0.0,
+            segment_end if segment_end is not None else 0.0,
+            status,
         )
 
 
@@ -361,11 +422,24 @@ def archive_view(request):
     """Serve a growing HLS playlist for a covered catch-up time window."""
     from django.http import HttpResponse
 
+    trace_id = secrets.token_hex(6) if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1" else ""
+    start_epoch = None
+    duration_seconds = None
+    programme_end_epoch = None
+    next_programme_end_epoch = None
+
+    def finish(response, reason):
+        _trace_archive_request(
+            request, start_epoch, duration_seconds, programme_end_epoch, response,
+            trace_id=trace_id, reason=reason, next_epg_end=next_programme_end_epoch,
+        )
+        return response
+
     if request.method not in {"GET", "HEAD"}:
-        return HttpResponse(status=405)
+        return finish(HttpResponse(status=405), "method_not_allowed")
     user, config, token = _authenticate(request, playback=True)
     if user is None:
-        return _denied()
+        return finish(_denied(), "unauthorized")
     channel = request.GET.get("channel_id", "")
     start = request.GET.get("utc", "")
     duration = request.GET.get("duration", "")
@@ -373,15 +447,14 @@ def archive_view(request):
         start_epoch = _catchup_epoch(start)
         duration_seconds = int(duration)
     except (TypeError, ValueError, OverflowError):
-        return _no_cache(HttpResponse("Invalid catch-up time", status=400))
+        return finish(_no_cache(HttpResponse("Invalid catch-up time", status=400)), "invalid_time")
     if not 0 < duration_seconds <= 24 * 60 * 60:
-        return _no_cache(HttpResponse("Invalid catch-up duration", status=400))
+        return finish(_no_cache(HttpResponse("Invalid catch-up duration", status=400)), "invalid_duration")
     now_epoch = datetime.now(timezone.utc).timestamp()
     if start_epoch > now_epoch or start_epoch + duration_seconds < now_epoch - config.retention_hours * 3600:
-        return _no_cache(HttpResponse("No archived programme", status=404))
+        return finish(_no_cache(HttpResponse("No archived programme", status=404)), "outside_retention")
     service = _archive_service(request, user, config)
     requested_end_epoch = start_epoch + duration_seconds
-    programme_end_epoch = None
     continuation_end_epoch = None
     authorized = (
         service.authorize_user_channel(str(user.id), channel)
@@ -392,9 +465,7 @@ def archive_view(request):
             channel, start_epoch, service.store
         )
         if programme_end_epoch is None:
-            return _no_cache(HttpResponse("No matching EPG programme", status=404))
-    else:
-        next_programme_end_epoch = None
+            return finish(_no_cache(HttpResponse("No matching EPG programme", status=404)), "missing_epg")
     end_epoch, continuation_end_epoch = _archive_playback_window(
         start_epoch,
         duration_seconds,
@@ -411,9 +482,7 @@ def archive_view(request):
         programme_end_utc=programme_end_epoch,
         continuation_end_utc=continuation_end_epoch,
     )
-    _trace_archive_request(
-        request, start_epoch, duration_seconds, programme_end_epoch, response
-    )
+    finish(response, _playlist_trace_reason(response))
     return _to_django_response(response, request.method)
 
 
@@ -564,16 +633,30 @@ def segment_view(request, channel_id: str, segment_id: str):
     from django.http import HttpResponse
 
     if request.method not in {"GET", "HEAD"}:
+        _trace_segment_request(request, channel_id, segment_id, 405)
         return HttpResponse(status=405)
     user, config, token = _authenticate(request, playback=True)
     if user is None:
+        _trace_segment_request(request, channel_id, segment_id, 401)
         return _denied()
     service = _archive_service(request, user, config)
     response = service.segment(
         token, channel_id, segment_id, request.GET.get("lease"),
         method=request.method, range_header=request.headers.get("Range"),
     )
-    _trace_segment_request(request, channel_id, segment_id, response.status)
+    segment_start = segment_end = None
+    if os.environ.get("CATCHUPARR_TRACE_REQUESTS") == "1":
+        try:
+            segment = service.store.segment(channel_id, segment_id)
+            if segment is not None:
+                segment_start = segment.start_utc.timestamp()
+                segment_end = segment.end_utc.timestamp()
+        except (OSError, RuntimeError, ValueError):
+            pass
+    _trace_segment_request(
+        request, channel_id, segment_id, response.status,
+        segment_start=segment_start, segment_end=segment_end,
+    )
     return _to_django_response(response, request.method)
 
 
