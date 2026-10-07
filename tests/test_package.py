@@ -40,6 +40,7 @@ class PackageTest(unittest.TestCase):
 
             modules = (
                 "catchuparr.plugin",
+                "catchuparr.compatibility",
                 "catchuparr.runtime",
                 "catchuparr.tasks",
                 "catchuparr.views",
