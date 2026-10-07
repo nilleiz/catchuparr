@@ -1,3 +1,4 @@
+import sqlite3
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -503,6 +504,24 @@ class ViewBoundaryTests(unittest.TestCase):
         self.assertIn(f"segment_start={start.timestamp():.3f}", logs.output[0])
         self.assertIn("range=bytes=0-188", logs.output[0])
         self.assertNotIn("token-secret", logs.output[0])
+
+    def test_segment_trace_database_error_keeps_successful_media_response(self):
+        django_http = types.ModuleType("django.http")
+        django_http.HttpResponse = Mock()
+        expected = HTTPResponse(206, {}, b"media")
+        service = SimpleNamespace(
+            segment=Mock(return_value=expected),
+            store=SimpleNamespace(segment=Mock(side_effect=sqlite3.OperationalError("busy"))),
+        )
+        request = SimpleNamespace(method="GET", GET={}, headers={"Range": "bytes=0-"})
+        with patch.dict("sys.modules", {"django.http": django_http}), patch.dict(
+            "os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}
+        ), patch("catchuparr.views._authenticate", return_value=(
+            SimpleNamespace(id="viewer"), SimpleNamespace(), "private"
+        )), patch("catchuparr.views._archive_service", return_value=service), patch(
+            "catchuparr.views._to_django_response", side_effect=lambda response, method: response
+        ), self.assertLogs("catchuparr.views", level="WARNING"):
+            self.assertIs(segment_view(request, "b" * 32, "c" * 32), expected)
 
     def test_segment_view_traces_method_and_authentication_rejections(self):
         class FakeResponse:

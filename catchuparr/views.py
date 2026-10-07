@@ -9,6 +9,7 @@ import math
 import os
 import re
 import secrets
+import sqlite3
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
@@ -651,7 +652,7 @@ def segment_view(request, channel_id: str, segment_id: str):
             if segment is not None:
                 segment_start = segment.start_utc.timestamp()
                 segment_end = segment.end_utc.timestamp()
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
             pass
     _trace_segment_request(
         request, channel_id, segment_id, response.status,
