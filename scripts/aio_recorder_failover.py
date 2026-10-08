@@ -354,7 +354,7 @@ def _segment_has_useful_av(ffprobe: str, path: Path) -> bool:
 def _estimate_tone_frequency(pcm: bytes, sample_rate: int = TONE_SAMPLE_RATE) -> int | None:
     """Estimate a fixture's sine tone from decoded signed 16-bit little-endian PCM."""
     usable_bytes = len(pcm) - (len(pcm) % 2)
-    if usable_bytes < sample_rate:
+    if usable_bytes < max(2, sample_rate // 50 * 2):
         return None
     samples = array.array("h")
     samples.frombytes(pcm[:usable_bytes])
@@ -369,17 +369,27 @@ def _estimate_tone_frequency(pcm: bytes, sample_rate: int = TONE_SAMPLE_RATE) ->
         return None
     threshold = max(20.0, rms * 0.08)
     armed = False
-    positive_crossings = 0
-    for sample in samples:
+    negative_index = 0
+    negative_value = 0.0
+    positive_crossings = []
+    for index, sample in enumerate(samples):
         value = sample - mean
         if value <= -threshold:
             armed = True
+            negative_index = index
+            negative_value = value
         elif value >= threshold and armed:
-            positive_crossings += 1
+            fraction = -negative_value / (value - negative_value)
+            positive_crossings.append(negative_index + fraction * (index - negative_index))
             armed = False
-    if positive_crossings == 0:
+    if len(positive_crossings) < 5:
         return None
-    return round(positive_crossings * sample_rate / len(samples))
+    period_samples = (
+        (positive_crossings[-1] - positive_crossings[0]) / (len(positive_crossings) - 1)
+    )
+    if period_samples <= 0:
+        return None
+    return round(sample_rate / period_samples)
 
 
 def _synthetic_source_for_frequency(frequency: int | None) -> str | None:

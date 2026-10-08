@@ -45,8 +45,19 @@ class RecorderFailoverMediaTests(unittest.TestCase):
                 self.assertIsNotNone(detected)
                 self.assertLessEqual(abs(detected - frequency), 2)
                 self.assertEqual(probe._synthetic_source_for_frequency(detected), source)
+                short_detected = probe._estimate_tone_frequency(
+                    _sine_pcm(frequency, duration=0.1)
+                )
+                self.assertIsNotNone(short_detected)
+                self.assertLessEqual(abs(short_detected - frequency), 5)
+                self.assertEqual(probe._synthetic_source_for_frequency(short_detected), source)
 
         self.assertIsNone(probe._synthetic_source_for_frequency(750))
+        self.assertIsNone(
+            probe._synthetic_source_for_frequency(
+                probe._estimate_tone_frequency(_sine_pcm(750, duration=0.1))
+            )
+        )
         self.assertIsNone(probe._estimate_tone_frequency(b"\0" * 96_000))
 
     def test_indexed_segments_are_classified_by_decoded_audio_not_service_tag(self):
