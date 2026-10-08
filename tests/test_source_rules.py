@@ -8,8 +8,8 @@ class SourceRulesTests(unittest.TestCase):
         self.channels = [
             {"uuid": "uuid-1", "number": "1", "name": "Synthetic Channel A", "group": "News"},
             {"uuid": "uuid-2", "number": "3.5", "name": "Synthetic Channel B", "group": "News"},
-            {"uuid": "uuid-3", "number": "10", "name": "Kultur", "group": "Arts"},
-            {"uuid": "uuid-4", "number": "20", "name": "Sport", "group": "Sports"},
+            {"uuid": "uuid-3", "number": "10", "name": "Synthetic Channel C", "group": "Arts"},
+            {"uuid": "uuid-4", "number": "20", "name": "Synthetic Channel D", "group": "Sports"},
         ]
         self.accounts = [
             {"id": "a", "name": "Synthetic Source A"},
