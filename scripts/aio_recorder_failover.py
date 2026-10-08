@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import array
 import json
+import math
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import types
 import uuid
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -21,6 +25,13 @@ POLL_INTERVAL = 0.2
 SOURCE_DURATION = 8.0
 SOURCE_CHUNK_PACKETS = 32
 FINITE_SOURCE_REPEATS = 4
+SYNTHETIC_SOURCE_TONES = {
+    "Synthetic Source B": 880,
+    "Synthetic Source C": 660,
+    "Synthetic Source D": 440,
+}
+TONE_MATCH_TOLERANCE_HZ = 45
+TONE_SAMPLE_RATE = 48_000
 
 
 def _require(condition: bool, message: str) -> None:
@@ -317,7 +328,7 @@ class _DjangoHTTPBridge:
                 time.sleep(0.05)
 
 
-def _segment_service(ffprobe: str, path: Path) -> tuple[str | None, bool]:
+def _segment_has_useful_av(ffprobe: str, path: Path) -> bool:
     try:
         result = subprocess.run(
             [
@@ -333,25 +344,108 @@ def _segment_service(ffprobe: str, path: Path) -> tuple[str | None, bool]:
     if result.returncode != 0:
         raise RuntimeError("Indexed synthetic segment was not decodable")
     details = json.loads(result.stdout.decode("utf-8"))
-    services = {
-        str(program.get("tags", {}).get("service_name") or "")
-        for program in details.get("programs", [])
-    }
     frame_counts = {
         item.get("codec_type"): int(item.get("nb_read_frames", "0") or 0)
         for item in details.get("streams", [])
     }
-    useful_av = frame_counts.get("video", 0) > 0 and frame_counts.get("audio", 0) > 0
-    return next(iter(services), None), useful_av
+    return frame_counts.get("video", 0) > 0 and frame_counts.get("audio", 0) > 0
 
 
-def _verified_segments(store, channel_uuid: str, ffprobe: str) -> dict[str, list]:
+def _estimate_tone_frequency(pcm: bytes, sample_rate: int = TONE_SAMPLE_RATE) -> int | None:
+    """Estimate a fixture's sine tone from decoded signed 16-bit little-endian PCM."""
+    usable_bytes = len(pcm) - (len(pcm) % 2)
+    if usable_bytes < sample_rate:
+        return None
+    samples = array.array("h")
+    samples.frombytes(pcm[:usable_bytes])
+    if sys.byteorder != "little":
+        samples.byteswap()
+
+    mean = sum(samples) / len(samples)
+    rms = math.sqrt(
+        sum((sample - mean) ** 2 for sample in samples) / len(samples)
+    )
+    if rms < 100:
+        return None
+    threshold = max(20.0, rms * 0.08)
+    armed = False
+    positive_crossings = 0
+    for sample in samples:
+        value = sample - mean
+        if value <= -threshold:
+            armed = True
+        elif value >= threshold and armed:
+            positive_crossings += 1
+            armed = False
+    if positive_crossings == 0:
+        return None
+    return round(positive_crossings * sample_rate / len(samples))
+
+
+def _synthetic_source_for_frequency(frequency: int | None) -> str | None:
+    if frequency is None:
+        return None
+    source_name, expected = min(
+        SYNTHETIC_SOURCE_TONES.items(),
+        key=lambda item: abs(frequency - item[1]),
+    )
+    if abs(frequency - expected) > TONE_MATCH_TOLERANCE_HZ:
+        return None
+    return source_name
+
+
+def _segment_tone_frequency(ffmpeg: str, path: Path) -> int | None:
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path),
+                "-map", "0:a:0", "-vn", "-ac", "1", "-ar", str(TONE_SAMPLE_RATE),
+                "-t", "1.5", "-f", "s16le", "pipe:1",
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Indexed synthetic audio inspection timed out") from exc
+    if result.returncode != 0:
+        raise RuntimeError("Indexed synthetic segment audio could not be decoded")
+    return _estimate_tone_frequency(result.stdout)
+
+
+@lru_cache(maxsize=4096)
+def _cached_segment_identity(
+    ffmpeg: str,
+    ffprobe: str,
+    path_text: str,
+    size: int,
+    modified_ns: int,
+) -> tuple[bool, str | None]:
+    del size, modified_ns
+    path = Path(path_text)
+    useful_av = _segment_has_useful_av(ffprobe, path)
+    if not useful_av:
+        return False, None
+    frequency = _segment_tone_frequency(ffmpeg, path)
+    return True, _synthetic_source_for_frequency(frequency)
+
+
+def _verified_segments(
+    store, channel_uuid: str, ffmpeg: str, ffprobe: str,
+) -> dict[str, list]:
     result: dict[str, list] = {}
     for segment in store.segments(channel_uuid):
-        service, useful_av = _segment_service(ffprobe, segment.path)
+        stat = segment.path.stat()
+        useful_av, source_name = _cached_segment_identity(
+            ffmpeg,
+            ffprobe,
+            str(segment.path),
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
         _require(useful_av, "Indexed failover segment lacks decoded audio/video")
-        if service:
-            result.setdefault(service, []).append(segment)
+        if source_name:
+            result.setdefault(source_name, []).append(segment)
     return result
 
 
@@ -460,17 +554,18 @@ def _wait_for_source_segments(
     run: _RecorderTaskRun,
     store,
     channel_uuid: str,
+    ffmpeg: str,
     ffprobe: str,
-    service_name: str,
+    source_name: str,
     minimum: int,
     timeout: float,
 ) -> list:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         _require(run.thread is not None and run.thread.is_alive(), "Recorder task ended before media was indexed")
-        tagged = _verified_segments(store, channel_uuid, ffprobe).get(service_name, [])
-        if len(tagged) >= minimum:
-            return tagged
+        identified = _verified_segments(store, channel_uuid, ffmpeg, ffprobe).get(source_name, [])
+        if len(identified) >= minimum:
+            return identified
         time.sleep(0.2)
     raise RuntimeError("Synthetic recorder did not index expected source media in time")
 
@@ -778,6 +873,7 @@ def probe_recorder_failover(root: Path) -> None:
                 startup_run,
                 startup_store,
                 str(startup_channel.uuid),
+                ffmpeg,
                 ffprobe,
                 "Synthetic Source B",
                 minimum=1,
@@ -797,10 +893,15 @@ def probe_recorder_failover(root: Path) -> None:
                 and startup_run.results[0].useful_segments == 0,
                 "High-ranked A did not fail for lack of useful media before B fallback",
             )
-            startup_b = _verified_segments(
-                startup_store, str(startup_channel.uuid), ffprobe
-            ).get("Synthetic Source B", [])
+            startup_sources = _verified_segments(
+                startup_store, str(startup_channel.uuid), ffmpeg, ffprobe
+            )
+            startup_b = startup_sources.get("Synthetic Source B", [])
             _require(len(startup_b) >= 2, "B did not retain useful indexed media after A failed")
+            _require(
+                not startup_sources.get("Synthetic Source C"),
+                "Startup fallback archived media from excluded source C",
+            )
             counts, _ = source_server.snapshot()
             _require(counts["source-a.ts"] > startup_baseline["source-a.ts"], "High-ranked A was not attempted")
             _require(counts["source-b.ts"] > startup_baseline["source-b.ts"], "Permitted B was not attempted")
@@ -845,6 +946,7 @@ def probe_recorder_failover(root: Path) -> None:
                 capacity_run,
                 capacity_store,
                 str(capacity_channel.uuid),
+                ffmpeg,
                 ffprobe,
                 "Synthetic Source B",
                 minimum=1,
@@ -854,6 +956,13 @@ def probe_recorder_failover(root: Path) -> None:
             _require(counts["source-a.ts"] == capacity_baseline["source-a.ts"], "Capacity-denied A opened upstream")
             _require(counts["source-c.ts"] == capacity_baseline["source-c.ts"], "Capacity probe opened excluded C")
             _require(counts["source-d.ts"] == capacity_baseline["source-d.ts"], "Capacity probe skipped successful B")
+            capacity_sources = _verified_segments(
+                capacity_store, str(capacity_channel.uuid), ffmpeg, ffprobe
+            )
+            _require(
+                not capacity_sources.get("Synthetic Source C"),
+                "Capacity fallback archived media from excluded source C",
+            )
             _require(active_counts["source-b.ts"] > 0, "Capacity fallback did not keep B active")
             _require(
                 len(capacity_run.results) == 1
@@ -915,6 +1024,7 @@ def probe_recorder_failover(root: Path) -> None:
                 runtime_run,
                 runtime_store,
                 str(runtime_channel.uuid),
+                ffmpeg,
                 ffprobe,
                 "Synthetic Source D",
                 minimum=1,
@@ -927,11 +1037,15 @@ def probe_recorder_failover(root: Path) -> None:
             if runtime_run.thread is not None:
                 runtime_run.thread.join(20)
             raise
-        tagged_runtime = _verified_segments(
-            runtime_store, str(runtime_channel.uuid), ffprobe
+        identified_runtime = _verified_segments(
+            runtime_store, str(runtime_channel.uuid), ffmpeg, ffprobe
         )
-        b_segments = tagged_runtime.get("Synthetic Source B", [])
-        d_segments = tagged_runtime.get("Synthetic Source D", [])
+        b_segments = identified_runtime.get("Synthetic Source B", [])
+        d_segments = identified_runtime.get("Synthetic Source D", [])
+        _require(
+            not identified_runtime.get("Synthetic Source C"),
+            "Runtime fallback archived media from excluded source C",
+        )
         _require(len(b_segments) >= 2, "Finite B source did not create two useful archive segments")
         _require(bool(d_segments), "Runtime fallback did not preserve indexed D media")
         _require(
