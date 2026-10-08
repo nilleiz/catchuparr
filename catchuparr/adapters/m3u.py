@@ -1,7 +1,7 @@
 """Pure M3U/XMLTV helpers for exposing locally archived channel programmes.
 
 These functions emit the IPTV client's ``{utc}`` and ``{duration}`` placeholders in
-seconds, as validated with the test client.
+seconds.
 """
 
 from __future__ import annotations
