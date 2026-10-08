@@ -500,6 +500,10 @@ def _validate_active_document(data: dict[str, Any]) -> None:
             if account_id in priority_ids or account_id not in set(known_ids):
                 raise ValueError("Active Catchuparr source priority account is invalid")
             priority_ids.add(account_id)
+        if include_ids is not None and not priority_ids <= set(include_ids):
+            raise ValueError("Active Catchuparr source priority violates the include filter")
+        if priority_ids & set(exclude_ids):
+            raise ValueError("Active Catchuparr source priority violates the exclude filter")
         if include_ids is None and not exclude_ids and not priorities:
             raise ValueError("Active Catchuparr source policy has no filter or ranking")
 
