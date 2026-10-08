@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -32,6 +34,95 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_live_route_tone_assertion_requires_expected_source(self):
+        probe._assert_tone_matches(441, 440, "Synthetic live A")
+        with self.assertRaisesRegex(RuntimeError, "unexpected synthetic source tone"):
+            probe._assert_tone_matches(880, 440, "Synthetic live A")
+        with self.assertRaisesRegex(RuntimeError, "no decodable synthetic audio tone"):
+            probe._assert_tone_matches(None, 440, "Synthetic live A")
+
+    def test_native_source_metadata_snapshot_ignores_health_fields(self):
+        class MetadataRedis:
+            @staticmethod
+            def hgetall(_key):
+                return {
+                    b"stream_id": b"23",
+                    b"stream_name": b"Synthetic isolation source A",
+                    b"url": b"http://127.0.0.1:12345/source-a.ts",
+                    b"state": b"ACTIVE",
+                    b"client_count": b"1",
+                }
+
+        metadata = probe._native_source_metadata(MetadataRedis(), "metadata")
+        self.assertEqual(
+            metadata,
+            {
+                "stream_id": "23",
+                "stream_name": "Synthetic isolation source A",
+                "url": "http://127.0.0.1:12345/source-a.ts",
+            },
+        )
+
+    def test_native_live_reader_returns_only_chunks_after_publication_floor(self):
+        class Tracker:
+            last_yielded_index = None
+
+        tracker = Tracker()
+
+        def chunks():
+            for index in range(1, 5):
+                tracker.last_yielded_index = index
+                yield bytes((index,)) * 188
+
+        reader = probe._NativeLiveMediaReader(iter(chunks()), tracker)
+        try:
+            media, last_index = reader.read_after(2, minimum_bytes=376, timeout=1)
+        finally:
+            reader.thread.join(timeout=1)
+        self.assertEqual(last_index, 4)
+        self.assertEqual(media, bytes((3,)) * 188 + bytes((4,)) * 188)
+
+    def test_live_reader_stops_at_iterator_boundary_before_response_close(self):
+        class Tracker:
+            last_yielded_index = 0
+
+        tracker = Tracker()
+
+        class SlowIterator:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.active = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                with self.lock:
+                    self.active = True
+                time.sleep(0.02)
+                with self.lock:
+                    self.active = False
+                tracker.last_yielded_index += 1
+                return b"x" * 188
+
+        iterator = SlowIterator()
+        reader = probe._NativeLiveMediaReader(iterator, tracker)
+
+        class Response:
+            closed = False
+
+            def close(self):
+                with iterator.lock:
+                    self.assert_idle = not iterator.active
+                self.assert_not_reading = not reader.thread.is_alive()
+                self.closed = True
+
+        response = Response()
+        reader.close(response)
+        self.assertTrue(response.closed)
+        self.assertTrue(response.assert_idle)
+        self.assertTrue(response.assert_not_reading)
+
     def test_redis_metadata_normalizes_bytes_strings_and_enum_values(self):
         enum_value = SimpleNamespace(value="ACTIVE")
         self.assertEqual(probe._redis_text(b"owner"), "owner")
