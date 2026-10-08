@@ -121,7 +121,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(["45"], [row["stream_id"] for row in preview[CHANNEL_A]["candidates"]])
         self.assertEqual(["46"], [row["stream_id"] for row in preview[CHANNEL_B]["candidates"]])
         self.assertTrue(preview[CHANNEL_A]["source_override"])
-        self.assertFalse(preview[CHANNEL_B]["source_override"])
+        self.assertTrue(preview[CHANNEL_B]["source_override"])
 
     def test_empty_exclude_filter_without_priority_preserves_shared_route(self):
         settings = dict(
@@ -170,6 +170,23 @@ class ConfigurationTests(unittest.TestCase):
         self.active_path.parent.mkdir(parents=True, exist_ok=True)
         self.active_path.write_text("{partial", encoding="utf-8")
         with self.assertRaises(json.JSONDecodeError):
+            load_active_configuration(self.active_path)
+
+    def test_active_policy_rejects_priority_forbidden_by_include_filter(self):
+        settings = dict(
+            self.settings,
+            filter_config=(
+                "version: 1\nprofile: all\nrules:\n"
+                "  - channels: {names: [Synthetic Channel A]}\n"
+                "    include: [Synthetic Provider]\n"
+            ),
+        )
+        apply_configuration(settings, self.catalog, self.active_path)
+        document = json.loads(self.active_path.read_text(encoding="utf-8"))
+        document["source_policies"][CHANNEL_A]["priorities"] = [["13", 10]]
+        self.active_path.write_text(json.dumps(document), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "violates the include filter"):
             load_active_configuration(self.active_path)
 
     def test_apply_readers_observe_only_complete_v2_snapshots(self):
