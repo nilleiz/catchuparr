@@ -3,6 +3,8 @@ import json
 import math
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -166,6 +168,36 @@ class RecorderFailoverMediaTests(unittest.TestCase):
                         )
             finally:
                 probe._cached_segment_identity.cache_clear()
+
+
+class RecorderFailoverBridgeTests(unittest.TestCase):
+    def test_bridge_idle_wait_observes_handler_close(self):
+        drained = threading.Event()
+        server = SimpleNamespace(active_requests=lambda: int(not drained.is_set()))
+
+        def finish_request():
+            time.sleep(0.03)
+            drained.set()
+
+        closer = threading.Thread(target=finish_request)
+        closer.start()
+        try:
+            active = probe._wait_for_bridge_idle(
+                SimpleNamespace(server=server), timeout=1
+            )
+        finally:
+            closer.join(timeout=1)
+
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(active, 0)
+
+    def test_bridge_idle_wait_leaves_timeout_failure_visible(self):
+        server = SimpleNamespace(active_requests=lambda: 1)
+        active = probe._wait_for_bridge_idle(
+            SimpleNamespace(server=server), timeout=0.02
+        )
+        self.assertEqual(active, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
