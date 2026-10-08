@@ -164,9 +164,6 @@ def compile_draft(
         catalog.profiles,
         catalog.streams_by_channel,
     )
-    channels_by_uuid = {
-        str(channel.get("uuid") or ""): channel for channel in catalog.channels
-    }
     encoded = {
         channel_uuid: {
             "include_account_ids": (
@@ -327,8 +324,8 @@ def reset_legacy_configuration(active_path: Path | None = None) -> bool:
         legacy_snapshot = type(current_version) is int and current_version == 1
 
         try:
-            from django.db import transaction
             from apps.plugins.models import PluginConfig
+            from django.db import transaction
         except (ImportError, ModuleNotFoundError):
             if legacy_snapshot:
                 _delete_legacy_snapshot_locked(path)

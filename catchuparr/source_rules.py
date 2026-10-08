@@ -12,7 +12,6 @@ from yaml.constructor import ConstructorError
 from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
 
-
 MAX_FILTER_CONFIG_BYTES = 64 * 1024
 MAX_RULES = 256
 
