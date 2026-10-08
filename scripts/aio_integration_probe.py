@@ -34,7 +34,11 @@ def probe_source_configuration(channel, root):
 
     from catchuparr.adapters.recorder_proxy import (
         _CredentialMarkerRedisFacade,
+        _release_worker_reservation,
         core_api_supported,
+        make_worker_id,
+        reservation_credential_marker_key,
+        write_worker_record,
     )
     from catchuparr.configuration import (
         apply_configuration,
@@ -98,30 +102,63 @@ def probe_source_configuration(channel, root):
     profile_key = profile_connections_key(profile.id)
     marker_key = profile_credential_release_key(profile.id)
     credential_key = "catchuparr:ci:synthetic-credential-count"
-    for order in ((0, 1), (1, 0)):
-        facades = [
-            _CredentialMarkerRedisFacade(redis_client, profile.id, uuid.uuid4().hex)
-            for _ in range(2)
-        ]
-        require(reserve_profile_slot(profile, redis_client)[0], "Native slot must reserve")
-        for facade in facades:
+    scenarios = (
+        (False, (0, 1)),
+        (True, ("live", 0, 1)),
+        (True, (0, "live", 1)),
+        (True, (1, 0, "live")),
+    )
+    for with_live, order in scenarios:
+        redis_client.delete(profile_key, marker_key, credential_key)
+        workers = []
+        private_markers = []
+        if with_live:
+            require(reserve_profile_slot(profile, redis_client)[0], "Native slot must reserve")
+        for index in range(2):
+            reservation_id = uuid.uuid4().hex
+            worker_id = make_worker_id(str(channel.uuid), str(source_a.id), "synthetic", 1,
+                                       reservation_id)
+            facade = _CredentialMarkerRedisFacade(redis_client, profile.id, reservation_id)
             require(reserve_profile_slot(profile, facade)[0], "Archive slot must reserve")
             facade.set(marker_key, credential_key)
-        redis_client.set(marker_key, credential_key)
-        redis_client.set(credential_key, 3)
-        require(not reserve_profile_slot(profile, redis_client)[0],
-                "Archive must respect native profile capacity")
+            write_worker_record(redis_client, worker_id, {
+                "profile_id": profile.id, "reservation_id": reservation_id,
+                "reservation_state": "reserved", "state": "active",
+            })
+            workers.append(worker_id)
+            private_markers.append(reservation_credential_marker_key(reservation_id))
+        if with_live:
+            redis_client.set(marker_key, credential_key)
+        else:
+            require(redis_client.get(marker_key) is None,
+                    "Recorder-only scenario must not seed a native release marker")
+        total = 2 + int(with_live)
+        redis_client.set(credential_key, total)
+        if with_live:
+            require(not reserve_profile_slot(profile, redis_client)[0],
+                    "Archive must respect native profile capacity")
+        live_pending = with_live
         for index, slot in enumerate(order):
-            release_profile_slot(profile.id, facades[slot])
-            require(int(redis_client.get(profile_key) or 0) == 2 - index,
-                    "Archive teardown must release precisely one profile slot")
-            require(int(redis_client.get(credential_key) or 0) == 2 - index,
-                    "Archive teardown must release precisely one credential slot")
-            require(redis_client.get(marker_key) is not None,
-                    "Archive teardown must preserve the native live release marker")
-        release_profile_slot(profile.id, redis_client)
-        require(int(redis_client.get(profile_key) or 0) == 0)
-        require(int(redis_client.get(credential_key) or 0) == 0)
+            if slot == "live":
+                release_profile_slot(profile.id, redis_client)
+                live_pending = False
+            else:
+                require(_release_worker_reservation(redis_client, workers[slot]),
+                        "Exact archive ledger reservation must release")
+                require(redis_client.get(private_markers[slot]) is None,
+                        "Released archive reservation must remove its private marker")
+                require(not _release_worker_reservation(redis_client, workers[slot]),
+                        "Duplicate archive release must not consume another slot")
+            remaining = total - index - 1
+            require(int(redis_client.get(profile_key) or 0) == remaining,
+                    "Teardown must release precisely one profile slot")
+            require(int(redis_client.get(credential_key) or 0) == remaining,
+                    "Teardown must release precisely one credential slot")
+            if live_pending:
+                require(redis_client.get(marker_key) is not None,
+                        "Archive teardown must preserve a live reservation's release marker")
+        require(redis_client.get(marker_key) is None,
+                "Final teardown must remove the native release marker")
     redis_client.delete(credential_key)
     print("AIO source catalog, atomic Apply, policy ranking and native pool checks passed")
 
