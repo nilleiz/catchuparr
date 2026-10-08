@@ -2104,7 +2104,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                         worker_to_release = str(channel.uuid)
 
                         def force_release_native() -> None:
-                            from apps.proxy.live_proxy.services.channel_service import ChannelService
+                            from apps.proxy.live_proxy.services.channel_service import (
+                                ChannelService,
+                            )
 
                             ChannelService.stop_channel(worker_to_release)
 
