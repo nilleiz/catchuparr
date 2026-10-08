@@ -22,7 +22,9 @@ See the [release roadmap](docs/roadmap.md), [installation and development](docs/
 [0.1.4](https://github.com/nilleiz/catchuparr/releases/tag/v0.1.4); XC player
 validation remains open.
 
-The 0.2.0 source-policy package is an unreleased candidate. Its server-side AIO
-checks passed on both supported Dispatcharr versions; real-player regression is
-still required before release. See the [candidate install, settings and rollback
-guide](docs/candidate-0.2.0.md).
+The upcoming 0.2.1 candidate combines channel selection and source policy in
+one YAML filter document. It replaces the unreleased 0.2.0 candidate; there is
+no configuration migration and recording requires a fresh Validate/Apply.
+Its implementation and acceptance are in progress. Existing server-side results
+do not establish acceptance of the new YAML engine. See the
+[candidate guide](docs/candidate-0.2.1.md).
