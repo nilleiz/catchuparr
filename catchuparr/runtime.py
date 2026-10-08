@@ -53,8 +53,9 @@ def parse_settings(settings: dict) -> Config:
 
 
 def load_config() -> Config | None:
-    from .configuration import load_active_configuration
     from apps.plugins.models import PluginConfig
+
+    from .configuration import load_active_configuration
 
     plugin = PluginConfig.objects.filter(key=PLUGIN_KEY, enabled=True).first()
     if plugin is None:
