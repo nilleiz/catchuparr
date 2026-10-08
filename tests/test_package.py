@@ -23,9 +23,13 @@ class PackageTest(unittest.TestCase):
             self.assertFalse(any("__pycache__" in name for name in names))
             manifest = json.loads(archive.read("catchuparr/plugin.json"))
             self.assertEqual(manifest["name"], "Catchuparr")
-            self.assertEqual(manifest["version"], "0.2.0")
+            self.assertEqual(manifest["version"], "0.2.1")
             self.assertEqual(Plugin.version, manifest["version"])
-            self.assertEqual(Path(archive_path).name, "catchuparr-0.2.0.zip")
+            self.assertEqual(Path(archive_path).name, "catchuparr-0.2.1.zip")
+            field_ids = [field["id"] for field in manifest["fields"]]
+            self.assertIn("filter_config", field_ids)
+            self.assertNotIn("channel_uuids", field_ids)
+            self.assertNotIn("source_rules", field_ids)
         self.assertTrue(Path(archive_path).is_file())
 
     def test_runtime_modules_import_from_built_zip(self):
@@ -45,6 +49,9 @@ class PackageTest(unittest.TestCase):
             modules = (
                 "catchuparr.plugin",
                 "catchuparr.compatibility",
+                "catchuparr.configuration",
+                "catchuparr.source_rules",
+                "catchuparr.recorder_proxy",
                 "catchuparr.runtime",
                 "catchuparr.tasks",
                 "catchuparr.views",
@@ -53,6 +60,7 @@ class PackageTest(unittest.TestCase):
                 "catchuparr.ts_http",
                 "catchuparr.xc_runtime",
                 "catchuparr.adapters.m3u",
+                "catchuparr.adapters.recorder_proxy",
                 "catchuparr.adapters.xc",
                 "catchuparr.engine.admission",
                 "catchuparr.engine.leases",
