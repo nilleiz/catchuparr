@@ -1471,6 +1471,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     from core.models import CoreSettings, StreamProfile
     from core.utils import RedisClient
     from django.test import Client
+    from gevent import sleep as gevent_sleep
 
     from catchuparr.adapters.recorder_proxy import _release_worker_reservation
     from catchuparr.configuration import (
@@ -2057,7 +2058,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 == profile_baselines[profile_a.id]
             ):
                 break
-            time.sleep(0.1)
+            # ClientManager schedules the owner's normal disconnect cleanup
+            # onto ProxyServer's gevent hub. Drive that hub while waiting so
+            # the harness observes the same cleanup path as a running web
+            # worker instead of blocking it with time.sleep.
+            gevent_sleep(0.1)
         _require(
             redis_client.get(RedisKeys.channel_owner(worker_id)) is None
             and native_server.stream_managers.get(worker_id) is None
