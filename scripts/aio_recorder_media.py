@@ -798,8 +798,13 @@ def probe_actual_recorder_media(root: Path) -> None:
         profile_name = "Synthetic recorder media profile"
         channel_profile = ChannelProfile.objects.create(name=profile_name)
         created_channel_profiles.append(channel_profile)
-        ChannelProfileMembership.objects.create(
-            channel_profile=channel_profile, channel=channel, enabled=True,
+        ChannelProfileMembership.objects.filter(channel_profile=channel_profile).update(
+            enabled=False
+        )
+        ChannelProfileMembership.objects.update_or_create(
+            channel_profile=channel_profile,
+            channel=channel,
+            defaults={"enabled": True},
         )
         ChannelStream.objects.create(channel=channel, stream=source_a, order=0)
         ChannelStream.objects.create(channel=channel, stream=source_b, order=1)
@@ -1609,8 +1614,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         profile_name = "Synthetic live archive profile"
         channel_profile = ChannelProfile.objects.create(name=profile_name)
         created_channel_profiles.append(channel_profile)
-        ChannelProfileMembership.objects.create(
-            channel_profile=channel_profile, channel=channel, enabled=True,
+        ChannelProfileMembership.objects.filter(channel_profile=channel_profile).update(
+            enabled=False
+        )
+        ChannelProfileMembership.objects.update_or_create(
+            channel_profile=channel_profile,
+            channel=channel,
+            defaults={"enabled": True},
         )
         ChannelStream.objects.create(channel=channel, stream=stream_a, order=0)
         ChannelStream.objects.create(channel=channel, stream=stream_b, order=1)
