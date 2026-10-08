@@ -456,8 +456,14 @@ def probe():
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", disabled_params,
     )).status_code == 403)
-    runtime.shutdown()
-    probe_source_configuration(channel, root)
+    try:
+        probe_source_configuration(channel, root)
+        sys.path.insert(0, "/tmp")
+        from aio_recorder_media import probe_actual_recorder_media
+
+        probe_actual_recorder_media(root)
+    finally:
+        runtime.shutdown()
     print(f"AIO integration passed: Dispatcharr {__version__}")
 
 

@@ -44,6 +44,7 @@ def run():
                 raise RuntimeError("Disposable AIO did not become ready within 240 seconds")
             time.sleep(3)
         docker("cp", str(ROOT / "catchuparr"), f"{name}:/data/plugins/catchuparr")
+        docker("cp", str(ROOT / "scripts/aio_recorder_media.py"), f"{name}:/tmp/aio_recorder_media.py")
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
         docker("cp", str(ROOT / "tests"), f"{name}:/tmp/tests")
         docker("exec", "--workdir", "/tmp", "-e", "PYTHONPATH=/data/plugins:/tmp",
