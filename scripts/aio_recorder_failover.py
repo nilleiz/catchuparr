@@ -444,8 +444,11 @@ def _verified_segments(
             stat.st_mtime_ns,
         )
         _require(useful_av, "Indexed failover segment lacks decoded audio/video")
-        if source_name:
-            result.setdefault(source_name, []).append(segment)
+        _require(
+            source_name is not None,
+            "Indexed failover segment has no recognized synthetic source fingerprint",
+        )
+        result.setdefault(source_name, []).append(segment)
     return result
 
 

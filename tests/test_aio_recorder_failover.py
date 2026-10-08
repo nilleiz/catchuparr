@@ -128,5 +128,33 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             finally:
                 probe._cached_segment_identity.cache_clear()
 
+    def test_useful_av_with_an_unrecognized_tone_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "unknown-tone.ts"
+            path.write_bytes(b"synthetic segment fixture")
+            useful_streams = [
+                {"codec_type": "video", "nb_read_frames": "12"},
+                {"codec_type": "audio", "nb_read_frames": "30"},
+            ]
+
+            def fake_run(command, **_kwargs):
+                if command[0] == "ffprobe":
+                    payload = json.dumps({"programs": [], "streams": useful_streams}).encode()
+                    return SimpleNamespace(returncode=0, stdout=payload)
+                return SimpleNamespace(returncode=0, stdout=_sine_pcm(750))
+
+            probe._cached_segment_identity.cache_clear()
+            try:
+                with patch.object(probe.subprocess, "run", side_effect=fake_run):
+                    with self.assertRaisesRegex(RuntimeError, "no recognized synthetic source"):
+                        probe._verified_segments(
+                            _SyntheticArchiveStore([path]),
+                            "synthetic-channel",
+                            "ffmpeg",
+                            "ffprobe",
+                        )
+            finally:
+                probe._cached_segment_identity.cache_clear()
+
 if __name__ == "__main__":
     unittest.main()
