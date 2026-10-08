@@ -17,7 +17,10 @@ python3 scripts/build_plugin.py
 ```
 
 The build creates `dist/catchuparr-0.2.0.zip`. Keep the previous plugin ZIP and
-a restorable snapshot of the isolated instance's settings and archive storage.
+a restorable snapshot of the isolated instance's application data and settings.
+Exclude archive storage, recordings and the archive database from Dev backups
+unless explicitly requested. Keep at most two verified Dev backups, pruning
+older task-owned backups only after the new backup passes verification.
 Stop active recorders before updating. Import the ZIP with overwrite enabled,
 reload plugin discovery, then restart the instance so web and worker processes
 load the same plugin files. Check that the plugin reports version 0.2.0, passes
@@ -86,8 +89,10 @@ To roll back, stop recorders, reinstall the saved plugin ZIP, reload plugins,
 and restart all processes. Restore the pre-upgrade plugin settings so the old
 version does not retain candidate-only policy values. Verify plugin status and
 archive playback. If the old package does not pass those checks, restore the
-matching pre-upgrade instance and archive snapshot together. Keep the archive
-storage when its checks pass; do not delete it as part of a package rollback.
+matching pre-upgrade application data and settings. Archive storage is excluded
+from the default backup and remains in place during rollback. An application
+backup cannot restore overwritten archive data; do not delete archive storage
+as part of a package rollback.
 
 ## Release gate
 
