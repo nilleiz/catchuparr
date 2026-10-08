@@ -55,13 +55,15 @@ def parse_settings(settings: dict) -> Config:
 def load_config() -> Config | None:
     from apps.plugins.models import PluginConfig
 
+    from .configuration import load_active_configuration
+
     plugin = PluginConfig.objects.filter(key=PLUGIN_KEY, enabled=True).first()
     if plugin is None:
         return None
-    from .configuration import load_active_configuration
-
     active = load_active_configuration()
-    return parse_settings(active if active is not None else (plugin.settings or {}))
+    if active is None:
+        return None
+    return parse_settings(active)
 
 
 def load_plugin_settings(fallback: dict | None = None) -> dict:
@@ -72,11 +74,18 @@ def load_plugin_settings(fallback: dict | None = None) -> dict:
 
 
 def load_runtime_settings(fallback: dict | None = None) -> dict:
-    """Use applied settings after first Apply, otherwise preserve legacy settings."""
-    from .configuration import load_active_configuration
+    """Use applied IDs, or draft base settings with no selected channels."""
+    from .configuration import load_active_configuration, reset_legacy_configuration
 
+    reset_legacy_configuration()
     active = load_active_configuration()
-    return active if active is not None else load_plugin_settings(fallback)
+    if active is not None:
+        return active
+    draft = load_plugin_settings(fallback)
+    draft.pop("channel_uuids", None)
+    draft.pop("source_rules", None)
+    draft["channel_uuids"] = ""
+    return draft
 
 
 def validate_configuration(settings: dict) -> dict:
@@ -92,10 +101,14 @@ def apply_configuration(settings: dict) -> dict:
 
 
 def active_configuration(settings: dict) -> dict:
-    """Return applied source rules; absent/invalid data means the legacy proxy."""
+    """Return applied filters; absent state has no selected channels or overrides."""
     from .configuration import load_active_configuration
 
-    return load_active_configuration() or {"source_policies": {}}
+    return load_active_configuration() or {
+        "channel_uuids": "",
+        "channel_profile_ids": [],
+        "source_policies": {},
+    }
 
 
 def require_supported_version() -> None:
@@ -114,6 +127,9 @@ def bootstrap() -> None:
     except RuntimeError as exc:
         logger.error("Catchuparr runtime disabled: %s", exc)
         return
+    from .configuration import reset_legacy_configuration
+
+    reset_legacy_configuration()
     # Import the tasks in every worker so Celery sees plugin task names.
     from . import tasks  # noqa: F401
 
@@ -234,13 +250,22 @@ def status(settings: dict) -> dict:
             **stats,
             "recorder_running": recorder_running,
         })
-    return {
+    from .configuration import configuration_reset_required
+
+    result = {
         "channels": channels,
         "archive_root": str(config.archive_root),
         "retention_hours": config.retention_hours,
         "max_storage_bytes": config.max_storage_bytes,
         "indexed_storage_bytes": store.indexed_size_bytes(),
     }
+    if configuration_reset_required():
+        result["configuration_status"] = (
+            "Previous channel selection was cleared. Validate and apply filter_config to resume recording."
+        )
+    elif not config.channel_uuids:
+        result["configuration_status"] = "No channels are selected. Validate and apply filter_config."
+    return result
 
 
 def create_access_token(settings: dict) -> dict:

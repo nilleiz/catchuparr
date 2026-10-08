@@ -16,12 +16,21 @@ def reconcile_recorders():
     from apps.channels.models import Channel
     from core.utils import RedisClient
 
+    from .configuration import reset_legacy_configuration
     from .runtime import load_config, require_supported_version
 
     require_supported_version()
+    reset_legacy_configuration()
     config = load_config()
     if config is None:
         return {"queued": 0}
+    from .configuration import load_active_configuration
+    from .recorder_proxy import configuration_generation
+
+    active = load_active_configuration()
+    if active is None:
+        return {"queued": 0}
+    generation = configuration_generation(active)
     redis = RedisClient.get_client()
     desired = set(config.channel_uuids)
     valid = set(str(value) for value in Channel.objects.filter(uuid__in=desired).values_list("uuid", flat=True))
@@ -32,7 +41,7 @@ def reconcile_recorders():
         if redis.exists(lease_key):
             continue
         if redis.set(dispatch_key, "1", nx=True, ex=60):
-            record_channel.apply_async(args=[channel], queue="dvr")
+            record_channel.apply_async(args=[channel, generation], queue="dvr")
             queued += 1
     from .engine.store import ArchiveStore
 
@@ -52,10 +61,12 @@ def snapshot_epg():
     from apps.channels.managers import with_effective_values
     from apps.channels.models import Channel
 
+    from .configuration import reset_legacy_configuration
     from .engine.store import ArchiveStore
     from .runtime import load_config, require_supported_version
 
     require_supported_version()
+    reset_legacy_configuration()
     config = load_config()
     if config is None:
         return {"saved": 0}
@@ -91,12 +102,12 @@ def snapshot_epg():
 
 
 @shared_task(name="catchuparr.record_channel")
-def record_channel(channel_uuid: str):
+def record_channel(channel_uuid: str, expected_generation: str | None = None):
     from apps.channels.tasks import get_dvr_stream_base_url
     from core.utils import RedisClient
 
     from .adapters.recorder_proxy import core_api_supported, install_proxyserver_cleanup_hook
-    from .configuration import load_active_configuration
+    from .configuration import load_active_configuration, reset_legacy_configuration
     from .engine.leases import RedisRecorderLease
     from .engine.recorder import FFmpegCopyRecorder
     from .engine.store import ArchiveStore
@@ -110,11 +121,16 @@ def record_channel(channel_uuid: str):
     from .runtime import load_config, require_supported_version
 
     require_supported_version()
+    reset_legacy_configuration()
     redis = RedisClient.get_client()
     redis.delete(f"catchuparr:dispatch:{channel_uuid}")
     config = load_config()
     if config is None or channel_uuid not in config.channel_uuids:
         return {"status": "disabled"}
+    active = load_active_configuration()
+    generation = configuration_generation(active) if active is not None else ""
+    if expected_generation is not None and generation != expected_generation:
+        return {"status": "stale_configuration"}
     store = ArchiveStore(config.archive_root)
     lease = RedisRecorderLease(
         redis, channel_uuid, ttl_seconds=30, archive_store=store
@@ -128,11 +144,9 @@ def record_channel(channel_uuid: str):
     attempt_state = {"attempt": None, "candidate": None}
     try:
         stop_event = threading.Event()
-        active = load_active_configuration()
-        generation = configuration_generation(active) if active is not None else ""
         candidates = ranked_source_candidates(channel_uuid, active)
-        # A missing policy or mode=unchanged deliberately keeps Dispatcharr's
-        # channel URL and its shared live worker.
+        # A missing filter override keeps Dispatcharr's default live route and
+        # its shared worker.
         if candidates is not None and not candidates:
             return {"status": "no_permitted_sources"}
         if candidates is not None and not core_api_supported():
