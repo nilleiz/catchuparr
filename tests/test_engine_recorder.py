@@ -6,9 +6,13 @@ import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from catchuparr.engine import ArchiveStore
-from catchuparr.engine.recorder import FFmpegCopyRecorder
+from catchuparr.engine.recorder import (
+    FFmpegCopyRecorder,
+    has_useful_transport_stream,
+)
 
 
 class RecorderTests(unittest.TestCase):
@@ -30,6 +34,156 @@ class RecorderTests(unittest.TestCase):
         self.assertNotIn("-reset_timestamps", args)
         self.assertNotIn("-vf", args)
         self.assertNotIn("-af", args)
+
+    def test_internal_capability_is_sent_as_header_not_url(self):
+        recorder = FFmpegCopyRecorder(
+            self.store,
+            "ch1",
+            "http://dispatcharr/catchuparr/recorder/ch1",
+            self.root / "work",
+            input_headers={"X-Catchuparr-Recorder": "opaque-capability"},
+        )
+        args = recorder.command(self.root / "output")
+        header_index = args.index("-headers")
+        input_index = args.index("-i")
+
+        self.assertLess(header_index, input_index)
+        self.assertEqual("X-Catchuparr-Recorder: opaque-capability\r\n", args[header_index + 1])
+        self.assertEqual("http://dispatcharr/catchuparr/recorder/ch1", args[input_index + 1])
+        self.assertNotIn("opaque-capability", args[input_index + 1])
+
+    def test_input_headers_reject_line_break_injection(self):
+        with self.assertRaisesRegex(ValueError, "header value"):
+            FFmpegCopyRecorder(
+                self.store,
+                "ch1",
+                "http://dispatcharr/catchuparr/recorder/ch1",
+                self.root / "work",
+                input_headers={"X-Catchuparr-Recorder": "cap\r\nX-Other: forged"},
+            )
+
+    @staticmethod
+    def _ts_packet(pid: int, *, start: bool = False) -> bytes:
+        packet = bytearray(b"\xff" * 188)
+        packet[0] = 0x47
+        packet[1] = ((pid >> 8) & 0x1F) | (0x40 if start else 0)
+        packet[2] = pid & 0xFF
+        packet[3] = 0x10
+        packet[4:8] = b"\x00\x00\x01\xc0"
+        return bytes(packet)
+
+    def test_useful_media_detection_rejects_null_keepalives(self):
+        media = self.root / "media.ts"
+        media.write_bytes(self._ts_packet(256, start=True) + self._ts_packet(256))
+        keepalive = self.root / "keepalive.ts"
+        keepalive.write_bytes(self._ts_packet(0x1FFF, start=True) + self._ts_packet(0x1FFF))
+
+        self.assertTrue(has_useful_transport_stream(media))
+        self.assertFalse(has_useful_transport_stream(keepalive))
+
+    def test_policy_attempt_indexes_useful_segments_and_discards_keepalive_segments(self):
+        out = self.root / "policy-attempt"
+        out.mkdir()
+        useful_path = out / "useful.ts"
+        useful_path.write_bytes(self._ts_packet(256, start=True) + self._ts_packet(256))
+        null_path = out / "null.ts"
+        null_path.write_bytes(self._ts_packet(0x1FFF, start=True) + self._ts_packet(0x1FFF))
+        listing = out / "segments.csv"
+        listing.write_text(
+            "useful.ts,0,6\nnull.ts,6,12\n", encoding="utf-8"
+        )
+        _, count = self.recorder._publish_csv_rows(
+            listing, 0, require_useful_media=True
+        )
+
+        self.assertEqual(1, count)
+        self.assertEqual(1, len(self.store.segments("ch1")))
+        self.assertFalse(null_path.exists())
+
+    def test_single_source_attempt_requires_a_useful_closed_segment(self):
+        class FinishedProcess:
+            def __init__(self, command, **_kwargs):
+                output_path = Path(command[-1])
+                listing = Path(command[command.index("-segment_list") + 1])
+                output_path.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                listing.write_text(f"{output_path.name},0,6\n", encoding="utf-8")
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        recorder = FFmpegCopyRecorder(
+            self.store,
+            "ch1",
+            "http://dispatcharr/catchuparr/recorder/ch1",
+            self.root / "candidate-work",
+            require_media_progress=True,
+        )
+        with patch("catchuparr.engine.recorder.subprocess.Popen", FinishedProcess):
+            result = recorder.run_candidate(threading.Event())
+
+        self.assertEqual("exited", result.status)
+        self.assertEqual(1, result.useful_segments)
+        self.assertEqual(1, len(self.store.segments("ch1")))
+
+    def test_candidate_stop_terminates_ffmpeg_before_indexing_final_segment(self):
+        events = []
+
+        class TerminatedProcess:
+            def __init__(self, command, **_kwargs):
+                self.command = command
+                self.return_code = None
+                self.killed = False
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self):
+                events.append("terminate")
+
+            def wait(self, timeout=None):
+                self.assert_terminated()
+                events.append("wait")
+                output_path = Path(self.command[-1])
+                listing = Path(self.command[self.command.index("-segment_list") + 1])
+                output_path.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                listing.write_text(f"{output_path.name},0,6\n", encoding="utf-8")
+                self.return_code = -15
+                return self.return_code
+
+            def assert_terminated(self):
+                if not events or events[-1] != "terminate":
+                    raise AssertionError("FFmpeg wait happened before SIGTERM")
+
+            def kill(self):
+                self.killed = True
+                events.append("kill")
+
+        recorder = FFmpegCopyRecorder(
+            self.store,
+            "ch1",
+            "http://dispatcharr/catchuparr/recorder/ch1",
+            self.root / "candidate-stop-work",
+            require_media_progress=True,
+        )
+        stop_event = threading.Event()
+        stop_event.set()
+        with patch("catchuparr.engine.recorder.subprocess.Popen", TerminatedProcess):
+            result = recorder.run_candidate(stop_event)
+
+        self.assertEqual("stopped", result.status)
+        self.assertEqual(-15, result.return_code)
+        self.assertEqual(1, result.useful_segments)
+        self.assertEqual(["terminate", "wait"], events)
+        self.assertEqual(1, len(self.store.segments("ch1")))
 
     def test_completed_csv_rows_are_indexed_only_after_file_exists(self):
         out = self.root / "session"

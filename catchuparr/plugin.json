@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Local rolling catch-up archive and start-over for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -10,7 +10,14 @@
       "label": "Channel UUIDs (one per line)",
       "type": "text",
       "default": "",
-      "help_text": "Only selected channels are recorded."
+      "help_text": "Only selected channels are recorded. Without a source override, recording uses the shared live stream."
+    },
+    {
+      "id": "source_rules",
+      "label": "Live source rules",
+      "type": "text",
+      "default": "",
+      "help_text": "Rules apply only to M3U sources already assigned to a channel. Leave blank to share the live stream. Use *, number, name, or group selectors with include-only, exclude-only, priority, or unchanged mode. Validate previews; Apply activates atomically. Overrides use a dedicated worker and may need another provider slot."
     },
     {
       "id": "archive_root",
@@ -40,8 +47,30 @@
     }
   ],
   "actions": [
-    {"id": "status", "label": "Archive status", "button_label": "Show status"},
-    {"id": "reconcile", "label": "Reconcile recorders", "button_label": "Reconcile"},
-    {"id": "create_access_token", "label": "Create M3U access token", "button_label": "Create token"}
+    {
+      "id": "status",
+      "label": "Archive status",
+      "button_label": "Show status"
+    },
+    {
+      "id": "reconcile",
+      "label": "Reconcile recorders",
+      "button_label": "Reconcile"
+    },
+    {
+      "id": "create_access_token",
+      "label": "Create M3U access token",
+      "button_label": "Create token"
+    },
+    {
+      "id": "validate_configuration",
+      "label": "Validate source rules",
+      "button_label": "Validate"
+    },
+    {
+      "id": "apply_configuration",
+      "label": "Apply source rules",
+      "button_label": "Apply configuration"
+    }
   ]
 }
