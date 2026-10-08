@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -211,7 +213,10 @@ def _read_stream_iterator(iterator, *, minimum_bytes: int, timeout: float, close
     reader.join(timeout)
     if reader.is_alive():
         if close is not None:
-            close()
+            try:
+                close()
+            except Exception:
+                pass
         reader.join(3)
         raise RuntimeError("Synthetic recorder route did not deliver media before timeout")
     if failures:
@@ -261,6 +266,127 @@ def _verify_media_identity(ffprobe: str, media: bytes) -> None:
         "Recorder route returned no decoded audio/video frames",
     )
 
+def _run_fresh_process_follower(
+    attempt,
+    *,
+    channel_uuid: str,
+    stream_id: str,
+    account_id: str,
+    profile_id: int,
+    expected_profile_count: int,
+    ffprobe: str,
+) -> None:
+    """Attach from a fresh Django process using the same private capability."""
+    bootstrap = (
+        "import os,runpy,sys; from pathlib import Path; "
+        "sys.path.insert(0, '/data/plugins'); "
+        "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
+        "sys.argv=['manage.py','shell']; "
+        "runpy.run_path('/app/manage.py',run_name='__main__')"
+    )
+    route_path = f"/catchuparr/recorder/{channel_uuid}"
+    child_script = f"""
+import sys
+sys.path.insert(0, "/data/plugins")
+sys.path.insert(0, "/tmp")
+from django.test import Client
+from apps.m3u.connection_pool import profile_connections_key
+from core.utils import RedisClient
+from catchuparr import runtime
+from catchuparr.adapters.recorder_proxy import read_worker_record
+from catchuparr.configuration import load_active_configuration
+from catchuparr.recorder_proxy import (
+    capability_binding_current,
+    configuration_generation,
+    verify_recorder_capability,
+)
+from aio_recorder_media import _read_stream_response, _verify_media_identity
+
+def follower_require(condition):
+    if not condition:
+        raise RuntimeError("synthetic follower assertion failed")
+
+runtime.bootstrap()
+token = {attempt.capability!r}
+worker_id = {str(attempt.worker_id)!r}
+channel_uuid = {channel_uuid!r}
+stream_id = {stream_id!r}
+account_id = {account_id!r}
+profile_id = {int(profile_id)!r}
+parent_pid = {os.getpid()!r}
+follower_require(os.getpid() != parent_pid)
+redis_client = RedisClient.get_client()
+binding = verify_recorder_capability(redis_client, token)
+follower_require(binding is not None and capability_binding_current(redis_client, binding))
+follower_require(binding.get("worker_id") == worker_id)
+follower_require(binding.get("channel_uuid") == channel_uuid)
+follower_require(binding.get("stream_id") == stream_id)
+follower_require(binding.get("account_id") == account_id)
+follower_require(binding.get("config_generation") == {str(attempt.config_generation)!r})
+active = load_active_configuration()
+follower_require(active is not None)
+follower_require(configuration_generation(active) == binding.get("config_generation"))
+record_before = read_worker_record(redis_client, worker_id)
+follower_require(record_before is not None)
+follower_require(record_before.get("worker_id") == worker_id)
+follower_require(record_before.get("state") == "active")
+follower_require(record_before.get("reservation_state") == "reserved")
+follower_require(record_before.get("stream_id") == stream_id)
+follower_require(record_before.get("account_id") == account_id)
+follower_require(record_before.get("profile_id") == str(profile_id))
+follower_require(record_before.get("config_generation") == binding.get("config_generation"))
+profile_key = profile_connections_key(profile_id)
+follower_require(int(redis_client.get(profile_key) or 0) == {expected_profile_count!r})
+
+response = None
+try:
+    client = Client(raise_request_exception=False)
+    response = client.get(
+        {route_path!r},
+        HTTP_HOST="localhost",
+        HTTP_USER_AGENT="Synthetic recorder follower",
+        HTTP_X_CATCHUPARR_RECORDER=token,
+    )
+    follower_require(response.status_code == 200)
+    follower_require(response.get("Content-Type", "").split(";", 1)[0] == "video/mp2t")
+    follower_require(not response.get("Location"))
+    follower_require(getattr(response, "streaming", False))
+    media = _read_stream_response(response, minimum_bytes=188 * 512, timeout=20)
+    _verify_media_identity({ffprobe!r}, media)
+finally:
+    if response is not None:
+        response.close()
+
+follower_require(capability_binding_current(redis_client, binding))
+record_after = read_worker_record(redis_client, worker_id)
+follower_require(record_after is not None)
+follower_require(record_after.get("worker_id") == worker_id)
+follower_require(record_after.get("state") == "active")
+follower_require(record_after.get("reservation_state") == "reserved")
+follower_require(record_after.get("reservation_id") == record_before.get("reservation_id"))
+follower_require(record_after.get("lease_value") == binding.get("lease_value"))
+follower_require(record_after.get("lease_fence") == binding.get("lease_fence"))
+follower_require(record_after.get("config_generation") == binding.get("config_generation"))
+follower_require(int(redis_client.get(profile_key) or 0) == {expected_profile_count!r})
+print("CATCHUPARR_RECORDER_FOLLOWER_OK")
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", bootstrap],
+            input=child_script.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd="/app",
+            timeout=45,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Fresh-process recorder follower exceeded its bounded timeout") from None
+    _require(
+        result.returncode == 0
+        and b"CATCHUPARR_RECORDER_FOLLOWER_OK" in result.stdout.splitlines(),
+        "Fresh-process recorder follower did not attach and release cleanly",
+    )
 
 def probe_actual_recorder_media(root: Path) -> None:
     """Exercise the guarded private route against real native Dispatcharr APIs."""
@@ -525,7 +651,10 @@ def probe_actual_recorder_media(root: Path) -> None:
                  "Authorized recorder response is not MPEG-TS")
         _require(not response.get("Location"), "Redirect profile leaked a provider redirect")
         _require(getattr(response, "streaming", False), "Recorder response is not a live stream")
-        media = _read_stream_response(response, minimum_bytes=188 * 512, timeout=20)
+        parent_iterator = iter(response.streaming_content)
+        media = _read_stream_iterator(
+            parent_iterator, minimum_bytes=188 * 512, timeout=20, close=response.close,
+        )
         _verify_media_identity(ffprobe, media)
         counts, _ = source_server.snapshot()
         _require(counts["source-a.ts"] == 0, "Forbidden source A was opened by the recorder")
@@ -550,6 +679,84 @@ def probe_actual_recorder_media(root: Path) -> None:
             list(ChannelStream.objects.filter(channel=channel).order_by("order", "id")
                  .values_list("stream_id", "order")) == original_assignments,
             "Recorder source changed native ChannelStream assignments",
+        )
+
+        counts_before_follower, active_before_follower = source_server.snapshot()
+        record_before_follower = read_worker_record(redis_client, attempt_b.worker_id)
+        _require(record_before_follower is not None, "Recorder worker disappeared before follower attach")
+        reservation_count_before_follower = _profile_count(
+            redis_client, profile_b.id, profile_connections_key,
+        )
+        _require(
+            reservation_count_before_follower == profile_baselines[profile_b.id] + 1,
+            "Recorder provider slot was not reserved before follower attach",
+        )
+        _require(
+            active_before_follower["source-b.ts"] >= 1,
+            "Synthetic B source was not active before follower attach",
+        )
+        _run_fresh_process_follower(
+            attempt_b,
+            channel_uuid=str(channel.uuid),
+            stream_id=str(source_b.id),
+            account_id=str(account_b.id),
+            profile_id=int(profile_b.id),
+            expected_profile_count=reservation_count_before_follower,
+            ffprobe=ffprobe,
+        )
+        counts_after_follower, active_after_follower = source_server.snapshot()
+        _require(
+            counts_after_follower == counts_before_follower,
+            "Fresh-process follower opened another synthetic provider connection",
+        )
+        _require(
+            active_after_follower["source-b.ts"] >= 1,
+            "Closing the follower stopped the parent synthetic B source",
+        )
+        record_after_follower = read_worker_record(redis_client, attempt_b.worker_id)
+        _require(
+            record_after_follower is not None
+            and record_after_follower.get("worker_id") == attempt_b.worker_id
+            and record_after_follower.get("state") == "active"
+            and record_after_follower.get("reservation_state") == "reserved"
+            and record_after_follower.get("reservation_id")
+            == record_before_follower.get("reservation_id")
+            and record_after_follower.get("lease_value")
+            == record_before_follower.get("lease_value")
+            and record_after_follower.get("lease_fence")
+            == record_before_follower.get("lease_fence")
+            and record_after_follower.get("config_generation")
+            == record_before_follower.get("config_generation")
+            and record_after_follower.get("stream_id") == str(source_b.id)
+            and record_after_follower.get("profile_id") == str(profile_b.id),
+            "Fresh-process follower changed the parent recorder worker or reservation",
+        )
+        _require(
+            _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == reservation_count_before_follower,
+            "Fresh-process follower changed provider profile capacity",
+        )
+
+        continued_media = _read_stream_iterator(
+            parent_iterator, minimum_bytes=188 * 512, timeout=20, close=response.close,
+        )
+        _verify_media_identity(ffprobe, continued_media)
+        _require(
+            continued_media != media,
+            "Parent recorder response did not advance to different useful B media after follower close",
+        )
+        _require(
+            source_server.snapshot()[0] == counts_before_follower,
+            "Parent recorder continuation opened another synthetic provider connection",
+        )
+        _require(
+            _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == reservation_count_before_follower,
+            "Parent recorder continuation changed provider profile capacity",
+        )
+        _require(
+            source_server.snapshot()[1]["source-b.ts"] >= 1,
+            "Parent recorder no longer owns an active synthetic B source after follower close",
         )
 
         response.close()
@@ -686,7 +893,7 @@ def probe_actual_recorder_media(root: Path) -> None:
             ),
             "Recorder teardown changed a shared profile credential marker",
         )
-        print("AIO private recorder route returned identified B audio/video TS with fenced cleanup")
+        print("AIO private recorder route returned identified B audio/video TS with cross-process reuse and fenced cleanup")
     finally:
         if response is not None:
             try:
