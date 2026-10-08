@@ -25,6 +25,7 @@ class _FakeRedis:
         return b"native-owner"
 
     def hget(self, _key, _field):
+        self.reads += 1
         if self.reads >= self.state_after_reads:
             return b"ACTIVE"
         return b"CONNECTING"
@@ -129,7 +130,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertEqual(probe._redis_text("owner"), "owner")
         self.assertEqual(probe._constant_text(enum_value), "ACTIVE")
 
-    def test_native_active_wait_consumes_until_state_is_really_active(self):
+    def test_native_active_wait_polls_until_state_is_really_active(self):
         redis = _FakeRedis(state_after_reads=2)
         manager = SimpleNamespace(running=True)
         client_manager = SimpleNamespace(get_client_count=lambda: 1)
@@ -158,14 +159,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         class States:
             ACTIVE = "ACTIVE"
 
-        def media_chunks():
-            while True:
-                redis.reads += 1
-                yield b"x" * 188
-
         owner, found_manager, found_client_manager = probe._wait_for_native_active(
-            iter(media_chunks()),
-            SimpleNamespace(close=lambda: None),
             redis,
             server,
             "worker",
@@ -208,8 +202,6 @@ class RecorderMediaProbeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "did not reach ACTIVE"):
             probe._wait_for_native_active(
-                iter(media_chunks()),
-                SimpleNamespace(close=lambda: None),
                 redis,
                 server,
                 "worker",
