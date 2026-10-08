@@ -324,14 +324,20 @@ class _NativeLiveMediaReader:
                     )
                 self._condition.wait(min(remaining, 0.25))
 
-    def close(self, response, *, force_release=None) -> None:
+    def close(self, response, *, force_release=None, join_timeout: float = 5) -> None:
         self._stop_requested.set()
-        self.thread.join(timeout=5)
+        self.thread.join(timeout=join_timeout)
+        force_release_error = None
         if self.thread.is_alive() and force_release is not None:
-            force_release()
-            self.thread.join(timeout=5)
+            try:
+                force_release()
+            except Exception as exc:
+                force_release_error = type(exc).__name__
+            self.thread.join(timeout=join_timeout)
         _require(not self.thread.is_alive(), "Native live reader did not stop at a chunk boundary")
         response.close()
+        if force_release_error is not None:
+            raise RuntimeError("Native live reader fallback stop failed")
 
 
 def _assert_tone_matches(actual: int | None, expected: int, label: str) -> None:
@@ -2096,8 +2102,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     force_release = None
                     if native_server is not None and channel is not None:
                         worker_to_release = str(channel.uuid)
+
                         def force_release_native() -> None:
-                            native_server._release_stream_resources(worker_to_release)
+                            from apps.proxy.live_proxy.services.channel_service import ChannelService
+
+                            ChannelService.stop_channel(worker_to_release)
 
                         force_release = force_release_native
                     live_reader.close(live_response, force_release=force_release)
