@@ -9,12 +9,11 @@ stored here.
 The supported Dispatcharr versions are 0.31.0 and 0.32.0. The first client path
 is M3U plus XMLTV with HLS archive playback. Dispatcharr remains the live proxy
 and EPG source. The XC adapter adds local TS archive playback and native XC M3U
-metadata through guarded, reversible hooks. TiviMate 5.3.3 on Shield TV has
-validated start-over, forward/backward seeking and pause/resume for Das Erste HD
-through the M3U/XMLTV path on the isolated Dispatcharr 0.32.0 Dev stack.
-The user also observed automatic playback from Tagesthemen into Maischberger;
-TiviMate requests a new archive window at the programme boundary. This client
-behavior is not a guarantee of automatic continuation in other players.
+metadata through guarded, reversible hooks. Real-player checks confirmed
+start-over, forward/backward seeking, pause/resume and client-managed programme
+transitions through M3U/XMLTV on Dispatcharr 0.32.0. This evidence is qualitative;
+exact displayed-frame timing and automatic continuation in other clients remain
+unverified.
 
 Repeat player tests after upgrades; native XC player validation is separate.
 

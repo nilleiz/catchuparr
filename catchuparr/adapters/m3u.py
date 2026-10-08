@@ -1,7 +1,7 @@
 """Pure M3U/XMLTV helpers for exposing locally archived channel programmes.
 
 These functions emit TiviMate's ``{utc}`` and ``{duration}`` placeholders in
-seconds, as validated with TiviMate 5.3.3.
+seconds.
 """
 
 from __future__ import annotations
