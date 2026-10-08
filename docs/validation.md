@@ -113,6 +113,6 @@ Safe reuse of an existing live worker with restrictive source rules has not
 been verified. Current source metadata and a fresh buffer cursor cannot prove
 chunk origin across source transitions or in-flight writes. The existing shared
 route remains the default without rules; the implemented override path uses a
-dedicated worker subject to native provider capacity. The intended release scope
-must be settled before publishing a source-policy release. See the
+dedicated worker subject to native provider capacity. This dedicated-connection behavior is the approved 0.2.0 release scope; safe
+reuse of native live workers remains deferred. See the
 [roadmap](roadmap.md) for the remaining acceptance requirements.
