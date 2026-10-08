@@ -174,9 +174,14 @@ def _transition_locked(
         _write_deny_marker(sidecar)
     except OSError:
         raise RecorderControlError("recorder control admission deny could not be persisted") from None
+    # A pending deny marker may be the only evidence that a prior Pause
+    # failed before publishing its paused sidecar. Re-enabling in that state
+    # must fence jobs queued under the old generation even if the sidecar
+    # already reads unpaused.
+    advance_generation = current.paused != paused or (marker_pending and not paused)
     updated = RecorderControlState(
         paused=paused,
-        generation=current.generation + (1 if current.paused != paused else 0),
+        generation=current.generation + (1 if advance_generation else 0),
     )
     try:
         _atomic_replace_sidecar(sidecar, updated)
