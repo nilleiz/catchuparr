@@ -15,7 +15,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 
 | Release | Feature | Relative effort | Status |
 | --- | --- | --- | --- |
-| 0.2.0 | M3U include/exclude rules and fixed priorities | High | In progress |
+| 0.2.0 | M3U include/exclude rules and fixed priorities | High | Candidate; real-player gate open |
 | 0.3.0 | Catch-up playback in Dispatcharr Stats | High to medium | Planned |
 | 0.4.0 | Recording windows by channel and weekday | Medium | Planned |
 | 0.5.0 | Hide archive recorders in Stats | Medium to low | Planned |
