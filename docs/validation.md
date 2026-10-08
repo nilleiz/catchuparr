@@ -127,8 +127,16 @@ teardown restored provider capacity. The probe also checked the resulting
 gap/discontinuity. Separate synthetic stream-copy checks covered short segments
 and rejection of unknown fingerprints.
 
-Isolation from an already active native live stream and Dev real-player
-regression remain separate acceptance gates.
+The native live/archive isolation probe passed in both images. Without source
+rules, recording shared the existing live connection. With a restricted source
+policy, a separate worker recorded the permitted source while the original live
+client continued yielding newly published media from its original source.
+Channel assignments and live-source metadata stayed unchanged. Closing the
+archive recorder left the live stream active; closing its final client then
+ran native disconnect cleanup and restored provider capacity. These checks used
+synthetic sources and the actual native routes and recording task.
+
+Dev real-player regression remains an acceptance gate.
 Passing parser or configuration tests alone is insufficient.
 
 Safe reuse of an existing live worker with restrictive source rules has not
