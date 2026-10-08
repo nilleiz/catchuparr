@@ -58,7 +58,44 @@ def load_config() -> Config | None:
     plugin = PluginConfig.objects.filter(key=PLUGIN_KEY, enabled=True).first()
     if plugin is None:
         return None
-    return parse_settings(plugin.settings or {})
+    from .configuration import load_active_configuration
+
+    active = load_active_configuration()
+    return parse_settings(active if active is not None else (plugin.settings or {}))
+
+
+def load_plugin_settings(fallback: dict | None = None) -> dict:
+    """Read the editable draft through Dispatcharr's existing PluginConfig row."""
+    from .configuration import load_draft_settings
+
+    return load_draft_settings(fallback)
+
+
+def load_runtime_settings(fallback: dict | None = None) -> dict:
+    """Use applied settings after first Apply, otherwise preserve legacy settings."""
+    from .configuration import load_active_configuration
+
+    active = load_active_configuration()
+    return active if active is not None else load_plugin_settings(fallback)
+
+
+def validate_configuration(settings: dict) -> dict:
+    from .configuration import validate_configuration as validate
+
+    return validate(settings)
+
+
+def apply_configuration(settings: dict) -> dict:
+    from .configuration import apply_configuration as apply
+
+    return apply(settings)
+
+
+def active_configuration(settings: dict) -> dict:
+    """Return applied source rules; absent/invalid data means the legacy proxy."""
+    from .configuration import load_active_configuration
+
+    return load_active_configuration() or {"source_policies": {}}
 
 
 def require_supported_version() -> None:

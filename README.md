@@ -21,3 +21,8 @@ See the [release roadmap](docs/roadmap.md), [installation and development](docs/
 [validation status](docs/validation.md). The M3U/HLS milestone is complete in
 [0.1.4](https://github.com/nilleiz/catchuparr/releases/tag/v0.1.4); XC player
 validation remains open.
+
+The 0.2.0 source-policy package is an unreleased candidate. Its server-side AIO
+checks passed on both supported Dispatcharr versions; real-player regression is
+still required before release. See the [candidate install, settings and rollback
+guide](docs/candidate-0.2.0.md).
