@@ -9,7 +9,10 @@ Use the single **Filter configuration (YAML)** field. Channel UUIDs are internal
 only. A blank document selects no channels. Validate lists every planned
 recorder; Apply activates the resolved selection and policies atomically.
 Saving a draft never changes recording. There is no migration from old settings
-or snapshots, and no recorder starts before a valid Apply.
+or snapshots. On startup, the plugin detects and deletes pre-0.2.1 filter
+settings and active snapshots, leaving an empty YAML configuration. General
+archive/storage settings, recordings and playback credentials are preserved.
+The reset is idempotent and no recorder starts before a valid Apply.
 
 ```yaml
 version: 1
@@ -61,8 +64,8 @@ and, where available, line information. Errors leave active settings intact.
 Build with the documented unit, compile, lint and package commands. Import
 `dist/catchuparr-0.2.1.zip` through Dispatcharr with overwrite enabled, then
 restart the isolated AIO so web and workers load the same version. Stop old
-recorders before installation. Start with empty filter settings, remove the
-superseded active configuration, and require a new Validate/Apply. Preserve the
+recorders before installation. The plugin removes detected legacy filter
+configuration and requires a new Validate/Apply. Preserve the
 archive path and general storage/retention settings; do not delete recordings.
 
 Use the designated operator for backups, installation and container start/stop/restart. Back up isolated application data and configuration only;

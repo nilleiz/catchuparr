@@ -46,7 +46,8 @@ identities, never a separate user selection.
   Overrides retain dedicated native workers, capacity limits and fenced cleanup.
 - Start with empty configuration and require Apply before any recorder starts.
   No previous configuration or active snapshot is migrated or activated.
-  Existing archive data and stable channel identities remain.
+  Detected pre-0.2.1 filter settings and active snapshots are deleted on startup.
+  General archive/storage settings, archive data and stable identities remain.
 - Apply stores a resolved JSON snapshot; later numbering/profile membership
   changes require another Apply. Old queued tasks recheck current configuration.
 - Strict YAML parsing rejects duplicate/unknown keys, invalid types, custom tags,
