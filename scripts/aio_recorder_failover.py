@@ -25,6 +25,7 @@ POLL_INTERVAL = 0.2
 SOURCE_DURATION = 8.0
 SOURCE_CHUNK_PACKETS = 32
 FINITE_SOURCE_REPEATS = 4
+BRIDGE_DRAIN_TIMEOUT = 5.0
 SYNTHETIC_SOURCE_TONES = {
     "Synthetic Source B": 880,
     "Synthetic Source C": 660,
@@ -326,6 +327,18 @@ class _DjangoHTTPBridge:
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and self.server.active_requests():
                 time.sleep(0.05)
+
+
+def _wait_for_bridge_idle(bridge: _DjangoHTTPBridge, *, timeout: float) -> int:
+    """Wait for the WSGI handler to finish closing its streaming response."""
+    if timeout <= 0:
+        raise ValueError("bridge drain timeout must be positive")
+    deadline = time.monotonic() + timeout
+    active = bridge.server.active_requests()
+    while active and time.monotonic() < deadline:
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        active = bridge.server.active_requests()
+    return active
 
 
 def _segment_has_useful_av(ffprobe: str, path: Path) -> bool:
@@ -1095,7 +1108,10 @@ def probe_recorder_failover(root: Path) -> None:
         )
         _assert_worker_cleanup(redis_client, runtime_channel.uuid)
 
-        bridge_active = bridge.server.active_requests() if bridge is not None else 0
+        bridge_active = (
+            _wait_for_bridge_idle(bridge, timeout=BRIDGE_DRAIN_TIMEOUT)
+            if bridge is not None else 0
+        )
         _require(bridge_active == 0, "Django bridge still has a private recorder response open")
         _require(
             all(
