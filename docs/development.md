@@ -22,13 +22,13 @@ The inspected compatibility targets are Dispatcharr v0.31.0 and v0.32.0. Unknown
 Create a separate archive access token for each playback device. Session identity is scoped to the credential, not proof of physical device identity: copying a playlist to another player shares its slot. Playlist reloads for the same programme reuse its session; switching programmes replaces that credential's session while preserving its previous segment URLs for a 30-second grace period.
 
 The authenticated M3U/XMLTV endpoint provides HLS archive playback. Its
-start-over, forward/backward seeks and pause/resume were confirmed on
-TiviMate 5.3.3/Shield TV with Dispatcharr 0.32.0. The plugin endpoint uses `{utc}`
+start-over, forward/backward seeks and pause/resume passed real-player
+acceptance with Dispatcharr 0.32.0. The plugin endpoint uses `{utc}`
 epoch seconds and `{duration}` seconds;
 Dispatcharr's native XC timeshift endpoint uses `{duration:60}` minutes. Keep
 those contracts separate. UTC metadata is attached only to locally annotated
 entries, so provider catch-up metadata is preserved. XC TS/Range playback must
-pass the AIO integration checks and a separate TiviMate test before being
+pass the AIO integration checks and separate real-player acceptance before being
 described as player-validated. Local availability is never persisted into
 Dispatcharr's provider-derived channel catch-up fields.
 
@@ -37,11 +37,11 @@ effective Dispatcharr guide programme. For older entries removed by an EPG
 refresh, it uses a locally saved programme snapshot only when that entire
 historical programme has archive coverage, matching the plugin XMLTV export.
 An unknown programme returns 404. The initial HLS playlist stops at that
-programme's end even if TiviMate sends its original full duration after a
+programme's end even if a client sends its original full duration after a
 seek. HLS reloads may append newly indexed segments within that programme.
-Fetching or prefetching its tail cannot unlock the next programme. TiviMate
-5.3.3 on Shield TV was observed automatically requesting a new archive window
-at a programme boundary, allowing Tagesthemen to continue into Maischberger.
+Fetching or prefetching its tail cannot unlock the next programme. Observed
+client-managed continuation requested a new archive window at a programme
+boundary.
 Server-side extension of the old playlist stays disabled; other clients need
 their own continuation test. A segment crossing the programme's end is omitted
 rather than serving
@@ -73,7 +73,7 @@ production is not updated. Preserve Dev bind addresses, volumes and egress rules
    Import the updated plugin through the authenticated API and restart Dev AIO
    so web and workers load the same version. Check anonymous requests are denied,
    recording progresses and both output adapters obey user catch-up restrictions.
-4. Repeat TiviMate 5.3.3/Shield tests for start-over, pause, multiple seeks,
+4. Repeat real-player tests for start-over, pause, multiple seeks,
    programme boundary, restart and retention. Enable sanitized tracing only for
    the test and record numeric time/range/status fields; never capture full URLs.
 5. To roll back, stop Dev, retain the failed Dev data privately, restore both cold
@@ -96,7 +96,7 @@ Never mount production directories into Dev. Keep host-specific names, addresses
 4. Restore using an authenticated **Dev admin** request: `POST /api/backups/<copied-zip-filename>/restore/`. In Dispatcharr v0.31.0, this route requires `IsAdmin`, returns HTTP 202 with `task_id` and `task_token`, and runs the restore in Celery. The backup must already be in Dev `/data/backups`; `POST /api/backups/upload/` is an alternative to copying it. Check completion at `GET /api/backups/status/<task_id>/?token=<task_token>` or through the Dev admin UI. Keep the token private; the restore can invalidate the initial admin session. A completed API task is still followed by a database content check. Do not assume elapsed time means success.
 5. While Beat remains stopped, apply `deploy/dev/scrub.sql` to **Dev** PostgreSQL (`docker exec -i catchuparr-dev-aio psql -U dispatch -d dispatcharr -v ON_ERROR_STOP=1 < deploy/dev/scrub.sql`). Verify zero enabled periodic tasks, provider accounts, EPG sources and plugins. The scrub disables DVR rules, recording jobs, provider refreshes, notifications and integrations too. Then send `SIGCONT` to the recorded Beat PID and restart only the Dev AIO container. Recheck the zero counts and an unauthenticated-denial endpoint. Select one test channel only after agreeing on its source connection and tuner usage.
 6. Before enabling a recorder, agree on a numeric `DEV_VU_IP` and `DEV_VU_PORT`. Stop Dev AIO; run `sudo python3 scripts/dev_egress.py remove --subnet "$DEV_LAN_SUBNET"`, then `apply` and `check` with `--vu-ip "$DEV_VU_IP" --vu-port "$DEV_VU_PORT"`; restart Dev. The rule permits established replies and new TCP connections only to that Vu+ endpoint. If the endpoint redirects elsewhere, leave it blocked and revise the allowlist explicitly.
-7. For a real player test, bind `DEV_BIND_IP` to the Dev host's LAN address and recreate only the Dev AIO. A fixed Shield TV address is optional; the M3U, XMLTV and archive routes authenticate with a separate, revocable token for that test device. Keep URLs containing the token in a private file outside the repository. Verify that an unauthenticated LAN request is rejected before importing the M3U and XMLTV URLs in TiviMate. Capture the installed TiviMate version/device. Test XC and M3U/XMLTV separately: archive icon, live start-over, repeated seeks, pause/resume, programme boundary, service restart, retention and rollback. Record HTTP method, URL template, time arguments, Range headers and response codes without logging credentials.
+7. For a real player test, bind `DEV_BIND_IP` to the Dev host's LAN address and recreate only the Dev AIO. A fixed player address is optional; the M3U, XMLTV and archive routes authenticate with a separate, revocable token for that test device. Keep URLs containing the token in a private file outside the repository. Verify that an unauthenticated LAN request is rejected before importing the M3U and XMLTV URLs in the test player. Keep player/device details in private operational notes. Test XC and M3U/XMLTV separately: archive icon, live start-over, repeated seeks, pause/resume, programme boundary, service restart, retention and rollback. Record HTTP method, URL template, time arguments, Range headers and response codes without logging credentials.
 
 For a Dev player trace, set `CATCHUPARR_TRACE_REQUESTS=1` in the private Dev
 Compose environment. AIO 0.32.0 starts web workers through `su -`, which strips
@@ -118,7 +118,7 @@ directory before importing. Retain the previous package and private cold Dev
 data/archive backup for rollback. A release does not authorize a production
 deployment.
 
-The current Dev instance was prepared from a consistent custom-format `pg_dump` before this API preference was clarified. For a future rebuild, the verified Dispatcharr ZIP and API flow above is the default. If no compatible ZIP exists, use `pg_dump -Fc`, verify it with `pg_restore -l` in a networkless container, restore into an isolated temporary PostgreSQL 17 container, apply `scrub.sql`, stop it, and copy only its cold cluster into the AIO Dev `/data/db` path (UID/GID 1000). A cold cluster prepared under a different glibc version may need `REINDEX DATABASE` for each copied database, followed by `ALTER DATABASE ... REFRESH COLLATION VERSION` inside the AIO image. Never mount a production database directory into Dev.
+Use the verified Dispatcharr backup ZIP and API flow above by default. If no compatible ZIP exists, use `pg_dump -Fc`, verify it with `pg_restore -l` in a networkless container, restore into an isolated temporary PostgreSQL 17 container, apply `scrub.sql`, stop it, and copy only its cold cluster into the AIO Dev `/data/db` path (UID/GID 1000). A cold cluster prepared under a different glibc version may need `REINDEX DATABASE` for each copied database, followed by `ALTER DATABASE ... REFRESH COLLATION VERSION` inside the AIO image. Never mount a production database directory into Dev.
 
 After stopping the Dev AIO container, remove the egress rule with `sudo python3 scripts/dev_egress.py remove --subnet "$DEV_LAN_SUBNET"`, then remove the dedicated bridge. Its isolated container and `${DEV_AIO_ROOT}` data can then be removed after the private backup and test findings are retained. Deleting the Dev stack never touches production mounts.
 

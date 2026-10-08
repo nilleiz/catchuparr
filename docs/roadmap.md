@@ -1,6 +1,6 @@
 # Catchuparr roadmap
 
-Baseline: released 0.1.4, M3U/XMLTV + HLS validated on TiviMate 5.3.3 / Shield TV with an isolated Dispatcharr 0.32.0 AIO. Production deployment is outside this roadmap. Each wishlist item gets its own release, ordered from hardest to easiest.
+Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. Each wishlist item gets its own release, ordered from hardest to easiest.
 
 ## Workflow and release gates
 
@@ -8,7 +8,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS validated on TiviMate 5.3.3 / Shield T
 - Every release includes an installable plugin ZIP, SHA-256 checksum, release notes and installation/update/rollback guidance.
 - Relevant synthetic tests, lint, compile and package checks, plus integration probes in pinned Dispatcharr 0.31.0 and 0.32.0 AIOs, gate publication. New private hooks are version/signature checked, idempotent and removable.
 - Deploy only to the isolated single-container Dev AIO, with its separate database, Redis, volumes, ports and restricted egress. Preserve consistent private backups and existing archives.
-- Recording changes require Shield regression for start-over, seeking, pause/resume and programme transition. CI does not replace real-player acceptance.
+- Recording changes require real-player regression for start-over, seeking, pause/resume and programme transition. CI does not replace real-player acceptance.
 - No companion container is planned; no production update or upstream PR is authorized by this roadmap.
 
 ## Release sequence
@@ -37,18 +37,18 @@ Preview lists resolved channels, permitted source order, recording windows, conf
 - Modes: unchanged, `include-only`, `exclude-only`, and priority only. Reference M3Us by unique name.
 - Higher priority wins. Missing priority is zero; equal priorities retain `ChannelStream` order. Weighting is deterministic preference, not random distribution.
 - Permit a global rule. A channel-specific rule replaces the global policy completely. Reject overlapping channel-specific rules, unknown or ambiguous M3U names and invalid syntax.
-- With no override, retain the existing shared channel proxy. With an override, reuse a matching permissible worker when safe, otherwise open a separate proxy worker. Additional provider connections or Vu+ tuners are permitted subject to actual limits.
+- With no override, retain the existing shared channel proxy. With an override, reuse a matching permissible worker when safe, otherwise open a separate proxy worker. Additional provider connections or source tuners are permitted subject to actual limits.
 - Do not modify channel membership/order, the live channel's Redis assignment, or the live worker's source. Reuse Dispatcharr profile reservation and slot release, including Redirect sources through a narrowly authenticated internal recorder/proxy adapter.
 - On connection exhaustion or failure, try the next permitted source. Never escape an include list. After successful fallback remain on that source until failure, a new recording window or applying new rules.
 - Preserve copy recording with all audio tracks, segment indexing and session-protected retention. Report unavailable sources as recorder status and real archive gaps.
 
 ### Rules
 
-Use `<selector> | mode=<mode> | m3u="Name","Other" | priority="Name":100,"Other":50`. `*` selects the global default. Selectors use `number:1,3,10-20`, `name:"Das Erste HD"` or `group:"News"`. The parser respects quoted names. Include/exclude lists apply before ranking.
+Use `<selector> | mode=<mode> | m3u="Name","Other" | priority="Name":100,"Other":50`. `*` selects the global default. Selectors use `number:1,3,10-20`, `name:"Synthetic Channel A"` or `group:"News"`. The parser respects quoted names. Include/exclude lists apply before ranking.
 
 ### Acceptance
 
-Synthetic tests cover filtering, deterministic ties, blocked profiles, failed starts, source failover and release of reservations. Both pinned AIOs must verify ordinary shared recording and isolated override workers, including Redirect sources. In Dev, a channel playing live from one source can archive from another without changing live playback. Agree real test sources/tuner availability before enabling additional connections. Shield playback regression must pass before publishing 0.2.0.
+Synthetic tests cover filtering, deterministic ties, blocked profiles, failed starts, source failover and release of reservations. Both pinned AIOs must verify ordinary shared recording and isolated override workers, including Redirect sources. In Dev, a channel playing live from one source can archive from another without changing live playback. Agree real test sources/tuner availability before enabling additional connections. Real-player playback regression must pass before publishing 0.2.0.
 
 ## 0.3.0 — playback Stats
 
@@ -76,7 +76,7 @@ REST and WebSocket agree. Test HLS/XC, reloads, seeks, pause, replacement/grace 
 
 ### Acceptance
 
-Synthetic clock tests cover weekdays, midnight, multiple/overlapping windows, DST changes and reboot inside/outside windows. Dev verifies start, stop, restart and archived playback outside the active window, with Shield regression.
+Synthetic clock tests cover weekdays, midnight, multiple/overlapping windows, DST changes and reboot inside/outside windows. Dev verifies start, stop, restart and archived playback outside the active window, with real-player regression.
 
 ## 0.5.0 — recorder visibility
 
@@ -96,7 +96,7 @@ Test recorder-only workers, shared workers, genuine local clients, more than ten
 ### Behavior
 
 - Replace the normal UUID input with channel numbers, inclusive ranges, decimal channel numbers, exact names and groups.
-- Examples: `number:1,3,10-20`, `name:"Das Erste HD"`, `group:"Öffentlich-rechtlich"`.
+- Examples: `number:1,3,10-20`, `name:"Synthetic Channel A"`, `group:"Synthetic Group A"`.
 - Union selection lines and deduplicate channels. Reject unknown/ambiguous identifiers and malformed ranges in preview.
 - Apply resolves to a stable UUID snapshot. Later renumbering or group changes require another Apply; no automatic unexpected recordings.
 - Preserve old UUID settings through compatible migration and retain every existing archive under its internal channel identity.
@@ -107,4 +107,4 @@ Test ranges, decimal numbers, ambiguous names/groups, duplicates, channel remova
 
 ## Deferred validation
 
-Native XC Shield acceptance remains separate from the completed 0.1.4 M3U/HLS milestone. Automatic continuation in other clients, exact displayed frame timing and extended retention/rollback playback checks are not yet established. Releases must describe actual evidence rather than infer player compatibility from server tests.
+Native XC real-player acceptance remains separate from the completed 0.1.4 M3U/HLS milestone. Automatic continuation in other clients, exact displayed frame timing and extended retention/rollback playback checks are not yet established. Releases must describe actual evidence rather than infer player compatibility from server tests.
