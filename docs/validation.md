@@ -1,191 +1,102 @@
 # Validation status
 
-The M3U/XMLTV + HLS milestone is complete for 0.1.4 on Shield TV with TiviMate
-5.3.3 and Dispatcharr 0.32.0. See the completed milestone below for current
-evidence and limitations. Earlier sections preserve the validation history;
-XC player validation remains open.
+## Released baseline: 0.1.4
 
-## Automated checks
+M3U/XMLTV with HLS passed qualitative real-player acceptance on Dispatcharr
+0.32.0: start-over, repeated forward/backward seeking, pause/resume and a
+programme transition. No consistent EPG-to-playback drift was reported.
+Client-managed continuation requested a new archive window at the boundary;
+the previous EVENT playlist stayed bounded to its programme.
 
-Run `python3 -m unittest discover -s tests -q`,
-`python3 -m compileall -q catchuparr scripts tests`,
-`ruff check .`, and `python3 scripts/build_plugin.py` before publishing a ZIP.
-CI runs the same checks with Python 3.12 and Ruff 0.13.3. Unit and synthetic
-stream tests do not establish player compatibility.
+These results do not establish exact displayed-frame timing or automatic
+continuation in other clients. Native XC real-player acceptance, extended
+retention and rollback playback checks remain open. Personal channel,
+programme, player and deployment details are not published.
 
-## Isolated Dispatcharr Dev stack
+## Automated release evidence
 
-The current Dev stack uses one Dispatcharr v0.32.0 AIO container with separate
-data, archive, Redis, database, network and port paths. The Dev egress rule
-permits the selected Vu+ endpoint only. The copied providers, scheduled jobs,
-recording rules and integrations were disabled before testing. The selected
-test channel is **Das Erste HD**; other imported channels are not recorded.
-This Dev instance predates the backup-ZIP/API restore procedure now documented
-for future rebuilds; it was seeded from an isolated, scrubbed database copy.
+Version 0.1.4 passed 157 local tests, Ruff, compileall, package build,
+independent review and all three required CI checks. Disposable, networkless
+AIO integration tests passed with the pinned Dispatcharr 0.31.0 and 0.32.0
+images. Those probes used the bundled FFmpeg and synthetic media, including
+two audio tracks and an unsupported private data PID.
 
-On 2026-10-05, the Dev recorder was observed adding short transport-stream
-segments continuously after an FFmpeg data-PID mapping fix. A non-admin Dev
-user received an M3U containing the selected channel's catch-up attributes
-and an XMLTV document containing its current programme. The authenticated
-archive route returned an appendable HLS event playlist and a real segment;
-`Range: bytes=188-563` returned HTTP 206, the corresponding `Content-Range`,
-and 376 bytes. These HTTP checks used a token in a private request header.
+The AIO probes cover plugin loading, route idempotence, M3U/XMLTV export,
+HLS playback, XC minute-based duration, UTC timestamps, timestamp seeks,
+user permissions, invalid credentials, the catch-up switch and byte ranges.
+Synthetic HTTP checks include 206 responses with matching Content-Range;
+unauthenticated requests are rejected. These checks do not establish player
+compatibility by themselves.
 
-Programme change, service restart and retention behavior still need a
-real-player check. Record request methods, time arguments, Range headers,
-status codes and observed playback without recording bearer tokens. XC must
-be tested separately before production use.
+Run before publishing a package:
 
-On 2026-10-06, the Dev AIO was rebound from loopback to the host's LAN
-interface for the Shield test. Its mounts and restricted Vu+ egress rule were
-rechecked. An unauthenticated LAN request returned HTTP 401; a separate
-device token fetched M3U and XMLTV successfully. The token and complete
-playlist URLs are stored only in a private local file outside this repository.
-The user then confirmed on TiviMate 5.3.3 running on Shield TV that the
-M3U/XMLTV setup, start-over from the beginning of the current programme,
-pause and seeking all work for **Das Erste HD** with the plugin's
-`catchup="default"` and `{utc}`/`{duration}` URL template. A request trace
-and separate results for programme changes, restarts, retention and XC remain
-open validation items.
+- `python3 -m unittest discover -s tests -q`
+- `python3 -m compileall -q catchuparr scripts tests`
+- `ruff check .`
+- `python3 scripts/build_plugin.py`
+- Both pinned AIO integration jobs in CI.
 
-## Dispatcharr 0.32.0 upgrade (2026-10-07)
+CI uses Python 3.12 and Ruff 0.13.3. Package assets contain no operational
+backups, personal recordings or diagnostic exports.
 
-The isolated Dev data and archive were backed up cold before changing the image.
-Dev now uses the pinned official 0.32.0 AIO with PostgreSQL 17 and the same
-isolated mounts, port and restricted source network. Production was not updated.
-The plugin was imported through the authenticated administrator API, then Dev
-was restarted so web and workers load the same package. Only Catchuparr's two
-schedules and the selected test provider were enabled; provider EPG refreshes
-remained disabled. A recorder lease and newly indexed segments were observed.
+## Programme boundaries and seeking
 
-Authenticated M3U and XMLTV requests returned 200; an anonymous playlist request
-returned 401. Local entries include UTC metadata while preserving the tested
-seconds-based URL template. Separate disposable AIOs passed synthetic HLS,
-authorization and Range checks for both 0.31.0 and 0.32.0. Native XC probes also
-exercise minute-based duration, integer UTC epoch values, timestamp seeks,
-channel permissions, invalid credentials and the user catch-up switch. Their
-checks passed in both pinned AIO images on the final implementation. Each AIO
-also passed 21 archive/playlist/recorder tests using its bundled FFmpeg, including
-two audio tracks and an unsupported private data PID. The final combined suite
-passed 131 tests, Ruff, compileall and package build. An independent review
-reproduced and verified session reuse, a 48-hour programme switch, HEAD requests
-during an open stream and second-device rejection under a one-stream limit.
+A reproduced request pattern changed the requested UTC instant on seeking
+while retaining the original programme duration. Using that duration without
+an EPG boundary could include the following programme. Local M3U windows now
+resolve the instant to the effective programme and stop at its end. Historical
+programme snapshots require archive coverage; missing guide data returns 404.
 
-The final Dev package loaded all four guarded XC hooks. Authenticated playlist
-access remained successful, and the selected recorder continued indexing new
-segments after the final restart. The original bootstrap, HLS integration and
-compatibility PRs were merged only after review and green checks. The final XC
-and AIO-CI PR requires both image integration jobs and the package job to pass.
+Tail reads may be prefetches and do not authorize extension into a following
+programme. HLS reloads may append newly completed segments within the selected
+programme. A crossing segment is omitted. The 60-second playlist target
+accommodates delayed keyframes, including a tested 16-second segment.
 
-The user will repeat the Shield/TiviMate tests later. The earlier successful
-0.31.0 player results do not establish 0.32.0 or XC player compatibility. A
-stable release remains gated on those real-player checks; CI plugin ZIPs are
-development artifacts.
+Sanitized server diagnostics showed successful requests with no playlist
+extending past its EPG programme end and first-segment alignment within one
+segment of the requested instant. This is segment-index evidence, not an
+instrumented measurement of the first displayed frame. Earlier checks found
+continuous archive segments and matching indexed UTC times; no programme-index
+shift was established.
 
-An additional historical Dev request exposed Dispatcharr's five-minute provider
-duration padding crossing a later archive gap. Local playback must use the
-exact requested minute interval, or the actual EPG end when no valid duration
-is supplied. Provider playback retains Dispatcharr's duration handling. A
-completed-minute fixture in both AIO integration jobs covers this regression.
-Both versions passed that fixture with an explicit duration and with the real
-EPG helper supplying the end. A subsequent Dev XC-first request exposed a
-legacy HLS-session schema that had not yet been migrated; the integration
-fixture now starts from that schema and exercises XC before HLS.
-The completed fix passed 136 local tests, Ruff, compileall, package build and
-both pinned AIO probes (including the bundled FFmpeg tests). Independent review
-also verified that malformed session schemas reject admission and clean up the
-pending admission row. After reinstalling and restarting the Dev AIO, an actual
-historical one-minute request returned HTTP 206 with the requested 188 TS bytes
-and `Content-Range: bytes 0-187/...`. No duration-padding or legacy-schema
-workaround was needed for that request.
+A reproducible real-player regression should start available programmes in
+chronological order, repeat each start, seek forward and backward at least
+three times, pause/resume and test a natural transition separately. Measure
+requested time against visible content when checking the two-segment tolerance.
+A 404 for unavailable material is not a successful start-over. Keep identifying
+traces and device details private.
 
-The plugin M3U/XMLTV endpoint and direct XC JSON are the two primary output
-paths. Native `/get.php` playlist annotation is tested separately; its core
-`/xmltv.php` guide has not been extended to restore local archive history.
-Historical guide visibility with that particular pairing remains unverified.
+## Other regressions and limits
 
-## TiviMate seek regression (2026-10-07)
+- Local XC playback uses the requested minute interval, or the actual EPG end
+  when no valid duration is supplied. Provider duration padding remains with
+  the provider path. Both AIO versions passed completed-minute fixtures.
+- XC-first admission migrates legacy HLS session schemas. Malformed schemas
+  reject admission and clean pending rows.
+- Session checks cover programme switches, grace periods, HEAD requests during
+  playback and rejection of another credential under a one-stream limit.
+- Recorder acquisition uses the archive's durable fence after Redis restarts
+  and releases leases on setup failure. An isolated restart resumed indexing
+  without manual fence repair.
+- Native XC M3U annotation does not restore historical guide entries through
+  the core XMLTV endpoint. Use the plugin M3U/XMLTV pairing for local history.
 
-The user confirmed that first start-over of the current programme works, but
-bar seeks can land minutes away from the selected point. Sanitized Dev access
-records show TiviMate 5.3.3 changes `{utc}` on each seek while leaving the
-original programme's `{duration}` at 2700 seconds. For a programme ending at
-16:00 UTC, one later request started at 15:47 UTC; the resulting 45-minute
-window contained 58 segments from the next programme. This is a reproducible
-server-side programme-boundary error. Version 0.1.2 bounds every M3U seek by
-its actual EPG programme, including historical programmes restored from the
-local XMLTV snapshots. A missing programme still returns 404. The sanitized
-archive trace now uses WARNING so it appears in the Dev AIO logs when enabled.
+## Development isolation and diagnostics
 
-The inspected 1026 indexed segments were continuous, with durations from 4.8
-to 7.02 seconds. The user subsequently reproduced a more serious symptom:
-selecting each of several programmes started the *following* programme. The
-sampled archive frames matched their indexed UTC times, so a one-programme
-index shift was not found. Tail segment reads may be player prefetches;
-allowing them to extend the HLS session into the next programme is therefore
-unsafe. Version 0.1.3 confined each session to the chosen programme and was
-scheduled for a Shield test before release. Server-side continuation across
-programme boundaries was disabled. The fixed 60-second target remains because FFmpeg
-can emit a 16-second segment when the next keyframe is delayed. TiviMate must
-still confirm that start-over and seeks land within two segments. At that stage,
-automatic cross-programme playback required a separate player test.
+Use one isolated AIO container with separate data and archive storage, blocked
+outgoing connections except explicitly allowed test sources, and initially
+disabled imported providers/jobs. The backup-ZIP/API restore procedure is in
+[development and deployment](development.md). Verify anonymous denial,
+authenticated playback and recorder progress after updates. Production changes
+are outside this validation scope.
 
-The planned Shield acceptance checklist was to use the unchanged private
-M3U/XMLTV URLs and refresh
-both exports. Choose programmes whose full start is still inside the available
-archive. Start three programmes in chronological order, note the first visible
-content, then repeat the same starts. For one programme, seek forwards and
-backwards at least three times and pause/resume. Record the selected time and
-visible time; an error greater than two archived segments fails acceptance.
-The server trace must show HTTP 200 for the requested programme and segments
-within that programme. A 404 indicates unavailable material and must not be
-counted as a successful start-over. Test automatic continuation separately
-using the client's actual behaviour. The completed test results follow below.
+Enable sanitized diagnostics only for a test and disable them afterward.
+Review collected output before sharing; never publish raw URLs, session tokens,
+personal EPG data or real-world request timestamps.
 
-PR #7 passed all three CI jobs and disposable AIO probes on both supported
-versions, and was merged. Isolated Dev 0.32.0 loaded 0.1.3; authenticated M3U,
-XMLTV and programme-bounded HLS returned 200, a partial segment Range returned
-206, and anonymous access returned 401. The cold Dev backup remains private.
-Dev retention is now four hours with a 10-GiB quota; previously deleted material
-cannot be restored by increasing the limits.
+## 0.2.0 work in progress
 
-The Dev restart also exposed an independent recorder integration bug: the
-task did not pass the durable archive fence into the existing Redis lease
-implementation. Redis reset its counter on AIO restart and the archive rejected
-the lower token. A safe counter-floor recovery resumed indexing; version 0.1.4
-wires the durable fence into task acquisition and releases leases on setup
-failure. The AIO web launcher also strips custom environment variables, so a
-private trace marker is required to enable sanitized web diagnostics there.
-At that point, Shield validation was still pending. The completed test follows.
-
-## M3U/HLS milestone completed: 0.1.4 (2026-10-07)
-
-On the isolated Dispatcharr 0.32.0 AIO, the user confirmed on Shield TV with
-TiviMate 5.3.3 that start-over, forward/backward seeking, pause and resume work
-as expected. No constant drift between EPG start and visible programme start
-was observed. Tagesthemen continued into Maischberger without manual input or
-a large interruption.
-
-The sanitized test trace contains 50 archive requests, all HTTP 200. No
-returned playlist extends past its EPG programme end. The first archived segment
-starts at most 5.534 seconds before the requested UTC instant. This is server
-segment alignment evidence, not an exact measurement of the displayed frame.
-The user's playback result is qualitative; the two-segment image tolerance
-was not measured with an instrumented player.
-
-At two boundaries, the server recorded a new archive request and session for
-the next programme. One request near 22:49:45 local time ended at 22:50:00;
-the subsequent request began at 22:50:03. Another boundary moved from a
-programme ending at 21:45:00 to a new request at 21:45:03. Together with the
-user's confirmation, this supports client-managed automatic continuation.
-The old EVENT playlist remains programme-bounded; tail prefetch does not
-extend it. Automatic continuation in other clients is unverified.
-
-Version 0.1.4 passed 157 local tests, Ruff, compileall, package build, independent
-review and all three CI checks, including actual pinned 0.31.0 and 0.32.0 AIOs.
-The real Dev recorder resumed after an AIO restart without manual fence repair.
-Authenticated M3U/XMLTV/HLS requests returned 200, a partial segment Range
-returned 206, anonymous access returned 401, and sanitized traces were observed.
-The M3U/XMLTV HLS milestone is complete. XC requires a separate Shield test;
-extended retention/rollback player tests and exact frame-time measurements
-remain future validation work. The production stack was not updated.
+Source policy enforcement is not released or accepted yet. Configuration,
+proxy lifecycle, reservation accounting and real media selection need the
+independent review and two-version AIO gates described in the
+[roadmap](roadmap.md). Passing parser or configuration tests alone is insufficient.
