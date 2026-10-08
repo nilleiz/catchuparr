@@ -343,8 +343,8 @@ class ArchiveStore:
             if right <= left:
                 continue
             # FFmpeg's segment CSV can leave a repeatable sub-frame offset
-            # between otherwise continuous TS files (0.14 s on the Dev Vu+
-            # stream). Treat only larger holes as unavailable archive time.
+            # between otherwise continuous TS files. Treat only larger holes
+            # as unavailable archive time.
             if merged and left <= merged[-1][1] + TIMELINE_GAP_TOLERANCE_SECONDS:
                 merged[-1][1] = max(merged[-1][1], right)
             else:
