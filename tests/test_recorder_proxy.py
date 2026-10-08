@@ -11,6 +11,10 @@ from catchuparr.adapters import recorder_proxy as adapter
 from catchuparr.configuration import SourceCatalog
 
 
+class PipelineWatchError(Exception):
+    pass
+
+
 class FakeRedis:
     def __init__(self):
         self.values = {}
@@ -83,6 +87,10 @@ class FakeRedis:
 
 
 class PipelineFakeRedis(FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.execute_conflicts_remaining = 0
+
     def pipeline(self):
         return FakeRedisPipeline(self)
 
@@ -115,6 +123,9 @@ class FakeRedisPipeline:
         self.commands.append(("delete", keys))
 
     def execute(self):
+        if self.redis.execute_conflicts_remaining:
+            self.redis.execute_conflicts_remaining -= 1
+            raise PipelineWatchError("simulated concurrent Redis update")
         for command, values in self.commands:
             if command == "decr":
                 self.redis.decr(values)
@@ -170,23 +181,28 @@ def _pipeline_connection_pool_module():
     def release_profile_slot(profile_id, redis_client):
         release_key = module.profile_credential_release_key(profile_id)
         profile_key = f"profile_connections:{profile_id}"
-        with redis_client.pipeline() as pipe:
-            pipe.watch(release_key, profile_key)
-            profile_count = int(pipe.get(profile_key) or 0)
-            credential_key = pipe.get(release_key)
-            if credential_key:
-                pipe.watch(credential_key)
-                credential_count = int(pipe.get(credential_key) or 0)
-            else:
-                credential_count = 0
-            pipe.multi()
-            if credential_key and profile_count > 0 and credential_count > 0:
-                pipe.decr(credential_key)
-            if profile_count <= 1:
-                pipe.delete(release_key)
-            if profile_count > 0:
-                pipe.decr(profile_key)
-            pipe.execute()
+        for _ in range(10):
+            with redis_client.pipeline() as pipe:
+                try:
+                    pipe.watch(release_key, profile_key)
+                    profile_count = int(pipe.get(profile_key) or 0)
+                    credential_key = pipe.get(release_key)
+                    if credential_key:
+                        pipe.watch(credential_key)
+                        credential_count = int(pipe.get(credential_key) or 0)
+                    else:
+                        credential_count = 0
+                    pipe.multi()
+                    if credential_key and profile_count > 0 and credential_count > 0:
+                        pipe.decr(credential_key)
+                    if profile_count <= 1:
+                        pipe.delete(release_key)
+                    if profile_count > 0:
+                        pipe.decr(profile_key)
+                    pipe.execute()
+                    return
+                except PipelineWatchError:
+                    continue
 
     module.release_profile_slot = release_profile_slot
     return module
@@ -422,6 +438,205 @@ class RecorderProxyTests(unittest.TestCase):
                 self.assertIsNone(redis.get(connection_pool.profile_credential_release_key(7)))
                 self.assertEqual("live-source-assignment", redis.get("channel_stream:44"))
                 self.assertEqual("live-profile-assignment", redis.get("stream_profile:44"))
+
+    def test_032_release_retry_exhaustion_preserves_reservation_marker(self):
+        connection_pool = _pipeline_connection_pool_module()
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        m3u = types.ModuleType("apps.m3u")
+        m3u.__path__ = []
+        m3u.connection_pool = connection_pool
+        with patch.dict(sys.modules, {
+            "apps": apps,
+            "apps.m3u": m3u,
+            "apps.m3u.connection_pool": connection_pool,
+        }):
+            redis = PipelineFakeRedis()
+            profile = SimpleNamespace(
+                id=7, is_default=True, max_streams=3,
+                credential_key="server_group_connections:1:abc"
+            )
+            reserved, _, _ = connection_pool.reserve_profile_slot(profile, redis)
+            reservation_id = "reservation-conflict-exhaustion"
+            facade = adapter._CredentialMarkerRedisFacade(redis, 7, reservation_id)
+            plugin_reserved, _, _ = connection_pool.reserve_profile_slot(profile, facade)
+            worker_id = adapter.make_worker_id("channel", "44", "generation", 7, reservation_id)
+            adapter.write_worker_record(redis, worker_id, {
+                "reservation_state": "reserved",
+                "state": "active",
+                "profile_id": "7",
+                "reservation_id": reservation_id,
+            })
+            marker = adapter.reservation_credential_marker_key(reservation_id)
+            self.assertTrue(reserved and plugin_reserved)
+            self.assertEqual(profile.credential_key, redis.get(marker))
+
+            redis.execute_conflicts_remaining = 10
+            with self.assertLogs("catchuparr.adapters.recorder_proxy", level="ERROR"):
+                self.assertFalse(adapter._release_worker_reservation(redis, worker_id))
+
+            record = adapter.read_worker_record(redis, worker_id)
+            self.assertEqual("release_failed", record["reservation_state"])
+            self.assertEqual(2, int(redis.get("profile_connections:7") or 0))
+            self.assertEqual(2, int(redis.get(profile.credential_key) or 0))
+            self.assertEqual(profile.credential_key, redis.get(marker))
+            self.assertEqual(profile.credential_key, redis.get(
+                connection_pool.profile_credential_release_key(7)
+            ))
+            self.assertFalse(adapter._release_worker_reservation(redis, worker_id))
+            self.assertEqual(2, int(redis.get("profile_connections:7") or 0))
+            self.assertEqual(2, int(redis.get(profile.credential_key) or 0))
+
+    def test_032_release_commits_after_transient_watch_conflicts(self):
+        connection_pool = _pipeline_connection_pool_module()
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        m3u = types.ModuleType("apps.m3u")
+        m3u.__path__ = []
+        m3u.connection_pool = connection_pool
+        with patch.dict(sys.modules, {
+            "apps": apps,
+            "apps.m3u": m3u,
+            "apps.m3u.connection_pool": connection_pool,
+        }):
+            redis = PipelineFakeRedis()
+            profile = SimpleNamespace(
+                id=7, is_default=True, max_streams=3,
+                credential_key="server_group_connections:1:abc"
+            )
+            reserved, _, _ = connection_pool.reserve_profile_slot(profile, redis)
+            reservation_id = "reservation-transient-conflicts"
+            facade = adapter._CredentialMarkerRedisFacade(redis, 7, reservation_id)
+            plugin_reserved, _, _ = connection_pool.reserve_profile_slot(profile, facade)
+            worker_id = adapter.make_worker_id("channel", "44", "generation", 7, reservation_id)
+            adapter.write_worker_record(redis, worker_id, {
+                "reservation_state": "reserved",
+                "state": "active",
+                "profile_id": "7",
+                "reservation_id": reservation_id,
+            })
+            self.assertTrue(reserved and plugin_reserved)
+
+            redis.execute_conflicts_remaining = 2
+            self.assertTrue(adapter._release_worker_reservation(redis, worker_id))
+
+            record = adapter.read_worker_record(redis, worker_id)
+            self.assertEqual("released", record["reservation_state"])
+            self.assertEqual(1, int(redis.get("profile_connections:7") or 0))
+            self.assertEqual(1, int(redis.get(profile.credential_key) or 0))
+            self.assertIsNone(redis.get(adapter.reservation_credential_marker_key(reservation_id)))
+            self.assertEqual(
+                profile.credential_key,
+                redis.get(connection_pool.profile_credential_release_key(7)),
+            )
+            self.assertFalse(adapter._release_worker_reservation(redis, worker_id))
+
+    def test_032_failed_reservation_ledger_write_keeps_exhausted_rollback_failed(self):
+        connection_pool = _pipeline_connection_pool_module()
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        m3u = types.ModuleType("apps.m3u")
+        m3u.__path__ = []
+        m3u.connection_pool = connection_pool
+        with patch.dict(sys.modules, {
+            "apps": apps,
+            "apps.m3u": m3u,
+            "apps.m3u.connection_pool": connection_pool,
+        }):
+            redis = PipelineFakeRedis()
+            profile = SimpleNamespace(
+                id=7, is_default=True, max_streams=3,
+                credential_key="server_group_connections:1:abc"
+            )
+            account = SimpleNamespace(
+                id=12,
+                profiles=SimpleNamespace(
+                    filter=lambda **_kwargs: SimpleNamespace(order_by=lambda *_args: [profile])
+                ),
+            )
+            source = SimpleNamespace(id=44)
+            reservation_id = "reservation-rollback-exhaustion"
+            worker_id = adapter.make_worker_id(
+                "channel", "44", "generation", 7, reservation_id
+            )
+            adapter.write_worker_record(redis, worker_id, {
+                "state": "issued",
+                "reservation_state": "none",
+                "reservation_id": reservation_id,
+            })
+            redis.execute_conflicts_remaining = 10
+            write_record = adapter.write_worker_record
+
+            def fail_reserved_record(redis_client, target_worker, values):
+                if values.get("reservation_state") == "reserved":
+                    raise RuntimeError("synthetic ledger write failure")
+                write_record(redis_client, target_worker, values)
+
+            with patch.object(adapter, "write_worker_record", side_effect=fail_reserved_record):
+                with self.assertRaisesRegex(RuntimeError, "synthetic ledger write failure"):
+                    adapter._reserve_source_profile(redis, worker_id, source, account)
+
+            record = adapter.read_worker_record(redis, worker_id)
+            self.assertEqual("release_failed", record["reservation_state"])
+            self.assertEqual(1, int(redis.get("profile_connections:7") or 0))
+            self.assertEqual(1, int(redis.get(profile.credential_key) or 0))
+            self.assertEqual(
+                profile.credential_key,
+                redis.get(adapter.reservation_credential_marker_key(reservation_id)),
+            )
+            self.assertIsNone(redis.get(connection_pool.profile_credential_release_key(7)))
+
+    def test_032_failed_reservation_ledger_write_commits_rollback_and_cleans_marker(self):
+        connection_pool = _pipeline_connection_pool_module()
+        apps = types.ModuleType("apps")
+        apps.__path__ = []
+        m3u = types.ModuleType("apps.m3u")
+        m3u.__path__ = []
+        m3u.connection_pool = connection_pool
+        with patch.dict(sys.modules, {
+            "apps": apps,
+            "apps.m3u": m3u,
+            "apps.m3u.connection_pool": connection_pool,
+        }):
+            redis = PipelineFakeRedis()
+            profile = SimpleNamespace(
+                id=7, is_default=True, max_streams=3,
+                credential_key="server_group_connections:1:abc"
+            )
+            account = SimpleNamespace(
+                id=12,
+                profiles=SimpleNamespace(
+                    filter=lambda **_kwargs: SimpleNamespace(order_by=lambda *_args: [profile])
+                ),
+            )
+            source = SimpleNamespace(id=44)
+            reservation_id = "reservation-rollback-success"
+            worker_id = adapter.make_worker_id(
+                "channel", "44", "generation", 7, reservation_id
+            )
+            adapter.write_worker_record(redis, worker_id, {
+                "state": "issued",
+                "reservation_state": "none",
+                "reservation_id": reservation_id,
+            })
+            redis.execute_conflicts_remaining = 2
+            write_record = adapter.write_worker_record
+
+            def fail_reserved_record(redis_client, target_worker, values):
+                if values.get("reservation_state") == "reserved":
+                    raise RuntimeError("synthetic ledger write failure")
+                write_record(redis_client, target_worker, values)
+
+            with patch.object(adapter, "write_worker_record", side_effect=fail_reserved_record):
+                with self.assertRaisesRegex(RuntimeError, "synthetic ledger write failure"):
+                    adapter._reserve_source_profile(redis, worker_id, source, account)
+
+            record = adapter.read_worker_record(redis, worker_id)
+            self.assertEqual("released", record["reservation_state"])
+            self.assertEqual(0, int(redis.get("profile_connections:7") or 0))
+            self.assertEqual(0, int(redis.get(profile.credential_key) or 0))
+            self.assertIsNone(redis.get(adapter.reservation_credential_marker_key(reservation_id)))
+            self.assertIsNone(redis.get(connection_pool.profile_credential_release_key(7)))
 
     def test_capacity_selection_skips_full_default_profile(self):
         connection_pool = _connection_pool_module()
