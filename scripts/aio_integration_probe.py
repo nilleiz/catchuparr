@@ -21,7 +21,12 @@ def require(condition, message="Integration check failed"):
 
 def probe_source_configuration(channel, root):
     """Exercise real ORM catalogs, published settings, and native Redis counters."""
-    from apps.channels.models import ChannelStream, Stream
+    from apps.channels.models import (
+        ChannelProfile,
+        ChannelProfileMembership,
+        ChannelStream,
+        Stream,
+    )
     from apps.m3u.connection_pool import (
         profile_connections_key,
         profile_credential_release_key,
@@ -65,13 +70,24 @@ def probe_source_configuration(channel, root):
     )
     ChannelStream.objects.create(channel=channel, stream=source_a, order=0)
     ChannelStream.objects.create(channel=channel, stream=source_b, order=1)
+    profile_name = "Synthetic source catalog profile"
+    channel_profile = ChannelProfile.objects.create(name=profile_name)
+    ChannelProfileMembership.objects.create(
+        channel_profile=channel_profile, channel=channel, enabled=True,
+    )
     catalog = source_catalog()
     require([row["id"] for row in catalog.streams_by_channel[str(channel.uuid)]]
             == [str(source_a.id), str(source_b.id)], "Catalog must preserve assigned order")
     settings = {
-        "channel_uuids": str(channel.uuid), "archive_root": str(root),
+        "filter_config": (
+            "version: 1\n"
+            f"profile: {profile_name}\n"
+            "rules:\n"
+            "  - channels: {profile: all}\n"
+            "    include: [Synthetic source B]\n"
+        ),
+        "archive_root": str(root),
         "retention_hours": 1, "max_storage_gib": 1,
-        "source_rules": '* | mode=include-only | m3u="Synthetic source B"',
     }
     active_path = root / "synthetic-active-settings.json"
     apply_configuration(settings, active_path=active_path)
@@ -81,7 +97,16 @@ def probe_source_configuration(channel, root):
     require([row["id"] for row in ranked_source_candidates(str(channel.uuid), active)]
             == [str(source_b.id)], "Include policy must reject assigned source A")
     previous = active_path.read_bytes()
-    invalid = dict(settings, source_rules='* | mode=include-only | m3u="Missing source"')
+    invalid = dict(
+        settings,
+        filter_config=(
+            "version: 1\n"
+            f"profile: {profile_name}\n"
+            "rules:\n"
+            "  - channels: {profile: all}\n"
+            "    include: [Missing source]\n"
+        ),
+    )
     try:
         apply_configuration(invalid, active_path=active_path)
     except ValueError:
@@ -89,7 +114,19 @@ def probe_source_configuration(channel, root):
     else:
         raise RuntimeError("Unknown source must fail Apply")
     require(active_path.read_bytes() == previous, "Rejected Apply must preserve active snapshot")
-    apply_configuration(dict(settings, source_rules=""), active_path=active_path)
+    apply_configuration(
+        dict(
+            settings,
+            filter_config=(
+                "version: 1\n"
+                f"profile: {profile_name}\n"
+                "rules:\n"
+                "  - channels: {profile: all}\n"
+                "    exclude: []\n"
+            ),
+        ),
+        active_path=active_path,
+    )
     require(ranked_source_candidates(str(channel.uuid), load_active_configuration(active_path))
             is None, "Cleared rules must restore the shared channel route")
 
@@ -171,7 +208,7 @@ def probe():
         raise RuntimeError("This probe requires a disposable integration container")
     sys.path.insert(0, "/data/plugins")
     from apps.accounts.models import User
-    from apps.channels.models import Channel
+    from apps.channels.models import Channel, ChannelProfile, ChannelProfileMembership
     from apps.epg.models import EPGData, ProgramData
     from apps.output import views as output
     from apps.plugins.models import PluginConfig
@@ -223,6 +260,11 @@ def probe():
     closed_channel = Channel.objects.create(name="Closed minute", channel_number=3, user_level=0)
     no_guide_channel = Channel.objects.create(name="Missing guide", channel_number=4, user_level=0)
     long_segment_channel = Channel.objects.create(name="Long GOP", channel_number=5, user_level=0)
+    channel_profile = ChannelProfile.objects.create(name="Synthetic playback profile")
+    for selected_channel in (channel, closed_channel, no_guide_channel, long_segment_channel):
+        ChannelProfileMembership.objects.create(
+            channel_profile=channel_profile, channel=selected_channel, enabled=True,
+        )
     root = Path("/data/ci-archive")
     root.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(root / "archive.sqlite3") as database:
@@ -232,13 +274,24 @@ def probe():
         )""")
     PluginConfig.objects.create(
         key="catchuparr", name="Catchuparr", enabled=True, ever_enabled=True,
-        settings={"channel_uuids": f"{channel.uuid},{closed_channel.uuid},{no_guide_channel.uuid},"
-                  f"{long_segment_channel.uuid}",
-                  "archive_root": str(root),
-                  "retention_hours": 1, "max_storage_gib": 1},
+        settings={
+            "filter_config": (
+                "version: 1\n"
+                "profile: Synthetic playback profile\n"
+                "rules:\n"
+                "  - channels: {profile: all}\n"
+            ),
+            "archive_root": str(root),
+            "retention_hours": 1,
+            "max_storage_gib": 1,
+        },
     )
     runtime.bootstrap()
     runtime.bootstrap()
+    initial_settings = PluginConfig.objects.get(key="catchuparr").settings
+    require(runtime.validate_configuration(initial_settings)["valid"],
+            "Synthetic YAML profile config did not validate")
+    runtime.apply_configuration(initial_settings)
     from django.urls import resolve
 
     require(resolve("/catchuparr/m3u").url_name == "catchuparr-m3u")

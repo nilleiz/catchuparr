@@ -1,137 +1,201 @@
 import unittest
 
-from catchuparr.source_rules import SourceRuleError, compile_source_rules, rank_candidates
+from catchuparr.source_rules import (
+    MAX_FILTER_CONFIG_BYTES,
+    SourceRuleError,
+    compile_filter_config,
+    rank_candidates,
+)
+
+
+CHANNEL_A = "00000000-0000-0000-0000-000000000001"
+CHANNEL_B = "00000000-0000-0000-0000-000000000002"
+CHANNEL_C = "00000000-0000-0000-0000-000000000003"
 
 
 class SourceRulesTests(unittest.TestCase):
     def setUp(self):
         self.channels = [
-            {"uuid": "uuid-1", "number": "1", "name": "Synthetic Channel A", "group": "News"},
-            {"uuid": "uuid-2", "number": "3.5", "name": "Synthetic Channel B", "group": "News"},
-            {"uuid": "uuid-3", "number": "10", "name": "Synthetic Channel C", "group": "Arts"},
-            {"uuid": "uuid-4", "number": "20", "name": "Synthetic Channel D", "group": "Sports"},
+            {"uuid": CHANNEL_A, "number": "1", "name": "Synthetic Channel A", "group": "News"},
+            {"uuid": CHANNEL_B, "number": "3.5", "name": "Synthetic Channel B", "group": "News"},
+            {"uuid": CHANNEL_C, "number": "10", "name": "Synthetic Channel C", "group": "Arts"},
         ]
         self.accounts = [
-            {"id": "a", "name": "Synthetic Source A"},
-            {"id": "b", "name": "Synthetic Source B"},
-            {"id": "c", "name": "Synthetic Source C"},
+            {"id": "11", "name": "Synthetic Source A"},
+            {"id": "12", "name": "Synthetic Source B"},
+            {"id": "13", "name": "Synthetic Source C"},
         ]
-
-    def test_selector_union_and_global_fallback_replacement(self):
-        policies = compile_source_rules(
-            '* | mode=exclude-only | m3u="Synthetic Source C"\n'
-            'number:1,10-20 | mode=include-only | m3u="Synthetic Source A"\n'
-            'name:"Synthetic Channel B" | mode=unchanged',
-            self.channels,
-            self.accounts,
-        )
-
-        self.assertEqual(set(policies), {channel["uuid"] for channel in self.channels})
-        self.assertEqual(policies["uuid-1"].mode, "include-only")
-        self.assertEqual(policies["uuid-3"].mode, "include-only")
-        self.assertEqual(policies["uuid-4"].mode, "include-only")
-        self.assertEqual(policies["uuid-2"].mode, "unchanged")
-        self.assertEqual(policies["uuid-1"].account_ids, frozenset({"a"}))
-
-    def test_group_selects_all_exact_group_members(self):
-        policies = compile_source_rules(
-            'group:"News" | mode=unchanged', self.channels, self.accounts
-        )
-
-        self.assertEqual(set(policies), {"uuid-1", "uuid-2"})
-
-    def test_number_ranges_use_decimal_bounds_and_union_deduplicates(self):
-        policies = compile_source_rules(
-            'number:1,1.0-3.5,10-20 | mode=unchanged', self.channels, self.accounts
-        )
-
-        self.assertEqual(set(policies), {"uuid-1", "uuid-2", "uuid-3", "uuid-4"})
-
-    def test_number_rules_skip_channels_with_blank_catalog_numbers(self):
-        channels = [
-            {"uuid": "uuid-decimal", "number": "1.25", "name": "Decimal", "group": "News"},
-            {"uuid": "uuid-none", "number": None, "name": "No number", "group": "News"},
-            {"uuid": "uuid-blank", "number": "  ", "name": "Blank number", "group": "News"},
+        self.profiles = [
+            {"id": "4", "name": "Synthetic Profile All", "channel_uuids": (CHANNEL_A, CHANNEL_B)},
+            {"id": "5", "name": "Synthetic Profile Limited", "channel_uuids": (CHANNEL_B,)},
+            {"id": "6", "name": "Disabled Memberships", "channel_uuids": ()},
         ]
+        self.streams = {
+            CHANNEL_A: (
+                {"id": "a1", "account_id": "11", "order": 0},
+                {"id": "a2", "account_id": "12", "order": 1},
+                {"id": "a3", "account_id": "13", "order": 2},
+            ),
+            CHANNEL_B: (
+                {"id": "b1", "account_id": "12", "order": 0},
+                {"id": "b2", "account_id": "11", "order": 1},
+            ),
+            CHANNEL_C: ({"id": "c1", "account_id": "11", "order": 0},),
+        }
 
-        policies = compile_source_rules(
-            "number:1.25,1.20-1.30 | mode=unchanged", channels, self.accounts
+    def compile(self, text, **kwargs):
+        return compile_filter_config(
+            text,
+            kwargs.get("channels", self.channels),
+            kwargs.get("accounts", self.accounts),
+            kwargs.get("profiles", self.profiles),
+            kwargs.get("streams", self.streams),
         )
 
-        self.assertEqual(set(policies), {"uuid-decimal"})
+    def test_blank_and_empty_rules_select_no_channels(self):
+        self.assertEqual((), self.compile("").channel_uuids)
+        result = self.compile("version: 1\nprofile: all\nrules: []\n")
+        self.assertEqual((), result.channel_uuids)
 
-    def test_priority_ranks_by_score_and_preserves_original_order_for_ties(self):
-        policy = compile_source_rules(
-            '* | mode=priority | priority="Synthetic Source A":100,"Synthetic Source B":50',
-            self.channels,
-            self.accounts,
-        )["uuid-1"]
+    def test_channel_profile_scope_uses_only_enabled_members(self):
+        result = self.compile(
+            "version: 1\nprofile: Synthetic Profile All\nrules:\n  - channels:\n      profile: all\n"
+        )
+        self.assertEqual((CHANNEL_A, CHANNEL_B), result.channel_uuids)
+        self.assertEqual(("4",), result.profile_ids)
+
+    def test_specific_rule_fully_overrides_baseline_filter(self):
+        result = self.compile(
+            "version: 1\n"
+            "profile: all\n"
+            "rules:\n"
+            "  - channels: {profile: all}\n"
+            "    exclude: [Synthetic Source C]\n"
+            "  - channels: {names: [Synthetic Channel B]}\n"
+            "    include: [Synthetic Source B]\n"
+        )
+        self.assertEqual((CHANNEL_A, CHANNEL_B), result.channel_uuids)
+        self.assertEqual(frozenset({"12"}), result.source_policies[CHANNEL_B].include_account_ids)
+        self.assertEqual(frozenset({"13"}), result.source_policies[CHANNEL_A].exclude_account_ids)
+        self.assertEqual(["b1"], [row["stream_id"] for row in result.channels[1]["candidates"]])
+
+    def test_selector_numbers_names_groups_and_profiles(self):
+        number = self.compile(
+            "version: 1\nprofile: all\nrules:\n  - channels:\n      numbers: [1, '3.5']\n"
+        )
+        self.assertEqual((CHANNEL_A, CHANNEL_B), number.channel_uuids)
+        group = self.compile(
+            "version: 1\nprofile: all\nrules:\n  - channels: {groups: [News]}\n"
+        )
+        self.assertEqual((CHANNEL_A, CHANNEL_B), group.channel_uuids)
+        profile = self.compile(
+            "version: 1\nprofile: all\nrules:\n  - channels: {profile: Synthetic Profile Limited}\n"
+        )
+        self.assertEqual((CHANNEL_B,), profile.channel_uuids)
+        self.assertEqual(("4", "5"), profile.profile_ids)
+
+    def test_priority_sorts_stably_and_filters_only_assigned_rows(self):
+        result = self.compile(
+            "version: 1\n"
+            "profile: all\n"
+            "rules:\n"
+            "  - channels: {numbers: [1]}\n"
+            "    exclude: []\n"
+            "    priority: {Synthetic Source B: 20, Synthetic Source C: 20}\n"
+        )
+        policy = result.source_policies[CHANNEL_A]
         streams = [
-            {"id": "source-b-first", "account_id": "b", "order": 0},
-            {"id": "source-c", "account_id": "c", "order": 1},
-            {"id": "source-a-second", "account_id": "a", "order": 2},
-            {"id": "source-b-second", "account_id": "b", "order": 3},
-            {"id": "unassigned", "account_id": None, "order": 4},
-            {"id": "unknown-account", "account_id": "missing", "order": 5},
+            {"id": "b", "account_id": "12", "order": 0},
+            {"id": "c", "account_id": "13", "order": 1},
+            {"id": "a", "account_id": "11", "order": 2},
+            {"id": "unknown", "account_id": "999", "order": 3},
         ]
+        self.assertEqual(["b", "c", "a"], [row["id"] for row in rank_candidates(policy, streams)])
 
-        self.assertEqual(
-            [stream["id"] for stream in rank_candidates(policy, streams)],
-            ["source-a-second", "source-b-first", "source-b-second", "source-c"],
+    def test_empty_exclude_without_priority_keeps_shared_route(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n  - channels: {profile: all}\n    exclude: []\n"
         )
-        with self.assertRaises((AttributeError, TypeError)):
-            policy.mode = "unchanged"
+        self.assertEqual({}, result.source_policies)
+        self.assertTrue(all(not row["source_override"] for row in result.channels))
 
-    def test_include_and_exclude_filter_only_resolved_assigned_streams(self):
-        streams = [
-            {"id": "a", "account_id": "a", "order": 0},
-            {"id": "b", "account_id": "b", "order": 1},
-            {"id": "unassigned", "account_id": None, "order": 2},
-            {"id": "unknown", "account_id": "not-an-account", "order": 3},
-        ]
-        include = compile_source_rules(
-            '* | mode=include-only | m3u="Synthetic Source A"', self.channels, self.accounts
-        )["uuid-1"]
-        exclude = compile_source_rules(
-            '* | mode=exclude-only | m3u="Synthetic Source A"', self.channels, self.accounts
-        )["uuid-1"]
+    def test_rejects_overlap_unknown_or_ambiguous_selectors(self):
+        invalid = (
+            (
+                "version: 1\nprofile: all\nrules:\n  - channels: {numbers: [1]}\n"
+                "  - channels: {names: [Synthetic Channel A]}\n",
+                "overlap",
+            ),
+            ("version: 1\nprofile: all\nrules:\n  - channels: {numbers: [99]}\n", "matches no channels"),
+            ("version: 1\nprofile: Missing\nrules: []\n", "unknown channel profile"),
+            (
+                "version: 1\nprofile: all\nrules:\n  - channels: {profile: Disabled Memberships}\n",
+                "no eligible channels",
+            ),
+        )
+        for document, message in invalid:
+            with self.subTest(message=message), self.assertRaisesRegex(SourceRuleError, message):
+                self.compile(document)
 
-        self.assertEqual([item["id"] for item in rank_candidates(include, streams)], ["a"])
-        self.assertEqual([item["id"] for item in rank_candidates(exclude, streams)], ["b"])
+    def test_rejects_filter_errors_with_rule_field_and_line(self):
+        invalid = (
+            (
+                "version: 1\nprofile: all\nrules:\n  - channels: {profile: all}\n    include: []\n",
+                r"line 4, field include",
+            ),
+            (
+                "version: 1\nprofile: all\nrules:\n  - channels: {profile: all}\n    include: [Missing]\n",
+                r"rule 1: line 4, field include.*unknown M3U account",
+            ),
+            (
+                "version: 1\nprofile: all\nrules:\n  - channels: {profile: all}\n    priority: {Synthetic Source A: 1}\n",
+                r"field priority.*requires include or exclude",
+            ),
+        )
+        for document, message in invalid:
+            with self.subTest(message=message), self.assertRaisesRegex(SourceRuleError, message):
+                self.compile(document)
 
-    def test_rejects_unknown_ambiguous_and_overlapping_selectors(self):
-        invalid = [
-            ('number:2 | mode=unchanged', "matches no channels"),
-            ('name:"Missing" | mode=unchanged', "matches no channels"),
-            ('group:"Missing" | mode=unchanged', "matches no channels"),
-            ('number:30-40 | mode=unchanged', "matches no channels"),
-            ('number:1 | mode=unchanged\nname:"Synthetic Channel A" | mode=unchanged', "overlap"),
-            ('* | mode=unchanged\n* | mode=unchanged', "only one global"),
-        ]
-        for rule, message in invalid:
-            with self.subTest(rule=rule), self.assertRaisesRegex(SourceRuleError, message):
-                compile_source_rules(rule, self.channels, self.accounts)
+    def test_rejects_duplicate_unknown_alias_anchor_merge_and_unsafe_tags(self):
+        invalid_documents = (
+            "version: 1\nversion: 1\nprofile: all\nrules: []\n",
+            "version: 1\nprofile: all\nrules: []\nunknown: true\n",
+            "version: 1\nprofile: all\nrules: &rules []\n",
+            "version: 1\nprofile: all\nrules: *rules\n",
+            "version: 1\nprofile: all\nrules: []\nextra: {<<: {x: 1}}\n",
+            "version: 1\nprofile: all\nrules: !!python/object/apply:os.system ['true']\n",
+        )
+        for document in invalid_documents:
+            with self.subTest(document=document), self.assertRaises(SourceRuleError):
+                self.compile(document)
+        with self.assertRaisesRegex(SourceRuleError, "64 KiB"):
+            self.compile(" " * (MAX_FILTER_CONFIG_BYTES + 1))
 
-    def test_rejects_ambiguous_names_numbers_and_account_names(self):
+    def test_rejects_ambiguous_catalog_names(self):
         duplicate_channels = [
             *self.channels,
-            {"uuid": "uuid-5", "number": "1.0", "name": "Synthetic Channel A", "group": "Other"},
+            {"uuid": "00000000-0000-0000-0000-000000000004", "number": "1", "name": "Synthetic Channel A", "group": "Other"},
         ]
-        duplicate_accounts = [*self.accounts, {"id": "d", "name": "Synthetic Source A"}]
-        invalid = [
-            ('number:1 | mode=unchanged', duplicate_channels, self.accounts, "number 1 is ambiguous"),
-            ('name:"Synthetic Channel A" | mode=unchanged', duplicate_channels, self.accounts,
-             "name 'Synthetic Channel A' is ambiguous"),
-            ('number:1-3 | mode=unchanged', duplicate_channels, self.accounts,
-             "number range 1..3 is ambiguous"),
-            ('* | mode=include-only | m3u="Synthetic Source A"', self.channels, duplicate_accounts,
-             "ambiguous M3U account name"),
-            ('* | mode=include-only | m3u="Missing"', self.channels, self.accounts,
-             "unknown M3U account name"),
+        duplicate_profiles = [
+            *self.profiles,
+            {
+                "id": "9",
+                "name": "Synthetic Profile Duplicate",
+                "channel_uuids": ("00000000-0000-0000-0000-000000000004",),
+            },
         ]
-        for rule, channels, accounts, message in invalid:
-            with self.subTest(rule=rule), self.assertRaisesRegex(SourceRuleError, message):
-                compile_source_rules(rule, channels, accounts)
+        duplicate_accounts = [*self.accounts, {"id": "14", "name": "Synthetic Source A"}]
+        with self.assertRaisesRegex(SourceRuleError, "ambiguous"):
+            self.compile(
+                "version: 1\nprofile: all\nrules:\n  - channels: {numbers: [1]}\n",
+                channels=duplicate_channels,
+                profiles=duplicate_profiles,
+            )
+        with self.assertRaisesRegex(SourceRuleError, "ambiguous"):
+            self.compile(
+                "version: 1\nprofile: all\nrules:\n  - channels: {profile: all}\n    include: [Synthetic Source A]\n",
+                accounts=duplicate_accounts,
+            )
 
 
 if __name__ == "__main__":
