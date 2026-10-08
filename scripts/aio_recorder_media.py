@@ -211,6 +211,7 @@ class _NativeBufferYieldTracker:
         self.buffer = buffer
         self._read_native = buffer.get_optimized_client_data
         self._pending = deque()
+        self._lock = threading.Lock()
         self.last_yielded_index = None
         self.unmapped_batches = 0
         self._had_instance_method = "get_optimized_client_data" in vars(buffer)
@@ -221,28 +222,30 @@ class _NativeBufferYieldTracker:
         chunks, next_index = self._read_native(client_index)
         client_index = int(client_index)
         next_index = int(next_index)
-        if len(chunks) != max(0, next_index - client_index):
-            self.unmapped_batches += 1
-            self._pending.extend((chunk, None) for chunk in chunks)
-            return chunks, next_index
-        self._pending.extend(
-            (chunk, client_index + offset)
-            for offset, chunk in enumerate(chunks, start=1)
-        )
+        with self._lock:
+            if len(chunks) != max(0, next_index - client_index):
+                self.unmapped_batches += 1
+                self._pending.extend((chunk, None) for chunk in chunks)
+                return chunks, next_index
+            self._pending.extend(
+                (chunk, client_index + offset)
+                for offset, chunk in enumerate(chunks, start=1)
+            )
         return chunks, next_index
 
     def observe(self, iterator):
         for chunk in iterator:
-            self.last_yielded_index = None
-            matched_index = None
-            for pending_index, (pending_chunk, native_index) in enumerate(self._pending):
-                if pending_chunk is chunk:
-                    matched_index = pending_index
-                    self.last_yielded_index = native_index
-                    break
-            if matched_index is not None:
-                for _ in range(matched_index + 1):
-                    self._pending.popleft()
+            with self._lock:
+                self.last_yielded_index = None
+                matched_index = None
+                for pending_index, (pending_chunk, native_index) in enumerate(self._pending):
+                    if pending_chunk is chunk:
+                        matched_index = pending_index
+                        self.last_yielded_index = native_index
+                        break
+                if matched_index is not None:
+                    for _ in range(matched_index + 1):
+                        self._pending.popleft()
             yield chunk
 
     def close(self):
@@ -250,7 +253,143 @@ class _NativeBufferYieldTracker:
             self.buffer.get_optimized_client_data = self._previous_instance_method
         else:
             del self.buffer.get_optimized_client_data
-        self._pending.clear()
+        with self._lock:
+            self._pending.clear()
+
+
+class _NativeLiveMediaReader:
+    """Continuously read one live client and retain indexed chunks for checks."""
+
+    def __init__(self, iterator, tracker: _NativeBufferYieldTracker):
+        self._iterator = iterator
+        self._tracker = tracker
+        self._condition = threading.Condition()
+        self._chunks = deque()
+        self._size = 0
+        self._finished = False
+        self._failure = None
+        self._stop_requested = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="catchuparr-live-media-reader",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_requested.is_set():
+                try:
+                    raw_chunk = next(self._iterator)
+                except StopIteration:
+                    break
+                index = self._tracker.last_yielded_index
+                if index is None:
+                    continue
+                chunk = bytes(raw_chunk)
+                with self._condition:
+                    self._chunks.append((index, chunk))
+                    self._size += len(chunk)
+                    while self._size > 2 * 1024 * 1024 and self._chunks:
+                        _old_index, old_chunk = self._chunks.popleft()
+                        self._size -= len(old_chunk)
+                    self._condition.notify_all()
+        except Exception as exc:  # Avoid leaking HTTP or URL details to CI output.
+            with self._condition:
+                self._failure = type(exc).__name__
+                self._condition.notify_all()
+        finally:
+            with self._condition:
+                self._finished = True
+                self._condition.notify_all()
+
+    def read_after(self, floor: int, *, minimum_bytes: int, timeout: float) -> tuple[bytes, int]:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                selected = [
+                    (index, chunk) for index, chunk in self._chunks if index > floor
+                ]
+                total = sum(len(chunk) for _index, chunk in selected)
+                if total >= minimum_bytes:
+                    return b"".join(chunk for _index, chunk in selected), selected[-1][0]
+                if self._failure is not None:
+                    raise RuntimeError("Native live reader failed while archive recording ran")
+                if self._finished:
+                    raise RuntimeError("Native live reader ended before fresh media arrived")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Native live route did not publish fresh media before timeout"
+                    )
+                self._condition.wait(min(remaining, 0.25))
+
+    def close(self, response, *, force_release=None) -> None:
+        self._stop_requested.set()
+        self.thread.join(timeout=5)
+        if self.thread.is_alive() and force_release is not None:
+            force_release()
+            self.thread.join(timeout=5)
+        _require(not self.thread.is_alive(), "Native live reader did not stop at a chunk boundary")
+        response.close()
+
+
+def _assert_tone_matches(actual: int | None, expected: int, label: str) -> None:
+    _require(actual is not None, f"{label} media has no decodable synthetic audio tone")
+    _require(
+        abs(actual - expected) <= 20,
+        f"{label} media decoded to an unexpected synthetic source tone",
+    )
+
+
+def _verify_audio_video_tone(
+    ffmpeg: str, ffprobe: str, media: bytes, expected: int, label: str,
+) -> int:
+    _require(
+        len(media) >= 188 * 100
+        and all(media[offset] == 0x47 for offset in range(0, len(media) - 187, 188)),
+        f"{label} route returned no useful packet-aligned transport stream",
+    )
+    try:
+        probe = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-count_frames", "-f", "mpegts",
+                "-show_streams", "-of", "json", "pipe:0",
+            ],
+            input=media,
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        decode = subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "mpegts",
+                "-i", "pipe:0", "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "48000",
+                "-t", "1.5", "-f", "s16le", "pipe:1",
+            ],
+            input=media,
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{label} media decoding exceeded its bounded timeout") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"{label} media was not decodable audio/video") from exc
+    details = json.loads(probe.stdout.decode("utf-8"))
+    frame_counts = {
+        item.get("codec_type"): int(item.get("nb_read_frames", "0") or 0)
+        for item in details.get("streams", [])
+    }
+    _require(
+        frame_counts.get("video", 0) > 0 and frame_counts.get("audio", 0) > 0,
+        f"{label} route returned no decoded audio/video frames",
+    )
+    from aio_recorder_failover import _estimate_tone_frequency
+
+    frequency = _estimate_tone_frequency(decode.stdout)
+    _assert_tone_matches(frequency, expected, label)
+    return frequency
 
 
 def _wait_for_native_active(
@@ -1235,3 +1374,849 @@ def probe_actual_recorder_media(root: Path) -> None:
             cleanup_errors.append("fixture-files")
         if cleanup_errors:
             raise RuntimeError("Synthetic recorder media cleanup was incomplete")
+
+    probe_actual_live_archive_isolation(root)
+
+
+def _wait_for_indexed_tone(
+    run,
+    store,
+    channel_uuid: str,
+    ffmpeg: str,
+    ffprobe: str,
+    *,
+    expected_hz: int,
+    existing_ids: set[str],
+    minimum: int,
+    timeout: float,
+) -> list:
+    from aio_recorder_failover import _segment_has_useful_av, _segment_tone_frequency
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _require(
+            run.thread is not None and run.thread.is_alive(),
+            "Synthetic recorder task ended before expected media was indexed",
+        )
+        matched = []
+        for segment in store.segments(channel_uuid):
+            if segment.id in existing_ids:
+                continue
+            _require(
+                _segment_has_useful_av(ffprobe, segment.path),
+                "Indexed synthetic archive segment lacks decoded audio/video",
+            )
+            frequency = _segment_tone_frequency(ffmpeg, segment.path)
+            _assert_tone_matches(frequency, expected_hz, "Indexed synthetic archive")
+            matched.append(segment)
+        if len(matched) >= minimum:
+            return matched
+        time.sleep(0.2)
+    raise RuntimeError("Synthetic recorder did not index the expected decoded source in time")
+
+
+def _native_source_metadata(redis_client, metadata_key) -> dict[str, str]:
+    raw = redis_client.hgetall(metadata_key)
+    relevant = {}
+    for key, value in raw.items():
+        name = _redis_text(key).lower()
+        if any(token in name for token in ("url", "source", "stream", "profile")):
+            relevant[name] = _redis_text(value)
+    return relevant
+
+
+def _wait_for_native_client_count(
+    redis_client,
+    native_server,
+    redis_keys,
+    worker_id: str,
+    expected: int,
+    *,
+    timeout: float = 15,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        manager = native_server.client_managers.get(worker_id)
+        global_count = int(redis_client.scard(redis_keys.clients(worker_id)) or 0)
+        local_count = int(manager.get_client_count()) if manager is not None else -1
+        if global_count == expected and local_count == expected:
+            return
+        time.sleep(0.1)
+    raise RuntimeError("Native live client count did not reach the expected bounded state")
+
+
+def probe_actual_live_archive_isolation(root: Path) -> None:
+    """Keep native live A active while real recorder tasks first share A, then isolate B."""
+    from aio_recorder_failover import (
+        _assert_worker_cleanup,
+        _DjangoHTTPBridge,
+        _make_paced_transport_stream,
+        _RecorderTaskRun,
+        _segment_has_useful_av,
+        _segment_tone_frequency,
+        _SyntheticFailoverSourceServer,
+        _worker_records,
+    )
+    from apps.channels import tasks as channel_tasks
+    from apps.channels.models import Channel, ChannelStream, Stream
+    from apps.m3u.connection_pool import (
+        profile_connections_key,
+        profile_credential_release_key,
+    )
+    from apps.m3u.models import M3UAccount
+    from apps.proxy.live_proxy.constants import ChannelMetadataField, ChannelState
+    from apps.proxy.live_proxy.redis_keys import RedisKeys
+    from apps.proxy.live_proxy.server import ProxyServer
+    from core.models import CoreSettings, StreamProfile
+    from core.utils import RedisClient
+    from django.test import Client
+
+    from catchuparr.adapters.recorder_proxy import _release_worker_reservation
+    from catchuparr.configuration import (
+        active_settings_path,
+        apply_configuration,
+        load_active_configuration,
+    )
+    from catchuparr.engine.store import ArchiveStore
+    from catchuparr.recorder_proxy import ranked_source_candidates
+
+    _require(
+        os.environ.get("CATCHUPARR_INTEGRATION_TEST") == "1",
+        "Live/archive isolation probe requires a disposable integration container",
+    )
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    _require(
+        ffmpeg is not None and ffprobe is not None,
+        "AIO live/archive probe requires ffmpeg and ffprobe",
+    )
+
+    root = Path(root)
+    fixture_root = root / "synthetic-live-archive-fixtures"
+    archive_root = root / "synthetic-live-archive"
+    fixture_root.mkdir(parents=True, exist_ok=True)
+    archive_root.mkdir(parents=True, exist_ok=True)
+
+    active_path = active_settings_path()
+    active_existed = active_path.exists()
+    active_bytes = active_path.read_bytes() if active_existed else None
+    active_lock_path = active_path.with_suffix(active_path.suffix + ".lock")
+    active_lock_existed = active_lock_path.exists()
+    active_lock_bytes = active_lock_path.read_bytes() if active_lock_existed else None
+
+    original_base_url = channel_tasks.get_dvr_stream_base_url
+    saved_default_profile = None
+    default_profile_saved = False
+    source_server = None
+    bridge = None
+    redis_client = None
+    live_response = None
+    live_tracker = None
+    live_reader = None
+    native_server = None
+    channel = None
+    created_accounts = []
+    created_streams = []
+    created_profiles = []
+    harnesses = []
+    profile_baselines = {}
+    marker_baselines = {}
+    cleanup_errors = []
+
+    try:
+        payload_a = _make_paced_transport_stream(
+            ffmpeg,
+            ffprobe,
+            fixture_root / "source-a.ts",
+            service_name="Synthetic Live Source A",
+            frequency=440,
+        )
+        payload_b = _make_paced_transport_stream(
+            ffmpeg,
+            ffprobe,
+            fixture_root / "source-b.ts",
+            service_name="Synthetic Archive Source B",
+            frequency=880,
+        )
+        source_server = _SyntheticFailoverSourceServer(
+            {"source-a.ts": payload_a, "source-b.ts": payload_b},
+            {"source-a.ts": 8.0, "source-b.ts": 8.0},
+        )
+        source_server.thread.start()
+
+        account_a = M3UAccount.objects.create(
+            name="Synthetic live isolation A", is_active=True, max_streams=1,
+        )
+        account_b = M3UAccount.objects.create(
+            name="Synthetic archive isolation B", is_active=True, max_streams=1,
+        )
+        created_accounts.extend((account_a, account_b))
+        stream_a = Stream.objects.create(
+            name="Synthetic isolation source A",
+            url=f"{source_server.base_url}/source-a.ts",
+            m3u_account=account_a,
+        )
+        stream_b = Stream.objects.create(
+            name="Synthetic isolation source B",
+            url=f"{source_server.base_url}/source-b.ts",
+            m3u_account=account_b,
+        )
+        created_streams.extend((stream_a, stream_b))
+        channel = Channel.objects.create(
+            name="Synthetic live archive isolation",
+            channel_number=97,
+            user_level=0,
+        )
+        ChannelStream.objects.create(channel=channel, stream=stream_a, order=0)
+        ChannelStream.objects.create(channel=channel, stream=stream_b, order=1)
+        assignment_rows = list(
+            ChannelStream.objects.filter(channel=channel)
+            .order_by("order", "id")
+            .values_list("stream_id", "order")
+        )
+        _require(
+            assignment_rows == [(stream_a.id, 0), (stream_b.id, 1)],
+            "Synthetic live/archive fixture did not preserve A then B assignment order",
+        )
+
+        profiles = []
+        for account in created_accounts:
+            profile = account.profiles.filter(is_default=True).first()
+            _require(profile is not None, "Synthetic live/archive M3U profile was not created")
+            profile.max_streams = 1
+            profile.is_active = True
+            profile.save(update_fields=("max_streams", "is_active"))
+            profiles.append(profile)
+        profile_a, profile_b = profiles
+        created_profiles.extend(profiles)
+
+        proxy_profile = StreamProfile.objects.filter(
+            name__iexact="Proxy", locked=True, is_active=True,
+        ).first()
+        _require(proxy_profile is not None and proxy_profile.is_proxy(),
+                 "Native non-redirect Proxy StreamProfile is unavailable")
+        saved_default_profile = _stream_default_profile_id(CoreSettings)
+        default_profile_saved = True
+        _set_stream_default_profile(CoreSettings, proxy_profile.id)
+        _require(
+            str(_stream_default_profile_id(CoreSettings)) == str(proxy_profile.id),
+            "Native default StreamProfile was not set to Proxy",
+        )
+
+        settings = {
+            "channel_uuids": str(channel.uuid),
+            "archive_root": str(archive_root),
+            "retention_hours": 1,
+            "max_storage_gib": 1,
+            "source_rules": "",
+        }
+        apply_configuration(settings, active_path=active_path)
+        active = load_active_configuration(active_path)
+        _require(active is not None, "Applied no-rules live/archive configuration was not readable")
+        _require(
+            ranked_source_candidates(str(channel.uuid), active) is None,
+            "No-rules configuration did not preserve native channel route selection",
+        )
+        from catchuparr.runtime import load_config
+
+        runtime_config = load_config()
+        _require(
+            runtime_config is not None and str(channel.uuid) in runtime_config.channel_uuids,
+            "Synthetic live/archive channel is absent from active recorder configuration",
+        )
+
+        redis_client = RedisClient.get_client()
+        redis_client.ping()
+        profile_baselines = {
+            int(profile.id): _profile_count(redis_client, profile.id, profile_connections_key)
+            for profile in created_profiles
+        }
+        marker_baselines = {
+            int(profile.id): _key_dump(
+                redis_client, profile_credential_release_key(profile.id),
+            )
+            for profile in created_profiles
+        }
+        _require(
+            all(value == 0 for value in profile_baselines.values()),
+            "Synthetic live/archive provider counters were not empty before use",
+        )
+        _require(
+            all(value is None for value in marker_baselines.values()),
+            "Synthetic live/archive credential markers were not empty before use",
+        )
+        store = ArchiveStore(archive_root)
+        bridge = _DjangoHTTPBridge()
+        bridge.start()
+        channel_tasks.get_dvr_stream_base_url = lambda: bridge.base_url
+
+        client = Client(raise_request_exception=False)
+        live_response = client.get(
+            f"/proxy/ts/stream/{channel.uuid}",
+            HTTP_HOST="localhost",
+            HTTP_USER_AGENT="Synthetic live/archive integration",
+        )
+        _require(live_response.status_code == 200, "Native live A route did not return HTTP 200")
+        _require(
+            live_response.get("Content-Type", "").split(";", 1)[0] == "video/mp2t",
+            "Native live A route did not return MPEG-TS",
+        )
+        _require(
+            not live_response.get("Location"),
+            "Native Proxy profile redirected the live A route",
+        )
+        _require(getattr(live_response, "streaming", False), "Native live A route was not a stream")
+
+        native_server = ProxyServer.get_instance()
+        worker_id = str(channel.uuid)
+        native_buffer = native_server.get_buffer(worker_id, profile=None)
+        live_tracker = _NativeBufferYieldTracker(native_buffer)
+        parent_iterator = iter(live_tracker.observe(iter(live_response.streaming_content)))
+        native_owner, native_manager, native_client_manager = _wait_for_native_active(
+            parent_iterator,
+            live_response,
+            redis_client,
+            native_server,
+            worker_id,
+            redis_keys=RedisKeys,
+            metadata_field=ChannelMetadataField,
+            channel_state=ChannelState,
+            timeout=45,
+        )
+        active_state = _constant_text(ChannelState.ACTIVE)
+        first_live_media = _read_stream_iterator(
+            parent_iterator,
+            minimum_bytes=188 * 512,
+            timeout=20,
+            close=live_response.close,
+        )
+        _verify_audio_video_tone(ffmpeg, ffprobe, first_live_media, 440, "Native live A")
+        _require(native_manager.running, "Native live A stream manager is not running")
+        _require(
+            native_client_manager is native_server.client_managers.get(worker_id),
+            "Native live A client manager changed during activation",
+        )
+        metadata_key = RedisKeys.channel_metadata(worker_id)
+        _require(
+            _redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STREAM_ID))
+            == str(stream_a.id),
+            "Native live A metadata does not identify assigned source A",
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1,
+            "Native live A did not reserve exactly one A profile slot",
+        )
+        native_a_marker = _key_dump(
+            redis_client, profile_credential_release_key(profile_a.id),
+        )
+        _require(
+            _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id],
+            "Native live A unexpectedly reserved B profile capacity",
+        )
+        counts, active_counts = source_server.snapshot()
+        _require(counts["source-a.ts"] >= 1 and active_counts["source-a.ts"] == 1,
+                 "Native live A did not open its synthetic A source")
+        _require(counts["source-b.ts"] == 0, "Native live A opened archive source B")
+        _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
+
+        assignment_keys = {
+            f"channel_stream:{stream_a.id}",
+            f"channel_stream:{stream_b.id}",
+            f"channel_stream:{worker_id}",
+            f"channel_stream:{channel.id}",
+            f"stream_profile:{stream_a.id}",
+            f"stream_profile:{stream_b.id}",
+            f"stream_profile:{channel.id}",
+            RedisKeys.channel_owner(worker_id),
+        }
+        assignment_snapshot = {
+            key: _key_dump(redis_client, key) for key in assignment_keys
+        }
+        _require(
+            assignment_snapshot[f"channel_stream:{stream_a.id}"] is not None
+            and assignment_snapshot[f"stream_profile:{stream_a.id}"] is not None,
+            "Native live A did not publish its channel assignment and profile keys",
+        )
+        source_metadata = _native_source_metadata(redis_client, metadata_key)
+        _require(
+            source_metadata.get("stream_id") == str(stream_a.id)
+            and source_metadata.get("stream_name") == stream_a.name
+            and source_metadata.get("url") == stream_a.url
+            and any(
+                "profile" in key and value
+                for key, value in source_metadata.items()
+            ),
+            "Native live A source metadata is incomplete",
+        )
+        live_reader = _NativeLiveMediaReader(parent_iterator, live_tracker)
+
+        # With no policy, the real recorder task must attach to this same
+        # native A worker and index decoded A rather than opening a second
+        # provider connection.
+        run_a = _RecorderTaskRun(worker_id, startup_timeout=45, media_idle_timeout=25)
+        run_a.start()
+        harnesses.append(run_a)
+        baseline_ids = {segment.id for segment in store.segments(worker_id)}
+        segments_a = _wait_for_indexed_tone(
+            run_a, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=baseline_ids, minimum=1, timeout=90,
+        )
+        _require(bool(segments_a), "No-rules recorder did not archive synthetic live source A")
+        _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 2)
+        _require(
+            native_server.stream_managers.get(worker_id) is native_manager
+            and native_manager.running
+            and _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner
+            and _redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE))
+            == active_state,
+            "No-rules archive did not share the existing native live A worker",
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1,
+            "No-rules archive acquired an extra A profile reservation",
+        )
+        counts_after_shared, active_after_shared = source_server.snapshot()
+        _require(
+            counts_after_shared["source-a.ts"] == counts["source-a.ts"]
+            and active_after_shared["source-a.ts"] == 1
+            and counts_after_shared["source-b.ts"] == 0,
+            "No-rules archive opened a second provider connection or source B",
+        )
+        _require(
+            {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot,
+            "No-rules archive changed native live A assignment keys",
+        )
+        _require(
+            _native_source_metadata(redis_client, metadata_key) == source_metadata,
+            "No-rules archive changed native live A source metadata",
+        )
+        run_a.stop()
+        run_a.join()
+        _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1,
+            "Stopping the shared no-rules archive released live A capacity",
+        )
+        _require(
+            _key_dump(redis_client, profile_credential_release_key(profile_a.id))
+            == native_a_marker,
+            "Stopping the shared no-rules archive changed the live A release marker",
+        )
+
+        # Applying B while A is live must create a dedicated recorder worker.
+        settings_b = dict(
+            settings,
+            source_rules='* | mode=include-only | m3u="Synthetic archive isolation B"',
+        )
+        apply_configuration(settings_b, active_path=active_path)
+        active_b = load_active_configuration(active_path)
+        _require(active_b is not None, "Applied B-only recorder configuration was not readable")
+        candidates_b = ranked_source_candidates(worker_id, active_b)
+        _require(
+            candidates_b is not None
+            and [str(candidate.get("id")) for candidate in candidates_b] == [str(stream_b.id)],
+            "Applied include-only policy did not select only assigned source B",
+        )
+        baseline_ids_b = {segment.id for segment in store.segments(worker_id)}
+        publication_floor_before_b = int(
+            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
+        )
+        _require(publication_floor_before_b > 0,
+                 "Native live A did not publish chunks before the B archive started")
+        run_b = _RecorderTaskRun(worker_id, startup_timeout=45, media_idle_timeout=25)
+        run_b.start()
+        harnesses.append(run_b)
+        segments_b = _wait_for_indexed_tone(
+            run_b, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=880, existing_ids=baseline_ids_b, minimum=1, timeout=90,
+        )
+        _require(bool(segments_b), "B-only recorder did not index synthetic archive source B")
+        _require(
+            all(segment.id not in baseline_ids_b for segment in segments_b),
+            "B-only recorder did not publish new archive segment IDs",
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + 1,
+            "Live A and archive B did not hold exactly one separate profile slot each",
+        )
+        counts_during_b, active_during_b = source_server.snapshot()
+        _require(
+            counts_during_b["source-a.ts"] == counts["source-a.ts"]
+            and active_during_b["source-a.ts"] == 1
+            and counts_during_b["source-b.ts"] == counts_after_shared["source-b.ts"] + 1
+            and active_during_b["source-b.ts"] == 1,
+            "Archive B disturbed live A or failed to open its own source",
+        )
+        _require(
+            native_server.stream_managers.get(worker_id) is native_manager
+            and native_manager.running
+            and _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner,
+            "Archive B replaced the existing native live A owner or manager",
+        )
+        _require(
+            _redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE))
+            == active_state,
+            "Native live A was not ACTIVE while archive B ran",
+        )
+        _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1,
+            "Dedicated archive B added a second live A profile reservation",
+        )
+        _require(
+            _key_dump(redis_client, profile_credential_release_key(profile_a.id))
+            == native_a_marker,
+            "Dedicated archive B changed the live A release marker",
+        )
+        _require(
+            {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot,
+            "Archive B changed native live A assignment keys",
+        )
+        _require(
+            _native_source_metadata(redis_client, metadata_key) == source_metadata,
+            "Archive B changed native live A source metadata",
+        )
+        _require(
+            list(ChannelStream.objects.filter(channel=channel).order_by("order", "id")
+                 .values_list("stream_id", "order")) == assignment_rows,
+            "Archive B reordered native ChannelStream rows",
+        )
+        active_records = [
+            record for record in _worker_records(redis_client, worker_id)
+            if record.get("state") == "active"
+            and record.get("reservation_state") == "reserved"
+        ]
+        _require(
+            len(active_records) == 1,
+            "B archive did not have exactly one active managed worker",
+        )
+        active_record = active_records[0]
+        b_worker_id = active_record.get("worker_id")
+        _require(
+            b_worker_id and b_worker_id != worker_id
+            and active_record.get("stream_id") == str(stream_b.id)
+            and active_record.get("profile_id") == str(profile_b.id),
+            "Archive B did not use a separate managed worker and B profile",
+        )
+        publication_floor_during_b = int(
+            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
+        )
+        _require(
+            publication_floor_during_b > publication_floor_before_b,
+            "Native live A did not publish a newer chunk after archive B became active",
+        )
+        live_media_during_b, live_index_during_b = live_reader.read_after(
+            publication_floor_during_b, minimum_bytes=188 * 100, timeout=20,
+        )
+        _require(live_index_during_b > publication_floor_during_b,
+                 "Native live A did not yield a new buffer chunk while B recorded")
+        _verify_audio_video_tone(
+            ffmpeg, ffprobe, live_media_during_b, 440, "Native live A during archive B",
+        )
+
+        run_b.stop()
+        run_b.join()
+        all_segments_after_b_stop = store.segments(worker_id)
+        segment_by_id = {segment.id: segment for segment in all_segments_after_b_stop}
+        _require(
+            baseline_ids_b <= set(segment_by_id),
+            "B archive cleanup removed previously indexed A media",
+        )
+        _require(
+            {segment.id for segment in segments_b} <= set(segment_by_id),
+            "B archive cleanup removed an indexed B segment",
+        )
+        for segment in all_segments_after_b_stop:
+            if segment.id in baseline_ids_b:
+                _require(
+                    _segment_has_useful_av(ffprobe, segment.path),
+                    "Previously indexed A archive media became unreadable",
+                )
+                _assert_tone_matches(
+                    _segment_tone_frequency(ffmpeg, segment.path),
+                    440,
+                    "Previously indexed live A archive",
+                )
+            else:
+                _require(
+                    _segment_has_useful_av(ffprobe, segment.path),
+                    "Final indexed B archive segment lacks decoded audio/video",
+                )
+                _assert_tone_matches(
+                    _segment_tone_frequency(ffmpeg, segment.path),
+                    880,
+                    "Final indexed archive B",
+                )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            b_manager = native_server.stream_managers.get(b_worker_id)
+            b_clients = int(redis_client.scard(RedisKeys.clients(b_worker_id)) or 0)
+            _counts, b_active = source_server.snapshot()
+            if (
+                b_manager is None
+                and redis_client.get(RedisKeys.channel_owner(b_worker_id)) is None
+                and b_clients == 0
+                and b_active["source-b.ts"] == 0
+            ):
+                break
+            time.sleep(0.1)
+        _require(
+            native_server.stream_managers.get(b_worker_id) is None
+            and redis_client.get(RedisKeys.channel_owner(b_worker_id)) is None
+            and int(redis_client.scard(RedisKeys.clients(b_worker_id)) or 0) == 0
+            and source_server.snapshot()[0]["source-b.ts"]
+            == counts_during_b["source-b.ts"]
+            and source_server.snapshot()[1]["source-b.ts"] == 0,
+            "Stopping archive B left its private native worker or provider source active",
+        )
+        _assert_worker_cleanup(redis_client, worker_id)
+        _require(
+            not _release_worker_reservation(redis_client, b_worker_id),
+            "Duplicate archive B cleanup claimed a second profile reservation",
+        )
+        _require(
+            _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id]
+            and _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1,
+            "Stopping archive B did not release B once while preserving live A capacity",
+        )
+        _require(
+            _key_dump(redis_client, profile_credential_release_key(profile_a.id))
+            == native_a_marker,
+            "Stopping archive B changed the live A release marker",
+        )
+        _require(
+            native_server.stream_managers.get(worker_id) is native_manager
+            and native_manager.running
+            and _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner,
+            "Stopping archive B stopped the native live A manager or owner",
+        )
+        _require(
+            _redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE))
+            == active_state,
+            "Native live A stopped being ACTIVE after archive B cleanup",
+        )
+        _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
+        _require(
+            {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot,
+            "Stopping archive B changed native live A assignment keys",
+        )
+        _require(
+            _native_source_metadata(redis_client, metadata_key) == source_metadata,
+            "Stopping archive B changed native live A source metadata",
+        )
+        counts_after_b_stop, active_after_b_stop = source_server.snapshot()
+        _require(
+            counts_after_b_stop["source-a.ts"] == counts["source-a.ts"]
+            and active_after_b_stop["source-a.ts"] >= 1,
+            "Stopping archive B interrupted the existing live A source",
+        )
+        stop_floor = int(native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0)
+        _require(stop_floor > 0, "Native live A buffer head disappeared after B cleanup")
+        live_media_after_b_stop, live_index_after_b_stop = live_reader.read_after(
+            stop_floor, minimum_bytes=188 * 100, timeout=20,
+        )
+        _require(live_index_after_b_stop > stop_floor,
+                 "Native live A did not yield fresh media after archive B cleanup")
+        _verify_audio_video_tone(
+            ffmpeg, ffprobe, live_media_after_b_stop, 440,
+            "Native live A after archive B cleanup",
+        )
+
+        live_reader.close(live_response)
+        live_response = None
+        live_reader = None
+        live_tracker.close()
+        live_tracker = None
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+            manager = native_server.stream_managers.get(worker_id)
+            client_manager = native_server.client_managers.get(worker_id)
+            clients = int(redis_client.scard(RedisKeys.clients(worker_id)) or 0)
+            counts_final, active_final = source_server.snapshot()
+            if (
+                owner is None
+                and manager is None
+                and clients == 0
+                and (client_manager is None or client_manager.get_client_count() == 0)
+                and active_final["source-a.ts"] == 0
+                and counts_final["source-a.ts"] == counts["source-a.ts"]
+                and _profile_count(redis_client, profile_a.id, profile_connections_key)
+                == profile_baselines[profile_a.id]
+            ):
+                break
+            time.sleep(0.1)
+        _require(
+            redis_client.get(RedisKeys.channel_owner(worker_id)) is None
+            and native_server.stream_managers.get(worker_id) is None
+            and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+            and _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id]
+            and source_server.snapshot()[0]["source-a.ts"] == counts["source-a.ts"]
+            and source_server.snapshot()[1]["source-a.ts"] == 0,
+            "Stopping the final native live A client did not release its owner and provider slot",
+        )
+        _require(
+            _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id],
+            "Archive B profile capacity changed after both workers stopped",
+        )
+        _require(
+            {
+                int(profile.id): _key_dump(
+                    redis_client, profile_credential_release_key(profile.id),
+                )
+                for profile in created_profiles
+            } == marker_baselines,
+            "Live/archive cleanup did not restore synthetic credential markers",
+        )
+        _require(
+            list(ChannelStream.objects.filter(channel=channel).order_by("order", "id")
+                 .values_list("stream_id", "order")) == assignment_rows,
+            "Live/archive probe changed native ChannelStream rows",
+        )
+        print("AIO native live A remained isolated while the real recorder indexed B")
+    finally:
+        for run in reversed(harnesses):
+            if run.thread is not None:
+                try:
+                    run.stop()
+                    run.join(20)
+                except Exception:
+                    cleanup_errors.append("recorder-task")
+        if live_response is not None:
+            try:
+                if live_reader is not None:
+                    force_release = None
+                    if native_server is not None and channel is not None:
+                        worker_to_release = str(channel.uuid)
+                        def force_release_native() -> None:
+                            native_server._release_stream_resources(worker_to_release)
+
+                        force_release = force_release_native
+                    live_reader.close(live_response, force_release=force_release)
+                    live_reader = None
+                else:
+                    live_response.close()
+            except Exception:
+                cleanup_errors.append("native-live-response")
+        if live_tracker is not None:
+            try:
+                live_tracker.close()
+            except Exception:
+                cleanup_errors.append("native-live-tracker")
+        try:
+            from catchuparr.adapters.recorder_proxy import stop_managed_workers
+
+            if not stop_managed_workers(timeout_seconds=8):
+                cleanup_errors.append("managed-workers")
+        except Exception:
+            cleanup_errors.append("managed-workers")
+        channel_tasks.get_dvr_stream_base_url = original_base_url
+        if bridge is not None:
+            try:
+                bridge.close()
+                if bridge.server.active_requests():
+                    cleanup_errors.append("http-bridge")
+            except Exception:
+                cleanup_errors.append("http-bridge")
+        if native_server is not None and channel is not None and redis_client is not None:
+            try:
+                worker_id = str(channel.uuid)
+                if native_server.stream_managers.get(worker_id) is not None:
+                    native_server._release_stream_resources(worker_id)
+                    deadline = time.monotonic() + 10
+                    while (
+                        time.monotonic() < deadline
+                        and native_server.stream_managers.get(worker_id) is not None
+                    ):
+                        time.sleep(0.1)
+                if redis_client.get(RedisKeys.channel_owner(worker_id)) is not None:
+                    cleanup_errors.append("native-live-owner")
+                if native_server.stream_managers.get(worker_id) is not None:
+                    cleanup_errors.append("native-live-manager")
+            except Exception:
+                cleanup_errors.append("native-live-cleanup-check")
+        if source_server is not None:
+            try:
+                source_server.close()
+                if any(source_server.snapshot()[1].values()):
+                    cleanup_errors.append("synthetic-source-connections")
+            except Exception:
+                cleanup_errors.append("synthetic-source-server")
+        if default_profile_saved:
+            try:
+                _set_stream_default_profile(CoreSettings, saved_default_profile)
+                _require(
+                    str(_stream_default_profile_id(CoreSettings)) == str(saved_default_profile),
+                    "Native default StreamProfile was not restored",
+                )
+            except Exception:
+                cleanup_errors.append("default-stream-profile")
+        try:
+            if active_existed:
+                active_path.write_bytes(active_bytes)
+            else:
+                active_path.unlink(missing_ok=True)
+            if active_lock_existed:
+                active_lock_path.write_bytes(active_lock_bytes)
+            else:
+                active_lock_path.unlink(missing_ok=True)
+        except Exception:
+            cleanup_errors.append("active-config")
+        if redis_client is not None and not cleanup_errors:
+            try:
+                _require(
+                    all(
+                        _profile_count(redis_client, profile.id, profile_connections_key)
+                        == profile_baselines.get(profile.id, 0)
+                        for profile in created_profiles
+                    ),
+                    "Live/archive cleanup did not restore provider profile capacity",
+                )
+                _require(
+                    {
+                        int(profile.id): _key_dump(
+                            redis_client, profile_credential_release_key(profile.id),
+                        )
+                        for profile in created_profiles
+                    } == marker_baselines,
+                    "Live/archive cleanup did not restore credential markers",
+                )
+            except Exception:
+                cleanup_errors.append("profile-capacity")
+        if not cleanup_errors:
+            try:
+                for profile in created_profiles:
+                    if redis_client is not None:
+                        redis_client.delete(
+                            profile_connections_key(profile.id),
+                            profile_credential_release_key(profile.id),
+                        )
+                    profile.delete()
+                for stream in created_streams:
+                    stream.delete()
+                for account in created_accounts:
+                    account.delete()
+                if channel is not None:
+                    channel.delete()
+            except Exception:
+                cleanup_errors.append("synthetic-database-rows")
+        if not cleanup_errors:
+            shutil.rmtree(archive_root, ignore_errors=True)
+        shutil.rmtree(fixture_root, ignore_errors=True)
+        if cleanup_errors:
+            raise RuntimeError("Synthetic live/archive isolation cleanup was incomplete")
