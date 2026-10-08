@@ -308,7 +308,8 @@ class RecorderProxyHookTests(unittest.TestCase):
         def drf_callback(request, *args, **kwargs):
             return view_class().get(request, *args, **kwargs)
 
-        drf_callback.__name__ = "stream_ts"
+        # DRF's APIView.as_view callback retains Django's generic name.
+        drf_callback.__name__ = "view"
         drf_callback.__module__ = proxy_views.__name__
         drf_callback.cls = view_class
         proxy_views.stream_ts = drf_callback

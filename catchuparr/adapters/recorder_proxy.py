@@ -260,6 +260,7 @@ def _release_managed_worker(proxy_server, worker_id: str) -> bool:
 
 def _stream_route_channel_id_issue(route, index: int, expected_view) -> str | None:
     route_name = f"route.stream[{index}]"
+    expected_view_name = "stream_ts"
     pattern = getattr(route, "pattern", None)
     converters = getattr(pattern, "converters", {})
     if not isinstance(converters, dict) or "channel_id" not in converters:
@@ -287,7 +288,7 @@ def _stream_route_channel_id_issue(route, index: int, expected_view) -> str | No
     view_class = getattr(callback, "cls", None) or getattr(unwrapped_callback, "cls", None)
     if (
         view_class is None
-        or getattr(view_class, "__name__", None) != getattr(expected_view, "__name__", None)
+        or getattr(view_class, "__name__", None) != expected_view_name
         or getattr(view_class, "__module__", None) != getattr(expected_view, "__module__", None)
     ):
         return f"signature:{route_name}.view-class"
@@ -309,7 +310,7 @@ def _stream_route_channel_id_issue(route, index: int, expected_view) -> str | No
 
     for function in handler_functions:
         if (
-            getattr(function, "__name__", None) != getattr(expected_view, "__name__", None)
+            getattr(function, "__name__", None) != expected_view_name
             or getattr(function, "__module__", None) != getattr(expected_view, "__module__", None)
         ):
             continue
