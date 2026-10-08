@@ -242,15 +242,17 @@ def _verify_media_identity(ffprobe: str, media: bytes) -> None:
 
 def probe_actual_recorder_media(root: Path) -> None:
     """Exercise the guarded private route against real native Dispatcharr APIs."""
-    from django.test import Client
-    from django.urls import resolve
-
     from apps.channels.models import Channel, ChannelStream, Stream
     from apps.m3u.connection_pool import (
         profile_connections_key,
         profile_credential_release_key,
     )
     from apps.m3u.models import M3UAccount, M3UAccountProfile
+    from core.models import CoreSettings, StreamProfile
+    from core.utils import RedisClient
+    from django.test import Client
+    from django.urls import resolve
+
     from catchuparr.adapters.recorder_proxy import (
         _release_worker_reservation,
         read_worker_record,
@@ -269,8 +271,6 @@ def probe_actual_recorder_media(root: Path) -> None:
         ranked_source_candidates,
         stop_recorder_attempt,
     )
-    from core.models import CoreSettings, StreamProfile
-    from core.utils import RedisClient
 
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
