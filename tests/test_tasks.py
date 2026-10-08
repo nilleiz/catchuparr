@@ -3,11 +3,13 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.engine import ArchiveStore
+from catchuparr.recorder_proxy import configuration_generation
 
 
 class FakeRedis:
@@ -57,6 +59,33 @@ def _fake_module(name, **attrs):
     module.__dict__.update(attrs)
     module.__path__ = []
     return module
+
+
+@contextmanager
+def _isolated_plugin_modules(fake_modules):
+    """Keep package children aligned with sys.modules while stubbing Dispatcharr."""
+    package = importlib.import_module("catchuparr")
+    child_names = ("tasks", "runtime", "configuration", "recorder_proxy", "adapters", "engine")
+    missing = object()
+    previous = {name: package.__dict__.get(name, missing) for name in child_names}
+    try:
+        with patch.dict(sys.modules, fake_modules):
+            for name in child_names:
+                module_name = f"catchuparr.{name}"
+                module = sys.modules.get(module_name)
+                if module is None:
+                    package.__dict__.pop(name, None)
+                else:
+                    package.__dict__[name] = module
+            sys.modules.pop("catchuparr.tasks", None)
+            package.__dict__.pop("tasks", None)
+            yield
+    finally:
+        for name, value in previous.items():
+            if value is missing:
+                package.__dict__.pop(name, None)
+            else:
+                package.__dict__[name] = value
 
 
 class RecorderTaskTests(unittest.TestCase):
@@ -109,27 +138,29 @@ class RecorderTaskTests(unittest.TestCase):
             "apps.channels.models": apps_channels_models,
             "core": core,
             "core.utils": core_utils,
+            "version": _fake_module("version", __version__="0.32.0"),
         }
+        active = {"channel_uuids": "channel-1", "source_policies": {}}
+        expected_generation = configuration_generation(active)
         config = SimpleNamespace(
             channel_uuids=("channel-1",),
             archive_root=Path("/tmp/synthetic-archive"),
             retention_hours=24,
             max_storage_bytes=1024,
         )
-        with patch.dict(sys.modules, fake_modules):
-            sys.modules.pop("catchuparr.tasks", None)
+        with _isolated_plugin_modules(fake_modules):
             tasks = importlib.import_module("catchuparr.tasks")
             with (
-                patch("catchuparr.runtime.require_supported_version"),
                 patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
                 patch("catchuparr.runtime.load_config", return_value=config),
-                patch("catchuparr.configuration.load_active_configuration", return_value={}),
-                patch("catchuparr.recorder_proxy.configuration_generation", return_value="generation-7"),
+                patch("catchuparr.configuration.load_active_configuration", return_value=active),
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
             ):
                 result = tasks.reconcile_recorders()
         self.assertEqual({"queued": 1}, result)
-        self.assertEqual([{"args": ["channel-1", "generation-7"], "queue": "dvr"}], queued)
+        self.assertEqual(
+            [{"args": ["channel-1", expected_generation], "queue": "dvr"}], queued
+        )
 
     def test_queued_recorder_does_not_start_for_a_stale_generation(self):
         redis = FakeRedis()
@@ -159,12 +190,11 @@ class RecorderTaskTests(unittest.TestCase):
             "apps.channels.tasks": apps_channels_tasks,
             "core": core,
             "core.utils": core_utils,
+            "version": _fake_module("version", __version__="0.32.0"),
         }
-        with patch.dict(sys.modules, fake_modules):
-            sys.modules.pop("catchuparr.tasks", None)
+        with _isolated_plugin_modules(fake_modules):
             tasks = importlib.import_module("catchuparr.tasks")
             with (
-                patch("catchuparr.runtime.require_supported_version"),
                 patch("catchuparr.runtime.load_config", return_value=config),
                 patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
                 patch("catchuparr.configuration.load_active_configuration", return_value=active),
@@ -206,14 +236,14 @@ class RecorderTaskTests(unittest.TestCase):
                 "apps.channels.tasks": apps_channels_tasks,
                 "core": core,
                 "core.utils": core_utils,
+                "version": _fake_module("version", __version__="0.32.0"),
             }
 
-            with patch.dict(sys.modules, fake_modules):
-                sys.modules.pop("catchuparr.tasks", None)
+            with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
-                with patch("catchuparr.runtime.require_supported_version"), patch(
-                    "catchuparr.runtime.load_config", return_value=config
-                ), patch("catchuparr.configuration.reset_legacy_configuration", return_value=False):
+                with patch("catchuparr.runtime.load_config", return_value=config), patch(
+                    "catchuparr.configuration.reset_legacy_configuration", return_value=False
+                ):
                     with self.assertRaisesRegex(RuntimeError, "DVR URL setup failed"):
                         tasks.record_channel("channel-1")
 
@@ -287,12 +317,11 @@ class RecorderTaskTests(unittest.TestCase):
                 "apps.channels.tasks": apps_channels_tasks,
                 "core": core,
                 "core.utils": core_utils,
+                "version": _fake_module("version", __version__="0.32.0"),
             }
-            with patch.dict(sys.modules, fake_modules):
-                sys.modules.pop("catchuparr.tasks", None)
+            with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
                 with (
-                    patch("catchuparr.runtime.require_supported_version"),
                     patch("catchuparr.runtime.load_config", return_value=config),
                     patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
                     patch("catchuparr.configuration.load_active_configuration", return_value=active),

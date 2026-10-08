@@ -10,7 +10,7 @@
       "label": "Channel and source filter (YAML)",
       "type": "text",
       "default": "",
-      "help_text": "Use version: 1, profile: all or a Dispatcharr channel profile, and rules with channels selected by numbers, names, groups, or profile. Include/exclude filters apply only to already assigned M3U sources. Validate before Apply; blank YAML selects no channels. Source filters may need another provider slot."
+      "help_text": "Use version: 1, optional profile (defaults to all), and rules with channels selected by numbers, names, groups, or a Dispatcharr channel profile. Include/exclude filters apply only to assigned M3U sources. Validate before Apply; blank YAML selects no channels. Filtered sources may need another provider slot."
     },
     {
       "id": "archive_root",

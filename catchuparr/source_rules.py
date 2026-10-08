@@ -299,6 +299,10 @@ def _resolve_channel_selector(
         if not isinstance(value, str) or not value:
             raise SourceRuleError(f"line {line}, field channels.profile: expected a profile name or all")
         if value == "all":
+            if not eligible_channel_ids:
+                raise SourceRuleError(
+                    f"line {line}, field channels.profile: selector matches no eligible channels"
+                )
             return set(eligible_channel_ids), set(), True
         profile = profiles_by_name.get(value)
         if profile is None:
@@ -380,6 +384,14 @@ def _resolve_filter(
             account_id = _account_id(
                 name, f"priority.{name}", line, account_names, account_ids, ambiguous_account_names
             )
+            if include_ids is not None and account_id not in include_ids:
+                raise SourceRuleError(
+                    f"line {line}, field priority.{name}: account is excluded by include filter"
+                )
+            if account_id in exclude_ids:
+                raise SourceRuleError(
+                    f"line {line}, field priority.{name}: account is excluded by source filter"
+                )
             pairs.append((account_id, value))
         priorities = tuple(pairs)
 
@@ -453,7 +465,7 @@ def _load_document(text: str) -> tuple[dict[str, Any] | None, tuple[int, ...]]:
         line=1,
         field="filter_config",
         allowed={"version", "profile", "rules"},
-        required={"version", "profile", "rules"},
+        required={"version", "rules"},
     )
     return document, rule_lines
 
@@ -471,7 +483,7 @@ def compile_filter_config(
         return FilterCompilation((), (), {}, ())
     if type(document.get("version")) is not int or document["version"] != 1:
         raise SourceRuleError("line 1, field version: expected integer version 1")
-    scope_name = document.get("profile")
+    scope_name = document.get("profile", "all")
     if not isinstance(scope_name, str) or not scope_name:
         raise SourceRuleError("line 1, field profile: expected all or a channel profile name")
 
@@ -566,7 +578,7 @@ def compile_filter_config(
         streams = streams_by_channel.get(channel_uuid, ())
         baseline = _ordered_assigned(streams, account_ids)
         ranked = rank_candidates(policy, streams) if policy is not None else baseline
-        if policy is not None and _requires_override(policy, baseline, ranked):
+        if policy is not None and _requires_override(policy):
             source_policies[channel_uuid] = policy
         candidate_views = []
         for row in ranked:
@@ -600,13 +612,10 @@ def compile_filter_config(
     )
 
 
-def _requires_override(
-    policy: SourcePolicy,
-    baseline: list[Mapping[str, Any]],
-    ranked: list[Mapping[str, Any]],
-) -> bool:
-    if len(baseline) != len(ranked):
-        return True
-    if any(left.get("id") != right.get("id") for left, right in zip(baseline, ranked)):
-        return True
-    return False
+def _requires_override(policy: SourcePolicy) -> bool:
+    """Keep every effective filter/ranking private even if today's order matches."""
+    return (
+        policy.include_account_ids is not None
+        or bool(policy.exclude_account_ids)
+        or bool(policy.priorities)
+    )

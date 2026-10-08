@@ -56,6 +56,15 @@ class SourceRulesTests(unittest.TestCase):
         result = self.compile("version: 1\nprofile: all\nrules: []\n")
         self.assertEqual((), result.channel_uuids)
 
+    def test_outer_profile_defaults_to_all(self):
+        omitted = self.compile(
+            "version: 1\nrules:\n  - channels: {numbers: [1]}\n"
+        )
+        explicit = self.compile(
+            "version: 1\nprofile: all\nrules:\n  - channels: {numbers: [1]}\n"
+        )
+        self.assertEqual(explicit, omitted)
+
     def test_channel_profile_scope_uses_only_enabled_members(self):
         result = self.compile(
             "version: 1\nprofile: Synthetic Profile All\nrules:\n  - channels:\n      profile: all\n"
@@ -118,6 +127,36 @@ class SourceRulesTests(unittest.TestCase):
         self.assertEqual({}, result.source_policies)
         self.assertTrue(all(not row["source_override"] for row in result.channels))
 
+    def test_explicit_include_stays_private_when_current_assignment_already_matches(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {numbers: [1]}\n"
+            "    include: [Synthetic Source A, Synthetic Source B, Synthetic Source C]\n"
+        )
+        self.assertEqual(
+            ["a1", "a2", "a3"],
+            [row["stream_id"] for row in result.channels[0]["candidates"]],
+        )
+        self.assertEqual(
+            frozenset({"11", "12", "13"}),
+            result.source_policies[CHANNEL_A].include_account_ids,
+        )
+        self.assertTrue(result.channels[0]["source_override"])
+
+    def test_priority_stays_private_when_current_assignment_already_matches(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {numbers: [1]}\n"
+            "    exclude: []\n"
+            "    priority: {Synthetic Source A: 100}\n"
+        )
+        self.assertEqual(
+            ["a1", "a2", "a3"],
+            [row["stream_id"] for row in result.channels[0]["candidates"]],
+        )
+        self.assertTrue(result.channels[0]["source_override"])
+        self.assertIn(CHANNEL_A, result.source_policies)
+
     def test_rejects_overlap_unknown_or_ambiguous_selectors(self):
         invalid = (
             (
@@ -129,6 +168,11 @@ class SourceRulesTests(unittest.TestCase):
             ("version: 1\nprofile: Missing\nrules: []\n", "unknown channel profile"),
             (
                 "version: 1\nprofile: all\nrules:\n  - channels: {profile: Disabled Memberships}\n",
+                "no eligible channels",
+            ),
+            (
+                "version: 1\nprofile: Disabled Memberships\nrules:\n"
+                "  - channels: {profile: all}\n",
                 "no eligible channels",
             ),
         )
@@ -149,6 +193,27 @@ class SourceRulesTests(unittest.TestCase):
             (
                 "version: 1\nprofile: all\nrules:\n  - channels: {profile: all}\n    priority: {Synthetic Source A: 1}\n",
                 r"field priority.*requires include or exclude",
+            ),
+        )
+        for document, message in invalid:
+            with self.subTest(message=message), self.assertRaisesRegex(SourceRuleError, message):
+                self.compile(document)
+
+    def test_rejects_priorities_forbidden_by_include_or_exclude(self):
+        invalid = (
+            (
+                "version: 1\nprofile: all\nrules:\n"
+                "  - channels: {numbers: [1]}\n"
+                "    include: [Synthetic Source A]\n"
+                "    priority: {Synthetic Source B: 10}\n",
+                "excluded by include filter",
+            ),
+            (
+                "version: 1\nprofile: all\nrules:\n"
+                "  - channels: {numbers: [1]}\n"
+                "    exclude: [Synthetic Source B]\n"
+                "    priority: {Synthetic Source B: 10}\n",
+                "excluded by source filter",
             ),
         )
         for document, message in invalid:
