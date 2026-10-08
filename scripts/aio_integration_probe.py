@@ -72,8 +72,13 @@ def probe_source_configuration(channel, root):
     ChannelStream.objects.create(channel=channel, stream=source_b, order=1)
     profile_name = "Synthetic source catalog profile"
     channel_profile = ChannelProfile.objects.create(name=profile_name)
-    ChannelProfileMembership.objects.create(
-        channel_profile=channel_profile, channel=channel, enabled=True,
+    ChannelProfileMembership.objects.filter(channel_profile=channel_profile).update(
+        enabled=False
+    )
+    ChannelProfileMembership.objects.update_or_create(
+        channel_profile=channel_profile,
+        channel=channel,
+        defaults={"enabled": True},
     )
     catalog = source_catalog()
     require([row["id"] for row in catalog.streams_by_channel[str(channel.uuid)]]
@@ -261,9 +266,14 @@ def probe():
     no_guide_channel = Channel.objects.create(name="Missing guide", channel_number=4, user_level=0)
     long_segment_channel = Channel.objects.create(name="Long GOP", channel_number=5, user_level=0)
     channel_profile = ChannelProfile.objects.create(name="Synthetic playback profile")
+    ChannelProfileMembership.objects.filter(channel_profile=channel_profile).update(
+        enabled=False
+    )
     for selected_channel in (channel, closed_channel, no_guide_channel, long_segment_channel):
-        ChannelProfileMembership.objects.create(
-            channel_profile=channel_profile, channel=selected_channel, enabled=True,
+        ChannelProfileMembership.objects.update_or_create(
+            channel_profile=channel_profile,
+            channel=selected_channel,
+            defaults={"enabled": True},
         )
     root = Path("/data/ci-archive")
     root.mkdir(parents=True, exist_ok=True)
