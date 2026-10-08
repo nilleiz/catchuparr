@@ -119,10 +119,51 @@ class RecorderMediaProbeTests(unittest.TestCase):
                 self.closed = True
 
         response = Response()
-        reader.close(response)
+        force_calls = []
+        reader.close(response, force_release=lambda: force_calls.append(True), join_timeout=1)
         self.assertTrue(response.closed)
         self.assertTrue(response.assert_idle)
         self.assertTrue(response.assert_not_reading)
+        self.assertEqual(force_calls, [])
+
+    def test_blocked_live_reader_stops_native_channel_before_response_close(self):
+        class Tracker:
+            last_yielded_index = None
+
+        class BlockingIterator:
+            def __init__(self):
+                self.started = threading.Event()
+                self.unblock = threading.Event()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.started.set()
+                if not self.unblock.wait(1):
+                    raise RuntimeError("test iterator was not released")
+                raise StopIteration
+
+        iterator = BlockingIterator()
+        reader = probe._NativeLiveMediaReader(iterator, Tracker())
+        self.assertTrue(iterator.started.wait(1))
+        events = []
+
+        class Response:
+            def close(self):
+                self.closed_after_reader_stopped = not reader.thread.is_alive()
+                events.append("response-close")
+
+        response = Response()
+
+        def stop_native_channel():
+            events.append("native-stop")
+            iterator.unblock.set()
+
+        reader.close(response, force_release=stop_native_channel, join_timeout=0.01)
+        self.assertEqual(events, ["native-stop", "response-close"])
+        self.assertTrue(response.closed_after_reader_stopped)
+        self.assertFalse(reader.thread.is_alive())
 
     def test_redis_metadata_normalizes_bytes_strings_and_enum_values(self):
         enum_value = SimpleNamespace(value="ACTIVE")
