@@ -94,10 +94,12 @@ Enable sanitized diagnostics only for a test and disable them afterward.
 Review collected output before sharing; never publish raw URLs, session tokens,
 personal EPG data or real-world request timestamps.
 
-## 0.2.0 work in progress
+## 0.2.0 candidate (unreleased)
 
-Source policy enforcement is not released or accepted yet. The current
-configuration and native-helper probes passed in both pinned AIO versions:
+Source-policy enforcement is an unreleased candidate. The combined server-side
+AIO checks passed in both pinned Dispatcharr versions; real-player regression
+remains an open release gate. The configuration and native-helper probes
+passed in both pinned AIO versions:
 real assigned-source catalog extraction, atomic Apply/read-back, include-policy
 ranking, native profile capacity and reservation-ledger teardown with duplicate
 release protection. The DRF compatibility gate passed after independent review
@@ -143,6 +145,7 @@ Safe reuse of an existing live worker with restrictive source rules has not
 been verified. Current source metadata and a fresh buffer cursor cannot prove
 chunk origin across source transitions or in-flight writes. The existing shared
 route remains the default without rules; the implemented override path uses a
-dedicated worker subject to native provider capacity. This dedicated-connection behavior is the approved 0.2.0 release scope; safe
-reuse of native live workers remains deferred. See the
+dedicated worker subject to native provider capacity. This dedicated-connection
+behavior is the approved 0.2.0 candidate scope; safe reuse of native live
+workers remains deferred. See the
 [roadmap](roadmap.md) for the remaining acceptance requirements.
