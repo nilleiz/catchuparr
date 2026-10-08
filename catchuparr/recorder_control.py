@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 CONTROL_STATE_NAME = ".catchuparr-recorder-control.json"
+CONTROL_DENY_NAME = ".catchuparr-recorder-control-deny"
 CONTROL_STATE_VERSION = 1
 
 
@@ -40,8 +41,14 @@ def control_state_path(active_path: Path | None = None) -> Path:
     return path.with_name(CONTROL_STATE_NAME)
 
 
+def control_deny_path(active_path: Path | None = None) -> Path:
+    """Return the persistent admission-deny marker beside the control state."""
+    path = Path(active_path) if active_path is not None else _default_active_path()
+    return path.with_name(CONTROL_DENY_NAME)
+
+
 def load_recorder_control(active_path: Path | None = None) -> RecorderControlState:
-    """Read control state, initializing the enabled default only when absent."""
+    """Read control state, initializing when absent and denying pending changes."""
     from .configuration import _config_lock
 
     active = Path(active_path) if active_path is not None else _default_active_path()
@@ -57,7 +64,7 @@ def apply_recorder_control(active_path: Path | None = None) -> RecorderControlSt
     active = Path(active_path) if active_path is not None else _default_active_path()
     sidecar = control_state_path(active)
     with _config_lock(active, exclusive=True):
-        current = _load_or_initialize_locked(sidecar)
+        current = _load_or_initialize_locked(sidecar, allow_pending=True)
         try:
             enabled = _read_recording_enabled_setting()
         except RecorderControlError:
@@ -84,7 +91,7 @@ def _set_recording_enabled(enabled: bool, active_path: Path | None) -> RecorderC
     active = Path(active_path) if active_path is not None else _default_active_path()
     sidecar = control_state_path(active)
     with _config_lock(active, exclusive=True):
-        current = _load_or_initialize_locked(sidecar)
+        current = _load_or_initialize_locked(sidecar, allow_pending=True)
         target_paused = not enabled
         if target_paused:
             current = _transition_locked(sidecar, current, paused=True)
@@ -110,14 +117,26 @@ def _default_active_path() -> Path:
     return active_settings_path()
 
 
-def _load_or_initialize_locked(sidecar: Path) -> RecorderControlState:
+def _load_or_initialize_locked(
+    sidecar: Path, *, allow_pending: bool = False
+) -> RecorderControlState:
+    marker = control_deny_path(sidecar)
+    pending = _deny_marker_exists(marker)
+    if pending and not allow_pending:
+        raise RecorderControlError("recorder admission is denied by a pending control transition")
     try:
         raw = json.loads(sidecar.read_text(encoding="utf-8"))
     except FileNotFoundError:
         initial = RecorderControlState(paused=False, generation=0)
         try:
+            if not pending:
+                _write_deny_marker(sidecar)
             _atomic_replace_sidecar(sidecar, initial)
+            if not allow_pending:
+                _clear_deny_marker(sidecar)
         except OSError:
+            raise RecorderControlError("recorder control state could not be initialized") from None
+        except RecorderControlError:
             raise RecorderControlError("recorder control state could not be initialized") from None
         return initial
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -145,48 +164,114 @@ def _transition_locked(
     *,
     paused: bool,
 ) -> RecorderControlState:
-    if current.paused == paused:
+    marker_pending = _deny_marker_exists(control_deny_path(sidecar))
+    if current.paused == paused and not marker_pending:
         return current
-    updated = RecorderControlState(paused=paused, generation=current.generation + 1)
+    try:
+        # The marker is durably in place before any sidecar state that could
+        # admit recording. Readers deny admission while it exists, including
+        # after a replace that reports a later fsync error.
+        _write_deny_marker(sidecar)
+    except OSError:
+        raise RecorderControlError("recorder control admission deny could not be persisted") from None
+    updated = RecorderControlState(
+        paused=paused,
+        generation=current.generation + (1 if current.paused != paused else 0),
+    )
     try:
         _atomic_replace_sidecar(sidecar, updated)
     except OSError:
-        # A failed directory fsync can be reported after replace(2) has
-        # already published the requested state. If that state was resume,
-        # publish a newer paused generation even when `current` was paused.
-        safe_generation = updated.generation + (1 if not paused else 0)
-        _force_paused_locked(
-            sidecar, current, minimum_generation=safe_generation
-        )
-        raise RecorderControlError("recorder control transition failed; recording remains paused") from None
+        # Keep the deny marker on every state-write failure. A published
+        # unpaused sidecar is still non-authoritative while that marker exists.
+        if paused:
+            try:
+                _write_paused_in_place(sidecar, updated)
+            except OSError:
+                pass
+        raise RecorderControlError("recorder control transition failed; admission remains denied") from None
+    try:
+        _clear_deny_marker(sidecar)
+    except RecorderControlError:
+        raise RecorderControlError("recorder control transition remains denied") from None
     return updated
 
 
 def _force_paused_locked(
     sidecar: Path,
     current: RecorderControlState,
-    *,
-    minimum_generation: int | None = None,
 ) -> RecorderControlState:
+    marker_pending = _deny_marker_exists(control_deny_path(sidecar))
+    if current.paused and not marker_pending:
+        return current
     generation = current.generation + (0 if current.paused else 1)
-    if minimum_generation is not None:
-        generation = max(generation, minimum_generation)
     paused = RecorderControlState(paused=True, generation=generation)
     try:
-        # Rewrite even an already-paused state. An earlier replace may have
-        # succeeded before its directory fsync reported failure.
+        _write_deny_marker(sidecar)
         _atomic_replace_sidecar(sidecar, paused)
     except OSError:
-        # If a rename fails, prefer a directly written paused document over
-        # preserving a potentially published resume state. Truncation during
-        # this fallback also fails closed because malformed JSON is denied.
         try:
             _write_paused_in_place(sidecar, paused)
         except OSError:
             raise RecorderControlError(
-                "recorder control could not confirm a paused state"
+                "recorder control could not confirm a paused state; admission remains denied"
             ) from None
+    _clear_deny_marker(sidecar)
     return paused
+
+
+def _deny_marker_exists(marker: Path) -> bool:
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable marker path is not evidence that recording is safe.
+        raise RecorderControlError("recorder admission deny state is unreadable") from None
+    return True
+
+
+def _write_deny_marker(sidecar: Path) -> None:
+    marker = control_deny_path(sidecar)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{marker.name}.", dir=marker.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write("deny\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, marker)
+        _fsync_directory(marker.parent)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _clear_deny_marker(sidecar: Path) -> None:
+    marker = control_deny_path(sidecar)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise RecorderControlError("recorder admission deny state could not be cleared") from None
+
+    # The control sidecar is fsynced before this unlink. If syncing the parent
+    # fails, a crash may restore the marker, which only denies admission; the
+    # current process may safely treat the durable sidecar as authoritative.
+    try:
+        _fsync_directory(marker.parent)
+    except OSError:
+        pass
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _write_paused_in_place(path: Path, state: RecorderControlState) -> None:
