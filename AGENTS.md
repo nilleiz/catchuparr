@@ -1,5 +1,15 @@
 # Repository Guidelines
 
+## Agent assignments
+
+Delegate operational tasks such as backups, plugin installation and container
+starts, stops and restarts to a subagent using **gpt-6-luna** with reasoning
+**low**. Keep implementation on **gpt-6-luna** with reasoning appropriate to
+complexity. Use **gpt-6.1-sol**, reasoning **medium**, for analysis, independent
+reviews and technical acceptance. If the required agent model or execution
+access is unavailable, report the constraint and agree an alternative with the
+user before taking over the operational task or changing models.
+
 ## Dev stack and restore policy
 
 For Dev plugin updates, back up the isolated application data and configuration

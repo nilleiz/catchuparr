@@ -5,6 +5,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 ## Workflow and release gates
 
 - Implementation: **gpt-6-luna**, reasoning appropriate to complexity.
+- Operational tasks (backups, plugin installation, container starts/stops/restarts): delegate to **gpt-6-luna**, reasoning **low**. If the required model or execution access is unavailable, agree an alternative before switching or taking over the task.
 - Analysis, independent reviews and technical acceptance: **gpt-6.1-sol**, reasoning **medium**.
 - Use separate worktrees, small `develop/` feature branches and PRs. Merge after independent review and green required checks; fix failures without weakening checks.
 - Every release includes an installable plugin ZIP, SHA-256 checksum, release notes and installation/update/rollback guidance.
