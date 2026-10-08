@@ -19,6 +19,153 @@ def require(condition, message="Integration check failed"):
         raise RuntimeError(message)
 
 
+def probe_source_configuration(channel, root):
+    """Exercise real ORM catalogs, published settings, and native Redis counters."""
+    from apps.channels.models import ChannelStream, Stream
+    from apps.m3u.connection_pool import (
+        profile_connections_key,
+        profile_credential_release_key,
+        release_profile_slot,
+        reserve_profile_slot,
+    )
+    from apps.m3u.models import M3UAccount, M3UAccountProfile
+    from apps.proxy.live_proxy.server import ProxyServer
+    from dispatcharr.utils import get_client_ip
+
+    from catchuparr.adapters.recorder_proxy import (
+        _core_api_compatibility_issues,
+        _CredentialMarkerRedisFacade,
+        _release_worker_reservation,
+        core_api_supported,
+        make_worker_id,
+        reservation_credential_marker_key,
+        write_worker_record,
+    )
+    from catchuparr.configuration import (
+        apply_configuration,
+        load_active_configuration,
+        source_catalog,
+    )
+    from catchuparr.recorder_proxy import ranked_source_candidates
+
+    require(callable(get_client_ip))
+    if not core_api_supported():
+        raise RuntimeError("Real source proxy API rejected: "
+                           + "; ".join(_core_api_compatibility_issues()))
+    first = M3UAccount.objects.create(name="Synthetic source A", max_streams=3)
+    second = M3UAccount.objects.create(name="Synthetic source B", max_streams=3)
+    source_a = Stream.objects.create(
+        name="Source A", url="http://127.0.0.1:1/a.ts", m3u_account=first,
+    )
+    source_b = Stream.objects.create(
+        name="Source B", url="http://127.0.0.1:1/b.ts", m3u_account=second,
+    )
+    Stream.objects.create(
+        name="Unassigned source", url="http://127.0.0.1:1/unused.ts", m3u_account=second,
+    )
+    ChannelStream.objects.create(channel=channel, stream=source_a, order=0)
+    ChannelStream.objects.create(channel=channel, stream=source_b, order=1)
+    catalog = source_catalog()
+    require([row["id"] for row in catalog.streams_by_channel[str(channel.uuid)]]
+            == [str(source_a.id), str(source_b.id)], "Catalog must preserve assigned order")
+    settings = {
+        "channel_uuids": str(channel.uuid), "archive_root": str(root),
+        "retention_hours": 1, "max_storage_gib": 1,
+        "source_rules": '* | mode=include-only | m3u="Synthetic source B"',
+    }
+    active_path = root / "synthetic-active-settings.json"
+    apply_configuration(settings, active_path=active_path)
+    active = load_active_configuration(active_path)
+    require(set(active["source_policies"]) == {str(channel.uuid)},
+            "Wildcard must persist policies only for enabled archive channels")
+    require([row["id"] for row in ranked_source_candidates(str(channel.uuid), active)]
+            == [str(source_b.id)], "Include policy must reject assigned source A")
+    previous = active_path.read_bytes()
+    invalid = dict(settings, source_rules='* | mode=include-only | m3u="Missing source"')
+    try:
+        apply_configuration(invalid, active_path=active_path)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("Unknown source must fail Apply")
+    require(active_path.read_bytes() == previous, "Rejected Apply must preserve active snapshot")
+    apply_configuration(dict(settings, source_rules=""), active_path=active_path)
+    require(ranked_source_candidates(str(channel.uuid), load_active_configuration(active_path))
+            is None, "Cleared rules must restore the shared channel route")
+
+    # Native release implementations differ between .31 and .32. Seed a shared
+    # credential ledger to check each private marker against the real helpers,
+    # including .32 WATCH/pipeline operations, in both teardown orders.
+    redis_client = ProxyServer.get_instance().redis_client
+    require(redis_client is not None, "Source tests require disposable Redis")
+    profile = M3UAccountProfile.objects.create(
+        m3u_account=first, name="Synthetic capacity", max_streams=3,
+        is_active=True, search_pattern="", replace_pattern="",
+    )
+    profile_key = profile_connections_key(profile.id)
+    marker_key = profile_credential_release_key(profile.id)
+    credential_key = "catchuparr:ci:synthetic-credential-count"
+    scenarios = (
+        (False, (0, 1)),
+        (True, ("live", 0, 1)),
+        (True, (0, "live", 1)),
+        (True, (1, 0, "live")),
+    )
+    for with_live, order in scenarios:
+        redis_client.delete(profile_key, marker_key, credential_key)
+        workers = []
+        private_markers = []
+        if with_live:
+            require(reserve_profile_slot(profile, redis_client)[0], "Native slot must reserve")
+        for index in range(2):
+            reservation_id = uuid.uuid4().hex
+            worker_id = make_worker_id(str(channel.uuid), str(source_a.id), "synthetic", 1,
+                                       reservation_id)
+            facade = _CredentialMarkerRedisFacade(redis_client, profile.id, reservation_id)
+            require(reserve_profile_slot(profile, facade)[0], "Archive slot must reserve")
+            facade.set(marker_key, credential_key)
+            write_worker_record(redis_client, worker_id, {
+                "profile_id": profile.id, "reservation_id": reservation_id,
+                "reservation_state": "reserved", "state": "active",
+            })
+            workers.append(worker_id)
+            private_markers.append(reservation_credential_marker_key(reservation_id))
+        if with_live:
+            redis_client.set(marker_key, credential_key)
+        else:
+            require(redis_client.get(marker_key) is None,
+                    "Recorder-only scenario must not seed a native release marker")
+        total = 2 + int(with_live)
+        redis_client.set(credential_key, total)
+        if with_live:
+            require(not reserve_profile_slot(profile, redis_client)[0],
+                    "Archive must respect native profile capacity")
+        live_pending = with_live
+        for index, slot in enumerate(order):
+            if slot == "live":
+                release_profile_slot(profile.id, redis_client)
+                live_pending = False
+            else:
+                require(_release_worker_reservation(redis_client, workers[slot]),
+                        "Exact archive ledger reservation must release")
+                require(redis_client.get(private_markers[slot]) is None,
+                        "Released archive reservation must remove its private marker")
+                require(not _release_worker_reservation(redis_client, workers[slot]),
+                        "Duplicate archive release must not consume another slot")
+            remaining = total - index - 1
+            require(int(redis_client.get(profile_key) or 0) == remaining,
+                    "Teardown must release precisely one profile slot")
+            require(int(redis_client.get(credential_key) or 0) == remaining,
+                    "Teardown must release precisely one credential slot")
+            if live_pending:
+                require(redis_client.get(marker_key) is not None,
+                        "Archive teardown must preserve a live reservation's release marker")
+        require(redis_client.get(marker_key) is None,
+                "Final teardown must remove the native release marker")
+    redis_client.delete(credential_key)
+    print("AIO source catalog, atomic Apply, policy ranking and native pool checks passed")
+
+
 def probe():
     if os.environ.get("CATCHUPARR_INTEGRATION_TEST") != "1":
         raise RuntimeError("This probe requires a disposable integration container")
@@ -309,7 +456,17 @@ def probe():
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", disabled_params,
     )).status_code == 403)
-    runtime.shutdown()
+    try:
+        probe_source_configuration(channel, root)
+        sys.path.insert(0, "/tmp")
+        from aio_recorder_media import probe_actual_recorder_media
+
+        probe_actual_recorder_media(root)
+        from aio_recorder_failover import probe_recorder_failover
+
+        probe_recorder_failover(root)
+    finally:
+        runtime.shutdown()
     print(f"AIO integration passed: Dispatcharr {__version__}")
 
 

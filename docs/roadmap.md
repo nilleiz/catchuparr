@@ -5,7 +5,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 ## Workflow and release gates
 
 - Implementation: **gpt-6-luna**, reasoning appropriate to complexity.
-- Analysis, independent reviews and technical acceptance: **gpt-6.1-sol**, reasoning **low through high**.
+- Analysis, independent reviews and technical acceptance: **gpt-6.1-sol**, reasoning **medium**.
 - Use separate worktrees, small `develop/` feature branches and PRs. Merge after independent review and green required checks; fix failures without weakening checks.
 - Every release includes an installable plugin ZIP, SHA-256 checksum, release notes and installation/update/rollback guidance.
 - Relevant synthetic tests, lint, compile and package checks, plus integration probes in pinned Dispatcharr 0.31.0 and 0.32.0 AIOs, gate publication. New private hooks are version/signature checked, idempotent and removable.
@@ -17,7 +17,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 
 | Release | Feature | Relative effort | Status |
 | --- | --- | --- | --- |
-| 0.2.0 | M3U include/exclude rules and fixed priorities | High | In progress |
+| 0.2.0 | M3U include/exclude rules and fixed priorities | High | Candidate; real-player gate open |
 | 0.3.0 | Catch-up playback in Dispatcharr Stats | High to medium | Planned |
 | 0.4.0 | Recording windows by channel and weekday | Medium | Planned |
 | 0.5.0 | Hide archive recorders in Stats | Medium to low | Planned |
@@ -39,7 +39,7 @@ Preview lists resolved channels, permitted source order, recording windows, conf
 - Modes: unchanged, `include-only`, `exclude-only`, and priority only. Reference M3Us by unique name.
 - Higher priority wins. Missing priority is zero; equal priorities retain `ChannelStream` order. Weighting is deterministic preference, not random distribution.
 - Permit a global rule. A channel-specific rule replaces the global policy completely. Reject overlapping channel-specific rules, unknown or ambiguous M3U names and invalid syntax.
-- With no override, retain the existing shared channel proxy. With an override, reuse a matching permissible worker when safe, otherwise open a separate proxy worker. Additional provider connections or source tuners are permitted subject to actual limits.
+- With no override, retain the existing shared channel proxy. With an override, use a dedicated proxy worker and respect native provider capacity. This release scope was explicitly approved after independent review found that existing live buffers lack verified source provenance. Additional provider connections or source tuners may be required. Safe reuse of existing native live workers is deferred; reconnecting to the same managed recorder worker is a separate lifecycle case.
 - Do not modify channel membership/order, the live channel's Redis assignment, or the live worker's source. Reuse Dispatcharr profile reservation and slot release, including Redirect sources through a narrowly authenticated internal recorder/proxy adapter.
 - On connection exhaustion or failure, try the next permitted source. Never escape an include list. After successful fallback remain on that source until failure, a new recording window or applying new rules.
 - Preserve copy recording with all audio tracks, segment indexing and session-protected retention. Report unavailable sources as recorder status and real archive gaps.

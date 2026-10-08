@@ -94,9 +94,58 @@ Enable sanitized diagnostics only for a test and disable them afterward.
 Review collected output before sharing; never publish raw URLs, session tokens,
 personal EPG data or real-world request timestamps.
 
-## 0.2.0 work in progress
+## 0.2.0 candidate (unreleased)
 
-Source policy enforcement is not released or accepted yet. Configuration,
-proxy lifecycle, reservation accounting and real media selection need the
-independent review and two-version AIO gates described in the
-[roadmap](roadmap.md). Passing parser or configuration tests alone is insufficient.
+Source-policy enforcement is an unreleased candidate. The combined server-side
+AIO checks passed in both pinned Dispatcharr versions; real-player regression
+remains an open release gate. The configuration and native-helper probes
+passed in both pinned AIO versions:
+real assigned-source catalog extraction, atomic Apply/read-back, include-policy
+ranking, native profile capacity and reservation-ledger teardown with duplicate
+release protection. The DRF compatibility gate passed after independent review
+of its registered-route association and captured original handler signature.
+
+The single-process native media probe also passed in both images. It used
+synthetic HTTP sources and the actual private recorder route to decode video and
+audio from the included source, reject forbidden/unassigned sources and forged
+capabilities, preserve native assignment keys, proxy an actual Redirect default
+profile without returning Location, and release the reserved slot exactly once.
+
+The cross-process probe passed in both images. A fresh process attached to the
+same private worker without opening another provider connection or reserving
+another slot. After that client closed, the original client consumed decoded
+media published beyond the recorded Redis head. Native ownership, active state,
+client counts and the running upstream manager remained valid; final teardown
+returned provider capacity to its baseline.
+
+Seeded credential counters do not prove provider credential acquisition.
+The recording-engine probe also passed in both images using the private HTTP
+route, actual recording task and bundled FFmpeg. It verified fallback when the
+first source supplied no useful media, fallback when that source was at capacity,
+and a later source change after useful recording stalled. Decoded synthetic
+audio identified archived sources independently of remuxed service names. The
+excluded source was absent, existing recordings survived the change, and
+teardown restored provider capacity. The probe also checked the resulting
+gap/discontinuity. Separate synthetic stream-copy checks covered short segments
+and rejection of unknown fingerprints.
+
+The native live/archive isolation probe passed in both images. Without source
+rules, recording shared the existing live connection. With a restricted source
+policy, a separate worker recorded the permitted source while the original live
+client continued yielding newly published media from its original source.
+Channel assignments and live-source metadata stayed unchanged. Closing the
+archive recorder left the live stream active; closing its final client then
+ran native disconnect cleanup and restored provider capacity. These checks used
+synthetic sources and the actual native routes and recording task.
+
+Dev real-player regression remains an acceptance gate.
+Passing parser or configuration tests alone is insufficient.
+
+Safe reuse of an existing live worker with restrictive source rules has not
+been verified. Current source metadata and a fresh buffer cursor cannot prove
+chunk origin across source transitions or in-flight writes. The existing shared
+route remains the default without rules; the implemented override path uses a
+dedicated worker subject to native provider capacity. This dedicated-connection
+behavior is the approved 0.2.0 candidate scope; safe reuse of native live
+workers remains deferred. See the
+[roadmap](roadmap.md) for the remaining acceptance requirements.
