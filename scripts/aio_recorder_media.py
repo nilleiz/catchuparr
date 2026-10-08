@@ -51,6 +51,7 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
                         for offset in range(0, len(payload), 188 * 32):
                             self.wfile.write(payload[offset:offset + 188 * 32])
                             self.wfile.flush()
+                            time.sleep(0.03)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
                 finally:
@@ -119,7 +120,7 @@ def _make_transport_stream(
         _require(len(payload) >= 188 * 100, "Synthetic TS fixture is too small")
         _require(payload[0] == 0x47, "Synthetic TS fixture is not packet aligned")
         probe = subprocess.run(
-            [ffprobe, "-v", "error", "-show_programs", "-show_streams", "-of", "json", str(output)],
+            [ffprobe, "-v", "error", "-count_frames", "-show_programs", "-show_streams", "-of", "json", str(output)],
             check=True, capture_output=True, timeout=15,
         )
         details = json.loads(probe.stdout.decode("utf-8"))
@@ -128,9 +129,13 @@ def _make_transport_stream(
             any(program.get("tags", {}).get("service_name") == service_name for program in programs),
             "Synthetic TS fixture lost its source identifier",
         )
+        frame_counts = {
+            item.get("codec_type"): int(item.get("nb_read_frames", "0") or 0)
+            for item in details.get("streams", [])
+        }
         _require(
-            {item.get("codec_type") for item in details.get("streams", [])} >= {"video", "audio"},
-            "Synthetic TS fixture must contain useful audio and video",
+            frame_counts.get("video", 0) > 0 and frame_counts.get("audio", 0) > 0,
+            "Synthetic TS fixture must decode useful audio and video frames",
         )
         return payload
     except subprocess.TimeoutExpired as exc:
@@ -223,7 +228,7 @@ def _verify_media_identity(ffprobe: str, media: bytes) -> None:
     )
     try:
         result = subprocess.run(
-            [ffprobe, "-v", "error", "-f", "mpegts", "-show_programs", "-show_streams", "-of", "json", "pipe:0"],
+            [ffprobe, "-v", "error", "-count_frames", "-f", "mpegts", "-show_programs", "-show_streams", "-of", "json", "pipe:0"],
             input=media, check=True, capture_output=True, timeout=15,
         )
     except subprocess.TimeoutExpired as exc:
@@ -237,7 +242,15 @@ def _verify_media_identity(ffprobe: str, media: bytes) -> None:
         "Recorder route returned media from a source other than the included B source",
     )
     stream_types = {item.get("codec_type") for item in details.get("streams", [])}
-    _require(stream_types >= {"video", "audio"}, "Recorder route did not deliver useful audio and video")
+    _require(stream_types >= {"video", "audio"}, "Recorder route did not expose audio and video streams")
+    frame_counts = {
+        item.get("codec_type"): int(item.get("nb_read_frames", "0") or 0)
+        for item in details.get("streams", [])
+    }
+    _require(
+        frame_counts.get("video", 0) > 0 and frame_counts.get("audio", 0) > 0,
+        "Recorder route returned no decoded audio/video frames",
+    )
 
 
 def probe_actual_recorder_media(root: Path) -> None:
@@ -266,10 +279,12 @@ def probe_actual_recorder_media(root: Path) -> None:
     from catchuparr.engine.leases import RedisRecorderLease
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.recorder_proxy import (
+        capability_binding_current,
         configuration_generation,
         issue_recorder_attempt,
         ranked_source_candidates,
         stop_recorder_attempt,
+        verify_recorder_capability,
     )
 
     ffmpeg = shutil.which("ffmpeg")
@@ -413,6 +428,10 @@ def probe_actual_recorder_media(root: Path) -> None:
             f"channel_stream:{source_b.id}",
             f"channel_stream:{source_c.id}",
             f"channel_stream:{channel.uuid}",
+            f"channel_stream:{channel.id}",
+            f"stream_profile:{source_a.id}",
+            f"stream_profile:{source_b.id}",
+            f"stream_profile:{channel.id}",
             RedisKeys.channel_metadata(str(channel.uuid)),
             RedisKeys.channel_owner(str(channel.uuid)),
         }
@@ -552,22 +571,57 @@ def probe_actual_recorder_media(root: Path) -> None:
         )
         managed_attempt = None
 
-        # A formerly valid capability must fail when the applied generation changes.
+        # Keep a fresh, otherwise valid capability so this 403 tests only the
+        # applied configuration generation check.
+        generation_attempt = issue({"id": str(source_b.id), "account_id": str(account_b.id)})
+        generation_binding = verify_recorder_capability(redis_client, generation_attempt.capability)
+        _require(
+            generation_binding is not None
+            and capability_binding_current(redis_client, generation_binding),
+            "Generation-check capability was not valid before changing configuration",
+        )
+        counts_before_generation_change = source_server.snapshot()[0]
+        counters_before_generation_change = {
+            profile.id: _profile_count(redis_client, profile.id, profile_connections_key)
+            for profile in created_profiles
+        }
         changed_settings = dict(settings, retention_hours=2)
         apply_configuration(changed_settings, active_path=active_path)
         stale_generation = client.get(
             route_path, HTTP_HOST="localhost",
-            HTTP_X_CATCHUPARR_RECORDER=attempt_b.capability,
+            HTTP_X_CATCHUPARR_RECORDER=generation_attempt.capability,
         )
         _require(stale_generation.status_code == 403, "Recorder capability survived an applied config change")
         stale_generation.close()
         _require(
-            _profile_count(redis_client, profile_b.id, profile_connections_key) == profile_baselines[profile_b.id],
-            "Stale capability changed provider profile capacity",
+            source_server.snapshot()[0] == counts_before_generation_change,
+            "Stale generation capability opened a synthetic provider source",
+        )
+        _require(
+            {
+                profile.id: _profile_count(redis_client, profile.id, profile_connections_key)
+                for profile in created_profiles
+            } == counters_before_generation_change,
+            "Stale generation capability changed provider profile capacity",
         )
         apply_configuration(settings, active_path=active_path)
+        _require(
+            capability_binding_current(redis_client, generation_binding),
+            "Generation-check capability did not become valid after restoring its configuration",
+        )
 
-        # Releasing the owner fences out a previously valid but replayed header.
+        # Keep another otherwise-valid capability, then replace only its owner lease.
+        owner_attempt = issue({"id": str(source_b.id), "account_id": str(account_b.id)})
+        owner_binding = verify_recorder_capability(redis_client, owner_attempt.capability)
+        _require(
+            owner_binding is not None and capability_binding_current(redis_client, owner_binding),
+            "Lease-check capability was not valid before replacing its owner",
+        )
+        counts_before_lease_change = source_server.snapshot()[0]
+        counters_before_lease_change = {
+            profile.id: _profile_count(redis_client, profile.id, profile_connections_key)
+            for profile in created_profiles
+        }
         _require(lease.release(), "Synthetic recorder lease did not release")
         lease = None
         replacement = RedisRecorderLease(redis_client, str(channel.uuid), ttl_seconds=120, archive_store=store)
@@ -575,12 +629,19 @@ def probe_actual_recorder_media(root: Path) -> None:
         _require(replacement.acquire() is not None, "Replacement recorder lease could not be acquired")
         replayed = client.get(
             route_path, HTTP_HOST="localhost",
-            HTTP_X_CATCHUPARR_RECORDER=attempt_b.capability,
+            HTTP_X_CATCHUPARR_RECORDER=owner_attempt.capability,
         )
         _require(replayed.status_code == 403, "Old owner capability was replayable after lease replacement")
         replayed.close()
         _require(
-            _profile_count(redis_client, profile_b.id, profile_connections_key) == profile_baselines[profile_b.id],
+            source_server.snapshot()[0] == counts_before_lease_change,
+            "Old owner capability opened a synthetic provider source",
+        )
+        _require(
+            {
+                profile.id: _profile_count(redis_client, profile.id, profile_connections_key)
+                for profile in created_profiles
+            } == counters_before_lease_change,
             "Old owner capability changed provider profile capacity",
         )
         _require(replacement.release(), "Replacement recorder lease did not release")
