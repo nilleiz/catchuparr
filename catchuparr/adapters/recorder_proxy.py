@@ -9,6 +9,7 @@ never writes Dispatcharr's unscoped ``channel_stream:<stream_id>`` keys.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import inspect
 import logging
 import re
@@ -99,6 +100,8 @@ class _CredentialMarkerRedisFacade:
         self._redis = redis_client
         self._profile_id = int(profile_id)
         self._marker = reservation_credential_marker_key(reservation_id)
+        self._pipeline_seen = False
+        self._pipeline_committed = False
 
     def _key(self, key):
         from apps.m3u.connection_pool import profile_credential_release_key
@@ -117,6 +120,7 @@ class _CredentialMarkerRedisFacade:
         return self._redis.delete(*(self._key(key) for key in keys))
 
     def pipeline(self, *args, **kwargs):
+        self._pipeline_seen = True
         return _CredentialMarkerPipelineFacade(
             self._redis.pipeline(*args, **kwargs), self
         )
@@ -159,6 +163,11 @@ class _CredentialMarkerPipelineFacade:
                 remapped.append(key)
         return self._pipeline.delete(*remapped)
 
+    def execute(self):
+        result = self._pipeline.execute()
+        self._redis_facade._pipeline_committed = True
+        return result
+
     def __getattr__(self, name):
         return getattr(self._pipeline, name)
 
@@ -178,13 +187,7 @@ def _release_worker_reservation(redis_client, worker_id: str) -> bool:
     if not claimed:
         return False
     try:
-        from apps.m3u.connection_pool import release_profile_slot
-
-        release_profile_slot(
-            int(profile_id),
-            _CredentialMarkerRedisFacade(redis_client, int(profile_id), reservation_id),
-        )
-        redis_client.delete(reservation_credential_marker_key(reservation_id))
+        _release_core_profile_slot(redis_client, int(profile_id), reservation_id)
     except Exception:
         # Do not retry a partially applied core release: its helper is not
         # reservation-ID aware. Leaving a capacity leak is safer than stealing
@@ -201,6 +204,22 @@ def _release_worker_reservation(redis_client, worker_id: str) -> bool:
     )
     redis_client.expire(worker_id_key(worker_id), WORKER_RECORD_TTL)
     return True
+
+
+def _release_core_profile_slot(redis_client, profile_id: int, reservation_id: str) -> None:
+    """Release a reservation and remove its marker only after a confirmed commit."""
+    from apps.m3u.connection_pool import release_profile_slot
+
+    marker_facade = _CredentialMarkerRedisFacade(
+        redis_client, int(profile_id), reservation_id
+    )
+    release_profile_slot(int(profile_id), marker_facade)
+    if marker_facade._pipeline_seen and not marker_facade._pipeline_committed:
+        # Dispatcharr 0.32 returns normally after exhausting its WatchError
+        # retries. Preserve the reservation marker so this uncertain release
+        # cannot be mistaken for a committed counter decrement.
+        raise RuntimeError("Dispatcharr profile release did not commit a Redis transaction")
+    redis_client.delete(reservation_credential_marker_key(reservation_id))
 
 
 def _clear_worker_reservation_metadata(redis_client, worker_id: str) -> None:
@@ -239,74 +258,129 @@ def _release_managed_worker(proxy_server, worker_id: str) -> bool:
     return released
 
 
+def _collect_core_api_compatibility_issues() -> tuple[str, ...]:
+    """Return safe module, callable, and parameter names for rejected APIs."""
+    module_names = (
+        "apps.channels.models",
+        "apps.m3u.connection_pool",
+        "apps.proxy.live_proxy.urls",
+        "apps.proxy.live_proxy.constants",
+        "apps.proxy.live_proxy.input.manager",
+        "apps.proxy.live_proxy.output.ts.generator",
+        "apps.proxy.live_proxy.redis_keys",
+        "apps.proxy.live_proxy.server",
+        "apps.proxy.live_proxy.services.channel_service",
+        "apps.proxy.live_proxy.url_utils",
+        "apps.proxy.live_proxy.views",
+        "dispatcharr.utils",
+    )
+    modules = {}
+    for name in module_names:
+        try:
+            modules[name] = importlib.import_module(name)
+        except Exception:
+            return (f"import:{name}",)
+
+    channel_stream = getattr(modules["apps.channels.models"], "ChannelStream", None)
+    pool = modules["apps.m3u.connection_pool"]
+    metadata_fields = getattr(modules["apps.proxy.live_proxy.constants"], "ChannelMetadataField", None)
+    input_manager = modules["apps.proxy.live_proxy.input.manager"]
+    generator = modules["apps.proxy.live_proxy.output.ts.generator"]
+    redis_keys = modules["apps.proxy.live_proxy.redis_keys"]
+    proxy_server = getattr(modules["apps.proxy.live_proxy.server"], "ProxyServer", None)
+    channel_service = getattr(
+        modules["apps.proxy.live_proxy.services.channel_service"], "ChannelService", None
+    )
+    url_utils = modules["apps.proxy.live_proxy.url_utils"]
+    proxy_views = modules["apps.proxy.live_proxy.views"]
+    dispatcharr_utils = modules["dispatcharr.utils"]
+
+    required = (
+        ("reserve_profile_slot", getattr(pool, "reserve_profile_slot", None), {"profile", "redis_client"}),
+        ("release_profile_slot", getattr(pool, "release_profile_slot", None), {"profile_id", "redis_client"}),
+        (
+            "ChannelService.initialize_channel",
+            getattr(channel_service, "initialize_channel", None),
+            {
+                "channel_id", "stream_url", "user_agent", "transcode",
+                "stream_profile_value", "stream_id", "m3u_profile_id",
+                "channel_name", "stream_name",
+            },
+        ),
+        (
+            "create_stream_generator",
+            getattr(generator, "create_stream_generator", None),
+            {
+                "channel_id", "client_id", "client_ip", "client_user_agent",
+                "channel_initializing", "user", "buffer", "channel_name",
+            },
+        ),
+        ("ProxyServer._release_stream_resources", getattr(proxy_server, "_release_stream_resources", None), {"self", "channel_id"}),
+        ("ProxyServer.try_acquire_ownership", getattr(proxy_server, "try_acquire_ownership", None), {"self", "channel_id", "ttl"}),
+        ("ProxyServer._get_channel_init_lock", getattr(proxy_server, "_get_channel_init_lock", None), {"self", "channel_id"}),
+        ("ProxyServer._finish_channel_init_lock", getattr(proxy_server, "_finish_channel_init_lock", None), {"self", "channel_id", "lock"}),
+        ("ProxyServer.get_buffer", getattr(proxy_server, "get_buffer", None), {"self", "channel_id", "profile"}),
+        ("ProxyServer.initialize_channel", getattr(proxy_server, "initialize_channel", None), {"self", "url", "channel_id", "user_agent", "transcode", "stream_id"}),
+        ("ChannelService.is_channel_unavailable_for_new_clients", getattr(channel_service, "is_channel_unavailable_for_new_clients", None), {"channel_id"}),
+        ("ChannelService.stop_channel", getattr(channel_service, "stop_channel", None), {"channel_id"}),
+        ("_resolve_live_stream_url", getattr(url_utils, "_resolve_live_stream_url", None), {"stream", "m3u_account", "m3u_profile"}),
+        ("get_client_ip", getattr(dispatcharr_utils, "get_client_ip", None), {"request"}),
+        ("_channel_setup_needed", getattr(proxy_views, "_channel_setup_needed", None), {"proxy_server", "channel_id"}),
+        ("get_alternate_streams", getattr(input_manager, "get_alternate_streams", None), {"channel_id"}),
+        ("RedisKeys.channel_metadata", getattr(getattr(redis_keys, "RedisKeys", None), "channel_metadata", None), {"channel_id"}),
+        ("RedisKeys.channel_owner", getattr(getattr(redis_keys, "RedisKeys", None), "channel_owner", None), {"channel_id"}),
+    )
+    issues = []
+    for name, function, expected in required:
+        if function is None:
+            issues.append(f"missing:{name}")
+            continue
+        try:
+            parameters = set(inspect.signature(function).parameters)
+        except Exception:
+            issues.append(f"signature:{name}")
+            continue
+        missing = sorted(expected - parameters)
+        if missing:
+            issues.append(f"parameters:{name}:{','.join(missing)}")
+
+    if channel_stream is None or not hasattr(channel_stream, "objects"):
+        issues.append("attribute:ChannelStream.objects")
+    if metadata_fields is None:
+        issues.append("attribute:ChannelMetadataField")
+    else:
+        for field in ("STREAM_ID", "M3U_PROFILE", "STREAM_PROFILE"):
+            if not hasattr(metadata_fields, field):
+                issues.append(f"attribute:ChannelMetadataField.{field}")
+
+    stream_routes = [
+        route
+        for route in getattr(modules["apps.proxy.live_proxy.urls"], "urlpatterns", ())
+        if getattr(route, "name", None) == "stream"
+    ]
+    if not stream_routes:
+        issues.append("route:stream")
+    for index, route in enumerate(stream_routes):
+        try:
+            parameters = set(inspect.signature(route.callback).parameters)
+        except Exception:
+            issues.append(f"signature:route.stream[{index}].callback")
+            continue
+        if "channel_id" not in parameters:
+            issues.append(f"parameters:route.stream[{index}].callback:channel_id")
+    return tuple(issues)
+
+
+def _core_api_compatibility_issues() -> tuple[str, ...]:
+    try:
+        return _collect_core_api_compatibility_issues()
+    except Exception:
+        return ("inspection:core-api",)
+
+
 def core_api_supported() -> bool:
     """Check the small shared API surface inspected in Dispatcharr 0.31/0.32."""
-    try:
-        from apps.channels.models import ChannelStream
-        from apps.m3u.connection_pool import release_profile_slot, reserve_profile_slot
-        from apps.proxy.live_proxy import urls as live_urls
-        from apps.proxy.live_proxy.constants import ChannelMetadataField
-        from apps.proxy.live_proxy.input import manager as input_manager
-        from apps.proxy.live_proxy.output.ts.generator import create_stream_generator
-        from apps.proxy.live_proxy.redis_keys import RedisKeys
-        from apps.proxy.live_proxy.server import ProxyServer
-        from apps.proxy.live_proxy.services.channel_service import ChannelService
-        from apps.proxy.live_proxy.url_utils import _resolve_live_stream_url
-        from apps.proxy.live_proxy.views import _channel_setup_needed
-        from dispatcharr.utils import get_client_ip
-
-        required = (
-            (reserve_profile_slot, {"profile", "redis_client"}),
-            (release_profile_slot, {"profile_id", "redis_client"}),
-            (
-                ChannelService.initialize_channel,
-                {
-                    "channel_id", "stream_url", "user_agent", "transcode",
-                    "stream_profile_value", "stream_id", "m3u_profile_id",
-                    "channel_name", "stream_name",
-                },
-            ),
-            (
-                create_stream_generator,
-                {
-                    "channel_id", "client_id", "client_ip", "client_user_agent",
-                    "channel_initializing", "user", "buffer", "channel_name",
-                },
-            ),
-            (ProxyServer._release_stream_resources, {"self", "channel_id"}),
-            (ProxyServer.try_acquire_ownership, {"self", "channel_id", "ttl"}),
-            (ProxyServer._get_channel_init_lock, {"self", "channel_id"}),
-            (ProxyServer._finish_channel_init_lock, {"self", "channel_id", "lock"}),
-            (ProxyServer.get_buffer, {"self", "channel_id", "profile"}),
-            (ProxyServer.initialize_channel, {"self", "url", "channel_id", "user_agent", "transcode", "stream_id"}),
-            (ChannelService.is_channel_unavailable_for_new_clients, {"channel_id"}),
-            (ChannelService.stop_channel, {"channel_id"}),
-            (_resolve_live_stream_url, {"stream", "m3u_account", "m3u_profile"}),
-            (get_client_ip, {"request"}),
-            (_channel_setup_needed, {"proxy_server", "channel_id"}),
-            (input_manager.get_alternate_streams, {"channel_id"}),
-            (RedisKeys.channel_metadata, {"channel_id"}),
-            (RedisKeys.channel_owner, {"channel_id"}),
-        )
-        stream_routes = [
-            route
-            for route in getattr(live_urls, "urlpatterns", ())
-            if getattr(route, "name", None) == "stream"
-        ]
-        return (
-            all(names <= set(inspect.signature(func).parameters) for func, names in required)
-            and hasattr(ChannelStream, "objects")
-            and all(hasattr(ChannelMetadataField, field) for field in (
-                "STREAM_ID", "M3U_PROFILE", "STREAM_PROFILE"
-            ))
-            and bool(stream_routes)
-            and all(
-                "channel_id" in inspect.signature(route.callback).parameters
-                for route in stream_routes
-            )
-        )
-    except Exception:
-        return False
+    return not _core_api_compatibility_issues()
 
 
 def _client_manager_api_supported(client_manager) -> bool:
@@ -355,8 +429,12 @@ class _SourceURLRedactor(logging.Filter):
 
 def install_proxyserver_cleanup_hook() -> bool:
     """Install per-process guards and exact reservation cleanup for plugin IDs."""
-    if not core_api_supported():
-        logger.error("Recorder source overrides disabled: Dispatcharr proxy API signature is unverified")
+    compatibility_issues = _core_api_compatibility_issues()
+    if compatibility_issues:
+        logger.error(
+            "Recorder source overrides disabled: Dispatcharr API checks failed: %s",
+            ", ".join(compatibility_issues),
+        )
         return False
     try:
         from apps.proxy.live_proxy import server as live_server
@@ -609,9 +687,7 @@ def _reserve_source_profile(redis_client, worker_id: str, source, account):
             # We know this invocation successfully reserved this slot, so it is
             # safe to immediately roll back with its private marker.
             try:
-                from apps.m3u.connection_pool import release_profile_slot
-
-                release_profile_slot(profile.id, facade)
+                _release_core_profile_slot(redis_client, profile.id, reservation_id)
                 write_worker_record(
                     redis_client,
                     worker_id,
@@ -920,5 +996,3 @@ def open_managed_source(request, worker_id: str, capability_record: dict[str, An
             # Let the bounded TTL clear an uncertain lock. An unconditional
             # delete could erase a newer opener's lock after expiry.
             logger.debug("Could not release recorder open lock for %s", worker_id, exc_info=True)
-
-
