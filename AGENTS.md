@@ -2,6 +2,13 @@
 
 ## Dev stack and restore policy
 
+For Dev plugin updates, back up the isolated application data and configuration
+only. Exclude the archive, recordings and archive database unless the user
+explicitly requests an archive backup. Record that exclusion in rollback notes.
+Keep at most two verified Dev backups. Verify a new backup before deleting older
+task-owned Dev backups; failed or partial backups do not count as restore points.
+Never apply this retention policy to production or unrelated backups.
+
 Match the production Dispatcharr topology: run one Dispatcharr AIO container
 with its embedded PostgreSQL, Redis and workers. Bind only isolated Dev data,
 archive and port paths. For the next Dev rebuild, use an existing Dispatcharr
