@@ -679,7 +679,13 @@ print("CATCHUPARR_RECORDER_FOLLOWER_OK")
 
 def probe_actual_recorder_media(root: Path) -> None:
     """Exercise the guarded private route against real native Dispatcharr APIs."""
-    from apps.channels.models import Channel, ChannelStream, Stream
+    from apps.channels.models import (
+        Channel,
+        ChannelProfile,
+        ChannelProfileMembership,
+        ChannelStream,
+        Stream,
+    )
     from apps.m3u.connection_pool import (
         profile_connections_key,
         profile_credential_release_key,
@@ -724,6 +730,9 @@ def probe_actual_recorder_media(root: Path) -> None:
     active_lock_path = active_path.with_suffix(active_path.suffix + ".lock")
     active_lock_existed = active_lock_path.exists()
     active_lock_bytes = active_lock_path.read_bytes() if active_lock_existed else None
+    reset_marker_path = active_path.with_name(".catchuparr-configuration-reset-required")
+    reset_marker_existed = reset_marker_path.exists()
+    reset_marker_bytes = reset_marker_path.read_bytes() if reset_marker_existed else None
     saved_default_profile = None
     default_profile_saved = False
     redis_client = None
@@ -734,6 +743,7 @@ def probe_actual_recorder_media(root: Path) -> None:
     created_accounts = []
     created_streams = []
     created_profiles = []
+    created_channel_profiles = []
     channel = None
     original_assignments = None
     profile_baselines = {}
@@ -785,6 +795,12 @@ def probe_actual_recorder_media(root: Path) -> None:
         channel = Channel.objects.create(
             name="Synthetic recorder media channel", channel_number=99, user_level=0,
         )
+        profile_name = "Synthetic recorder media profile"
+        channel_profile = ChannelProfile.objects.create(name=profile_name)
+        created_channel_profiles.append(channel_profile)
+        ChannelProfileMembership.objects.create(
+            channel_profile=channel_profile, channel=channel, enabled=True,
+        )
         ChannelStream.objects.create(channel=channel, stream=source_a, order=0)
         ChannelStream.objects.create(channel=channel, stream=source_b, order=1)
         original_assignments = list(
@@ -814,11 +830,16 @@ def probe_actual_recorder_media(root: Path) -> None:
         )
 
         settings = {
-            "channel_uuids": str(channel.uuid),
+            "filter_config": (
+                "version: 1\n"
+                f"profile: {profile_name}\n"
+                "rules:\n"
+                "  - channels: {profile: all}\n"
+                "    include: [Synthetic media source B]\n"
+            ),
             "archive_root": str(root),
             "retention_hours": 1,
             "max_storage_gib": 1,
-            "source_rules": '* | mode=include-only | m3u="Synthetic media source B"',
         }
         apply_configuration(settings, active_path=active_path)
         active = load_active_configuration(active_path)
@@ -1350,6 +1371,10 @@ def probe_actual_recorder_media(root: Path) -> None:
                 active_lock_path.write_bytes(active_lock_bytes)
             else:
                 active_lock_path.unlink(missing_ok=True)
+            if reset_marker_existed:
+                reset_marker_path.write_bytes(reset_marker_bytes)
+            else:
+                reset_marker_path.unlink(missing_ok=True)
         except Exception:
             cleanup_errors.append("active-config")
         if not cleanup_errors:
@@ -1367,6 +1392,8 @@ def probe_actual_recorder_media(root: Path) -> None:
                     account.delete()
                 if channel is not None:
                     channel.delete()
+                for channel_profile in created_channel_profiles:
+                    channel_profile.delete()
             except Exception:
                 cleanup_errors.append("synthetic-database-rows")
         try:
@@ -1459,7 +1486,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _worker_records,
     )
     from apps.channels import tasks as channel_tasks
-    from apps.channels.models import Channel, ChannelStream, Stream
+    from apps.channels.models import (
+        Channel,
+        ChannelProfile,
+        ChannelProfileMembership,
+        ChannelStream,
+        Stream,
+    )
     from apps.m3u.connection_pool import (
         profile_connections_key,
         profile_credential_release_key,
@@ -1505,6 +1538,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     active_lock_path = active_path.with_suffix(active_path.suffix + ".lock")
     active_lock_existed = active_lock_path.exists()
     active_lock_bytes = active_lock_path.read_bytes() if active_lock_existed else None
+    reset_marker_path = active_path.with_name(".catchuparr-configuration-reset-required")
+    reset_marker_existed = reset_marker_path.exists()
+    reset_marker_bytes = reset_marker_path.read_bytes() if reset_marker_existed else None
 
     original_base_url = channel_tasks.get_dvr_stream_base_url
     saved_default_profile = None
@@ -1520,6 +1556,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     created_accounts = []
     created_streams = []
     created_profiles = []
+    created_channel_profiles = []
     harnesses = []
     profile_baselines = {}
     marker_baselines = {}
@@ -1569,6 +1606,12 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             channel_number=97,
             user_level=0,
         )
+        profile_name = "Synthetic live archive profile"
+        channel_profile = ChannelProfile.objects.create(name=profile_name)
+        created_channel_profiles.append(channel_profile)
+        ChannelProfileMembership.objects.create(
+            channel_profile=channel_profile, channel=channel, enabled=True,
+        )
         ChannelStream.objects.create(channel=channel, stream=stream_a, order=0)
         ChannelStream.objects.create(channel=channel, stream=stream_b, order=1)
         assignment_rows = list(
@@ -1606,11 +1649,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
 
         settings = {
-            "channel_uuids": str(channel.uuid),
+            "filter_config": (
+                "version: 1\n"
+                f"profile: {profile_name}\n"
+                "rules:\n"
+                "  - channels: {profile: all}\n"
+                "    exclude: []\n"
+            ),
             "archive_root": str(archive_root),
             "retention_hours": 1,
             "max_storage_gib": 1,
-            "source_rules": "",
         }
         apply_configuration(settings, active_path=active_path)
         active = load_active_configuration(active_path)
@@ -1811,7 +1859,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # Applying B while A is live must create a dedicated recorder worker.
         settings_b = dict(
             settings,
-            source_rules='* | mode=include-only | m3u="Synthetic archive isolation B"',
+            filter_config=(
+                "version: 1\n"
+                f"profile: {profile_name}\n"
+                "rules:\n"
+                "  - channels: {profile: all}\n"
+                "    include: [Synthetic archive isolation B]\n"
+            ),
         )
         apply_configuration(settings_b, active_path=active_path)
         active_b = load_active_configuration(active_path)
@@ -2190,6 +2244,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 active_lock_path.write_bytes(active_lock_bytes)
             else:
                 active_lock_path.unlink(missing_ok=True)
+            if reset_marker_existed:
+                reset_marker_path.write_bytes(reset_marker_bytes)
+            else:
+                reset_marker_path.unlink(missing_ok=True)
         except Exception:
             cleanup_errors.append("active-config")
         if redis_client is not None and not cleanup_errors:
@@ -2228,6 +2286,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     account.delete()
                 if channel is not None:
                     channel.delete()
+                for channel_profile in created_channel_profiles:
+                    channel_profile.delete()
             except Exception:
                 cleanup_errors.append("synthetic-database-rows")
         if not cleanup_errors:
