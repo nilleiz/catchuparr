@@ -103,11 +103,16 @@ ranking, native profile capacity and reservation-ledger teardown with duplicate
 release protection. The DRF compatibility gate passed after independent review
 of its registered-route association and captured original handler signature.
 
-These are configuration and native-helper checks. Seeded credential counters do
-not prove provider credential acquisition; real selected-media delivery,
-Redirect handling, cross-process attachment and final lifecycle cleanup remain
-separate acceptance gates. Passing parser or configuration tests alone is
-insufficient.
+The single-process native media probe also passed in both images. It used
+synthetic HTTP sources and the actual private recorder route to decode video and
+audio from the included source, reject forbidden/unassigned sources and forged
+capabilities, preserve native assignment keys, proxy an actual Redirect default
+profile without returning Location, and release the reserved slot exactly once.
+
+Seeded credential counters do not prove provider credential acquisition.
+Cross-process attachment, publication of fresh media after follower cleanup,
+recording-engine source fallback and Dev real-player regression remain separate
+acceptance gates. Passing parser or configuration tests alone is insufficient.
 
 Safe reuse of an existing live worker with restrictive source rules has not
 been verified. Current source metadata and a fresh buffer cursor cannot prove
