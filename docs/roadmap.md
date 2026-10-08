@@ -5,7 +5,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 ## Workflow and release gates
 
 - Implementation: **gpt-6-luna**, reasoning appropriate to complexity.
-- Analysis, independent reviews and technical acceptance: **gpt-6.1-sol**, reasoning **low through high**.
+- Analysis, independent reviews and technical acceptance: **gpt-6.1-sol**, reasoning **medium**.
 - Use separate worktrees, small `develop/` feature branches and PRs. Merge after independent review and green required checks; fix failures without weakening checks.
 - Every release includes an installable plugin ZIP, SHA-256 checksum, release notes and installation/update/rollback guidance.
 - Relevant synthetic tests, lint, compile and package checks, plus integration probes in pinned Dispatcharr 0.31.0 and 0.32.0 AIOs, gate publication. New private hooks are version/signature checked, idempotent and removable.
