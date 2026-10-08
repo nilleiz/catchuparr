@@ -51,7 +51,7 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
                         for offset in range(0, len(payload), 188 * 32):
                             self.wfile.write(payload[offset:offset + 188 * 32])
                             self.wfile.flush()
-                            time.sleep(0.03)
+                            time.sleep(0.05)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
                 finally:
@@ -189,7 +189,7 @@ def _profile_count(redis_client, profile_id, key_builder) -> int:
     return int(value or 0)
 
 
-def _read_stream_response(response, *, minimum_bytes: int, timeout: float) -> bytes:
+def _read_stream_iterator(iterator, *, minimum_bytes: int, timeout: float, close=None) -> bytes:
     chunks = []
     total = 0
     failures = []
@@ -197,11 +197,12 @@ def _read_stream_response(response, *, minimum_bytes: int, timeout: float) -> by
     def consume() -> None:
         nonlocal total
         try:
-            for chunk in response.streaming_content:
+            while total < minimum_bytes:
+                chunk = next(iterator)
                 chunks.append(bytes(chunk))
                 total += len(chunk)
-                if total >= minimum_bytes:
-                    return
+        except StopIteration:
+            return
         except Exception as exc:  # Keep exception/URL data out of CI logs.
             failures.append(type(exc).__name__)
 
@@ -209,7 +210,8 @@ def _read_stream_response(response, *, minimum_bytes: int, timeout: float) -> by
     reader.start()
     reader.join(timeout)
     if reader.is_alive():
-        response.close()
+        if close is not None:
+            close()
         reader.join(3)
         raise RuntimeError("Synthetic recorder route did not deliver media before timeout")
     if failures:
@@ -217,6 +219,13 @@ def _read_stream_response(response, *, minimum_bytes: int, timeout: float) -> by
     media = b"".join(chunks)
     _require(len(media) >= minimum_bytes, "Synthetic recorder route returned too little media")
     return media
+
+
+def _read_stream_response(response, *, minimum_bytes: int, timeout: float) -> bytes:
+    return _read_stream_iterator(
+        iter(response.streaming_content), minimum_bytes=minimum_bytes, timeout=timeout,
+        close=response.close,
+    )
 
 
 def _verify_media_identity(ffprobe: str, media: bytes) -> None:
