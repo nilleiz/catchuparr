@@ -10,14 +10,14 @@
       "label": "Channel UUIDs (one per line)",
       "type": "text",
       "default": "",
-      "help_text": "Only selected channels are recorded."
+      "help_text": "Only selected channels are recorded. Without a source override, recording uses the shared live stream."
     },
     {
       "id": "source_rules",
       "label": "Live source rules",
       "type": "text",
       "default": "",
-      "help_text": "Choose assigned M3U sources by channel number, name, or group. Rules are drafts until Apply configuration succeeds."
+      "help_text": "Choose assigned M3U sources by channel number, name, or group. Rules are drafts until Apply configuration succeeds. An override opens a dedicated provider connection and may use additional provider or tuner capacity."
     },
     {
       "id": "archive_root",
