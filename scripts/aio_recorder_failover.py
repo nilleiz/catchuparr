@@ -662,7 +662,13 @@ def probe_recorder_failover(root: Path) -> None:
         _stream_default_profile_id,
     )
     from apps.channels import tasks as channel_tasks
-    from apps.channels.models import Channel, ChannelStream, Stream
+    from apps.channels.models import (
+        Channel,
+        ChannelProfile,
+        ChannelProfileMembership,
+        ChannelStream,
+        Stream,
+    )
     from apps.m3u.connection_pool import (
         profile_connections_key,
         profile_credential_release_key,
@@ -701,6 +707,9 @@ def probe_recorder_failover(root: Path) -> None:
     active_lock_path = active_path.with_suffix(active_path.suffix + ".lock")
     active_lock_existed = active_lock_path.exists()
     active_lock_bytes = active_lock_path.read_bytes() if active_lock_existed else None
+    reset_marker_path = active_path.with_name(".catchuparr-configuration-reset-required")
+    reset_marker_existed = reset_marker_path.exists()
+    reset_marker_bytes = reset_marker_path.read_bytes() if reset_marker_existed else None
 
     source_server = None
     bridge = None
@@ -711,6 +720,7 @@ def probe_recorder_failover(root: Path) -> None:
     created_accounts = []
     created_streams = []
     created_channels = []
+    created_channel_profiles = []
     harnesses: list[_RecorderTaskRun] = []
     held_a_slot = False
     profile_a = None
@@ -791,6 +801,14 @@ def probe_recorder_failover(root: Path) -> None:
                     order=order,
                 )
 
+        profile_name = "Synthetic failover channel profile"
+        channel_profile = ChannelProfile.objects.create(name=profile_name)
+        created_channel_profiles.append(channel_profile)
+        for channel in channels.values():
+            ChannelProfileMembership.objects.create(
+                channel_profile=channel_profile, channel=channel, enabled=True,
+            )
+
         redirect_profile = StreamProfile.objects.filter(name__iexact="Redirect").first()
         _require(redirect_profile is not None, "Native Redirect StreamProfile is unavailable")
         saved_default_profile = _stream_default_profile_id(CoreSettings)
@@ -802,14 +820,20 @@ def probe_recorder_failover(root: Path) -> None:
         )
 
         settings = {
-            "channel_uuids": "\n".join(str(channel.uuid) for channel in channels.values()),
+            "filter_config": (
+                "version: 1\n"
+                f"profile: {profile_name}\n"
+                "rules:\n"
+                "  - channels: {profile: all}\n"
+                "    exclude: []\n"
+                "    priority:\n"
+                '      "Synthetic failover A": 300\n'
+                '      "Synthetic failover B": 200\n'
+                '      "Synthetic failover D": 100\n'
+            ),
             "archive_root": str(archive_root),
             "retention_hours": 1,
             "max_storage_gib": 1,
-            "source_rules": (
-                '* | mode=priority | priority="Synthetic failover A":300,'
-                '"Synthetic failover B":200,"Synthetic failover D":100'
-            ),
         }
         apply_configuration(settings, active_path=active_path)
         active = load_active_configuration(active_path)
@@ -1160,8 +1184,14 @@ def probe_recorder_failover(root: Path) -> None:
         try:
             _restore_file(active_path, active_existed, active_bytes)
             _restore_file(active_lock_path, active_lock_existed, active_lock_bytes)
+            _restore_file(reset_marker_path, reset_marker_existed, reset_marker_bytes)
         except Exception:
             cleanup_errors.append("active configuration snapshot")
+        for channel_profile in reversed(created_channel_profiles):
+            try:
+                channel_profile.delete()
+            except Exception:
+                cleanup_errors.append("synthetic channel profile records")
         for channel in reversed(created_channels):
             try:
                 channel.delete()

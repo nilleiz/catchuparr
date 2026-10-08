@@ -308,8 +308,8 @@ class RecorderProxyTests(unittest.TestCase):
             "channel_uuids": channel_uuid,
             "source_policies": {
                 channel_uuid: {
-                    "mode": "include-only",
-                    "account_ids": ["12"],
+                    "include_account_ids": ["12"],
+                    "exclude_account_ids": [],
                     "priorities": [],
                     "known_account_ids": ["12", "13"],
                 }
