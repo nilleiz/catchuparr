@@ -804,9 +804,14 @@ def probe_recorder_failover(root: Path) -> None:
         profile_name = "Synthetic failover channel profile"
         channel_profile = ChannelProfile.objects.create(name=profile_name)
         created_channel_profiles.append(channel_profile)
+        ChannelProfileMembership.objects.filter(channel_profile=channel_profile).update(
+            enabled=False
+        )
         for channel in channels.values():
-            ChannelProfileMembership.objects.create(
-                channel_profile=channel_profile, channel=channel, enabled=True,
+            ChannelProfileMembership.objects.update_or_create(
+                channel_profile=channel_profile,
+                channel=channel,
+                defaults={"enabled": True},
             )
 
         redirect_profile = StreamProfile.objects.filter(name__iexact="Redirect").first()
