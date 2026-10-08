@@ -258,6 +258,69 @@ def _release_managed_worker(proxy_server, worker_id: str) -> bool:
     return released
 
 
+def _stream_route_channel_id_issue(route, index: int, expected_view) -> str | None:
+    route_name = f"route.stream[{index}]"
+    pattern = getattr(route, "pattern", None)
+    converters = getattr(pattern, "converters", {})
+    if not isinstance(converters, dict) or "channel_id" not in converters:
+        return f"parameters:{route_name}.pattern:channel_id"
+
+    callback = getattr(route, "callback", None)
+    if callback is None:
+        return f"missing:{route_name}.callback"
+    try:
+        if "channel_id" in inspect.signature(callback).parameters:
+            return None
+    except Exception:
+        pass
+
+    # Django REST Framework turns @api_view functions into an APIView callback
+    # whose callable signature is variadic. Confirm the route is still attached
+    # to the expected stream endpoint, then inspect that DRF wrapper's GET
+    # handler closure for the original function signature.
+    if expected_view is None or callback is not expected_view:
+        return f"parameters:{route_name}.callback:channel_id"
+    try:
+        unwrapped_callback = inspect.unwrap(callback)
+    except Exception:
+        unwrapped_callback = callback
+    view_class = getattr(callback, "cls", None) or getattr(unwrapped_callback, "cls", None)
+    if (
+        view_class is None
+        or getattr(view_class, "__name__", None) != getattr(expected_view, "__name__", None)
+        or getattr(view_class, "__module__", None) != getattr(expected_view, "__module__", None)
+    ):
+        return f"signature:{route_name}.view-class"
+
+    methods = set(getattr(view_class, "http_method_names", ()))
+    if "get" not in methods or not methods <= {"get", "options"}:
+        return f"methods:{route_name}.get"
+    handler = getattr(view_class, "get", None)
+    if handler is None:
+        return f"missing:{route_name}.get"
+    handler_functions = [handler]
+    for cell in getattr(handler, "__closure__", ()) or ():
+        try:
+            enclosed = cell.cell_contents
+        except ValueError:
+            continue
+        if callable(enclosed):
+            handler_functions.append(enclosed)
+
+    for function in handler_functions:
+        if (
+            getattr(function, "__name__", None) != getattr(expected_view, "__name__", None)
+            or getattr(function, "__module__", None) != getattr(expected_view, "__module__", None)
+        ):
+            continue
+        try:
+            if "channel_id" in inspect.signature(function).parameters:
+                return None
+        except Exception:
+            continue
+    return f"parameters:{route_name}.get:channel_id"
+
+
 def _collect_core_api_compatibility_issues() -> tuple[str, ...]:
     """Return safe module, callable, and parameter names for rejected APIs."""
     module_names = (
@@ -360,14 +423,11 @@ def _collect_core_api_compatibility_issues() -> tuple[str, ...]:
     ]
     if not stream_routes:
         issues.append("route:stream")
+    stream_view = getattr(proxy_views, "stream_ts", None)
     for index, route in enumerate(stream_routes):
-        try:
-            parameters = set(inspect.signature(route.callback).parameters)
-        except Exception:
-            issues.append(f"signature:route.stream[{index}].callback")
-            continue
-        if "channel_id" not in parameters:
-            issues.append(f"parameters:route.stream[{index}].callback:channel_id")
+        issue = _stream_route_channel_id_issue(route, index, stream_view)
+        if issue:
+            issues.append(issue)
     return tuple(issues)
 
 
