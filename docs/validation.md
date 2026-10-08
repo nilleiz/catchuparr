@@ -117,8 +117,18 @@ client counts and the running upstream manager remained valid; final teardown
 returned provider capacity to its baseline.
 
 Seeded credential counters do not prove provider credential acquisition.
-Recording-engine source fallback, isolation from an already active native live
-stream, and Dev real-player regression remain separate acceptance gates.
+The recording-engine probe also passed in both images using the private HTTP
+route, actual recording task and bundled FFmpeg. It verified fallback when the
+first source supplied no useful media, fallback when that source was at capacity,
+and a later source change after useful recording stalled. Decoded synthetic
+audio identified archived sources independently of remuxed service names. The
+excluded source was absent, existing recordings survived the change, and
+teardown restored provider capacity. The probe also checked the resulting
+gap/discontinuity. Separate synthetic stream-copy checks covered short segments
+and rejection of unknown fingerprints.
+
+Isolation from an already active native live stream and Dev real-player
+regression remain separate acceptance gates.
 Passing parser or configuration tests alone is insufficient.
 
 Safe reuse of an existing live worker with restrictive source rules has not
