@@ -393,8 +393,6 @@ def _verify_audio_video_tone(
 
 
 def _wait_for_native_active(
-    iterator,
-    response,
     redis_client,
     native_server,
     worker_id,
@@ -404,7 +402,7 @@ def _wait_for_native_active(
     channel_state,
     timeout: float = 45,
 ):
-    """Keep the real parent client reading until core reaches ACTIVE."""
+    """Wait for strict native readiness without pulling an unstarted response body."""
     from time import monotonic
 
     owner_key = redis_keys.channel_owner(worker_id)
@@ -435,12 +433,11 @@ def _wait_for_native_active(
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise RuntimeError("Native recorder did not reach ACTIVE before its bounded timeout")
-        _read_stream_iterator(
-            iterator,
-            minimum_bytes=188,
-            timeout=min(3, remaining),
-            close=response.close,
-        )
+        # The public route's streaming generator waits for this state before
+        # yielding its first packet. Pulling it here blocks inside next(), so
+        # wait on Redis/native state first and start the single media reader
+        # only after ACTIVE has been observed.
+        time.sleep(min(0.1, remaining))
 
 
 def _read_stream_iterator(
@@ -978,8 +975,6 @@ def probe_actual_recorder_media(root: Path) -> None:
         )
 
         native_owner, native_manager, native_client_manager = _wait_for_native_active(
-            parent_iterator,
-            response,
             redis_client,
             native_server,
             attempt_b.worker_id,
@@ -1673,8 +1668,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         live_tracker = _NativeBufferYieldTracker(native_buffer)
         parent_iterator = iter(live_tracker.observe(iter(live_response.streaming_content)))
         native_owner, native_manager, native_client_manager = _wait_for_native_active(
-            parent_iterator,
-            live_response,
             redis_client,
             native_server,
             worker_id,
@@ -2137,7 +2130,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             try:
                 worker_id = str(channel.uuid)
                 if native_server.stream_managers.get(worker_id) is not None:
-                    native_server._release_stream_resources(worker_id)
+                    from apps.proxy.live_proxy.services.channel_service import ChannelService
+
+                    # This is failure-path cleanup only. The successful path
+                    # above still proves that closing the real response stops
+                    # its own native client and leaves the worker intact until
+                    # that final client disconnects.
+                    ChannelService.stop_channel(worker_id)
                     deadline = time.monotonic() + 10
                     while (
                         time.monotonic() < deadline
@@ -2219,4 +2218,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             shutil.rmtree(archive_root, ignore_errors=True)
         shutil.rmtree(fixture_root, ignore_errors=True)
         if cleanup_errors:
-            raise RuntimeError("Synthetic live/archive isolation cleanup was incomplete")
+            details = ", ".join(sorted(set(cleanup_errors)))
+            raise RuntimeError(
+                f"Synthetic live/archive isolation cleanup was incomplete ({details})"
+            )
