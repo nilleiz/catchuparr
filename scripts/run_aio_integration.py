@@ -45,6 +45,7 @@ def run():
             time.sleep(3)
         docker("cp", str(ROOT / "catchuparr"), f"{name}:/data/plugins/catchuparr")
         docker("cp", str(ROOT / "scripts/aio_recorder_media.py"), f"{name}:/tmp/aio_recorder_media.py")
+        docker("cp", str(ROOT / "scripts/aio_recorder_failover.py"), f"{name}:/tmp/aio_recorder_failover.py")
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
         docker("cp", str(ROOT / "tests"), f"{name}:/tmp/tests")
         docker("exec", "--workdir", "/tmp", "-e", "PYTHONPATH=/data/plugins:/tmp",
@@ -56,7 +57,9 @@ def run():
                    "import os,runpy,sys; from pathlib import Path; "
                    "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
                    "sys.argv=['manage.py','shell']; runpy.run_path('/app/manage.py',run_name='__main__')",
-                   stdin=script, timeout=120)
+                   # Sequential media, follower and recording failover phases
+                   # have their own bounded waits within this overall budget.
+                   stdin=script, timeout=600)
     finally:
         subprocess.run(["docker", "rm", "-f", "-v", name],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)

@@ -462,6 +462,9 @@ def probe():
         from aio_recorder_media import probe_actual_recorder_media
 
         probe_actual_recorder_media(root)
+        from aio_recorder_failover import probe_recorder_failover
+
+        probe_recorder_failover(root)
     finally:
         runtime.shutdown()
     print(f"AIO integration passed: Dispatcharr {__version__}")
