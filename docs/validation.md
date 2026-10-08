@@ -96,7 +96,23 @@ personal EPG data or real-world request timestamps.
 
 ## 0.2.0 work in progress
 
-Source policy enforcement is not released or accepted yet. Configuration,
-proxy lifecycle, reservation accounting and real media selection need the
-independent review and two-version AIO gates described in the
-[roadmap](roadmap.md). Passing parser or configuration tests alone is insufficient.
+Source policy enforcement is not released or accepted yet. The current
+configuration and native-helper probes passed in both pinned AIO versions:
+real assigned-source catalog extraction, atomic Apply/read-back, include-policy
+ranking, native profile capacity and reservation-ledger teardown with duplicate
+release protection. The DRF compatibility gate passed after independent review
+of its registered-route association and captured original handler signature.
+
+These are configuration and native-helper checks. Seeded credential counters do
+not prove provider credential acquisition; real selected-media delivery,
+Redirect handling, cross-process attachment and final lifecycle cleanup remain
+separate acceptance gates. Passing parser or configuration tests alone is
+insufficient.
+
+Safe reuse of an existing live worker with restrictive source rules has not
+been verified. Current source metadata and a fresh buffer cursor cannot prove
+chunk origin across source transitions or in-flight writes. The existing shared
+route remains the default without rules; the implemented override path uses a
+dedicated worker subject to native provider capacity. The intended release scope
+must be settled before publishing a source-policy release. See the
+[roadmap](roadmap.md) for the remaining acceptance requirements.
