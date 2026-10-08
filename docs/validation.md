@@ -109,10 +109,17 @@ audio from the included source, reject forbidden/unassigned sources and forged
 capabilities, preserve native assignment keys, proxy an actual Redirect default
 profile without returning Location, and release the reserved slot exactly once.
 
+The cross-process probe passed in both images. A fresh process attached to the
+same private worker without opening another provider connection or reserving
+another slot. After that client closed, the original client consumed decoded
+media published beyond the recorded Redis head. Native ownership, active state,
+client counts and the running upstream manager remained valid; final teardown
+returned provider capacity to its baseline.
+
 Seeded credential counters do not prove provider credential acquisition.
-Cross-process attachment, publication of fresh media after follower cleanup,
-recording-engine source fallback and Dev real-player regression remain separate
-acceptance gates. Passing parser or configuration tests alone is insufficient.
+Recording-engine source fallback, isolation from an already active native live
+stream, and Dev real-player regression remain separate acceptance gates.
+Passing parser or configuration tests alone is insufficient.
 
 Safe reuse of an existing live worker with restrictive source rules has not
 been verified. Current source metadata and a fresh buffer cursor cannot prove
