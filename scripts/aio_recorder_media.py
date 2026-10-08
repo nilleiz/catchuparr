@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -191,7 +192,50 @@ def _profile_count(redis_client, profile_id, key_builder) -> int:
     return int(value or 0)
 
 
-def _read_stream_iterator(iterator, *, minimum_bytes: int, timeout: float, close=None) -> bytes:
+class _NativeReadObserver:
+    """Observe native batches and actual yields without changing either."""
+
+    def __init__(self, buffer):
+        self.buffer = buffer
+        self.original = buffer.get_optimized_client_data
+        self.pending = deque()
+        self.last_consumed_range = None
+        self.had_instance_method = "get_optimized_client_data" in vars(buffer)
+        self.instance_method = vars(buffer).get("get_optimized_client_data")
+        buffer.get_optimized_client_data = self.read
+
+    def read(self, client_index):
+        result = self.original(client_index)
+        chunks, new_index = result
+        # Holding each byte object's identity avoids confusing equal/repeated
+        # TS content with a genuinely later native-buffer read.
+        for chunk in chunks:
+            self.pending.append((chunk, client_index, new_index))
+        return result
+
+    def consume(self, iterator):
+        for chunk in iterator:
+            self.last_consumed_range = None
+            if self.pending and chunk is self.pending[0][0]:
+                _, start, end = self.pending.popleft()
+                self.last_consumed_range = (start, end)
+            yield chunk
+
+    def consumed_after(self, floor):
+        bounds = self.last_consumed_range
+        return bounds is not None and bounds[0] > floor and bounds[1] > bounds[0]
+
+    def close(self):
+        if self.had_instance_method:
+            self.buffer.get_optimized_client_data = self.instance_method
+        else:
+            del self.buffer.get_optimized_client_data
+        self.pending.clear()
+
+
+def _read_stream_iterator(
+    iterator, *, minimum_bytes: int, timeout: float, close=None, accept_chunk=None,
+) -> bytes:
     chunks = []
     total = 0
     failures = []
@@ -201,6 +245,8 @@ def _read_stream_iterator(iterator, *, minimum_bytes: int, timeout: float, close
         try:
             while total < minimum_bytes:
                 chunk = next(iterator)
+                if accept_chunk is not None and not accept_chunk():
+                    continue
                 chunks.append(bytes(chunk))
                 total += len(chunk)
         except StopIteration:
@@ -275,6 +321,8 @@ def _run_fresh_process_follower(
     profile_id: int,
     expected_profile_count: int,
     ffprobe: str,
+    native_owner,
+    parent_client_count: int,
 ) -> None:
     """Attach from a fresh Django process using the same private capability."""
     bootstrap = (
@@ -286,12 +334,16 @@ def _run_fresh_process_follower(
     )
     route_path = f"/catchuparr/recorder/{channel_uuid}"
     child_script = f"""
+import os
 import sys
 sys.path.insert(0, "/data/plugins")
 sys.path.insert(0, "/tmp")
 from django.test import Client
 from apps.m3u.connection_pool import profile_connections_key
 from core.utils import RedisClient
+from apps.proxy.live_proxy.server import ProxyServer
+from apps.proxy.live_proxy.redis_keys import RedisKeys
+from apps.proxy.live_proxy.constants import ChannelMetadataField, ChannelState
 from catchuparr import runtime
 from catchuparr.adapters.recorder_proxy import read_worker_record
 from catchuparr.configuration import load_active_configuration
@@ -316,6 +368,12 @@ profile_id = {int(profile_id)!r}
 parent_pid = {os.getpid()!r}
 follower_require(os.getpid() != parent_pid)
 redis_client = RedisClient.get_client()
+proxy_server = ProxyServer.get_instance()
+expected_owner = {native_owner!r}
+follower_require(proxy_server.worker_id.encode() != expected_owner)
+follower_require(redis_client.get(RedisKeys.channel_owner(worker_id)) == expected_owner)
+follower_require(worker_id not in proxy_server.stream_managers)
+follower_require(redis_client.scard(RedisKeys.clients(worker_id)) == {parent_client_count!r})
 binding = verify_recorder_capability(redis_client, token)
 follower_require(binding is not None and capability_binding_current(redis_client, binding))
 follower_require(binding.get("worker_id") == worker_id)
@@ -351,12 +409,28 @@ try:
     follower_require(response.get("Content-Type", "").split(";", 1)[0] == "video/mp2t")
     follower_require(not response.get("Location"))
     follower_require(getattr(response, "streaming", False))
+    follower_require(worker_id not in proxy_server.stream_managers)
+    follower_require(proxy_server.client_managers[worker_id].get_client_count() == 1)
+    follower_require(redis_client.get(RedisKeys.channel_owner(worker_id)) == expected_owner)
+    follower_require(
+        redis_client.scard(RedisKeys.clients(worker_id)) == {parent_client_count + 1!r}
+    )
     media = _read_stream_response(response, minimum_bytes=188 * 512, timeout=20)
     _verify_media_identity({ffprobe!r}, media)
 finally:
     if response is not None:
         response.close()
 
+follower_require(worker_id not in proxy_server.stream_managers)
+follower_require(proxy_server.client_managers[worker_id].get_client_count() == 0)
+follower_require(redis_client.get(RedisKeys.channel_owner(worker_id)) == expected_owner)
+follower_require(
+    redis_client.hget(RedisKeys.channel_metadata(worker_id), ChannelMetadataField.STATE)
+    == ChannelState.ACTIVE.encode()
+)
+follower_require(
+    redis_client.scard(RedisKeys.clients(worker_id)) == {parent_client_count!r}
+)
 follower_require(capability_binding_current(redis_client, binding))
 record_after = read_worker_record(redis_client, worker_id)
 follower_require(record_after is not None)
@@ -450,6 +524,7 @@ def probe_actual_recorder_media(root: Path) -> None:
     profile_baselines = {}
     media_baselines = {}
     cleanup_errors = []
+    read_observer = None
 
     try:
         payload_a = _make_transport_stream(
@@ -651,7 +726,13 @@ def probe_actual_recorder_media(root: Path) -> None:
                  "Authorized recorder response is not MPEG-TS")
         _require(not response.get("Location"), "Redirect profile leaked a provider redirect")
         _require(getattr(response, "streaming", False), "Recorder response is not a live stream")
-        parent_iterator = iter(response.streaming_content)
+        from apps.proxy.live_proxy.constants import ChannelMetadataField, ChannelState
+        from apps.proxy.live_proxy.server import ProxyServer
+
+        native_server = ProxyServer.get_instance()
+        native_buffer = native_server.get_buffer(attempt_b.worker_id, profile=None)
+        read_observer = _NativeReadObserver(native_buffer)
+        parent_iterator = iter(read_observer.consume(iter(response.streaming_content)))
         media = _read_stream_iterator(
             parent_iterator, minimum_bytes=188 * 512, timeout=20, close=response.close,
         )
@@ -681,6 +762,19 @@ def probe_actual_recorder_media(root: Path) -> None:
             "Recorder source changed native ChannelStream assignments",
         )
 
+        native_owner = redis_client.get(RedisKeys.channel_owner(attempt_b.worker_id))
+        native_manager = native_server.stream_managers.get(attempt_b.worker_id)
+        native_client_manager = native_server.client_managers[attempt_b.worker_id]
+        parent_client_count = redis_client.scard(RedisKeys.clients(attempt_b.worker_id))
+        _require(
+            native_owner == native_server.worker_id.encode()
+            and native_manager is not None and native_manager.running
+            and parent_client_count == 1
+            and redis_client.hget(
+                RedisKeys.channel_metadata(attempt_b.worker_id), ChannelMetadataField.STATE,
+            ) == ChannelState.ACTIVE.encode(),
+            "Parent recorder has no active native owner, manager or sole client",
+        )
         counts_before_follower, active_before_follower = source_server.snapshot()
         record_before_follower = read_worker_record(redis_client, attempt_b.worker_id)
         _require(record_before_follower is not None, "Recorder worker disappeared before follower attach")
@@ -702,7 +796,7 @@ def probe_actual_recorder_media(root: Path) -> None:
             account_id=str(account_b.id),
             profile_id=int(profile_b.id),
             expected_profile_count=reservation_count_before_follower,
-            ffprobe=ffprobe,
+            ffprobe=ffprobe, native_owner=native_owner, parent_client_count=parent_client_count,
         )
         counts_after_follower, active_after_follower = source_server.snapshot()
         _require(
@@ -737,8 +831,27 @@ def probe_actual_recorder_media(root: Path) -> None:
             "Fresh-process follower changed provider profile capacity",
         )
 
+        _require(
+            redis_client.scard(RedisKeys.clients(attempt_b.worker_id)) == parent_client_count
+            and native_client_manager.get_client_count() == parent_client_count
+            and redis_client.get(RedisKeys.channel_owner(attempt_b.worker_id)) == native_owner
+            and redis_client.hget(
+                RedisKeys.channel_metadata(attempt_b.worker_id), ChannelMetadataField.STATE,
+            ) == ChannelState.ACTIVE.encode()
+            and native_server.stream_managers.get(attempt_b.worker_id) is native_manager
+            and native_manager.running,
+            "Follower cleanup changed native parent ownership, state, manager or clients",
+        )
+        publication_floor = int(native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0)
+        _require(publication_floor > 0, "Native parent buffer has no published head")
         continued_media = _read_stream_iterator(
             parent_iterator, minimum_bytes=188 * 512, timeout=20, close=response.close,
+            accept_chunk=lambda: read_observer.consumed_after(publication_floor),
+        )
+        _require(
+            int(native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0) > publication_floor
+            and read_observer.consumed_after(publication_floor),
+            "Parent did not consume newly published native media after follower cleanup",
         )
         _verify_media_identity(ffprobe, continued_media)
         _require(
@@ -760,6 +873,8 @@ def probe_actual_recorder_media(root: Path) -> None:
         )
 
         response.close()
+        read_observer.close()
+        read_observer = None
         response = None
         _require(stop_recorder_attempt(redis_client, attempt_b, lease), "Managed recorder worker did not stop cleanly")
         _require(
@@ -900,6 +1015,11 @@ def probe_actual_recorder_media(root: Path) -> None:
                 response.close()
             except Exception:
                 cleanup_errors.append("response")
+        if read_observer is not None:
+            try:
+                read_observer.close()
+            except Exception:
+                cleanup_errors.append("native-read-observer")
         if redis_client is not None:
             if managed_attempt is not None and lease is not None:
                 try:
