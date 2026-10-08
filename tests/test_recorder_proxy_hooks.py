@@ -126,7 +126,11 @@ def _dispatcharr_api_modules():
     live_proxy = _module("apps.proxy.live_proxy")
     live_urls = _module(
         "apps.proxy.live_proxy.urls",
-        urlpatterns=[SimpleNamespace(name="stream", callback=stream)],
+        urlpatterns=[SimpleNamespace(
+            name="stream",
+            callback=stream,
+            pattern=SimpleNamespace(converters={"channel_id": object()}),
+        )],
     )
     constants = _module(
         "apps.proxy.live_proxy.constants", ChannelMetadataField=ChannelMetadataField
@@ -277,6 +281,55 @@ class RecorderProxyHookTests(unittest.TestCase):
             ("parameters:ProxyServer.initialize_channel:stream_id",),
             tuple(issue for issue in issues if issue.startswith("parameters:ProxyServer.initialize_channel:")),
         )
+
+    def test_compatibility_gate_checks_original_drf_view_signature(self):
+        modules, _proxy_server, _input_manager, live_urls = _dispatcharr_api_modules()
+        proxy_views = modules["apps.proxy.live_proxy.views"]
+
+        def original_stream_ts(request, channel_id, user=None):
+            return (request, channel_id, user)
+
+        original_stream_ts.__name__ = "stream_ts"
+        original_stream_ts.__module__ = proxy_views.__name__
+
+        def drf_get_handler(self, *args, **kwargs):
+            return original_stream_ts(*args, **kwargs)
+
+        view_class = type(
+            "stream_ts",
+            (),
+            {
+                "__module__": proxy_views.__name__,
+                "http_method_names": ["get", "options"],
+                "get": drf_get_handler,
+            },
+        )
+
+        def drf_callback(request, *args, **kwargs):
+            return view_class().get(request, *args, **kwargs)
+
+        drf_callback.__name__ = "stream_ts"
+        drf_callback.__module__ = proxy_views.__name__
+        drf_callback.cls = view_class
+        proxy_views.stream_ts = drf_callback
+        live_urls.urlpatterns[0].callback = drf_callback
+
+        with patch.dict(sys.modules, modules):
+            self.assertEqual((), recorder_proxy._core_api_compatibility_issues())
+
+            def wrong_stream_ts(request, stream_id):
+                return (request, stream_id)
+
+            wrong_stream_ts.__name__ = "stream_ts"
+            wrong_stream_ts.__module__ = proxy_views.__name__
+
+            def wrong_get_handler(self, *args, **kwargs):
+                return wrong_stream_ts(*args, **kwargs)
+
+            view_class.get = wrong_get_handler
+            issues = recorder_proxy._core_api_compatibility_issues()
+
+        self.assertIn("parameters:route.stream[0].get:channel_id", issues)
 
 
 if __name__ == "__main__":
