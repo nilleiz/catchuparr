@@ -6,22 +6,22 @@ from catchuparr.source_rules import SourceRuleError, compile_source_rules, rank_
 class SourceRulesTests(unittest.TestCase):
     def setUp(self):
         self.channels = [
-            {"uuid": "uuid-1", "number": "1", "name": "Das Erste HD", "group": "News"},
-            {"uuid": "uuid-2", "number": "3.5", "name": "ZDF", "group": "News"},
-            {"uuid": "uuid-3", "number": "10", "name": "Kultur", "group": "Arts"},
-            {"uuid": "uuid-4", "number": "20", "name": "Sport", "group": "Sports"},
+            {"uuid": "uuid-1", "number": "1", "name": "Synthetic Channel A", "group": "News"},
+            {"uuid": "uuid-2", "number": "3.5", "name": "Synthetic Channel B", "group": "News"},
+            {"uuid": "uuid-3", "number": "10", "name": "Synthetic Channel C", "group": "Arts"},
+            {"uuid": "uuid-4", "number": "20", "name": "Synthetic Channel D", "group": "Sports"},
         ]
         self.accounts = [
-            {"id": "a", "name": "Vu+"},
-            {"id": "b", "name": "Waipu"},
-            {"id": "c", "name": "Zattoo"},
+            {"id": "a", "name": "Synthetic Source A"},
+            {"id": "b", "name": "Synthetic Source B"},
+            {"id": "c", "name": "Synthetic Source C"},
         ]
 
     def test_selector_union_and_global_fallback_replacement(self):
         policies = compile_source_rules(
-            '* | mode=exclude-only | m3u="Zattoo"\n'
-            'number:1,10-20 | mode=include-only | m3u="Vu+"\n'
-            'name:"ZDF" | mode=unchanged',
+            '* | mode=exclude-only | m3u="Synthetic Source C"\n'
+            'number:1,10-20 | mode=include-only | m3u="Synthetic Source A"\n'
+            'name:"Synthetic Channel B" | mode=unchanged',
             self.channels,
             self.accounts,
         )
@@ -62,22 +62,22 @@ class SourceRulesTests(unittest.TestCase):
 
     def test_priority_ranks_by_score_and_preserves_original_order_for_ties(self):
         policy = compile_source_rules(
-            '* | mode=priority | priority="Vu+":100,"Waipu":50',
+            '* | mode=priority | priority="Synthetic Source A":100,"Synthetic Source B":50',
             self.channels,
             self.accounts,
         )["uuid-1"]
         streams = [
-            {"id": "waipu-first", "account_id": "b", "order": 0},
-            {"id": "zattoo", "account_id": "c", "order": 1},
-            {"id": "vu-second", "account_id": "a", "order": 2},
-            {"id": "waipu-second", "account_id": "b", "order": 3},
+            {"id": "source-b-first", "account_id": "b", "order": 0},
+            {"id": "source-c", "account_id": "c", "order": 1},
+            {"id": "source-a-second", "account_id": "a", "order": 2},
+            {"id": "source-b-second", "account_id": "b", "order": 3},
             {"id": "unassigned", "account_id": None, "order": 4},
             {"id": "unknown-account", "account_id": "missing", "order": 5},
         ]
 
         self.assertEqual(
             [stream["id"] for stream in rank_candidates(policy, streams)],
-            ["vu-second", "waipu-first", "waipu-second", "zattoo"],
+            ["source-a-second", "source-b-first", "source-b-second", "source-c"],
         )
         with self.assertRaises((AttributeError, TypeError)):
             policy.mode = "unchanged"
@@ -90,10 +90,10 @@ class SourceRulesTests(unittest.TestCase):
             {"id": "unknown", "account_id": "not-an-account", "order": 3},
         ]
         include = compile_source_rules(
-            '* | mode=include-only | m3u="Vu+"', self.channels, self.accounts
+            '* | mode=include-only | m3u="Synthetic Source A"', self.channels, self.accounts
         )["uuid-1"]
         exclude = compile_source_rules(
-            '* | mode=exclude-only | m3u="Vu+"', self.channels, self.accounts
+            '* | mode=exclude-only | m3u="Synthetic Source A"', self.channels, self.accounts
         )["uuid-1"]
 
         self.assertEqual([item["id"] for item in rank_candidates(include, streams)], ["a"])
@@ -105,7 +105,7 @@ class SourceRulesTests(unittest.TestCase):
             ('name:"Missing" | mode=unchanged', "matches no channels"),
             ('group:"Missing" | mode=unchanged', "matches no channels"),
             ('number:30-40 | mode=unchanged', "matches no channels"),
-            ('number:1 | mode=unchanged\nname:"Das Erste HD" | mode=unchanged', "overlap"),
+            ('number:1 | mode=unchanged\nname:"Synthetic Channel A" | mode=unchanged', "overlap"),
             ('* | mode=unchanged\n* | mode=unchanged', "only one global"),
         ]
         for rule, message in invalid:
@@ -115,16 +115,16 @@ class SourceRulesTests(unittest.TestCase):
     def test_rejects_ambiguous_names_numbers_and_account_names(self):
         duplicate_channels = [
             *self.channels,
-            {"uuid": "uuid-5", "number": "1.0", "name": "Das Erste HD", "group": "Other"},
+            {"uuid": "uuid-5", "number": "1.0", "name": "Synthetic Channel A", "group": "Other"},
         ]
-        duplicate_accounts = [*self.accounts, {"id": "d", "name": "Vu+"}]
+        duplicate_accounts = [*self.accounts, {"id": "d", "name": "Synthetic Source A"}]
         invalid = [
             ('number:1 | mode=unchanged', duplicate_channels, self.accounts, "number 1 is ambiguous"),
-            ('name:"Das Erste HD" | mode=unchanged', duplicate_channels, self.accounts,
-             "name 'Das Erste HD' is ambiguous"),
+            ('name:"Synthetic Channel A" | mode=unchanged', duplicate_channels, self.accounts,
+             "name 'Synthetic Channel A' is ambiguous"),
             ('number:1-3 | mode=unchanged', duplicate_channels, self.accounts,
              "number range 1..3 is ambiguous"),
-            ('* | mode=include-only | m3u="Vu+"', self.channels, duplicate_accounts,
+            ('* | mode=include-only | m3u="Synthetic Source A"', self.channels, duplicate_accounts,
              "ambiguous M3U account name"),
             ('* | mode=include-only | m3u="Missing"', self.channels, self.accounts,
              "unknown M3U account name"),
