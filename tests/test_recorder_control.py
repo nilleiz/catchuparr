@@ -1,5 +1,7 @@
 import copy
 import json
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -12,6 +14,7 @@ from catchuparr.recorder_control import (
     RecorderControlError,
     RecorderControlState,
     apply_recorder_control,
+    control_deny_path,
     control_state_path,
     load_recorder_control,
     pause_recorders,
@@ -96,6 +99,25 @@ class RecorderControlTests(unittest.TestCase):
 
     def _read_json_state(self):
         return json.loads(self.sidecar.read_text(encoding="utf-8"))
+
+    def _assert_cross_process_denied(self, active_path):
+        script = (
+            "import sys; from pathlib import Path; "
+            "from catchuparr.recorder_control import RecorderControlError, load_recorder_control; "
+            "\ntry: load_recorder_control(Path(sys.argv[1]))\n"
+            "except RecorderControlError: print('denied')\n"
+            "else: print('admitted'); sys.exit(1)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(active_path)],
+            cwd=Path(__file__).resolve().parents[1],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("denied", result.stdout.strip())
 
     def _instrument_lock(self, events):
         @contextmanager
@@ -202,29 +224,42 @@ class RecorderControlTests(unittest.TestCase):
         )
         self.assertFalse(database.row.settings["recording_enabled"])
 
-    def test_failed_resume_replace_republishes_a_newer_paused_generation(self):
+    def test_failed_resume_replace_stays_denied_when_rollback_writes_fail(self):
         database = _FakeDatabase({"recording_enabled": False})
         self._write_state(RecorderControlState(paused=True, generation=4))
         atomic_replace = recorder_control._atomic_replace_sidecar
 
-        def fail_after_publishing_resume(path, state):
+        def fail_publishing_resume_and_rollback(path, state):
+            if state.paused:
+                raise OSError("synthetic persistent rollback failure")
             atomic_replace(path, state)
-            if not state.paused:
-                raise OSError("synthetic directory fsync failure")
+            raise OSError("synthetic directory fsync failure")
 
         with (
             database.patch(),
-            patch.object(recorder_control, "_atomic_replace_sidecar", fail_after_publishing_resume),
+            patch.object(
+                recorder_control, "_atomic_replace_sidecar", fail_publishing_resume_and_rollback
+            ),
+            patch.object(
+                recorder_control,
+                "_write_paused_in_place",
+                side_effect=OSError("synthetic persistent in-place failure"),
+            ) as fallback_write,
             self.assertRaises(RecorderControlError),
         ):
             resume_recorders(self.active_path)
+        fallback_write.assert_not_called()
 
         self.assertEqual(
-            {"version": 1, "paused": True, "generation": 6}, self._read_json_state()
+            {"version": 1, "paused": False, "generation": 5}, self._read_json_state()
         )
+        self.assertTrue(control_deny_path(self.active_path).exists())
+        with self.assertRaises(RecorderControlError):
+            load_recorder_control(self.active_path)
+        self._assert_cross_process_denied(self.active_path)
         self.assertTrue(database.row.settings["recording_enabled"])
 
-    def test_failed_resume_replace_uses_fail_closed_in_place_fallback(self):
+    def test_failed_resume_replace_stays_denied_when_atomic_replace_fails(self):
         database = _FakeDatabase({"recording_enabled": False})
         self._write_state(RecorderControlState(paused=True, generation=4))
 
@@ -240,8 +275,148 @@ class RecorderControlTests(unittest.TestCase):
             resume_recorders(self.active_path)
 
         self.assertEqual(
-            {"version": 1, "paused": True, "generation": 6}, self._read_json_state()
+            {"version": 1, "paused": True, "generation": 4}, self._read_json_state()
         )
+        self.assertTrue(control_deny_path(self.active_path).exists())
+        with self.assertRaises(RecorderControlError):
+            load_recorder_control(self.active_path)
+
+    def test_initialization_publish_failure_during_pause_or_apply_keeps_deny(self):
+        for action_name in ("pause", "apply"):
+            with self.subTest(action=action_name), tempfile.TemporaryDirectory() as directory:
+                active_path = Path(directory) / ".catchuparr-active-settings.json"
+                sidecar = control_state_path(active_path)
+                marker = control_deny_path(active_path)
+                real_atomic_replace = recorder_control._atomic_replace_sidecar
+
+                def fail_after_publishing_initial_state(path, state):
+                    real_atomic_replace(path, state)
+                    if state.generation == 0:
+                        raise OSError("synthetic directory fsync failure")
+
+                database = _FakeDatabase({"recording_enabled": False})
+                action = pause_recorders if action_name == "pause" else apply_recorder_control
+                with (
+                    database.patch(),
+                    patch.object(
+                        recorder_control,
+                        "_atomic_replace_sidecar",
+                        fail_after_publishing_initial_state,
+                    ),
+                    self.assertRaises(RecorderControlError),
+                ):
+                    action(active_path)
+
+                self.assertTrue(sidecar.exists())
+                self.assertTrue(marker.exists())
+                with self.assertRaises(RecorderControlError):
+                    load_recorder_control(active_path)
+                self._assert_cross_process_denied(active_path)
+
+    def test_pause_action_recovers_a_pending_failed_resume(self):
+        self._write_state(RecorderControlState(paused=True, generation=4))
+        database = _FakeDatabase({"recording_enabled": False})
+        real_atomic_replace = recorder_control._atomic_replace_sidecar
+
+        def fail_after_publishing_resume(path, state):
+            real_atomic_replace(path, state)
+            if not state.paused:
+                raise OSError("synthetic directory fsync failure")
+
+        with (
+            database.patch(),
+            patch.object(recorder_control, "_atomic_replace_sidecar", fail_after_publishing_resume),
+            self.assertRaises(RecorderControlError),
+        ):
+            resume_recorders(self.active_path)
+
+        with database.patch():
+            paused = pause_recorders(self.active_path)
+
+        self.assertEqual(RecorderControlState(paused=True, generation=6), paused)
+        self.assertFalse(control_deny_path(self.active_path).exists())
+        self.assertEqual(paused, load_recorder_control(self.active_path))
+
+    def test_marker_is_durable_before_resume_sidecar_publication(self):
+        database = _FakeDatabase({"recording_enabled": False})
+        self._write_state(RecorderControlState(paused=True, generation=4))
+        events = database.events
+        write_marker = recorder_control._write_deny_marker
+        replace_state = recorder_control._atomic_replace_sidecar
+        clear_marker = recorder_control._clear_deny_marker
+
+        def record_marker(sidecar):
+            result = write_marker(sidecar)
+            events.append("deny_marker_durable")
+            return result
+
+        def record_state(sidecar, state):
+            result = replace_state(sidecar, state)
+            if not state.paused:
+                events.append("unpaused_state_durable")
+            return result
+
+        def record_clear(sidecar):
+            events.append("clear_deny_marker")
+            return clear_marker(sidecar)
+
+        with (
+            database.patch(),
+            patch.object(recorder_control, "_write_deny_marker", record_marker),
+            patch.object(recorder_control, "_atomic_replace_sidecar", record_state),
+            patch.object(recorder_control, "_clear_deny_marker", record_clear),
+        ):
+            resume_recorders(self.active_path)
+
+        self.assertLess(events.index("transaction_commit"), events.index("deny_marker_durable"))
+        self.assertLess(events.index("deny_marker_durable"), events.index("unpaused_state_durable"))
+        self.assertLess(events.index("unpaused_state_durable"), events.index("clear_deny_marker"))
+
+    def test_deny_marker_directory_fsync_failure_prevents_state_publication(self):
+        database = _FakeDatabase({"recording_enabled": False})
+        self._write_state(RecorderControlState(paused=True, generation=2))
+        atomic_replace = recorder_control._atomic_replace_sidecar
+
+        with (
+            database.patch(),
+            patch.object(
+                recorder_control,
+                "_fsync_directory",
+                side_effect=OSError("synthetic deny directory fsync failure"),
+            ),
+            patch.object(recorder_control, "_atomic_replace_sidecar", wraps=atomic_replace) as replace,
+            self.assertRaises(RecorderControlError),
+        ):
+            resume_recorders(self.active_path)
+
+        replace.assert_not_called()
+        self.assertEqual(
+            {"version": 1, "paused": True, "generation": 2}, self._read_json_state()
+        )
+        self.assertTrue(control_deny_path(self.active_path).exists())
+        with self.assertRaises(RecorderControlError):
+            load_recorder_control(self.active_path)
+        self._assert_cross_process_denied(self.active_path)
+
+    def test_marker_clear_failure_after_resume_keeps_all_readers_denied(self):
+        database = _FakeDatabase({"recording_enabled": False})
+        self._write_state(RecorderControlState(paused=True, generation=2))
+
+        with (
+            database.patch(),
+            patch.object(
+                recorder_control,
+                "_clear_deny_marker",
+                side_effect=RecorderControlError("synthetic marker unlink failure"),
+            ),
+            self.assertRaises(RecorderControlError),
+        ):
+            resume_recorders(self.active_path)
+
+        self.assertTrue(control_deny_path(self.active_path).exists())
+        with self.assertRaises(RecorderControlError):
+            load_recorder_control(self.active_path)
+        self._assert_cross_process_denied(self.active_path)
 
     def test_setting_read_failure_best_effort_pauses_existing_enabled_state(self):
         self._write_state(RecorderControlState(paused=False, generation=3))
