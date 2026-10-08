@@ -130,6 +130,42 @@ class RecorderControlTests(unittest.TestCase):
 
         return lock
 
+    def _leave_pending_failed_pause(self, active_path):
+        sidecar = control_state_path(active_path)
+        marker = control_deny_path(active_path)
+        atomic_replace = recorder_control._atomic_replace_sidecar
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(
+            json.dumps(RecorderControlState(paused=False, generation=3).to_json()),
+            encoding="utf-8",
+        )
+        database = _FakeDatabase({"recording_enabled": True})
+
+        def fail_pause_state_before_publish(path, state):
+            if state.paused:
+                raise OSError("synthetic pause sidecar failure")
+            return atomic_replace(path, state)
+
+        with (
+            database.patch(),
+            patch.object(
+                recorder_control, "_atomic_replace_sidecar", fail_pause_state_before_publish
+            ),
+            patch.object(
+                recorder_control,
+                "_write_paused_in_place",
+                side_effect=OSError("synthetic pause fallback failure"),
+            ),
+            self.assertRaises(RecorderControlError),
+        ):
+            pause_recorders(active_path)
+
+        self.assertTrue(marker.exists())
+        self.assertEqual(
+            {"version": 1, "paused": False, "generation": 3},
+            json.loads(sidecar.read_text(encoding="utf-8")),
+        )
+
     def test_missing_sidecar_initializes_enabled_default_without_reading_draft(self):
         with patch(
             "catchuparr.recorder_control._plugin_config_api",
@@ -336,6 +372,34 @@ class RecorderControlTests(unittest.TestCase):
         self.assertEqual(RecorderControlState(paused=True, generation=6), paused)
         self.assertFalse(control_deny_path(self.active_path).exists())
         self.assertEqual(paused, load_recorder_control(self.active_path))
+
+    def test_resume_recovery_from_failed_pause_advances_stale_job_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active_path = Path(directory) / ".catchuparr-active-settings.json"
+            self._leave_pending_failed_pause(active_path)
+            database = _FakeDatabase({"recording_enabled": True})
+
+            with database.patch():
+                resumed = resume_recorders(active_path)
+
+            self.assertEqual(4, resumed.generation)
+            self.assertNotEqual(3, resumed.generation)
+            self.assertFalse(control_deny_path(active_path).exists())
+            self.assertEqual(resumed, load_recorder_control(active_path))
+
+    def test_apply_enabled_recovery_from_failed_pause_advances_stale_job_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active_path = Path(directory) / ".catchuparr-active-settings.json"
+            self._leave_pending_failed_pause(active_path)
+            database = _FakeDatabase({"recording_enabled": True})
+
+            with database.patch():
+                applied = apply_recorder_control(active_path)
+
+            self.assertEqual(4, applied.generation)
+            self.assertNotEqual(3, applied.generation)
+            self.assertFalse(control_deny_path(active_path).exists())
+            self.assertEqual(applied, load_recorder_control(active_path))
 
     def test_marker_is_durable_before_resume_sidecar_publication(self):
         database = _FakeDatabase({"recording_enabled": False})
