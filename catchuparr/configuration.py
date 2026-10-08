@@ -121,6 +121,9 @@ def compile_draft(
         compile_source_rules(rules_text, catalog.channels, catalog.accounts)
         if rules_text else {}
     )
+    channels_by_uuid = {
+        str(channel.get("uuid") or ""): channel for channel in catalog.channels
+    }
     encoded: dict[str, dict[str, Any]] = {}
     previews: list[dict[str, Any]] = []
     for channel_uuid, policy in sorted(policies.items()):
@@ -153,12 +156,17 @@ def compile_draft(
                 "account_name": str(account.get("name") or ""),
                 "order": int(candidate.get("order", 0) or 0),
             })
+        channel = channels_by_uuid.get(str(channel_uuid), {})
         previews.append({
             "channel_uuid": str(channel_uuid),
+            "channel_name": str(channel.get("name") or ""),
+            "channel_number": str(channel.get("number") or ""),
+            "channel_group": str(channel.get("group") or ""),
             "candidates": candidate_views,
             "warning": (
-                "Selected sources may open a separate provider connection."
-                if len({item["account_id"] for item in candidate_views if item["account_id"]}) > 1
+                "This override opens a dedicated provider connection and may use "
+                "additional provider or tuner capacity."
+                if policy.mode != "unchanged" and candidate_views
                 else None
             ),
         })
