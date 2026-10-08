@@ -269,7 +269,7 @@ def probe_actual_recorder_media(root: Path) -> None:
         profile_connections_key,
         profile_credential_release_key,
     )
-    from apps.m3u.models import M3UAccount, M3UAccountProfile
+    from apps.m3u.models import M3UAccount
     from core.models import CoreSettings, StreamProfile
     from core.utils import RedisClient
     from django.test import Client
@@ -345,9 +345,15 @@ def probe_actual_recorder_media(root: Path) -> None:
         })
         source_server.thread.start()
 
-        account_a = M3UAccount.objects.create(name="Synthetic media source A", is_active=True)
-        account_b = M3UAccount.objects.create(name="Synthetic media source B", is_active=True)
-        account_c = M3UAccount.objects.create(name="Synthetic media source C", is_active=True)
+        account_a = M3UAccount.objects.create(
+            name="Synthetic media source A", is_active=True, max_streams=1,
+        )
+        account_b = M3UAccount.objects.create(
+            name="Synthetic media source B", is_active=True, max_streams=1,
+        )
+        account_c = M3UAccount.objects.create(
+            name="Synthetic media source C", is_active=True, max_streams=1,
+        )
         created_accounts.extend((account_a, account_b, account_c))
         source_a = Stream.objects.create(
             name="Synthetic media A", url=f"{source_server.base_url}/source-a.ts", m3u_account=account_a,
@@ -370,19 +376,16 @@ def probe_actual_recorder_media(root: Path) -> None:
             .order_by("order", "id").values_list("stream_id", "order")
         )
 
-        profile_a = M3UAccountProfile.objects.create(
-            m3u_account=account_a, name="Synthetic media A profile", max_streams=1,
-            is_active=True, search_pattern="", replace_pattern="",
-        )
-        profile_b = M3UAccountProfile.objects.create(
-            m3u_account=account_b, name="Synthetic media B profile", max_streams=1,
-            is_active=True, search_pattern="", replace_pattern="",
-        )
-        profile_c = M3UAccountProfile.objects.create(
-            m3u_account=account_c, name="Synthetic media C profile", max_streams=1,
-            is_active=True, search_pattern="", replace_pattern="",
-        )
-        created_profiles.extend((profile_a, profile_b, profile_c))
+        profiles = []
+        for account in created_accounts:
+            profile = account.profiles.filter(is_default=True).first()
+            _require(profile is not None, "Native M3U account default profile was not created")
+            profile.max_streams = 1
+            profile.is_active = True
+            profile.save(update_fields=("max_streams", "is_active"))
+            profiles.append(profile)
+        profile_a, profile_b, profile_c = profiles
+        created_profiles.extend(profiles)
 
         redirect_profile = StreamProfile.objects.filter(name__iexact="Redirect").first()
         _require(redirect_profile is not None, "Native Redirect StreamProfile is unavailable")
@@ -531,6 +534,13 @@ def probe_actual_recorder_media(root: Path) -> None:
         _require(
             _profile_count(redis_client, profile_b.id, profile_connections_key) == profile_baselines[profile_b.id] + 1,
             "Authorized recorder did not reserve exactly one provider profile slot",
+        )
+        active_record = read_worker_record(redis_client, attempt_b.worker_id)
+        _require(
+            active_record is not None
+            and active_record.get("profile_id") == str(profile_b.id)
+            and active_record.get("stream_id") == str(source_b.id),
+            "Native recorder did not reserve the expected source B profile",
         )
         _require(
             {key: _key_dump(redis_client, key) for key in native_keys} == native_snapshot,
@@ -729,6 +739,8 @@ def probe_actual_recorder_media(root: Path) -> None:
         if source_server is not None:
             try:
                 source_server.close()
+                if any(source_server.snapshot()[1].values()):
+                    cleanup_errors.append("source-connections")
             except Exception:
                 cleanup_errors.append("source-server")
         if default_profile_saved:
