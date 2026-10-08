@@ -68,8 +68,7 @@ recorders before installation. The plugin removes detected legacy filter
 configuration and requires a new Validate/Apply. Preserve the
 archive path and general storage/retention settings; do not delete recordings.
 
-Delegate backups, installation and container start/stop/restart to a
-gpt-6-luna low agent. Back up isolated application data and configuration only;
+Use the designated operator for backups, installation and container start/stop/restart. Back up isolated application data and configuration only;
 exclude recordings and the archive database unless explicitly requested. Keep
 at most two verified task-owned Dev backups, pruning older backups only after
 verification. Production and unrelated backups are outside this policy.

@@ -1,12 +1,9 @@
 # Catchuparr roadmap
 
-Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. Each wishlist item gets its own release, ordered from hardest to easiest.
+Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. Related features are grouped into releases; native output integration comes last.
 
 ## Workflow and release gates
 
-- Implementation: **gpt-6-luna**, reasoning appropriate to complexity.
-- Operational tasks (backups, plugin installation, container starts/stops/restarts): delegate to **gpt-6-luna**, reasoning **low**. If the required model or execution access is unavailable, agree an alternative before switching or taking over the task.
-- Analysis, independent reviews and technical acceptance: **gpt-6.1-sol**, reasoning **medium**.
 - Use separate worktrees, small `develop/` feature branches and PRs. Merge after independent review and green required checks; fix failures without weakening checks.
 - Every release includes an installable plugin ZIP, SHA-256 checksum, release notes and installation/update/rollback guidance.
 - Relevant synthetic tests, lint, compile and package checks, plus integration probes in pinned Dispatcharr 0.31.0 and 0.32.0 AIOs, gate publication. New private hooks are version/signature checked, idempotent and removable.
@@ -19,9 +16,9 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | Release | Feature | Relative effort | Status |
 | --- | --- | --- | --- |
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | In progress; supersedes unreleased 0.2.0 |
-| 0.3.0 | Catch-up playback in Dispatcharr Stats | High to medium | Planned |
-| 0.4.0 | Recording windows by channel and weekday | Medium | Planned |
-| 0.5.0 | Hide archive recorders in Stats | Medium to low | Planned |
+| 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Planned |
+| 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
+| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate will not be published as the next release.
@@ -61,7 +58,11 @@ identities, never a separate user selection.
 See [the YAML candidate guide](candidate-0.2.1.md) for the exact syntax and
 installation/rollback procedure.
 
-## 0.3.0 — playback Stats
+## Next intermediate step — repository content cleanup
+
+Move local working instructions outside tracked content, remove public orchestration details and prepare a separate historical cleanup preview. Shared-history rewriting, tag replacement and published-asset changes require approval of the concrete result. Preserve technical diagnostics and reproducible validation. No plugin release is required.
+
+## 0.4.0 — playback Stats
 
 ### Behavior
 
@@ -75,25 +76,29 @@ installation/rollback procedure.
 
 REST and WebSocket agree. Test HLS/XC, reloads, seeks, pause, replacement/grace sessions, disconnect, restart, stale heartbeat cleanup and isolated Stop actions. Verify no duplicate limit counting and existing native controls cannot target a live worker through an archive entry.
 
-## 0.4.0 — recording schedules
+## 0.3.0 — recording schedules, recorder control and logging
 
 ### Behavior
 
 - Modes: continuous (default) or weekly schedule. Default timezone: `Europe/Berlin`.
-- Global default windows plus full per-channel weekly overrides. A channel override replaces the global schedule; unspecified override days do not record. Multiple windows per day are supported and overlaps merge.
+- Store schedules in the existing YAML configuration: global default windows plus full per-rule weekly overrides. A rule override replaces the global schedule; unspecified override days do not record. Multiple windows per day are supported and overlaps merge.
 - Windows crossing midnight belong to their start weekday. Local wall time governs DST: missing times disappear, repeated times apply in both occurrences.
 - Both reconciliation and the running recorder check eligibility. Start by the next 30-second reconciliation; stop through the existing recorder supervisor. Do not leave a recorder running after its window closes.
 - Preserve existing archive availability outside recording windows. Keep missing programme starts and gaps explicit; closing a scheduled recorder must not advertise future segments as available.
+
+- Add a durable global recording switch and explicit pause/resume actions, independent of plugin activation. Keep archive playback, exports and retention active while paused; resume only applied selections within eligible windows.
+- Validate previews schedules; Apply activates selection, source policies and schedules atomically. A missing schedule records continuously; an explicitly empty weekly schedule records nothing.
+- Add consistent `[Catchuparr]` logging using Dispatcharr formatting, configurable level (default INFO), sanitized events and bounded repeated failures.
 
 ### Acceptance
 
 Synthetic clock tests cover weekdays, midnight, multiple/overlapping windows, DST changes and reboot inside/outside windows. Dev verifies start, stop, restart and archived playback outside the active window, with real-player regression.
 
-## 0.5.0 — recorder visibility
+## 0.4.0 — recorder visibility
 
 ### Behavior
 
-- Add **Hide recorders in Stats**, enabled by default.
+- Add **Hide recorders in Stats**, enabled by default and independent of **Show archive playback in Stats**. Test all four combinations.
 - Identify only server-registered Catchuparr recorder clients. Never hide every loopback IP or rely solely on a forgeable User-Agent.
 - Hide recorder-only rows; preserve real viewers on shared workers. Adjust visible client counts consistently, including lists capped by Dispatcharr.
 - Cover known REST, detail and WebSocket producers. Provider occupancy, operational ownership and actual connection-limit accounting remain accurate.
@@ -101,6 +106,13 @@ Synthetic clock tests cover weekdays, midnight, multiple/overlapping windows, DS
 ### Acceptance
 
 Test recorder-only workers, shared workers, genuine local clients, more than ten clients, removal/restart and toggle changes. Hiding the recorder must neither close it nor release provider capacity.
+
+## 0.5.0 — native output integration
+
+- One settings toggle, disabled by default, enables local catch-up attributes and archived EPG in native Dispatcharr M3U/XMLTV links.
+- Keep the full existing channel list, profiles, permissions, live URLs and provider catch-up. Separate plugin links remain available independently.
+- Disable the toggle to restore original output without local additions. Toggle changes require no container restart.
+- Use version-checked, idempotent and removable wrappers; test authorization, gaps, duplicate EPG entries and both toggle states.
 
 ## Deferred validation
 
