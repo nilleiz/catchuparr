@@ -33,6 +33,7 @@ def probe_source_configuration(channel, root):
     from dispatcharr.utils import get_client_ip
 
     from catchuparr.adapters.recorder_proxy import (
+        _core_api_compatibility_issues,
         _CredentialMarkerRedisFacade,
         _release_worker_reservation,
         core_api_supported,
@@ -48,7 +49,9 @@ def probe_source_configuration(channel, root):
     from catchuparr.recorder_proxy import ranked_source_candidates
 
     require(callable(get_client_ip))
-    require(core_api_supported(), "Real source proxy API must pass its version gate")
+    if not core_api_supported():
+        raise RuntimeError("Real source proxy API rejected: "
+                           + "; ".join(_core_api_compatibility_issues()))
     first = M3UAccount.objects.create(name="Synthetic source A", max_streams=3)
     second = M3UAccount.objects.create(name="Synthetic source B", max_streams=3)
     source_a = Stream.objects.create(
