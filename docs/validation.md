@@ -94,7 +94,15 @@ Enable sanitized diagnostics only for a test and disable them afterward.
 Review collected output before sharing; never publish raw URLs, session tokens,
 personal EPG data or real-world request timestamps.
 
-## 0.2.0 candidate (unreleased)
+## 0.2.1 YAML filter engine (in progress)
+
+The unified YAML engine replaces the unreleased 0.2.0 configuration interface.
+Its parser, profile selection, configuration reset, recorder selection and
+native integration require fresh validation. No 0.2.1 player acceptance has
+been established. Earlier results below describe the previous candidate and
+do not imply acceptance of the new engine.
+
+## Historical 0.2.0 candidate evidence (unreleased)
 
 Source-policy enforcement is an unreleased candidate. The combined server-side
 AIO checks passed in both pinned Dispatcharr versions; real-player regression

@@ -15,40 +15,47 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 
 | Release | Feature | Relative effort | Status |
 | --- | --- | --- | --- |
-| 0.2.0 | M3U include/exclude rules and fixed priorities | High | Candidate; real-player gate open |
+| 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | In progress; supersedes unreleased 0.2.0 |
 | 0.3.0 | Catch-up playback in Dispatcharr Stats | High to medium | Planned |
 | 0.4.0 | Recording windows by channel and weekday | Medium | Planned |
 | 0.5.0 | Hide archive recorders in Stats | Medium to low | Planned |
-| 0.6.0 | Select channels by number, range, name or group | Low | Planned |
 
-Shared rule parsing and the internal channel resolver begin in 0.2.0. The complete replacement of the recording channel selection UI ships in 0.6.0, rather than an additional foundation release.
+Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
+0.2.0 candidate will not be published as the next release.
 
 ## Settings contract
 
-All parameters are configured in the native Plugin Settings dialog using switches, selections and readable text rules with examples. Add **Validate/Preview** and **Apply** actions. Saving a draft does not activate unvalidated rules. Apply validates the whole applicable configuration and activates it atomically; errors preserve the last active configuration.
+A single native Plugin Settings text field contains the YAML filter document.
+Archive path, retention, the global storage limit and playback user remain
+separate fields. Validate previews every planned recorder and its permitted
+source order; Apply atomically activates the complete resolved configuration.
+Saving a draft does not change active recordings. UUIDs remain internal archive
+identities, never a separate user selection.
 
-Preview lists resolved channels, permitted source order, recording windows, conflicts and possible additional source connections. UUIDs remain internal stable archive identities. Existing settings migrate compatibly; absent new rules preserve the existing behavior.
+## 0.2.1 — YAML filter engine
 
-## 0.2.0 — source rules
+- Select channels directly by number/range, exact name, group or Channel Profile.
+  Named profiles include enabled members only; the outer profile defaults to all.
+- Use profile: all as the explicit all-channel selector. Wildcards are rejected.
+  The all-profile rule is a default; specific rules replace its whole policy.
+  Other overlapping rules fail validation.
+- Include/exclude are mutually exclusive; priorities are optional with either.
+  Filter first, then sort by descending priority, retaining channel stream order
+  for ties and when no priorities are supplied.
+- No effective source restriction or priority preserves the shared live route.
+  Overrides retain dedicated native workers, capacity limits and fenced cleanup.
+- Start with empty configuration and require Apply before any recorder starts.
+  No previous configuration or active snapshot is migrated or activated.
+  Existing archive data and stable channel identities remain.
+- Apply stores a resolved JSON snapshot; later numbering/profile membership
+  changes require another Apply. Old queued tasks recheck current configuration.
+- Strict YAML parsing rejects duplicate/unknown keys, invalid types, custom tags,
+  anchors, aliases and merges, with a 64 KiB input limit and useful field errors.
+- Unit, package and both pinned native AIO checks gate the Dev candidate.
+  Recording selection, source enforcement and real-player regression gate release.
 
-### Behavior
-
-- Consider only streams already assigned to the Dispatcharr channel; do not discover or auto-map unassigned streams.
-- Modes: unchanged, `include-only`, `exclude-only`, and priority only. Reference M3Us by unique name.
-- Higher priority wins. Missing priority is zero; equal priorities retain `ChannelStream` order. Weighting is deterministic preference, not random distribution.
-- Permit a global rule. A channel-specific rule replaces the global policy completely. Reject overlapping channel-specific rules, unknown or ambiguous M3U names and invalid syntax.
-- With no override, retain the existing shared channel proxy. With an override, use a dedicated proxy worker and respect native provider capacity. This release scope was explicitly approved after independent review found that existing live buffers lack verified source provenance. Additional provider connections or source tuners may be required. Safe reuse of existing native live workers is deferred; reconnecting to the same managed recorder worker is a separate lifecycle case.
-- Do not modify channel membership/order, the live channel's Redis assignment, or the live worker's source. Reuse Dispatcharr profile reservation and slot release, including Redirect sources through a narrowly authenticated internal recorder/proxy adapter.
-- On connection exhaustion or failure, try the next permitted source. Never escape an include list. After successful fallback remain on that source until failure, a new recording window or applying new rules.
-- Preserve copy recording with all audio tracks, segment indexing and session-protected retention. Report unavailable sources as recorder status and real archive gaps.
-
-### Rules
-
-Use `<selector> | mode=<mode> | m3u="Name","Other" | priority="Name":100,"Other":50`. `*` selects the global default. Selectors use `number:1,3,10-20`, `name:"Synthetic Channel A"` or `group:"News"`. The parser respects quoted names. Include/exclude lists apply before ranking.
-
-### Acceptance
-
-Synthetic tests cover filtering, deterministic ties, blocked profiles, failed starts, source failover and release of reservations. Both pinned AIOs must verify ordinary shared recording and isolated override workers, including Redirect sources. In Dev, a channel playing live from one source can archive from another without changing live playback. Agree real test sources/tuner availability before enabling additional connections. Real-player playback regression must pass before publishing 0.2.0.
+See [the YAML candidate guide](candidate-0.2.1.md) for the exact syntax and
+installation/rollback procedure.
 
 ## 0.3.0 — playback Stats
 
@@ -90,20 +97,6 @@ Synthetic clock tests cover weekdays, midnight, multiple/overlapping windows, DS
 ### Acceptance
 
 Test recorder-only workers, shared workers, genuine local clients, more than ten clients, removal/restart and toggle changes. Hiding the recorder must neither close it nor release provider capacity.
-
-## 0.6.0 — channel selection
-
-### Behavior
-
-- Replace the normal UUID input with channel numbers, inclusive ranges, decimal channel numbers, exact names and groups.
-- Examples: `number:1,3,10-20`, `name:"Synthetic Channel A"`, `group:"Synthetic Group A"`.
-- Union selection lines and deduplicate channels. Reject unknown/ambiguous identifiers and malformed ranges in preview.
-- Apply resolves to a stable UUID snapshot. Later renumbering or group changes require another Apply; no automatic unexpected recordings.
-- Preserve old UUID settings through compatible migration and retain every existing archive under its internal channel identity.
-
-### Acceptance
-
-Test ranges, decimal numbers, ambiguous names/groups, duplicates, channel removal/renumbering, changed group membership, migration and the actual recorder selection against preview. No archive resets or implicit all-channel fallback.
 
 ## Deferred validation
 
