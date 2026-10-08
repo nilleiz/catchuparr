@@ -68,14 +68,19 @@ def _policy_for_channel(active: Mapping[str, Any], channel_uuid: str) -> SourceP
         return None
     if not isinstance(encoded, dict):
         raise ValueError("applied source policy is invalid")
-    mode = encoded.get("mode")
-    if mode not in {"include-only", "exclude-only", "priority", "unchanged"}:
-        raise ValueError("applied source policy mode is invalid")
-    account_ids = encoded.get("account_ids", [])
-    if not isinstance(account_ids, list) or any(
-        not isinstance(value, (str, int)) or not str(value) for value in account_ids
+    include_ids = encoded.get("include_account_ids")
+    if include_ids is not None and (
+        not isinstance(include_ids, list)
+        or any(not isinstance(value, (str, int)) or not str(value) for value in include_ids)
     ):
-        raise ValueError("applied source account IDs are invalid")
+        raise ValueError("applied source include IDs are invalid")
+    exclude_ids = encoded.get("exclude_account_ids")
+    if not isinstance(exclude_ids, list) or any(
+        not isinstance(value, (str, int)) or not str(value) for value in exclude_ids
+    ):
+        raise ValueError("applied source exclude IDs are invalid")
+    if include_ids is not None and exclude_ids:
+        raise ValueError("applied source policy has both include and exclude")
     priorities = encoded.get("priorities", [])
     if not isinstance(priorities, list):
         raise ValueError("applied source priorities are invalid")
@@ -93,16 +98,8 @@ def _policy_for_channel(active: Mapping[str, Any], channel_uuid: str) -> SourceP
         decoded_priorities.append((str(pair[0]), pair[1]))
     if len({account_id for account_id, _ in decoded_priorities}) != len(decoded_priorities):
         raise ValueError("applied source priorities contain duplicates")
-    account_ids_set = frozenset(str(value) for value in account_ids)
-    if len(account_ids_set) != len(account_ids):
-        raise ValueError("applied source account IDs contain duplicates")
     known = encoded.get("known_account_ids")
-    if known is None:
-        # Older snapshots did not store the validation catalog. At runtime only
-        # currently assigned IDs can be considered, so no unassigned account
-        # can become a candidate through this compatibility path.
-        known_ids = frozenset()
-    elif isinstance(known, list) and all(
+    if isinstance(known, list) and all(
         isinstance(value, (str, int)) and str(value) for value in known
     ):
         known_ids = frozenset(str(value) for value in known)
@@ -110,17 +107,17 @@ def _policy_for_channel(active: Mapping[str, Any], channel_uuid: str) -> SourceP
             raise ValueError("applied known account IDs contain duplicates")
     else:
         raise ValueError("applied known account IDs are invalid")
-    if known is not None and (not account_ids_set <= known_ids or not {
-        account_id for account_id, _ in decoded_priorities
-    } <= known_ids):
+    include_ids_set = frozenset(str(value) for value in (include_ids or ()))
+    exclude_ids_set = frozenset(str(value) for value in exclude_ids)
+    if (
+        not include_ids_set <= known_ids
+        or not exclude_ids_set <= known_ids
+        or not {account_id for account_id, _ in decoded_priorities} <= known_ids
+    ):
         raise ValueError("applied policy references an unknown account")
-    if mode != "priority" and decoded_priorities:
-        raise ValueError("priority values are only valid in priority mode")
-    if mode == "unchanged" and (account_ids_set or decoded_priorities):
-        raise ValueError("unchanged policies cannot select accounts")
     return SourcePolicy(
-        mode=str(mode),
-        account_ids=account_ids_set,
+        include_account_ids=include_ids_set if include_ids is not None else None,
+        exclude_account_ids=exclude_ids_set,
         priorities=tuple(decoded_priorities),
         known_account_ids=known_ids,
     )
@@ -130,12 +127,12 @@ def ranked_source_candidates(
     channel_uuid: str,
     active_configuration: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Return ranked assigned sources, or None when legacy channel sharing applies."""
+    """Return ranked assigned sources, or None when the default live route applies."""
     active = active_configuration if active_configuration is not None else _active_configuration()
     if active is None:
         return None
     policy = _policy_for_channel(active, str(channel_uuid))
-    if policy is None or policy.mode == "unchanged":
+    if policy is None:
         return None
     from .configuration import source_catalog
 
@@ -143,16 +140,20 @@ def ranked_source_candidates(
     current_accounts = {
         str(account["id"]) for account in catalog.accounts if account.get("id") is not None
     }
-    # Use the IDs captured when Apply compiled the policy. Older applied files
-    # fall back to currently assigned catalog IDs but remain filtered to rows
-    # actually assigned to this channel.
-    encoded_policy = active.get("source_policies", {}).get(str(channel_uuid), {})
-    if "known_account_ids" not in encoded_policy:
+    if not policy.known_account_ids <= current_accounts:
+        current_ids = policy.known_account_ids & current_accounts
         policy = SourcePolicy(
-            policy.mode,
-            policy.account_ids,
-            policy.priorities,
-            frozenset(current_accounts),
+            include_account_ids=(
+                policy.include_account_ids & current_ids
+                if policy.include_account_ids is not None else None
+            ),
+            exclude_account_ids=policy.exclude_account_ids & current_ids,
+            priorities=tuple(
+                (account_id, score)
+                for account_id, score in policy.priorities
+                if account_id in current_ids
+            ),
+            known_account_ids=current_ids,
         )
     streams = catalog.streams_by_channel.get(str(channel_uuid), ())
     return [dict(candidate) for candidate in rank_candidates(policy, streams)]

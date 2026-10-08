@@ -1,23 +1,16 @@
 {
   "name": "Catchuparr",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local rolling catch-up archive and start-over for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
   "fields": [
     {
-      "id": "channel_uuids",
-      "label": "Channel UUIDs (one per line)",
+      "id": "filter_config",
+      "label": "Channel and source filter (YAML)",
       "type": "text",
       "default": "",
-      "help_text": "Only selected channels are recorded. Without a source override, recording uses the shared live stream."
-    },
-    {
-      "id": "source_rules",
-      "label": "Live source rules",
-      "type": "text",
-      "default": "",
-      "help_text": "Rules apply only to M3U sources already assigned to a channel. Leave blank to share the live stream. Use *, number, name, or group selectors with include-only, exclude-only, priority, or unchanged mode. Validate previews; Apply activates atomically. Overrides use a dedicated worker and may need another provider slot."
+      "help_text": "Use version: 1, optional profile (defaults to all), and rules with channels selected by numbers, names, groups, or a Dispatcharr channel profile. Include/exclude filters apply only to assigned M3U sources. Validate before Apply; blank YAML selects no channels. Filtered sources may need another provider slot."
     },
     {
       "id": "archive_root",
@@ -64,12 +57,12 @@
     },
     {
       "id": "validate_configuration",
-      "label": "Validate source rules",
+      "label": "Validate configuration",
       "button_label": "Validate"
     },
     {
       "id": "apply_configuration",
-      "label": "Apply source rules",
+      "label": "Apply configuration",
       "button_label": "Apply configuration"
     }
   ]
