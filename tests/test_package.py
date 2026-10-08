@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from zipfile import ZipFile
 
+from catchuparr.plugin import Plugin
 from scripts.build_plugin import REQUIRED_MODULES, build
 
 
@@ -22,6 +23,9 @@ class PackageTest(unittest.TestCase):
             self.assertFalse(any("__pycache__" in name for name in names))
             manifest = json.loads(archive.read("catchuparr/plugin.json"))
             self.assertEqual(manifest["name"], "Catchuparr")
+            self.assertEqual(manifest["version"], "0.2.0")
+            self.assertEqual(Plugin.version, manifest["version"])
+            self.assertEqual(Path(archive_path).name, "catchuparr-0.2.0.zip")
         self.assertTrue(Path(archive_path).is_file())
 
     def test_runtime_modules_import_from_built_zip(self):

@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Local rolling catch-up archive and start-over for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -17,7 +17,7 @@
       "label": "Live source rules",
       "type": "text",
       "default": "",
-      "help_text": "Choose assigned M3U sources by channel number, name, or group. Rules are drafts until Apply configuration succeeds. An override opens a dedicated provider connection and may use additional provider or tuner capacity."
+      "help_text": "Rules apply only to M3U sources already assigned to a channel. Leave blank to share the live stream. Use *, number, name, or group selectors with include-only, exclude-only, priority, or unchanged mode. Validate previews; Apply activates atomically. Overrides use a dedicated worker and may need another provider slot."
     },
     {
       "id": "archive_root",
