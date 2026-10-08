@@ -94,7 +94,27 @@ Enable sanitized diagnostics only for a test and disable them afterward.
 Review collected output before sharing; never publish raw URLs, session tokens,
 personal EPG data or real-world request timestamps.
 
-## 0.2.0 candidate (unreleased)
+## 0.2.1 YAML filter engine (in progress)
+
+The unified YAML engine replaces the unreleased 0.2.0 configuration interface.
+The implementation passed 232 local unit tests, Ruff, compileall and package
+build. Independent review covered the YAML schema, enabled Channel Profile
+memberships, source-policy enforcement, snapshot validation, automatic legacy
+filter reset and isolated task tests.
+
+Fresh synthetic integration passed in both pinned Dispatcharr 0.31.0 and
+0.32.0 AIO images. The probes covered catalog extraction, atomic Apply,
+source ranking, native pool accounting, private recorder media, fenced
+cross-process reuse, concurrent native live-stream isolation, recorder startup,
+capacity and runtime failover, indexed media gaps and connection cleanup.
+Native profile creation automatically supplies memberships; fixtures disable
+these before enabling their intended synthetic members.
+
+Required CI, Dev configuration/source-selection acceptance and real-player
+regression remain open gates. No 0.2.1 player acceptance or release is claimed.
+Earlier results below describe the previous candidate.
+
+## Historical 0.2.0 candidate evidence (unreleased)
 
 Source-policy enforcement is an unreleased candidate. The combined server-side
 AIO checks passed in both pinned Dispatcharr versions; real-player regression

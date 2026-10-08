@@ -3,11 +3,13 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.engine import ArchiveStore
+from catchuparr.recorder_proxy import configuration_generation
 
 
 class FakeRedis:
@@ -16,6 +18,15 @@ class FakeRedis:
 
     def delete(self, key):
         return int(self.values.pop(key, None) is not None)
+
+    def exists(self, key):
+        return int(key in self.values)
+
+    def set(self, key, value, **kwargs):
+        if kwargs.get("nx") and key in self.values:
+            return False
+        self.values[key] = value
+        return True
 
     def eval(self, script, numkeys, *args):
         keys = args[:numkeys]
@@ -50,7 +61,148 @@ def _fake_module(name, **attrs):
     return module
 
 
+@contextmanager
+def _isolated_plugin_modules(fake_modules):
+    """Keep package children aligned with sys.modules while stubbing Dispatcharr."""
+    package = importlib.import_module("catchuparr")
+    child_names = ("tasks", "runtime", "configuration", "recorder_proxy", "adapters", "engine")
+    missing = object()
+    previous = {name: package.__dict__.get(name, missing) for name in child_names}
+    try:
+        with patch.dict(sys.modules, fake_modules):
+            for name in child_names:
+                module_name = f"catchuparr.{name}"
+                module = sys.modules.get(module_name)
+                if module is None:
+                    package.__dict__.pop(name, None)
+                else:
+                    package.__dict__[name] = module
+            sys.modules.pop("catchuparr.tasks", None)
+            package.__dict__.pop("tasks", None)
+            yield
+    finally:
+        for name, value in previous.items():
+            if value is missing:
+                package.__dict__.pop(name, None)
+            else:
+                package.__dict__[name] = value
+
+
 class RecorderTaskTests(unittest.TestCase):
+    def test_reconcile_queues_the_applied_generation_with_each_channel(self):
+        redis = FakeRedis()
+        queued = []
+
+        class ChannelQuery:
+            def filter(self, **kwargs):
+                self.kwargs = kwargs
+                return self
+
+            def values_list(self, *args, **kwargs):
+                return ["channel-1"]
+
+        class FakeStore:
+            def __init__(self, _root):
+                pass
+
+            def cleanup(self, **_kwargs):
+                return None
+
+            def reconcile_orphans(self, **_kwargs):
+                return None
+
+        def task_decorator(*, name):
+            def decorate(function):
+                if name == "catchuparr.record_channel":
+                    function.apply_async = lambda **kwargs: queued.append(kwargs)
+                return function
+
+            return decorate
+
+        celery = _fake_module("celery", shared_task=task_decorator)
+        apps = _fake_module("apps")
+        apps_channels = _fake_module("apps.channels")
+        apps_channels_models = _fake_module(
+            "apps.channels.models",
+            Channel=SimpleNamespace(objects=ChannelQuery()),
+        )
+        apps_channels.models = apps_channels_models
+        core = _fake_module("core")
+        core_utils = _fake_module(
+            "core.utils", RedisClient=SimpleNamespace(get_client=lambda: redis)
+        )
+        fake_modules = {
+            "celery": celery,
+            "apps": apps,
+            "apps.channels": apps_channels,
+            "apps.channels.models": apps_channels_models,
+            "core": core,
+            "core.utils": core_utils,
+            "version": _fake_module("version", __version__="0.32.0"),
+        }
+        active = {"channel_uuids": "channel-1", "source_policies": {}}
+        expected_generation = configuration_generation(active)
+        config = SimpleNamespace(
+            channel_uuids=("channel-1",),
+            archive_root=Path("/tmp/synthetic-archive"),
+            retention_hours=24,
+            max_storage_bytes=1024,
+        )
+        with _isolated_plugin_modules(fake_modules):
+            tasks = importlib.import_module("catchuparr.tasks")
+            with (
+                patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
+                patch("catchuparr.runtime.load_config", return_value=config),
+                patch("catchuparr.configuration.load_active_configuration", return_value=active),
+                patch("catchuparr.engine.store.ArchiveStore", FakeStore),
+            ):
+                result = tasks.reconcile_recorders()
+        self.assertEqual({"queued": 1}, result)
+        self.assertEqual(
+            [{"args": ["channel-1", expected_generation], "queue": "dvr"}], queued
+        )
+
+    def test_queued_recorder_does_not_start_for_a_stale_generation(self):
+        redis = FakeRedis()
+        config = SimpleNamespace(
+            channel_uuids=("channel-1",), archive_root=Path("/tmp/synthetic-archive")
+        )
+        active = {"channel_uuids": "channel-1", "source_policies": {}}
+        celery = _fake_module(
+            "celery",
+            shared_task=lambda *, name: lambda function: function,
+        )
+        apps = _fake_module("apps")
+        apps_channels = _fake_module("apps.channels")
+        apps_channels_tasks = _fake_module(
+            "apps.channels.tasks",
+            get_dvr_stream_base_url=lambda: "http://dispatcharr",
+        )
+        core = _fake_module("core")
+        core_utils = _fake_module(
+            "core.utils",
+            RedisClient=SimpleNamespace(get_client=lambda: redis),
+        )
+        fake_modules = {
+            "celery": celery,
+            "apps": apps,
+            "apps.channels": apps_channels,
+            "apps.channels.tasks": apps_channels_tasks,
+            "core": core,
+            "core.utils": core_utils,
+            "version": _fake_module("version", __version__="0.32.0"),
+        }
+        with _isolated_plugin_modules(fake_modules):
+            tasks = importlib.import_module("catchuparr.tasks")
+            with (
+                patch("catchuparr.runtime.load_config", return_value=config),
+                patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
+                patch("catchuparr.configuration.load_active_configuration", return_value=active),
+            ):
+                result = tasks.record_channel("channel-1", "older-generation")
+        self.assertEqual({"status": "stale_configuration"}, result)
+        self.assertEqual({}, redis.values)
+
     def test_setup_failure_releases_lease_after_durable_fence_acquisition(self):
         with tempfile.TemporaryDirectory() as temp:
             archive_root = Path(temp) / "archive"
@@ -84,13 +236,13 @@ class RecorderTaskTests(unittest.TestCase):
                 "apps.channels.tasks": apps_channels_tasks,
                 "core": core,
                 "core.utils": core_utils,
+                "version": _fake_module("version", __version__="0.32.0"),
             }
 
-            with patch.dict(sys.modules, fake_modules):
-                sys.modules.pop("catchuparr.tasks", None)
+            with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
-                with patch("catchuparr.runtime.require_supported_version"), patch(
-                    "catchuparr.runtime.load_config", return_value=config
+                with patch("catchuparr.runtime.load_config", return_value=config), patch(
+                    "catchuparr.configuration.reset_legacy_configuration", return_value=False
                 ):
                     with self.assertRaisesRegex(RuntimeError, "DVR URL setup failed"):
                         tasks.record_channel("channel-1")
@@ -165,13 +317,13 @@ class RecorderTaskTests(unittest.TestCase):
                 "apps.channels.tasks": apps_channels_tasks,
                 "core": core,
                 "core.utils": core_utils,
+                "version": _fake_module("version", __version__="0.32.0"),
             }
-            with patch.dict(sys.modules, fake_modules):
-                sys.modules.pop("catchuparr.tasks", None)
+            with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
                 with (
-                    patch("catchuparr.runtime.require_supported_version"),
                     patch("catchuparr.runtime.load_config", return_value=config),
+                    patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
                     patch("catchuparr.configuration.load_active_configuration", return_value=active),
                     patch("catchuparr.recorder_proxy.ranked_source_candidates", return_value=source_candidates),
                     patch(
