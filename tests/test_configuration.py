@@ -47,12 +47,20 @@ class ConfigurationTests(unittest.TestCase):
         }
         self.catalog = SourceCatalog(
             channels=(
-                {"uuid": CHANNEL_1, "number": "7", "name": "News", "group": "Local"},
-                {"uuid": CHANNEL_2, "number": "8", "name": "Sports", "group": "Local"},
+                {
+                    "uuid": CHANNEL_1, "number": "7", "name": "Synthetic Channel A",
+                    "group": "Synthetic Group",
+                },
+                {
+                    "uuid": CHANNEL_2, "number": "8", "name": "Synthetic Channel B",
+                    "group": "Synthetic Group",
+                },
             ),
-            accounts=({"id": "12", "name": "Provider"},),
+            accounts=({"id": "12", "name": "Synthetic Provider"},),
             streams_by_channel={
-                CHANNEL_1: ({"id": "44", "account_id": "12", "order": 0},)
+                CHANNEL_1: ({
+                    "id": "44", "name": "Synthetic Stream A", "account_id": "12", "order": 0,
+                },)
             },
         )
 
@@ -83,7 +91,12 @@ class ConfigurationTests(unittest.TestCase):
 
         self.assertTrue(result["valid"])
         self.assertEqual("44", result["channels"][0]["candidates"][0]["stream_id"])
-        self.assertEqual("Provider", result["channels"][0]["candidates"][0]["account_name"])
+        self.assertEqual(
+            "Synthetic Provider", result["channels"][0]["candidates"][0]["account_name"]
+        )
+        self.assertEqual("Synthetic Channel A", result["channels"][0]["channel_name"])
+        self.assertEqual("7", result["channels"][0]["channel_number"])
+        self.assertEqual("Synthetic Group", result["channels"][0]["channel_group"])
         serialized = json.dumps(result)
         self.assertNotIn("http://", serialized)
         self.assertNotIn("token", serialized)
@@ -99,7 +112,8 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(result["applied"])
         self.assertEqual(["12"], active["source_policies"][CHANNEL_1]["account_ids"])
         serialized = self.active_path.read_text()
-        self.assertNotIn("Provider", serialized)
+        self.assertNotIn("Synthetic Provider", serialized)
+        self.assertNotIn("Synthetic Channel A", serialized)
         self.assertNotIn("url", serialized.lower())
 
     def test_compile_error_preserves_previous_active_file(self):
@@ -115,7 +129,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_real_compiler_applies_assigned_source_policy_and_roundtrips_ids(self):
         settings = dict(self.settings)
-        settings["source_rules"] = 'number:7 | mode=include-only | m3u="Provider"'
+        settings["source_rules"] = 'number:7 | mode=include-only | m3u="Synthetic Provider"'
         applied = apply_configuration(settings, self.catalog, self.active_path)
         active = load_active_configuration(self.active_path)
 
@@ -140,9 +154,54 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(0, result["source_policy_count"])
         self.assertEqual({}, load_active_configuration(self.active_path)["source_policies"])
 
+    def test_single_account_override_warns_and_unchanged_policy_does_not(self):
+        override_settings = dict(self.settings)
+        override_settings["source_rules"] = '* | mode=include-only | m3u="Synthetic Provider"'
+        unchanged_settings = dict(self.settings)
+        unchanged_settings["source_rules"] = "* | mode=unchanged"
+
+        override_preview = validate_configuration(override_settings, self.catalog)[
+            "channels"
+        ][0]
+        unchanged_preview = validate_configuration(unchanged_settings, self.catalog)[
+            "channels"
+        ][0]
+
+        self.assertEqual(1, len(override_preview["candidates"]))
+        self.assertIn("dedicated provider connection", override_preview["warning"])
+        self.assertIn("provider or tuner capacity", override_preview["warning"])
+        self.assertIsNone(unchanged_preview["warning"])
+
+    def test_exclude_and_priority_overrides_warn_when_candidates_remain(self):
+        catalog = SourceCatalog(
+            channels=self.catalog.channels,
+            accounts=(
+                *self.catalog.accounts,
+                {"id": "13", "name": "Synthetic Provider B"},
+            ),
+            streams_by_channel={
+                CHANNEL_1: (
+                    {"id": "44", "account_id": "12", "order": 0},
+                    {"id": "45", "account_id": "13", "order": 1},
+                ),
+            },
+        )
+        rules = (
+            '* | mode=exclude-only | m3u="Synthetic Provider"',
+            '* | mode=priority | priority="Synthetic Provider":100',
+        )
+
+        for source_rule in rules:
+            settings = dict(self.settings)
+            settings["source_rules"] = source_rule
+            with self.subTest(source_rule=source_rule):
+                preview = validate_configuration(settings, catalog)["channels"][0]
+                self.assertTrue(preview["candidates"])
+                self.assertIn("dedicated provider connection", preview["warning"])
+
     def test_real_compiler_limits_wildcard_policies_to_configured_channels(self):
         settings = dict(self.settings)
-        settings["source_rules"] = '* | mode=include-only | m3u="Provider"'
+        settings["source_rules"] = '* | mode=include-only | m3u="Synthetic Provider"'
 
         preview = validate_configuration(settings, self.catalog)
         applied = apply_configuration(settings, self.catalog, self.active_path)
@@ -273,16 +332,16 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_catalog_uses_only_current_assignments_and_safe_stream_metadata(self):
         channel = types.SimpleNamespace(
-            uuid="channel-1", channel_number=7, name="News",
-            channel_group=types.SimpleNamespace(name="Local"),
+            uuid="channel-1", channel_number=7, name="Synthetic Channel A",
+            channel_group=types.SimpleNamespace(name="Synthetic Group"),
         )
         unassigned_channel = types.SimpleNamespace(
-            uuid="channel-2", channel_number=8, name="Sports",
-            channel_group=types.SimpleNamespace(name="Local"),
+            uuid="channel-2", channel_number=8, name="Synthetic Channel B",
+            channel_group=types.SimpleNamespace(name="Synthetic Group"),
         )
-        account = types.SimpleNamespace(id=12, name="Provider")
+        account = types.SimpleNamespace(id=12, name="Synthetic Provider")
         stream = types.SimpleNamespace(
-            id=44, name="News HD", m3u_account_id=12, m3u_account=account,
+            id=44, name="Synthetic Stream A", m3u_account_id=12, m3u_account=account,
             url="https://provider.invalid/secret?token=hidden",
         )
         assignment = types.SimpleNamespace(channel=channel, stream=stream, order=3)
@@ -341,7 +400,7 @@ class ConfigurationTests(unittest.TestCase):
             ["channel-1", "channel-2"], [item["uuid"] for item in catalog.channels]
         )
         self.assertEqual("7", catalog.channels[0]["number"])
-        self.assertEqual("Local", catalog.channels[0]["group"])
+        self.assertEqual("Synthetic Group", catalog.channels[0]["group"])
         self.assertEqual(
             {"id", "name", "account_id", "order"},
             set(catalog.streams_by_channel["channel-1"][0]),
