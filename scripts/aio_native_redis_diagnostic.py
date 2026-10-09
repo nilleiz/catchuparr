@@ -7,7 +7,7 @@ import inspect
 import sys
 import threading
 import time
-from functools import partial
+from functools import partial, wraps
 
 _MAX_EVENTS = 96
 _NATIVE_MODULE_PREFIX = "apps.proxy.live_proxy"
@@ -355,6 +355,7 @@ class NativeRedisInitDiagnostic:
                 return
 
             def wrap(original):
+                @wraps(original)
                 def traced(*args, **kwargs):
                     return callback(original, *args, **kwargs)
 
