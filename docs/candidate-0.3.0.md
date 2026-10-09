@@ -94,6 +94,13 @@ plugin manifest version. Before importing the candidate, check the generated ZIP
 contents and checksum. Follow the repository's isolated-install and rollback
 procedure in [development and deployment](development.md).
 
+That procedure backs up application/configuration data only by default, excludes
+the archive directory, recordings and archive database, and keeps at most two
+verified task-owned Dev restore points. Archive inclusion requires explicit
+authorization. Rollback restores the previous package/image and its matching
+application/configuration restore point while preserving the current archive;
+that restore point cannot recover archive content that was lost or overwritten.
+
 The candidate's synthetic native probes passed in both pinned Dispatcharr
 versions for schedule closure, global pause/resume while running, stale-job
 fencing, failover media, concurrent live/archive isolation and cleanup. The

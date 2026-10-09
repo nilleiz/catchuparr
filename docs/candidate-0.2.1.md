@@ -78,8 +78,9 @@ verification. Production and unrelated backups are outside this policy.
 
 For rollback, stop candidate recorders, reinstall the saved previous package
 and restore its matching application settings/snapshot before restarting.
-Existing archives stay in place. A data-only backup cannot restore overwritten
-archive content. Check status, recording progress and authenticated playback.
+Existing archives stay in place. An application/configuration-only restore
+point cannot restore lost or overwritten archive content. Check status, recording
+progress and authenticated playback.
 
 ## Acceptance
 
