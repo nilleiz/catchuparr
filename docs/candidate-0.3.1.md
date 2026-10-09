@@ -52,9 +52,9 @@ rules:
 
 The global Monday list replaces `weekdays` for Monday; the remaining weekdays
 use the group list. In the rule schedule, Friday replaces that rule's
-`weekdays` list. Saturday and Sunday use `daily` because no `weekend` entry is
-present in the rule schedule. A rule schedule replaces the global schedule for
-the rule's channels. Adjacent and overlapping windows merge. An overnight
+`weekdays` list. A rule schedule replaces the global schedule for that rule's
+channels, so Saturday and Sunday are off: this rule has no `daily` or `weekend`
+entry for those days. Adjacent and overlapping windows merge. An overnight
 window belongs to its start weekday, and the end is exclusive. `24:00` is
 allowed only as an end time; equal start and end values are invalid. DST gaps
 produce no local instants, while repeated local times apply in both occurrences.
