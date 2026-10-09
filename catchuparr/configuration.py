@@ -258,9 +258,15 @@ def apply_configuration(
         else:
             result, prepared = _apply_configuration_locked(settings, catalog, path)
         prepared.commit()
+        warnings = []
         if prepared.recording_paused_warning:
-            warning = "Settings were applied, but recording remains paused while cleanup is retried."
             result["recording_paused"] = True
+            warnings.append("recording remains paused while recovery is retried")
+        if prepared.activation_cleanup_warning:
+            result["activation_cleanup_pending"] = True
+            warnings.append("activation cleanup remains pending and will be retried")
+        if warnings:
+            warning = f"Settings were applied, but {'; '.join(warnings)}."
             result["warning"] = warning
             result["message"] = f"{result['message']} {warning}"
         return result
@@ -357,6 +363,7 @@ class _PreparedActivation:
         self.activation_id = activation_id
         self.finished = False
         self.recording_paused_warning = False
+        self.activation_cleanup_warning = False
 
     def commit(self) -> None:
         if self.finished:
@@ -378,6 +385,23 @@ class _PreparedActivation:
             raise RecorderControlError(message) from None
         self.finished = True
         try:
+            _write_activation_state_locked(
+                self.active_path, "committed", self.activation_id
+            )
+        except Exception:
+            # The durable commit record is authoritative even if the journal
+            # transition fails. Clear the deny marker when possible so the
+            # committed snapshot remains available; recovery will finish the
+            # journal cleanup later.
+            self.activation_cleanup_warning = True
+            try:
+                from .recorder_control import _clear_deny_marker
+
+                _clear_deny_marker(self.sidecar)
+            except Exception:
+                self.recording_paused_warning = True
+            return
+        try:
             from .recorder_control import _clear_deny_marker
 
             _clear_deny_marker(self.sidecar)
@@ -385,12 +409,14 @@ class _PreparedActivation:
             # Keep the commit journal so control recovery can retry clearing
             # this marker and report that recording remains paused meanwhile.
             self.recording_paused_warning = True
+            self.activation_cleanup_warning = True
             return
         try:
             _remove_reset_required_marker(self.active_path)
-        except OSError:
-            pass
-        _cleanup_committed_activation_locked(self.active_path)
+        except Exception:
+            self.activation_cleanup_warning = True
+        if not _cleanup_committed_activation_locked(self.active_path):
+            self.activation_cleanup_warning = True
 
     def rollback(self) -> bool:
         if self.finished:
@@ -398,6 +424,12 @@ class _PreparedActivation:
         try:
             _remove_activation_commit_locked(self.active_path)
         except Exception:
+            try:
+                _write_activation_state_locked(
+                    self.active_path, "unconfirmed", self.activation_id
+                )
+            except Exception:
+                pass
             return False
         active_restored = _restore_file_bytes_locked(self.active_path, self.previous_active)
         control_restored = _restore_file_bytes_locked(self.sidecar, self.previous_control)
@@ -563,7 +595,7 @@ def _read_activation_state_locked(path: Path) -> tuple[str, str] | None:
         or set(raw) != {"version", "state", "activation_id"}
         or type(raw.get("version")) is not int
         or raw["version"] != ACTIVATION_STATE_VERSION
-        or raw.get("state") not in {"pending", "committed"}
+        or raw.get("state") not in {"pending", "committed", "unconfirmed"}
         or not _valid_activation_id(raw.get("activation_id"))
     ):
         raise ValueError("Configuration activation state is invalid")
@@ -571,7 +603,7 @@ def _read_activation_state_locked(path: Path) -> tuple[str, str] | None:
 
 
 def _write_activation_state_locked(path: Path, state: str, activation_id: str) -> None:
-    if state not in {"pending", "committed"} or not _valid_activation_id(activation_id):
+    if state not in {"pending", "committed", "unconfirmed"} or not _valid_activation_id(activation_id):
         raise ValueError("Configuration activation state is invalid")
     _atomic_json_replace_locked(
         _activation_state_path(path),
@@ -613,6 +645,7 @@ def _activation_commit_matches(
 ) -> bool:
     return (
         activation_state is not None
+        and activation_state[0] != "unconfirmed"
         and _read_activation_commit_locked(path) == activation_state[1]
     )
 
@@ -689,19 +722,20 @@ def _recover_interrupted_activation_locked(path: Path) -> None:
     _remove_activation_commit_locked(path)
 
 
-def _cleanup_committed_activation_locked(path: Path) -> None:
+def _cleanup_committed_activation_locked(path: Path) -> bool:
     try:
         _remove_activation_state_locked(path)
-    except OSError:
-        return
+    except Exception:
+        return False
     try:
         _remove_activation_backup_locked(path)
-    except OSError:
-        pass
+    except Exception:
+        return False
     try:
         _remove_activation_commit_locked(path)
-    except OSError:
-        pass
+    except Exception:
+        return False
+    return True
 
 
 def _active_configuration_from_bytes(contents: bytes | None) -> dict[str, Any] | None:
