@@ -1,3 +1,4 @@
+import importlib
 import sys
 import tempfile
 import types
@@ -8,13 +9,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.engine.store import ArchiveStore
+from catchuparr.recorder_control import RecorderControlState
 from catchuparr.runtime import require_supported_version, status
 
 
 class RuntimeStatusTests(unittest.TestCase):
     def test_status_reports_last_segment_and_storage_usage(self):
         channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "catchuparr.recorder_control.load_recorder_control",
+            return_value=RecorderControlState(False, 0),
+        ):
             root = Path(directory)
             source = root / "source.ts"
             source.write_bytes(b"transport stream")
@@ -73,9 +78,51 @@ class RuntimeStatusTests(unittest.TestCase):
 
             self.assertIsNone(load_config())
 
+    def test_load_config_derives_runtime_settings_from_supplied_snapshot(self):
+        apps = types.ModuleType("apps")
+        plugins = types.ModuleType("apps.plugins")
+        models = types.ModuleType("apps.plugins.models")
+
+        class Manager:
+            def filter(self, **kwargs):
+                self.kwargs = kwargs
+                return self
+
+            def first(self):
+                return SimpleNamespace(enabled=True)
+
+        models.PluginConfig = type("PluginConfig", (), {"objects": Manager()})
+        plugins.models = models
+        apps.plugins = plugins
+        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        active = {
+            "channel_uuids": channel,
+            "archive_root": "/tmp/synthetic-active-root",
+            "retention_hours": 72,
+            "max_storage_gib": 8,
+        }
+        with patch.dict(sys.modules, {
+            "apps": apps,
+            "apps.plugins": plugins,
+            "apps.plugins.models": models,
+        }), patch(
+            "catchuparr.configuration.load_active_configuration",
+            side_effect=AssertionError("active snapshot was reread"),
+        ):
+            from catchuparr.runtime import load_config
+
+            config = load_config(active_snapshot=active)
+        self.assertEqual((channel,), config.channel_uuids)
+        self.assertEqual(Path("/tmp/synthetic-active-root"), config.archive_root)
+        self.assertEqual(72, config.retention_hours)
+
     def test_status_explains_that_apply_is_required_after_legacy_reset(self):
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "catchuparr.configuration.configuration_reset_required", return_value=True
+        configuration = importlib.import_module("catchuparr.configuration")
+        recorder_control = importlib.import_module("catchuparr.recorder_control")
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            configuration, "configuration_reset_required", return_value=True
+        ), patch.object(
+            recorder_control, "load_recorder_control", return_value=RecorderControlState(False, 0)
         ):
             result = status({
                 "channel_uuids": "",
@@ -86,6 +133,28 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual([], result["channels"])
         self.assertIn("cleared", result["configuration_status"])
         self.assertIn("apply filter_config", result["configuration_status"])
+
+    def test_status_exposes_recording_control_without_affecting_archive_stats(self):
+        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "catchuparr.recorder_control.load_recorder_control",
+            return_value=RecorderControlState(True, 8),
+        ):
+            result = status({
+                "channel_uuids": channel,
+                "archive_root": directory,
+                "retention_hours": 2,
+                "max_storage_gib": 5,
+                "recording_schedule": {
+                    "timezone": "UTC",
+                    "channels": {channel: {"mode": "continuous"}},
+                },
+            })
+        self.assertFalse(result["recording_enabled"])
+        self.assertEqual(8, result["control_generation"])
+        self.assertTrue(result["recording_control_available"])
+        self.assertTrue(result["channels"][0]["recording_scheduled"])
+        self.assertIn("segments", result["channels"][0])
 
 
 if __name__ == "__main__":

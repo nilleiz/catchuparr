@@ -8,6 +8,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _manage_script_exec(script_path: str) -> str:
+    """Build a runpy-free entrypoint that preserves the selected process argv."""
+    return (
+        f"filename={script_path!r}; "
+        "namespace={'__name__':'__main__','__file__':filename,'__cached__':None,"
+        "'__doc__':None,'__loader__':None,'__package__':None,'__spec__':None}; "
+        "exec(compile(Path(filename).read_bytes(),filename,'exec'),namespace)"
+    )
+
+
 def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True)
@@ -45,6 +55,8 @@ def run():
             time.sleep(3)
         docker("cp", str(ROOT / "catchuparr"), f"{name}:/data/plugins/catchuparr")
         docker("cp", str(ROOT / "scripts/aio_recorder_media.py"), f"{name}:/tmp/aio_recorder_media.py")
+        docker("cp", str(ROOT / "scripts/aio_native_redis_diagnostic.py"),
+               f"{name}:/tmp/aio_native_redis_diagnostic.py")
         docker("cp", str(ROOT / "scripts/aio_recorder_failover.py"), f"{name}:/tmp/aio_recorder_failover.py")
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
         docker("cp", str(ROOT / "tests"), f"{name}:/tmp/tests")
@@ -54,9 +66,14 @@ def run():
                "tests.test_engine_store", "-q", timeout=120)
         with (ROOT / "scripts/aio_integration_probe.py").open("rb") as script:
             docker("exec", "-i", name, "/dispatcharrpy/bin/python", "-c",
-                   "import os,runpy,sys; from pathlib import Path; "
+                   "import os,sys; from pathlib import Path; "
                    "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
-                   "sys.argv=['manage.py','shell']; runpy.run_path('/app/manage.py',run_name='__main__')",
+                   # Simulate only Dispatcharr's recognized stream-worker process role.
+                   # Django still executes its normal shell command; app startup sees
+                   # argv[0] == gunicorn and follows the real ProxyConfig.ready path.
+                   # This synthetic shell does not start a Gunicorn HTTP server.
+                   "sys.argv=['gunicorn','shell']; "
+                   + _manage_script_exec("/app/manage.py"),
                    # Sequential media, follower and recording failover phases
                    # have their own bounded waits within this overall budget.
                    stdin=script, timeout=600)

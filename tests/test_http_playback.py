@@ -30,10 +30,11 @@ class Segment:
 
 
 class FakeArchive:
-    def __init__(self, root, segments):
+    def __init__(self, root, segments, *, clock=time.time):
         self.root = Path(root)
         self.items = segments
         self.leases = {}
+        self.clock = clock
 
     def segments(self, channel_id, start_utc=None, end_utc=None):
         selected = [s for s in self.items if s.channel_id == channel_id]
@@ -47,7 +48,7 @@ class FakeArchive:
 
     def begin_playback(self, channel, start, end, *, ttl_seconds):
         key = uuid.uuid4().hex
-        expiry = time.time() + ttl_seconds
+        expiry = self.clock() + ttl_seconds
         lease = SimpleNamespace(id=key, expires_at=expiry)
         self.leases[key] = {
             "channel": channel, "start": float(start), "end": float(end),
@@ -57,16 +58,16 @@ class FakeArchive:
 
     def renew_playback(self, lease_id, *, ttl_seconds):
         lease = self.leases.get(lease_id)
-        if lease is None or lease["expires_at"] <= time.time():
+        if lease is None or lease["expires_at"] <= self.clock():
             return False
-        lease["expires_at"] = time.time() + ttl_seconds
+        lease["expires_at"] = self.clock() + ttl_seconds
         return True
 
     def extend_playback(self, lease_id, end, *, ttl_seconds):
         if lease_id not in self.leases:
             return False
         self.leases[lease_id]["end"] = max(self.leases[lease_id]["end"], float(end))
-        self.leases[lease_id]["expires_at"] = time.time() + ttl_seconds
+        self.leases[lease_id]["expires_at"] = self.clock() + ttl_seconds
         return True
 
     def segment(self, channel_id, segment_id):
@@ -77,6 +78,17 @@ class FakeArchive:
 
     def end_playback(self, lease_id):
         self.leases.pop(lease_id, None)
+
+
+class FakeClock:
+    def __init__(self, now):
+        self.now = float(now)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += float(seconds)
 
 
 def _builder(segments, *, live, uri_for, start_offset=None):
@@ -404,6 +416,8 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertEqual(different.status, 403)
 
     def test_same_device_switch_replaces_active_session_and_keeps_old_urls_briefly(self):
+        clock = FakeClock(time.time())
+        self.archive = FakeArchive(self.root, [self.segment_item], clock=clock)
         service = ArchiveHTTPService(
             self.archive,
             self.tokens,
@@ -412,6 +426,7 @@ class ArchiveHTTPTests(unittest.TestCase):
             allow_new_session=lambda _user, _channel, count: count < 2,
             playlist_builder=_builder,
             replacement_grace_seconds=0.5,
+            clock=clock,
         )
         first = service.playlist(self.token, "news", self.start, self.start + timedelta(seconds=10))
         first_lease = first.body.decode().split("&lease=")[1].splitlines()[0]
@@ -433,7 +448,8 @@ class ArchiveHTTPTests(unittest.TestCase):
         )
         self.assertEqual({lease_id for lease_id, grace_until in rows if grace_until is not None}, {first_lease})
         old_expiry = self.archive.leases[first_lease]["expires_at"]
-        self.assertLessEqual(old_expiry, time.time() + 0.5)
+        self.assertEqual(old_expiry, clock() + 0.5)
+        self.assertGreater(old_expiry, clock())
 
         reload = service.playlist(
             self.token, "news", self.start + timedelta(seconds=1), self.start + timedelta(seconds=11)
@@ -448,7 +464,7 @@ class ArchiveHTTPTests(unittest.TestCase):
         )
         self.assertEqual(second_device.status, 200)
         self.assertEqual(service.segment(self.token, "news", "seg-A", first_lease).status, 200)
-        time.sleep(0.55)
+        clock.advance(old_expiry - clock())
         self.assertEqual(service.segment(self.token, "news", "seg-A", first_lease).status, 403)
 
     def test_same_device_switch_fits_within_a_one_session_limit(self):

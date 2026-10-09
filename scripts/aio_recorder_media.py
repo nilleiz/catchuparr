@@ -19,6 +19,42 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+_NATIVE_LIVE_A_INVARIANT_NAMES = (
+    "owner_read_ok",
+    "owner_present",
+    "owner_matches",
+    "stream_manager_lookup_ok",
+    "stream_manager_present",
+    "stream_manager_identity",
+    "stream_manager_running",
+    "client_manager_lookup_ok",
+    "client_manager_present",
+    "client_manager_identity",
+    "local_client_count_read_ok",
+    "local_client_count_one",
+    "global_client_count_read_ok",
+    "global_client_count_one",
+    "metadata_state_read_ok",
+    "metadata_active",
+)
+
+
+def _native_live_a_invariant_flags(**observations) -> dict[str, bool]:
+    """Return only named boolean checks for the synthetic live-A worker."""
+    return {
+        name: observations.get(name) is True
+        for name in _NATIVE_LIVE_A_INVARIANT_NAMES
+    }
+
+
+def _native_live_a_invariant_message(stage: str, flags: dict[str, bool]) -> str:
+    """Format sanitized per-conjunct state without emitting Redis/native values."""
+    return (
+        f"Native live A invariant failed at {stage}; "
+        f"flags={json.dumps(flags, sort_keys=True)}"
+    )
+
+
 class _SyntheticSourceServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
@@ -340,6 +376,35 @@ class _NativeLiveMediaReader:
             raise RuntimeError("Native live reader fallback stop failed")
 
 
+class _NativeLiveReaderSession:
+    """Own exactly one indexed reader from response startup through cleanup."""
+
+    def __init__(self, response, buffer):
+        self.response = response
+        self.tracker = _NativeBufferYieldTracker(buffer)
+        iterator = iter(self.tracker.observe(iter(response.streaming_content)))
+        try:
+            self.reader = _NativeLiveMediaReader(iterator, self.tracker)
+        except Exception:
+            self.tracker.close()
+            raise
+        self._closed = False
+
+    def close(self, *, force_release=None) -> None:
+        if self._closed:
+            return
+        self.reader.close(self.response, force_release=force_release)
+        self.tracker.close()
+        self._closed = True
+
+
+def _create_native_live_reader_session(response, native_server, worker_id):
+    """Bind the reader to the buffer installed by successful native startup."""
+    buffer = native_server.get_buffer(worker_id, profile=None)
+    _require(buffer is not None, "Native live route did not install its stream buffer")
+    return _NativeLiveReaderSession(response, buffer), buffer
+
+
 def _assert_tone_matches(actual: int | None, expected: int, label: str) -> None:
     _require(actual is not None, f"{label} media has no decodable synthetic audio tone")
     _require(
@@ -408,7 +473,7 @@ def _wait_for_native_active(
     channel_state,
     timeout: float = 45,
 ):
-    """Wait for strict native readiness without pulling an unstarted response body."""
+    """Verify strict native readiness after one real response client registers."""
     from time import monotonic
 
     owner_key = redis_keys.channel_owner(worker_id)
@@ -439,10 +504,8 @@ def _wait_for_native_active(
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise RuntimeError("Native recorder did not reach ACTIVE before its bounded timeout")
-        # The public route's streaming generator waits for this state before
-        # yielding its first packet. Pulling it here blocks inside next(), so
-        # wait on Redis/native state first and start the single media reader
-        # only after ACTIVE has been observed.
+        # The public route's actual response iterator is already being consumed;
+        # keep polling only the native readiness fields while it waits for data.
         time.sleep(min(0.1, remaining))
 
 
@@ -708,6 +771,7 @@ def probe_actual_recorder_media(root: Path) -> None:
     )
     from catchuparr.engine.leases import RedisRecorderLease
     from catchuparr.engine.store import ArchiveStore
+    from catchuparr.recorder_control import control_deny_path, control_state_path
     from catchuparr.recorder_proxy import (
         capability_binding_current,
         configuration_generation,
@@ -733,6 +797,12 @@ def probe_actual_recorder_media(root: Path) -> None:
     reset_marker_path = active_path.with_name(".catchuparr-configuration-reset-required")
     reset_marker_existed = reset_marker_path.exists()
     reset_marker_bytes = reset_marker_path.read_bytes() if reset_marker_existed else None
+    control_path = control_state_path(active_path)
+    control_existed = control_path.exists()
+    control_bytes = control_path.read_bytes() if control_existed else None
+    control_deny = control_deny_path(active_path)
+    control_deny_existed = control_deny.exists()
+    control_deny_bytes = control_deny.read_bytes() if control_deny_existed else None
     saved_default_profile = None
     default_profile_saved = False
     redis_client = None
@@ -1380,6 +1450,14 @@ def probe_actual_recorder_media(root: Path) -> None:
                 reset_marker_path.write_bytes(reset_marker_bytes)
             else:
                 reset_marker_path.unlink(missing_ok=True)
+            if control_existed:
+                control_path.write_bytes(control_bytes)
+            else:
+                control_path.unlink(missing_ok=True)
+            if control_deny_existed:
+                control_deny.write_bytes(control_deny_bytes)
+            else:
+                control_deny.unlink(missing_ok=True)
         except Exception:
             cleanup_errors.append("active-config")
         if not cleanup_errors:
@@ -1422,6 +1500,7 @@ def _wait_for_indexed_tone(
     existing_ids: set[str],
     minimum: int,
     timeout: float,
+    cooperative_sleep=None,
 ) -> list:
     from aio_recorder_failover import _segment_has_useful_av, _segment_tone_frequency
 
@@ -1444,7 +1523,7 @@ def _wait_for_indexed_tone(
             matched.append(segment)
         if len(matched) >= minimum:
             return matched
-        time.sleep(0.2)
+        (cooperative_sleep or time.sleep)(0.2)
     raise RuntimeError("Synthetic recorder did not index the expected decoded source in time")
 
 
@@ -1466,6 +1545,7 @@ def _wait_for_native_client_count(
     expected: int,
     *,
     timeout: float = 15,
+    reject_excess: bool = False,
 ) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1474,8 +1554,631 @@ def _wait_for_native_client_count(
         local_count = int(manager.get_client_count()) if manager is not None else -1
         if global_count == expected and local_count == expected:
             return
+        if reject_excess:
+            _require(
+                global_count <= expected and local_count <= expected,
+                "Native live route registered more clients than the fixture expected",
+            )
         time.sleep(0.1)
     raise RuntimeError("Native live client count did not reach the expected bounded state")
+
+
+def _probe_running_recorder_controls(
+    *,
+    channel_uuid: str,
+    settings: dict,
+    active_path: Path,
+    archive_store,
+    source_server,
+    redis_client,
+    native_server,
+    native_buffer,
+    native_owner: str,
+    native_manager,
+    native_client_manager,
+    metadata_key: str,
+    active_state: str,
+    assignment_snapshot: dict,
+    source_metadata: dict,
+    live_reader,
+    profile_a,
+    profile_b,
+    profile_baselines: dict,
+    native_a_marker,
+    initial_b_request_baseline: int,
+    ffmpeg: str,
+    ffprobe: str,
+    harnesses: list,
+    gevent_sleep,
+    initial_run,
+) -> None:
+    """Exercise pause, resume and schedule fences against live native media."""
+    import logging
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+
+    from aio_recorder_failover import (
+        _assert_worker_cleanup,
+        _RecorderTaskRun,
+        _worker_records,
+    )
+    from apps.m3u.connection_pool import (
+        profile_connections_key,
+        profile_credential_release_key,
+    )
+    from apps.plugins.models import PluginConfig
+    from apps.proxy.live_proxy.constants import ChannelMetadataField
+    from apps.proxy.live_proxy.redis_keys import RedisKeys
+
+    from catchuparr import runtime, tasks
+    from catchuparr.configuration import load_active_configuration
+    from catchuparr.recorder_control import load_recorder_control
+    from catchuparr.recorder_proxy import CAPABILITY_PREFIX, configuration_generation
+    from catchuparr.schedule import schedule_from_snapshot, schedule_is_active
+
+    def require_live_a(
+        stage: str,
+        expected_b_active: int,
+        *,
+        read_fresh_media: bool,
+    ) -> None:
+        observations = {}
+        try:
+            owner = redis_client.get(RedisKeys.channel_owner(channel_uuid))
+            observations["owner_read_ok"] = True
+            observations["owner_present"] = owner is not None
+            observations["owner_matches"] = _redis_text(owner) == native_owner
+        except Exception:
+            observations.update({
+                "owner_read_ok": False,
+                "owner_present": False,
+                "owner_matches": False,
+            })
+
+        try:
+            manager = native_server.stream_managers.get(channel_uuid)
+            observations["stream_manager_lookup_ok"] = True
+            observations["stream_manager_present"] = manager is not None
+            observations["stream_manager_identity"] = manager is native_manager
+            observations["stream_manager_running"] = bool(
+                getattr(manager, "running", False)
+            )
+        except Exception:
+            observations.update({
+                "stream_manager_lookup_ok": False,
+                "stream_manager_present": False,
+                "stream_manager_identity": False,
+                "stream_manager_running": False,
+            })
+
+        try:
+            client_manager = native_server.client_managers.get(channel_uuid)
+            observations["client_manager_lookup_ok"] = True
+            observations["client_manager_present"] = client_manager is not None
+            observations["client_manager_identity"] = (
+                client_manager is native_client_manager
+            )
+        except Exception:
+            client_manager = None
+            observations.update({
+                "client_manager_lookup_ok": False,
+                "client_manager_present": False,
+                "client_manager_identity": False,
+            })
+
+        try:
+            observations["local_client_count_read_ok"] = client_manager is not None
+            observations["local_client_count_one"] = (
+                client_manager is not None
+                and int(client_manager.get_client_count()) == 1
+            )
+        except Exception:
+            observations.update({
+                "local_client_count_read_ok": False,
+                "local_client_count_one": False,
+            })
+
+        try:
+            global_client_count = int(
+                redis_client.scard(RedisKeys.clients(channel_uuid)) or 0
+            )
+            observations["global_client_count_read_ok"] = True
+            observations["global_client_count_one"] = global_client_count == 1
+        except Exception:
+            observations.update({
+                "global_client_count_read_ok": False,
+                "global_client_count_one": False,
+            })
+
+        try:
+            state = _redis_text(
+                redis_client.hget(metadata_key, ChannelMetadataField.STATE)
+            )
+            observations["metadata_state_read_ok"] = True
+            observations["metadata_active"] = state == active_state
+        except Exception:
+            observations.update({
+                "metadata_state_read_ok": False,
+                "metadata_active": False,
+            })
+
+        flags = _native_live_a_invariant_flags(**observations)
+        _require(
+            all(flags.values()),
+            _native_live_a_invariant_message(stage, flags),
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + expected_b_active
+            and bool(redis_client.exists(f"catchuparr:recorder:{channel_uuid}"))
+            == bool(expected_b_active),
+            "Recorder control changed native provider capacity unexpectedly",
+        )
+        _require(
+            _key_dump(redis_client, profile_credential_release_key(profile_a.id))
+            == native_a_marker,
+            "Recorder control changed the native live A credential release marker",
+        )
+        _require(
+            {key: _key_dump(redis_client, key) for key in assignment_snapshot}
+            == assignment_snapshot
+            and _native_source_metadata(redis_client, metadata_key) == source_metadata,
+            "Recorder control changed native live A assignments or source metadata",
+        )
+        counts, active_counts = source_server.snapshot()
+        _require(
+            counts["source-a.ts"] > 0
+            and active_counts["source-a.ts"] == 1
+            and active_counts["source-b.ts"] == expected_b_active,
+            "Recorder control interrupted live A or left the archive B source active",
+        )
+        if read_fresh_media:
+            floor = int(native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0)
+            _require(floor > 0, "Native live A has no published buffer head")
+            media, index = live_reader.read_after(
+                floor, minimum_bytes=188 * 100, timeout=20,
+            )
+            _require(index > floor, "Native live A did not publish fresh media after recorder control")
+            _verify_audio_video_tone(ffmpeg, ffprobe, media, 440, "Native live A during recorder control")
+
+    def current_private_worker() -> str:
+        records = [
+            record for record in _worker_records(redis_client, channel_uuid)
+            if record.get("state") == "active"
+            and record.get("reservation_state") == "reserved"
+        ]
+        _require(len(records) == 1, "Expected one active private archive worker")
+        worker_id = records[0].get("worker_id")
+        _require(
+            bool(worker_id) and worker_id != channel_uuid,
+            "Archive recording did not use its dedicated worker identity",
+        )
+        return str(worker_id)
+
+    def persisted_recording_enabled() -> object:
+        return dict(PluginConfig.objects.get(key="catchuparr").settings or {}).get(
+            "recording_enabled"
+        )
+
+    def persist_draft(draft_settings: dict) -> None:
+        from django.db import transaction
+
+        with transaction.atomic():
+            row = PluginConfig.objects.select_for_update().get(key="catchuparr")
+            current_settings = dict(row.settings or {})
+            current_settings.update(draft_settings)
+            row.settings = current_settings
+            row.save(update_fields=("settings",))
+
+    def wait_for_private_cleanup(worker_id: str, expected_b_requests: int) -> None:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            manager = native_server.stream_managers.get(worker_id)
+            owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+            clients = int(redis_client.scard(RedisKeys.clients(worker_id)) or 0)
+            active_counts = source_server.snapshot()[1]
+            profile_count = _profile_count(
+                redis_client, profile_b.id, profile_connections_key,
+            )
+            if (
+                manager is None and owner is None and clients == 0
+                and active_counts["source-b.ts"] == 0
+                and source_server.snapshot()[0]["source-b.ts"] == expected_b_requests
+                and profile_count == profile_baselines[profile_b.id]
+            ):
+                break
+            gevent_sleep(0.1)
+        _require(
+            native_server.stream_managers.get(worker_id) is None
+            and redis_client.get(RedisKeys.channel_owner(worker_id)) is None
+            and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+            and source_server.snapshot()[1]["source-b.ts"] == 0
+            and source_server.snapshot()[0]["source-b.ts"] == expected_b_requests
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id],
+            "Recorder supervisor did not release the private worker and provider slot",
+        )
+        _assert_worker_cleanup(redis_client, channel_uuid)
+        _require(
+            all(
+                not redis_client.exists(CAPABILITY_PREFIX + str(record.get("capability_digest")))
+                for record in _worker_records(redis_client, channel_uuid)
+                if record.get("capability_digest")
+            ),
+            "Recorder supervisor left a private capability active",
+        )
+
+    def reconcile_arguments() -> tuple:
+        captured = []
+
+        def capture(*, args=None, queue=None, **_kwargs):
+            captured.append((tuple(args or ()), queue))
+            return None
+
+        with patch.object(tasks.record_channel, "apply_async", side_effect=capture):
+            result = tasks.reconcile_recorders.run()
+        _require(result == {"queued": 1} and len(captured) == 1,
+                 "Real recorder reconciliation did not queue exactly the selected channel")
+        args, queue = captured[0]
+        _require(queue == "dvr" and len(args) == 3 and str(args[0]) == channel_uuid,
+                 "Recorder reconciliation produced unexpected task arguments")
+        current_active = load_active_configuration(active_path)
+        current_control = load_recorder_control(active_path)
+        _require(
+            current_active is not None
+            and args[1] == configuration_generation(current_active)
+            and args[2] == current_control.generation,
+            "Recorder reconciliation queued stale applied generations",
+        )
+        return args
+
+    def invoke_control_action(action, name: str) -> dict:
+        dispatched = []
+
+        def capture(*args, **kwargs):
+            dispatched.append((args, kwargs))
+            return None
+
+        with patch.object(tasks.reconcile_recorders, "apply_async", side_effect=capture):
+            result = action()
+        _require(
+            len(dispatched) == 1 and dispatched[0][1].get("queue") == "dvr",
+            f"Real {name} action did not enqueue one DVR reconciliation",
+        )
+        return result
+
+    def start_reconciled_run(label: str) -> _RecorderTaskRun:
+        args = reconcile_arguments()
+        run = _RecorderTaskRun(
+            channel_uuid, startup_timeout=45, media_idle_timeout=25,
+        )
+        harnesses.append(run)
+        run.start(task_args=args)
+        _require(
+            run.expected_generation == args[1]
+            and run.expected_control_generation == args[2],
+            f"{label} recorder did not use the generations selected by reconciliation",
+        )
+        return run
+
+    persist_draft(settings)
+    previous_control_generation = load_recorder_control(active_path).generation
+    active = load_active_configuration(active_path)
+    _require(active is not None, "Running-control probe requires an applied configuration")
+    _require(
+        initial_run.thread is not None and initial_run.thread.is_alive()
+        and configuration_generation(active) == initial_run.expected_generation,
+        "Initial B recorder is not actively using the applied configuration",
+    )
+    _require(
+        settings.get("filter_config")
+        and schedule_is_active(
+            schedule_from_snapshot(active["recording_schedule"]["channels"][channel_uuid]),
+            active["recording_schedule"]["timezone"],
+            datetime.now(timezone.utc),
+        ),
+        "Running-control probe requires an active applied schedule",
+    )
+    initial_worker_id = current_private_worker()
+    require_live_a("initial_b_active", 1, read_fresh_media=True)
+    initial_counts, initial_active_counts = source_server.snapshot()
+    _require(
+        initial_counts["source-b.ts"] == initial_b_request_baseline + 1
+        and initial_active_counts["source-b.ts"] == 1,
+        "Initial running-control B recorder did not hold one provider connection",
+    )
+    initial_control = load_recorder_control(active_path)
+    _require(
+        initial_control.generation == initial_run.expected_control_generation
+        and not initial_control.paused,
+        "Running archive worker did not start with the current control generation",
+    )
+
+    paused_result = invoke_control_action(runtime.pause_recorders, "Pause")
+    paused = load_recorder_control(active_path)
+    _require(
+        paused.paused and paused.generation > initial_control.generation
+        and paused_result == {"paused": True, "generation": paused.generation}
+        and persisted_recording_enabled() is False,
+        "Real Pause action did not persist and advance recorder control",
+    )
+    initial_run.join_after_supervisor(timeout=25, cooperative_sleep=gevent_sleep)
+    _require(
+        initial_run.result == {"status": "stopped"},
+        "Pause did not stop the running recorder through its supervisor",
+    )
+    wait_for_private_cleanup(initial_worker_id, initial_counts["source-b.ts"])
+    require_live_a("after_pause_private_cleanup", 0, read_fresh_media=True)
+    pause_reconcile_dispatches = []
+
+    def capture_pause_reconcile(*, args=None, queue=None, **_kwargs):
+        pause_reconcile_dispatches.append((tuple(args or ()), queue))
+        return None
+
+    with patch.object(tasks.record_channel, "apply_async", side_effect=capture_pause_reconcile):
+        pause_reconcile_result = tasks.reconcile_recorders.run()
+    _require(
+        pause_reconcile_result == {"queued": 0} and not pause_reconcile_dispatches,
+        "Paused real reconciliation queued another recorder task",
+    )
+    _require(
+        source_server.snapshot()[0]["source-b.ts"] == initial_counts["source-b.ts"],
+        "Paused recorder reopened archive B after its worker stopped",
+    )
+
+    resumed_result = invoke_control_action(runtime.resume_recorders, "Resume")
+    resumed = load_recorder_control(active_path)
+    _require(
+        not resumed.paused and resumed.generation > paused.generation
+        and resumed_result == {"paused": False, "generation": resumed.generation}
+        and persisted_recording_enabled() is True,
+        "Real Resume action did not publish a newer enabled control generation",
+    )
+    _require(
+        resumed.generation > previous_control_generation,
+        "Pause and Resume did not fence the pre-pause queued job generation",
+    )
+
+    resumed_baseline_ids = {
+        segment.id for segment in archive_store.segments(channel_uuid)
+    }
+    resumed_request_baseline = source_server.snapshot()[0]["source-b.ts"]
+    resumed_run = start_reconciled_run("Resumed")
+    resumed_segments = _wait_for_indexed_tone(
+        resumed_run, archive_store, channel_uuid, ffmpeg, ffprobe,
+        expected_hz=880, existing_ids=resumed_baseline_ids, minimum=1, timeout=90,
+        cooperative_sleep=gevent_sleep,
+    )
+    _require(
+        all(segment.id not in resumed_baseline_ids for segment in resumed_segments),
+        "Resume did not index fresh source B archive segments",
+    )
+    resumed_counts, resumed_active_counts = source_server.snapshot()
+    _require(
+        resumed_counts["source-b.ts"] == resumed_request_baseline + 1
+        and resumed_active_counts["source-b.ts"] == 1,
+        "Resume did not open exactly one new B provider connection",
+    )
+    resumed_worker_id = current_private_worker()
+    require_live_a("after_resume_new_private_worker", 1, read_fresh_media=True)
+    resumed_generation = resumed_run.expected_generation
+    before_closed_apply = source_server.snapshot()[0]
+
+    closed_settings = dict(
+        settings,
+        filter_config=settings["filter_config"].replace(
+            "rules:\n", "schedule: {}\nrules:\n", 1,
+        ),
+    )
+    persist_draft(closed_settings)
+    closed_apply_result = runtime.apply_configuration()
+    _require(
+        closed_apply_result.get("applied") is True,
+        "Current-row recorder Apply did not accept the closed schedule",
+    )
+    closed_active = load_active_configuration(active_path)
+    _require(closed_active is not None, "Applied closed schedule was not readable")
+    closed_generation = configuration_generation(closed_active)
+    _require(
+        closed_generation != resumed_generation
+        and closed_active["recording_schedule"]["channels"][channel_uuid]
+        == {"mode": "weekly", "intervals": []},
+        "Applying a closed schedule did not publish an immutable empty channel schedule",
+    )
+    resumed_run.join_after_supervisor(timeout=25, cooperative_sleep=gevent_sleep)
+    _require(
+        resumed_run.result == {"status": "stopped"},
+        "Applying a closed schedule did not stop the running recorder supervisor",
+    )
+    wait_for_private_cleanup(resumed_worker_id, resumed_counts["source-b.ts"])
+    require_live_a("after_closed_schedule_private_cleanup", 0, read_fresh_media=True)
+    _require(
+        source_server.snapshot()[0]["source-b.ts"] == before_closed_apply["source-b.ts"],
+        "Closed-schedule Apply reopened archive B after the running worker stopped",
+    )
+
+    from catchuparr.tasks import record_channel
+
+    counts_before_stale = source_server.snapshot()
+    profile_counts_before_stale = {
+        int(profile.id): _profile_count(
+            redis_client, profile.id, profile_connections_key,
+        )
+        for profile in (profile_a, profile_b)
+    }
+    current_control = load_recorder_control(active_path)
+    stale_configuration = record_channel.run(
+        channel_uuid, resumed_generation, current_control.generation,
+    )
+    stale_control = record_channel.run(
+        channel_uuid, initial_run.expected_generation, previous_control_generation,
+    )
+    outside_schedule = record_channel.run(
+        channel_uuid, closed_generation, current_control.generation,
+    )
+    _require(
+        stale_configuration == {"status": "stale_configuration"}
+        and stale_control == {"status": "stale_control"}
+        and outside_schedule == {"status": "outside_schedule"},
+        "Actual recorder task did not reject stale generations and a closed schedule",
+    )
+    _require(
+        source_server.snapshot() == counts_before_stale
+        and profile_counts_before_stale == {
+            int(profile.id): _profile_count(
+                redis_client, profile.id, profile_connections_key,
+            )
+            for profile in (profile_a, profile_b)
+        }
+        and not redis_client.exists(f"catchuparr:recorder:{channel_uuid}")
+        and not any(record.get("state") == "active" for record in _worker_records(
+            redis_client, channel_uuid,
+        )),
+        "Rejected stale or closed-schedule task changed a provider or worker resource",
+    )
+    require_live_a("after_stale_task_rejections", 0, read_fresh_media=True)
+
+    window_start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    window_end = window_start + timedelta(minutes=2 if datetime.now(timezone.utc).second < 30 else 3)
+    weekday = window_start.strftime("%A").lower()
+    start_clock = window_start.strftime("%H:%M")
+    end_clock = window_end.strftime("%H:%M")
+
+    timed_settings = dict(
+        settings,
+        filter_config=(
+            settings["filter_config"].split("rules:", 1)[0]
+            + "timezone: UTC\n"
+            + "schedule:\n"
+            + f"  {weekday}:\n"
+            + f"    - {{start: \"{start_clock}\", end: \"{end_clock}\"}}\n"
+            + "rules:\n"
+            + "  - channels: {profile: all}\n"
+            + "    include: [Synthetic archive isolation B]\n"
+        ),
+    )
+    persist_draft(timed_settings)
+    timed_apply_result = runtime.apply_configuration()
+    _require(
+        timed_apply_result.get("applied") is True,
+        "Current-row recorder Apply did not accept the active timed schedule",
+    )
+    timed_active = load_active_configuration(active_path)
+    _require(timed_active is not None, "Timed schedule snapshot was not readable")
+    timed_generation = configuration_generation(timed_active)
+    timed_schedule = schedule_from_snapshot(
+        timed_active["recording_schedule"]["channels"][channel_uuid]
+    )
+    _require(
+        schedule_is_active(timed_schedule, "UTC", datetime.now(timezone.utc)),
+        "Synthetic timed schedule was not active at recorder startup",
+    )
+    timed_baseline_ids = {
+        segment.id for segment in archive_store.segments(channel_uuid)
+    }
+    timed_request_baseline = source_server.snapshot()[0]["source-b.ts"]
+    schedule_events = []
+
+    class ScheduleEventCapture(logging.Handler):
+        def emit(self, record):
+            if (
+                record.name == "catchuparr"
+                and record.getMessage() == "[Catchuparr] recorder_schedule_closed"
+            ):
+                schedule_events.append(record.getMessage())
+
+    logger = logging.getLogger("catchuparr")
+    previous_log_level = logger.level
+    schedule_event_capture = ScheduleEventCapture(logging.INFO)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(schedule_event_capture)
+    try:
+        timed_run = start_reconciled_run("Timed schedule")
+        timed_segments = _wait_for_indexed_tone(
+            timed_run, archive_store, channel_uuid, ffmpeg, ffprobe,
+            expected_hz=880, existing_ids=timed_baseline_ids, minimum=2, timeout=90,
+            cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(timed_segments), "Active timed schedule did not index useful source B media")
+        timed_counts, timed_active_counts = source_server.snapshot()
+        _require(
+            timed_counts["source-b.ts"] == timed_request_baseline + 1
+            and timed_active_counts["source-b.ts"] == 1,
+            "Timed recorder did not open exactly one B provider connection",
+        )
+        timed_worker_id = current_private_worker()
+        require_live_a("during_timed_schedule", 1, read_fresh_media=True)
+        _require(
+            timed_run.expected_generation == timed_generation
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + 1
+            and redis_client.exists(f"catchuparr:recorder:{channel_uuid}"),
+            "Timed recorder did not hold its applied generation, lease, and provider slot",
+        )
+        close_deadline = time.monotonic() + 150
+        while schedule_is_active(timed_schedule, "UTC", datetime.now(timezone.utc)):
+            _require(
+                time.monotonic() < close_deadline,
+                "Synthetic weekly schedule did not reach its real-time close boundary",
+            )
+            _require(
+                timed_run.thread is not None and timed_run.thread.is_alive()
+                and source_server.snapshot()[1]["source-b.ts"] == 1
+                and _profile_count(redis_client, profile_b.id, profile_connections_key)
+                == profile_baselines[profile_b.id] + 1
+                and redis_client.exists(f"catchuparr:recorder:{channel_uuid}"),
+                "Recorder stopped before the applied weekly schedule reached its end",
+            )
+            gevent_sleep(0.25)
+        timed_run.join_after_supervisor(timeout=20, cooperative_sleep=gevent_sleep)
+        _require(
+            timed_run.result == {"status": "stopped"},
+            "Recorder supervisor did not stop when the active schedule window closed",
+        )
+        _require(
+            bool(schedule_events),
+            "Recorder supervisor did not report the closed schedule as its stop reason",
+        )
+        wait_for_private_cleanup(timed_worker_id, timed_counts["source-b.ts"])
+        require_live_a("after_timed_schedule_close", 0, read_fresh_media=True)
+        latest_timed_active = load_active_configuration(active_path)
+        _require(
+            latest_timed_active is not None
+            and configuration_generation(latest_timed_active) == timed_generation
+            and load_recorder_control(active_path).generation
+            == timed_run.expected_control_generation,
+            "Schedule-boundary stop changed configuration or control generation",
+        )
+        after_close_counts = source_server.snapshot()
+        after_close_profiles = {
+            int(profile.id): _profile_count(
+                redis_client, profile.id, profile_connections_key,
+            )
+            for profile in (profile_a, profile_b)
+        }
+    finally:
+        logger.removeHandler(schedule_event_capture)
+        logger.setLevel(previous_log_level)
+
+    closed_by_clock = record_channel.run(
+        channel_uuid, timed_generation, timed_run.expected_control_generation,
+    )
+    _require(
+        closed_by_clock == {"status": "outside_schedule"}
+        and source_server.snapshot() == after_close_counts
+        and {
+            int(profile.id): _profile_count(
+                redis_client, profile.id, profile_connections_key,
+            )
+            for profile in (profile_a, profile_b)
+        } == after_close_profiles
+        and not redis_client.exists(f"catchuparr:recorder:{channel_uuid}")
+        and after_close_counts[0]["source-b.ts"] == initial_b_request_baseline + 3,
+        "Actual closed schedule admitted a task or changed recorder resources",
+    )
+    print("AIO running pause, resume, schedule-close, stale-job, and live-viewer gates passed")
 
 
 def probe_actual_live_archive_isolation(root: Path) -> None:
@@ -1503,6 +2206,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         profile_credential_release_key,
     )
     from apps.m3u.models import M3UAccount
+    from apps.plugins.models import PluginConfig
     from apps.proxy.live_proxy.constants import ChannelMetadataField, ChannelState
     from apps.proxy.live_proxy.redis_keys import RedisKeys
     from apps.proxy.live_proxy.server import ProxyServer
@@ -1518,6 +2222,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         load_active_configuration,
     )
     from catchuparr.engine.store import ArchiveStore
+    from catchuparr.recorder_control import control_deny_path, control_state_path
     from catchuparr.recorder_proxy import ranked_source_candidates
 
     _require(
@@ -1546,6 +2251,14 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     reset_marker_path = active_path.with_name(".catchuparr-configuration-reset-required")
     reset_marker_existed = reset_marker_path.exists()
     reset_marker_bytes = reset_marker_path.read_bytes() if reset_marker_existed else None
+    control_path = control_state_path(active_path)
+    control_existed = control_path.exists()
+    control_bytes = control_path.read_bytes() if control_existed else None
+    control_deny = control_deny_path(active_path)
+    control_deny_existed = control_deny.exists()
+    control_deny_bytes = control_deny.read_bytes() if control_deny_existed else None
+    plugin_config = PluginConfig.objects.get(key="catchuparr")
+    original_plugin_settings = dict(plugin_config.settings or {})
 
     original_base_url = channel_tasks.get_dvr_stream_base_url
     saved_default_profile = None
@@ -1554,9 +2267,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     bridge = None
     redis_client = None
     live_response = None
-    live_tracker = None
     live_reader = None
+    live_session = None
     native_server = None
+    native_diagnostic = None
+    native_diagnostic_report = None
     channel = None
     created_accounts = []
     created_streams = []
@@ -1711,6 +2426,18 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         channel_tasks.get_dvr_stream_base_url = lambda: bridge.base_url
 
         client = Client(raise_request_exception=False)
+        native_server = ProxyServer.get_instance()
+        worker_id = str(channel.uuid)
+        from aio_native_redis_diagnostic import NativeRedisInitDiagnostic
+
+        native_diagnostic = NativeRedisInitDiagnostic(
+            worker_id=worker_id,
+            redis_keys=RedisKeys,
+            native_server=native_server,
+        )
+        native_diagnostic.start(
+            redis_client=redis_client,
+        )
         live_response = client.get(
             f"/proxy/ts/stream/{channel.uuid}",
             HTTP_HOST="localhost",
@@ -1727,11 +2454,21 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         _require(getattr(live_response, "streaming", False), "Native live A route was not a stream")
 
-        native_server = ProxyServer.get_instance()
-        worker_id = str(channel.uuid)
-        native_buffer = native_server.get_buffer(worker_id, profile=None)
-        live_tracker = _NativeBufferYieldTracker(native_buffer)
-        parent_iterator = iter(live_tracker.observe(iter(live_response.streaming_content)))
+        # Keep one reader on the real public response through native startup.
+        # On failure, outer cleanup stops the channel before joining the reader.
+        live_session, native_buffer = _create_native_live_reader_session(
+            live_response, native_server, worker_id,
+        )
+        live_reader = live_session.reader
+        _wait_for_native_client_count(
+            redis_client,
+            native_server,
+            RedisKeys,
+            worker_id,
+            1,
+            timeout=45,
+            reject_excess=True,
+        )
         native_owner, native_manager, native_client_manager = _wait_for_native_active(
             redis_client,
             native_server,
@@ -1741,12 +2478,40 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             channel_state=ChannelState,
             timeout=45,
         )
+        # Capture only the native startup interval. Once the real route client
+        # is registered and the first ownership check has completed, restore
+        # every diagnostic hook before the longer archive/control phases.
+        native_diagnostic_report = native_diagnostic.close()
+        diagnostic_observed = native_diagnostic_report["observed"]
+        _require(
+            all(
+                diagnostic_observed[name]
+                for name in (
+                    "channel_initialize",
+                    "metadata_write",
+                    "native_manager_thread_start",
+                    "ownership_check",
+                    "ownership_allowed",
+                    "client_add",
+                )
+            )
+            and native_diagnostic_report["redis_targets_match"],
+            "Native Redis startup diagnostic did not observe the complete synthetic init path",
+        )
         active_state = _constant_text(ChannelState.ACTIVE)
-        first_live_media = _read_stream_iterator(
-            parent_iterator,
-            minimum_bytes=188 * 512,
-            timeout=20,
-            close=live_response.close,
+        first_publication_floor = int(
+            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
+        )
+        _require(
+            first_publication_floor > 0,
+            "Native live A did not publish an initial buffer chunk",
+        )
+        first_live_media, first_live_index = live_reader.read_after(
+            first_publication_floor, minimum_bytes=188 * 512, timeout=20,
+        )
+        _require(
+            first_live_index > first_publication_floor,
+            "Native live A did not deliver a newly published buffer chunk",
         )
         _verify_audio_video_tone(ffmpeg, ffprobe, first_live_media, 440, "Native live A")
         _require(native_manager.running, "Native live A stream manager is not running")
@@ -1808,8 +2573,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             ),
             "Native live A source metadata is incomplete",
         )
-        live_reader = _NativeLiveMediaReader(parent_iterator, live_tracker)
-
         # With no policy, the real recorder task must attach to this same
         # native A worker and index decoded A rather than opening a second
         # provider connection.
@@ -1820,6 +2583,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         segments_a = _wait_for_indexed_tone(
             run_a, store, worker_id, ffmpeg, ffprobe,
             expected_hz=440, existing_ids=baseline_ids, minimum=1, timeout=90,
+            cooperative_sleep=gevent_sleep,
         )
         _require(bool(segments_a), "No-rules recorder did not archive synthetic live source A")
         _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 2)
@@ -1853,7 +2617,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "No-rules archive changed native live A source metadata",
         )
         run_a.stop()
-        run_a.join()
+        run_a.join(cooperative_sleep=gevent_sleep)
         _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
         _require(
             _profile_count(redis_client, profile_a.id, profile_connections_key)
@@ -1898,6 +2662,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         segments_b = _wait_for_indexed_tone(
             run_b, store, worker_id, ffmpeg, ffprobe,
             expected_hz=880, existing_ids=baseline_ids_b, minimum=1, timeout=90,
+            cooperative_sleep=gevent_sleep,
         )
         _require(bool(segments_b), "B-only recorder did not index synthetic archive source B")
         _require(
@@ -1988,8 +2753,38 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             ffmpeg, ffprobe, live_media_during_b, 440, "Native live A during archive B",
         )
 
+        _probe_running_recorder_controls(
+            channel_uuid=worker_id,
+            settings=settings_b,
+            active_path=active_path,
+            archive_store=store,
+            source_server=source_server,
+            redis_client=redis_client,
+            native_server=native_server,
+            native_buffer=native_buffer,
+            native_owner=native_owner,
+            native_manager=native_manager,
+            native_client_manager=native_client_manager,
+            metadata_key=metadata_key,
+            active_state=active_state,
+            assignment_snapshot=assignment_snapshot,
+            source_metadata=source_metadata,
+            live_reader=live_reader,
+            profile_a=profile_a,
+            profile_b=profile_b,
+            profile_baselines=profile_baselines,
+            native_a_marker=native_a_marker,
+            initial_b_request_baseline=counts_after_shared["source-b.ts"],
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            harnesses=harnesses,
+            gevent_sleep=gevent_sleep,
+            initial_run=run_b,
+        )
+        counts_after_running_controls, _ = source_server.snapshot()
+
         run_b.stop()
-        run_b.join()
+        run_b.join(cooperative_sleep=gevent_sleep)
         all_segments_after_b_stop = store.segments(worker_id)
         segment_by_id = {segment.id: segment for segment in all_segments_after_b_stop}
         _require(
@@ -2039,7 +2834,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and redis_client.get(RedisKeys.channel_owner(b_worker_id)) is None
             and int(redis_client.scard(RedisKeys.clients(b_worker_id)) or 0) == 0
             and source_server.snapshot()[0]["source-b.ts"]
-            == counts_during_b["source-b.ts"]
+            == counts_after_running_controls["source-b.ts"]
             and source_server.snapshot()[1]["source-b.ts"] == 0,
             "Stopping archive B left its private native worker or provider source active",
         )
@@ -2099,11 +2894,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Native live A after archive B cleanup",
         )
 
-        live_reader.close(live_response)
+        live_session.close()
         live_response = None
         live_reader = None
-        live_tracker.close()
-        live_tracker = None
+        live_session = None
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             owner = redis_client.get(RedisKeys.channel_owner(worker_id))
@@ -2158,39 +2952,44 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         print("AIO native live A remained isolated while the real recorder indexed B")
     finally:
+        # On a startup failure, freeze the observed state before cleanup
+        # changes Redis keys or native worker state. The successful path has
+        # already captured and restored the hooks above.
+        if native_diagnostic is not None and native_diagnostic_report is None:
+            try:
+                native_diagnostic_report = native_diagnostic.close()
+            except Exception:
+                # Diagnostics must not replace the probe's original result.
+                pass
         for run in reversed(harnesses):
             if run.thread is not None:
                 try:
                     run.stop()
-                    run.join(20)
+                    run.join(20, cooperative_sleep=gevent_sleep)
                 except Exception:
                     cleanup_errors.append("recorder-task")
-        if live_response is not None:
+        if live_session is not None:
             try:
-                if live_reader is not None:
-                    force_release = None
-                    if native_server is not None and channel is not None:
-                        worker_to_release = str(channel.uuid)
+                force_release = None
+                if native_server is not None and channel is not None:
+                    worker_to_release = str(channel.uuid)
 
-                        def force_release_native() -> None:
-                            from apps.proxy.live_proxy.services.channel_service import (
-                                ChannelService,
-                            )
+                    def force_release_native() -> None:
+                        from apps.proxy.live_proxy.services.channel_service import ChannelService
 
-                            ChannelService.stop_channel(worker_to_release)
+                        ChannelService.stop_channel(worker_to_release)
 
-                        force_release = force_release_native
-                    live_reader.close(live_response, force_release=force_release)
-                    live_reader = None
-                else:
-                    live_response.close()
+                    force_release = force_release_native
+                live_session.close(force_release=force_release)
+                live_reader = None
+                live_session = None
             except Exception:
                 cleanup_errors.append("native-live-response")
-        if live_tracker is not None:
+        elif live_response is not None:
             try:
-                live_tracker.close()
+                live_response.close()
             except Exception:
-                cleanup_errors.append("native-live-tracker")
+                cleanup_errors.append("native-live-response")
         try:
             from catchuparr.adapters.recorder_proxy import stop_managed_workers
 
@@ -2229,6 +3028,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     cleanup_errors.append("native-live-manager")
             except Exception:
                 cleanup_errors.append("native-live-cleanup-check")
+        if native_diagnostic is not None:
+            try:
+                if native_diagnostic_report is not None:
+                    print(
+                        "CATCHUPARR_NATIVE_REDIS_INIT_DIAGNOSTIC "
+                        + json.dumps(native_diagnostic_report, sort_keys=True)
+                    )
+            except Exception:
+                # Diagnostics must not replace the probe's original result.
+                pass
         if source_server is not None:
             try:
                 source_server.close()
@@ -2258,8 +3067,22 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 reset_marker_path.write_bytes(reset_marker_bytes)
             else:
                 reset_marker_path.unlink(missing_ok=True)
+            if control_existed:
+                control_path.write_bytes(control_bytes)
+            else:
+                control_path.unlink(missing_ok=True)
+            if control_deny_existed:
+                control_deny.write_bytes(control_deny_bytes)
+            else:
+                control_deny.unlink(missing_ok=True)
         except Exception:
             cleanup_errors.append("active-config")
+        try:
+            latest_plugin_config = PluginConfig.objects.get(key="catchuparr")
+            latest_plugin_config.settings = original_plugin_settings
+            latest_plugin_config.save(update_fields=("settings",))
+        except Exception:
+            cleanup_errors.append("plugin-settings")
         if redis_client is not None and not cleanup_errors:
             try:
                 _require(

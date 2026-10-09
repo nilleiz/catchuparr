@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.adapters import recorder_proxy
+from scripts.aio_native_redis_diagnostic import NativeRedisInitDiagnostic
 
 
 def _module(name, **attributes):
@@ -229,6 +230,28 @@ def _dispatcharr_api_modules():
 
 
 class RecorderProxyHookTests(unittest.TestCase):
+    def test_native_redis_diagnostic_preserves_proxy_api_signature(self):
+        modules, proxy_server, _input_manager, _live_urls = _dispatcharr_api_modules()
+        native_keys = modules["apps.proxy.live_proxy.redis_keys"].RedisKeys
+        redis_keys = SimpleNamespace(
+            channel_metadata=native_keys.channel_metadata,
+            channel_owner=native_keys.channel_owner,
+            clients=lambda channel_id: f"clients:{channel_id}",
+        )
+        original = proxy_server.__dict__["initialize_channel"]
+        diagnostic = NativeRedisInitDiagnostic(
+            worker_id="synthetic-worker",
+            redis_keys=redis_keys,
+            native_server=SimpleNamespace(),
+        )
+
+        with patch.dict(sys.modules, modules):
+            diagnostic._patch_initialize(proxy_server)
+            self.assertEqual((), recorder_proxy._core_api_compatibility_issues())
+            diagnostic.close()
+
+        self.assertIs(proxy_server.__dict__["initialize_channel"], original)
+
     def test_hook_install_twice_and_shutdown_restore_originals(self):
         modules, proxy_server, input_manager, live_urls = _dispatcharr_api_modules()
         original_release = proxy_server._release_stream_resources

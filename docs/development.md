@@ -6,7 +6,12 @@ Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q catchu
 
 ## Installing the plugin
 
-Import `dist/catchuparr-<version>.zip` from Dispatcharr's Plugins page and enable it after inspecting its settings. The plugin code is installed under Dispatcharr's `/data/plugins/catchuparr`. The AIO container runs web and Celery with the same `/data/catchuparr` archive mount. During an update, stop the recorders, install the new ZIP, reload plugins, run the compatibility check, and resume the selected channels. Keep the prior ZIP and archive snapshot until playback smoke tests pass.
+Import `dist/catchuparr-<version>.zip` from Dispatcharr's Plugins page and enable it after inspecting its settings. The plugin code is installed under Dispatcharr's `/data/plugins/catchuparr`. The AIO container runs web and Celery with the same `/data/catchuparr` archive mount. During an update, stop the recorders, install the new ZIP, reload plugins, run the compatibility check, and resume the selected channels. Keep the prior ZIP and a verified application/configuration restore point until playback smoke tests pass; use the backup policy below.
+
+For the unreleased 0.3.0 candidate, use the
+[candidate guide](candidate-0.3.0.md) for YAML schedules, recorder controls,
+legacy-setting reset behavior and current acceptance status. The build command
+uses the manifest version when naming the ZIP.
 
 Dispatcharr v0.31.0 and v0.32.0 accept a manual update at authenticated admin
 `POST /api/plugins/plugins/import/` with multipart field `file` and explicit
@@ -56,6 +61,20 @@ extra provider duration padding is never required for local archive coverage.
 Use the plugin XMLTV endpoint with the plugin M3U export. Native XC M3U tags
 do not extend the core XMLTV endpoint's historical guide.
 
+## Backup and rollback scope
+
+By default, Dev restore points cover application data and configuration only.
+Exclude the archive directory, recordings and archive database. Keep at most two
+verified task-owned Dev backups, and prune an older one only after the new
+restore point has been verified. Include archive data only with explicit
+authorization. An application/configuration-only restore point cannot recover
+archive files or database content that was lost or overwritten.
+
+Rollback uses the previous plugin/image and its matching application/configuration
+restore point while preserving the current archive directory, recordings and
+archive database. Do not restore or replace archive data as part of an ordinary
+rollback.
+
 ## Upgrading the isolated AIO to 0.32.0
 
 Use `ghcr.io/dispatcharr/dispatcharr@sha256:b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`
@@ -63,9 +82,11 @@ with `DISPATCHARR_ENV=aio`. This remains one container with PostgreSQL 17,
 Redis, web and workers. The official image replaces the Dev custom image only;
 production is not updated. Preserve Dev bind addresses, volumes and egress rules.
 
-1. Stop only the Dev AIO and verify it is stopped. Create a private cold archive
-   of its entire `data` and `archive` directories, preserving ownership. Retain
-   the old private environment file/image digest and verify the archive can be read.
+1. Stop only the Dev AIO and verify it is stopped. Create and verify a private
+   restore point for application data and configuration only. Exclude the
+   `archive` directory, recordings and archive database. Retain the previous
+   plugin ZIP and private image digest. Keep no more than two verified task-owned
+   Dev restore points.
 2. Verify `scripts/dev_egress.py check` against the agreed Dev subnet and source.
    Change only the private `DISPATCHARR_DEV_AIO_IMAGE` pin, then recreate the Dev AIO.
 3. Verify Dispatcharr version, migration completion and PostgreSQL major version.
@@ -76,9 +97,12 @@ production is not updated. Preserve Dev bind addresses, volumes and egress rules
 4. Repeat real-player tests for start-over, pause, multiple seeks,
    programme boundary, restart and retention. Enable sanitized tracing only for
    the test and record numeric time/range/status fields; never capture full URLs.
-5. To roll back, stop Dev, retain the failed Dev data privately, restore both cold
-   directories and the old private image pin, then recreate Dev. Do not run the
-   old application against a database migrated by the new release.
+5. To roll back, stop Dev and retain diagnostic data privately. Reinstall the
+   previous plugin/image and restore its matching application/configuration
+   restore point, then recreate Dev. Preserve the current archive directory,
+   recordings and archive database; the application/configuration restore point
+   cannot recover archive data if it was lost. Do not run the old application
+   against a database migrated by the new release.
 
 For a rebuild instead of an in-place upgrade, use the backup ZIP/API restoration
 procedure below. Run `python3 scripts/run_aio_integration.py --image <pinned-image>`
@@ -114,9 +138,11 @@ web-server access logs because URL query strings may contain bearer tokens.
 
 Release assets include the installable ZIP and `SHA256SUMS`. Download both
 from the tagged GitHub release and run `sha256sum -c SHA256SUMS` in the download
-directory before importing. Retain the previous package and private cold Dev
-data/archive backup for rollback. A release does not authorize a production
-deployment.
+directory before importing. Retain the previous package and a verified
+application/configuration-only Dev restore point for rollback, following the
+two-backup limit above. Archives, recordings and the archive database are
+excluded unless explicitly authorized. A release does not authorize a
+production deployment.
 
 Use the verified Dispatcharr backup ZIP and API flow above by default. If no compatible ZIP exists, use `pg_dump -Fc`, verify it with `pg_restore -l` in a networkless container, restore into an isolated temporary PostgreSQL 17 container, apply `scrub.sql`, stop it, and copy only its cold cluster into the AIO Dev `/data/db` path (UID/GID 1000). A cold cluster prepared under a different glibc version may need `REINDEX DATABASE` for each copied database, followed by `ALTER DATABASE ... REFRESH COLLATION VERSION` inside the AIO image. Never mount a production database directory into Dev.
 
