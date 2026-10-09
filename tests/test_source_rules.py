@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest.mock import patch
 
 from catchuparr.source_rules import (
     MAX_FILTER_CONFIG_BYTES,
@@ -58,7 +60,8 @@ class SourceRulesTests(unittest.TestCase):
 
     def test_schedule_defaults_continuous_and_rule_schedule_replaces_global(self):
         inherited = self.compile(
-            "version: 1\nrules:\n  - channels: {profile: all}\n"
+            "version: 1\ntimezone: Europe/Berlin\n"
+            "rules:\n  - channels: {profile: all}\n"
         )
         self.assertEqual("Europe/Berlin", inherited.timezone)
         self.assertEqual(
@@ -83,6 +86,47 @@ class SourceRulesTests(unittest.TestCase):
             {"mode": "weekly", "intervals": []},
             replaced.channel_schedules[CHANNEL_B].to_snapshot(),
         )
+
+    def test_global_and_rule_day_groups_expand_with_specific_day_precedence(self):
+        result = self.compile(
+            "version: 1\ntimezone: UTC\nschedule:\n"
+            "  daily: [{start: '07:00', end: '08:00'}]\n"
+            "  weekdays: [{start: '18:00', end: '20:00'}]\n"
+            "  weekend: [{start: '10:00', end: '12:00'}]\n"
+            "rules:\n"
+            "  - channels: {profile: all}\n"
+            "  - channels: {names: [Synthetic Channel A]}\n"
+            "    schedule:\n"
+            "      daily: [{start: '09:00', end: '10:00'}]\n"
+            "      weekdays: [{start: '19:00', end: '21:00'}]\n"
+            "      tuesday: [{start: '06:00', end: '07:00'}]\n"
+        )
+        schedules = {
+            channel: schedule.to_snapshot()
+            for channel, schedule in result.channel_schedules.items()
+        }
+        self.assertEqual(
+            {"mode": "weekly", "intervals": [[1080, 1200], [2520, 2640],
+             [3960, 4080], [5400, 5520], [6840, 6960], [7800, 7920], [9240, 9360]]},
+            schedules[CHANNEL_B],
+        )
+        self.assertEqual(
+            {"mode": "weekly", "intervals": [[1140, 1260], [1800, 1860],
+             [4020, 4140], [5460, 5580], [6900, 7020], [7740, 7800], [9180, 9240]]},
+            schedules[CHANNEL_A],
+        )
+
+    def test_timezone_defaults_use_container_environment_and_explicit_yaml_wins(self):
+        with patch.dict(os.environ, {"TZ": "Asia/Tokyo"}):
+            inherited = self.compile("version: 1\nrules: []\n")
+            explicit = self.compile("version: 1\ntimezone: UTC\nrules: []\n")
+        self.assertEqual("Asia/Tokyo", inherited.timezone)
+        self.assertEqual("UTC", explicit.timezone)
+
+    def test_invalid_container_timezone_is_not_silently_replaced_by_system_zone(self):
+        with patch.dict(os.environ, {"TZ": "Synthetic/Invalid"}):
+            with self.assertRaisesRegex(SourceRuleError, "field TZ"):
+                self.compile("version: 1\nrules: []\n")
 
     def test_schedule_supports_overnight_and_full_day_boundaries(self):
         compiled = self.compile(
