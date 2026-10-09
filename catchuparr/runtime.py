@@ -179,7 +179,7 @@ def load_runtime_state() -> tuple[dict, object]:
         runtime_settings["recording_enabled"] = (
             control.recording_enabled
             if control is not None
-            else bool(active.get("recording_enabled", False))
+            else False
         )
         return runtime_settings, control
     return {
@@ -219,16 +219,23 @@ def validate_configuration(settings: dict) -> dict:
 
 def apply_configuration(settings: dict | None = None) -> dict:
     from .configuration import apply_configuration as apply
-    from .configuration import load_applied_state
+    from .configuration import load_active_configuration, load_applied_state
     from .logging_utils import apply_log_level, event
+    from .recorder_control import RecorderControlError
 
     result = apply(settings)
-    active, _control = load_applied_state()
+    try:
+        active, _control = load_applied_state()
+    except RecorderControlError:
+        if not result.get("recording_paused"):
+            raise
+        active = load_active_configuration()
     apply_log_level(active.get("log_level", "INFO") if active else "INFO")
     event(
         "configuration_applied",
         channel_count=result["selected_channel_count"],
         source_policy_count=result["source_policy_count"],
+        recording_paused=bool(result.get("recording_paused", False)),
     )
     return result
 
