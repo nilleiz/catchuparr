@@ -309,9 +309,16 @@ def bootstrap() -> None:
     except RuntimeError:
         event("runtime_disabled", logging.ERROR, reason="version")
         return
-    from .configuration import reset_legacy_configuration
+    from .configuration import recover_interrupted_activation, reset_legacy_configuration
 
-    reset_legacy_configuration()
+    try:
+        recover_interrupted_activation()
+        reset_legacy_configuration()
+    except Exception:
+        # An unresolved activation keeps recorder admission denied and the
+        # last validated bundle in use. Bootstrap can still expose playback
+        # and status paths against that bundle.
+        error("configuration_recovery_failed")
     # Import the tasks in every worker so Celery sees plugin task names.
     from . import tasks  # noqa: F401
 

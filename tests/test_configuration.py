@@ -506,7 +506,8 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(result["activation_pending"])
         self.assertTrue(result["recovery_required"])
         self.assertTrue(result["recording_paused"])
-        self.assertIn("previous settings remain active", result["warning"])
+        self.assertTrue(result["outcome_unknown"])
+        self.assertIn("outcome is unknown", result["warning"])
         self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
         state_path = self.active_path.parent / configuration.ACTIVATION_STATE_NAME
         commit_path = self.active_path.parent / configuration.ACTIVATION_COMMIT_NAME
@@ -524,6 +525,201 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
         self.assertFalse(state_path.exists())
         self.assertFalse(commit_path.exists())
+
+    def test_guard_write_failure_keeps_pending_old_authority(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        with patch.object(
+            configuration,
+            "_write_activation_uncertain_locked",
+            side_effect=OSError("synthetic guard publication failure"),
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["activation_pending"])
+        self.assertTrue(result["recovery_required"])
+        self.assertNotIn("outcome_unknown", result)
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        state = json.loads(
+            (self.active_path.parent / configuration.ACTIVATION_STATE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("pending", state["state"])
+        self.assertFalse(configuration._activation_uncertain_path(self.active_path).exists())
+
+    def test_postreplace_journal_fsync_failure_gates_reads_until_restart_recovery(self):
+        initial = dict(self.settings, log_level="WARNING")
+        apply_configuration(initial, self.catalog, self.active_path)
+        write_state = configuration._write_activation_state_locked
+
+        def write_committed_then_fail(path, state, activation_id):
+            write_state(path, state, activation_id)
+            if state == "committed":
+                raise OSError("synthetic directory-fsync failure after journal replace")
+
+        updated = dict(self.settings, retention_hours=2, log_level="DEBUG")
+        with patch.object(
+            configuration,
+            "_write_activation_state_locked",
+            side_effect=write_committed_then_fail,
+        ):
+            result = apply_configuration(updated, self.catalog, self.active_path)
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["outcome_unknown"])
+        self.assertTrue(result["recovery_required"])
+        self.assertTrue(result["recording_paused"])
+        self.assertIn("outcome is unknown", result["warning"])
+        self.assertNotIn("previous settings remain active", result["warning"])
+        self.assertTrue(configuration._activation_uncertain_path(self.active_path).exists())
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertEqual("WARNING", load_active_configuration(self.active_path)["log_level"])
+
+        from catchuparr.recorder_control import RecorderControlError
+
+        with self.assertRaisesRegex(RecorderControlError, "outcome is unknown"):
+            load_applied_state(self.active_path)
+
+        from catchuparr import runtime
+
+        with patch.object(configuration, "active_settings_path", return_value=self.active_path), patch.object(
+            configuration, "reset_legacy_configuration"
+        ):
+            runtime_settings, control = runtime.load_runtime_state()
+        self.assertEqual(24, runtime_settings["retention_hours"])
+        self.assertEqual("WARNING", runtime_settings["log_level"])
+        self.assertFalse(runtime_settings["recording_enabled"])
+        self.assertIsNone(control)
+
+        with patch.object(
+            configuration,
+            "_confirm_committed_bundle_durability",
+            side_effect=OSError("synthetic restart re-fsync failure"),
+        ), self.assertRaisesRegex(ValueError, "durability could not be confirmed"):
+            configuration.recover_interrupted_activation(self.active_path)
+        self.assertTrue(configuration._activation_uncertain_path(self.active_path).exists())
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        with self.assertRaisesRegex(RecorderControlError, "outcome is unknown"):
+            load_applied_state(self.active_path)
+
+        # Simulated restart recovery accepts the surviving committed bundle
+        # only after validating and re-fsyncing its snapshot, control sidecar,
+        # journal, and commit record.
+        configuration.recover_interrupted_activation(self.active_path)
+        recovered = load_active_configuration(self.active_path)
+        active, control = load_applied_state(self.active_path)
+        self.assertEqual(2, recovered["retention_hours"])
+        self.assertEqual("DEBUG", recovered["log_level"])
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
+        )
+        self.assertFalse(control.paused)
+        self.assertFalse(configuration._activation_uncertain_path(self.active_path).exists())
+        self.assertFalse(
+            (self.active_path.parent / configuration.ACTIVATION_STATE_NAME).exists()
+        )
+
+    def test_restart_recovery_restores_old_bundle_when_committed_candidate_is_invalid(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        write_state = configuration._write_activation_state_locked
+
+        def write_committed_then_fail(path, state, activation_id):
+            write_state(path, state, activation_id)
+            if state == "committed":
+                raise OSError("synthetic directory-fsync failure after journal replace")
+
+        with patch.object(
+            configuration,
+            "_write_activation_state_locked",
+            side_effect=write_committed_then_fail,
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+        self.assertTrue(result["outcome_unknown"])
+
+        sidecar = configuration._activation_uncertain_path(self.active_path).with_name(
+            ".catchuparr-recorder-control.json"
+        )
+        control = json.loads(sidecar.read_text(encoding="utf-8"))
+        control["configuration_generation"] = "invalid-generation"
+        sidecar.write_text(json.dumps(control), encoding="utf-8")
+
+        configuration.recover_interrupted_activation(self.active_path)
+        active, recorder_control = load_applied_state(self.active_path)
+        self.assertEqual(24, active["retention_hours"])
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            recorder_control.configuration_generation,
+        )
+        self.assertFalse(configuration._activation_uncertain_path(self.active_path).exists())
+
+    def test_guard_removal_failure_keeps_old_reads_until_recovery(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        with patch.object(
+            configuration,
+            "_remove_activation_uncertain_locked",
+            side_effect=OSError("synthetic guard unlink failure before removal"),
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["outcome_unknown"])
+        self.assertTrue(configuration._activation_uncertain_path(self.active_path).exists())
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+
+        configuration.recover_interrupted_activation(self.active_path)
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertFalse(configuration._activation_uncertain_path(self.active_path).exists())
+
+    def test_guard_unlink_fsync_error_keeps_committed_pair_recoverable(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        remove_guard = configuration._remove_activation_uncertain_locked
+
+        def remove_guard_then_fail(path):
+            remove_guard(path)
+            raise OSError("synthetic directory-fsync failure after guard unlink")
+
+        with patch.object(
+            configuration,
+            "_remove_activation_uncertain_locked",
+            side_effect=remove_guard_then_fail,
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+
+        self.assertTrue(result["applied"])
+        self.assertTrue(result["recording_paused"])
+        self.assertTrue(result["activation_cleanup_pending"])
+        self.assertFalse(configuration._activation_uncertain_path(self.active_path).exists())
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        state = json.loads(
+            (self.active_path.parent / configuration.ACTIVATION_STATE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+
+        # A crash can restore the guard directory entry after its unlink
+        # fsync failed. The retained committed journal and backup let recovery
+        # validate the candidate without rolling it back.
+        configuration._write_activation_uncertain_locked(
+            self.active_path, state["activation_id"]
+        )
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        configuration.recover_interrupted_activation(self.active_path)
+        active, control = load_applied_state(self.active_path)
+        self.assertEqual(2, active["retention_hours"])
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
+        )
 
     def test_deny_cleanup_failure_keeps_committed_settings_but_pauses_recording(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
