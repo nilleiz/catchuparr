@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import logging
 import threading
 from datetime import datetime, timedelta, timezone
 
 from celery import shared_task
-
-logger = logging.getLogger(__name__)
 
 
 @shared_task(name="catchuparr.reconcile")
@@ -16,42 +13,60 @@ def reconcile_recorders():
     from apps.channels.models import Channel
     from core.utils import RedisClient
 
-    from .configuration import reset_legacy_configuration
+    from .configuration import load_active_configuration, reset_legacy_configuration
+    from .engine.store import ArchiveStore
+    from .recorder_control import RecorderControlError, load_recorder_control
+    from .recorder_proxy import configuration_generation
     from .runtime import load_config, require_supported_version
+    from .schedule import ScheduleError, schedule_from_snapshot, schedule_is_active
 
     require_supported_version()
     reset_legacy_configuration()
     config = load_config()
-    if config is None:
-        return {"queued": 0}
-    from .configuration import load_active_configuration
-    from .recorder_proxy import configuration_generation
-
-    active = load_active_configuration()
-    if active is None:
-        return {"queued": 0}
-    generation = configuration_generation(active)
-    redis = RedisClient.get_client()
-    desired = set(config.channel_uuids)
-    valid = set(str(value) for value in Channel.objects.filter(uuid__in=desired).values_list("uuid", flat=True))
     queued = 0
-    for channel in sorted(valid):
-        lease_key = f"catchuparr:recorder:{channel}"
-        dispatch_key = f"catchuparr:dispatch:{channel}"
-        if redis.exists(lease_key):
-            continue
-        if redis.set(dispatch_key, "1", nx=True, ex=60):
-            record_channel.apply_async(args=[channel, generation], queue="dvr")
-            queued += 1
-    from .engine.store import ArchiveStore
-
-    store = ArchiveStore(config.archive_root)
-    store.cleanup(
-        older_than_utc=datetime.now(timezone.utc) - timedelta(hours=config.retention_hours),
-        max_bytes=config.max_storage_bytes,
-    )
-    if redis.set("catchuparr:orphan-reconcile", "1", nx=True, ex=600):
-        store.reconcile_orphans(grace_seconds=3600)
+    redis = RedisClient.get_client()
+    active = load_active_configuration() if config is not None else None
+    if config is not None and active is not None:
+        generation = configuration_generation(active)
+        desired = set(config.channel_uuids)
+        valid = set(
+            str(value)
+            for value in Channel.objects.filter(uuid__in=desired).values_list("uuid", flat=True)
+        )
+        try:
+            control = load_recorder_control()
+        except RecorderControlError:
+            control = None
+        if control is not None and not control.paused:
+            schedules = active.get("recording_schedule", {})
+            timezone_name = schedules.get("timezone") if isinstance(schedules, dict) else None
+            channel_schedules = schedules.get("channels") if isinstance(schedules, dict) else None
+            if isinstance(timezone_name, str) and isinstance(channel_schedules, dict):
+                now = datetime.now(timezone.utc)
+                for channel in sorted(valid):
+                    try:
+                        schedule = schedule_from_snapshot(channel_schedules[channel])
+                        if not schedule_is_active(schedule, timezone_name, now):
+                            continue
+                    except (KeyError, ScheduleError, ValueError):
+                        continue
+                    lease_key = f"catchuparr:recorder:{channel}"
+                    dispatch_key = f"catchuparr:dispatch:{channel}"
+                    if redis.exists(lease_key):
+                        continue
+                    if redis.set(dispatch_key, "1", nx=True, ex=60):
+                        record_channel.apply_async(
+                            args=[channel, generation, control.generation], queue="dvr"
+                        )
+                        queued += 1
+    if config is not None:
+        store = ArchiveStore(config.archive_root)
+        store.cleanup(
+            older_than_utc=datetime.now(timezone.utc) - timedelta(hours=config.retention_hours),
+            max_bytes=config.max_storage_bytes,
+        )
+        if redis.set("catchuparr:orphan-reconcile", "1", nx=True, ex=600):
+            store.reconcile_orphans(grace_seconds=3600)
     return {"queued": queued}
 
 
@@ -102,35 +117,44 @@ def snapshot_epg():
 
 
 @shared_task(name="catchuparr.record_channel")
-def record_channel(channel_uuid: str, expected_generation: str | None = None):
+def record_channel(
+    channel_uuid: str,
+    expected_generation: str | None = None,
+    expected_control_generation: int | None = None,
+):
     from apps.channels.tasks import get_dvr_stream_base_url
     from core.utils import RedisClient
 
     from .adapters.recorder_proxy import core_api_supported, install_proxyserver_cleanup_hook
-    from .configuration import load_active_configuration, reset_legacy_configuration
+    from .configuration import reset_legacy_configuration
     from .engine.leases import RedisRecorderLease
     from .engine.recorder import FFmpegCopyRecorder
     from .engine.store import ArchiveStore
+    from .logging_utils import error, event
     from .recorder_proxy import (
         candidate_is_current,
-        configuration_generation,
         issue_recorder_attempt,
         ranked_source_candidates,
         stop_recorder_attempt,
     )
-    from .runtime import load_config, require_supported_version
+    from .runtime import require_supported_version
 
     require_supported_version()
     reset_legacy_configuration()
     redis = RedisClient.get_client()
     redis.delete(f"catchuparr:dispatch:{channel_uuid}")
-    config = load_config()
-    if config is None or channel_uuid not in config.channel_uuids:
-        return {"status": "disabled"}
-    active = load_active_configuration()
-    generation = configuration_generation(active) if active is not None else ""
-    if expected_generation is not None and generation != expected_generation:
-        return {"status": "stale_configuration"}
+    if not isinstance(expected_generation, str) or not expected_generation:
+        return {"status": "legacy_job"}
+    if type(expected_control_generation) is not int or expected_control_generation < 0:
+        return {"status": "legacy_job"}
+    state = _recorder_admission_state(
+        channel_uuid, expected_generation, expected_control_generation
+    )
+    if state["status"] != "ready":
+        return {"status": state["status"]}
+    config = state["config"]
+    active = state["active"]
+    generation = expected_generation
     store = ArchiveStore(config.archive_root)
     lease = RedisRecorderLease(
         redis, channel_uuid, ttl_seconds=30, archive_store=store
@@ -150,10 +174,10 @@ def record_channel(channel_uuid: str, expected_generation: str | None = None):
         if candidates is not None and not candidates:
             return {"status": "no_permitted_sources"}
         if candidates is not None and not core_api_supported():
-            logger.error("Recorder source overrides disabled for channel %s: unverified core API", channel_uuid)
+            event("runtime_disabled", level=40, reason="proxy_api")
             return {"status": "proxy_integration_unsupported"}
         if candidates is not None and not install_proxyserver_cleanup_hook():
-            logger.error("Recorder source overrides disabled for channel %s: cleanup guard unavailable", channel_uuid)
+            event("runtime_disabled", level=40, reason="cleanup_guard")
             return {"status": "proxy_integration_unsupported"}
 
         # Dispatcharr's DVR helper accounts for modular and AIO deployments.
@@ -163,20 +187,15 @@ def record_channel(channel_uuid: str, expected_generation: str | None = None):
         def supervise():
             while not stop_event.wait(10):
                 try:
-                    current = load_config()
-                    current_active = load_active_configuration()
-                    current_generation = (
-                        configuration_generation(current_active)
-                        if current_active is not None else ""
+                    current_admission = _recorder_admission_state(
+                        channel_uuid, expected_generation, expected_control_generation
                     )
                     if (
-                        current is None
-                        or channel_uuid not in current.channel_uuids
-                        or current_generation != generation
-                        or not lease.renew()
+                        current_admission["status"] != "ready" or not lease.renew()
                     ):
                         stop_event.set()
                         return
+                    current_active = current_admission["active"]
                     with attempt_state_lock:
                         current_attempt = attempt_state["attempt"]
                         current_candidate = attempt_state["candidate"]
@@ -192,7 +211,7 @@ def record_channel(channel_uuid: str, expected_generation: str | None = None):
                         stop_event.set()
                         return
                 except Exception:
-                    logger.exception("Recorder supervision failed for %s", channel_uuid)
+                    error("supervision_failed")
                     stop_event.set()
                     return
 
@@ -201,10 +220,15 @@ def record_channel(channel_uuid: str, expected_generation: str | None = None):
         )
         monitor.start()
         if candidates is None:
+            current_state = _recorder_admission_state(
+                channel_uuid, expected_generation, expected_control_generation
+            )
+            if current_state["status"] != "ready":
+                return {"status": current_state["status"]}
             recorder = FFmpegCopyRecorder(
                 store, channel_uuid, proxy_url, config.archive_root / "work",
                 fencing_token=fence,
-                on_error=lambda message: logger.warning("%s: %s", channel_uuid, message),
+                on_error=lambda _message: error("recorder_worker_stopped"),
             )
             recorder.run_forever(stop_event)
         else:
@@ -222,6 +246,16 @@ def record_channel(channel_uuid: str, expected_generation: str | None = None):
                 with attempt_state_lock:
                     attempt_state["attempt"] = attempt
                     attempt_state["candidate"] = candidate
+                current_state = _recorder_admission_state(
+                    channel_uuid, expected_generation, expected_control_generation
+                )
+                if current_state["status"] != "ready":
+                    attempt.revoke(redis)
+                    stop_recorder_attempt(redis, attempt, lease)
+                    with attempt_state_lock:
+                        attempt_state["attempt"] = None
+                        attempt_state["candidate"] = None
+                    return {"status": current_state["status"]}
                 recorder = FFmpegCopyRecorder(
                     store,
                     channel_uuid,
@@ -240,13 +274,7 @@ def record_channel(channel_uuid: str, expected_generation: str | None = None):
                         media_idle_timeout=120,
                     )
                 except Exception:
-                    # Exception text from HTTP/FFmpeg libraries can contain
-                    # request details, so log only the stable source ID.
-                    logger.warning(
-                        "Recorder candidate %s failed for channel %s",
-                        attempt.stream_id,
-                        channel_uuid,
-                    )
+                    error("recorder_worker_stopped")
                     result = None
                 finally:
                     attempt.revoke(redis)
@@ -254,11 +282,7 @@ def record_channel(channel_uuid: str, expected_generation: str | None = None):
                     try:
                         cleanup_ok = stop_recorder_attempt(redis, attempt, lease)
                     except Exception:
-                        logger.exception(
-                            "Could not stop recorder worker for channel %s source %s",
-                            channel_uuid,
-                            attempt.stream_id,
-                        )
+                        error("supervision_failed")
                     if not cleanup_ok:
                         stop_event.set()
                     with attempt_state_lock:
@@ -276,3 +300,60 @@ def record_channel(channel_uuid: str, expected_generation: str | None = None):
         finally:
             lease.release()
     return {"status": "stopped"}
+
+
+def _active_schedule(active, channel_uuid):
+    from .schedule import ScheduleError, schedule_from_snapshot, validate_timezone
+
+    schedule_config = active.get("recording_schedule") if isinstance(active, dict) else None
+    if not isinstance(schedule_config, dict):
+        raise ScheduleError("active schedule is missing")
+    timezone_name = validate_timezone(schedule_config.get("timezone"))
+    schedules = schedule_config.get("channels")
+    if not isinstance(schedules, dict) or channel_uuid not in schedules:
+        raise ScheduleError("channel schedule is missing")
+    return schedule_from_snapshot(schedules[channel_uuid]), timezone_name
+
+
+def _recorder_admission_state(channel_uuid, expected_generation, expected_control_generation):
+    from .configuration import load_active_configuration
+    from .logging_utils import error, event
+    from .recorder_control import RecorderControlError, load_recorder_control
+    from .recorder_proxy import configuration_generation
+    from .runtime import load_config
+    from .schedule import ScheduleError, schedule_is_active
+
+    try:
+        control = load_recorder_control()
+    except RecorderControlError:
+        error("control_state_invalid")
+        return {"status": "control_unavailable"}
+    if control.paused:
+        return {"status": "recording_paused"}
+    if control.generation != expected_control_generation:
+        event("recorder_stale_job")
+        return {"status": "stale_control"}
+    active = load_active_configuration()
+    if active is None:
+        event("recorder_disabled")
+        return {"status": "disabled"}
+    config = load_config(active_snapshot=active)
+    if config is None or channel_uuid not in config.channel_uuids:
+        event("recorder_disabled")
+        return {"status": "disabled"}
+    if configuration_generation(active) != expected_generation:
+        event("recorder_stale_job")
+        return {"status": "stale_configuration"}
+    active_channels = set(str(active.get("channel_uuids") or "").splitlines())
+    if channel_uuid not in active_channels or set(config.channel_uuids) != active_channels:
+        event("recorder_stale_job")
+        return {"status": "stale_configuration"}
+    try:
+        schedule, timezone_name = _active_schedule(active, channel_uuid)
+    except (ScheduleError, ValueError):
+        error("schedule_install_failed")
+        return {"status": "invalid_schedule"}
+    if not schedule_is_active(schedule, timezone_name, datetime.now(timezone.utc)):
+        event("recorder_schedule_closed")
+        return {"status": "outside_schedule"}
+    return {"status": "ready", "config": config, "active": active, "control": control}

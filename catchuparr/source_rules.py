@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
@@ -11,6 +11,14 @@ import yaml
 from yaml.constructor import ConstructorError
 from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
+
+from .schedule import (
+    DEFAULT_TIMEZONE,
+    RecordingSchedule,
+    ScheduleError,
+    normalize_schedule,
+    validate_timezone,
+)
 
 MAX_FILTER_CONFIG_BYTES = 64 * 1024
 MAX_RULES = 256
@@ -39,6 +47,8 @@ class FilterCompilation:
     profile_ids: tuple[str, ...]
     source_policies: dict[str, SourcePolicy]
     channels: tuple[dict[str, Any], ...]
+    timezone: str = DEFAULT_TIMEZONE
+    channel_schedules: dict[str, RecordingSchedule] = field(default_factory=dict)
 
 
 class _RestrictedSafeLoader(yaml.SafeLoader):
@@ -464,7 +474,7 @@ def _load_document(text: str) -> tuple[dict[str, Any] | None, tuple[int, ...]]:
         document,
         line=1,
         field="filter_config",
-        allowed={"version", "profile", "rules"},
+        allowed={"version", "profile", "rules", "timezone", "schedule"},
         required={"version", "rules"},
     )
     return document, rule_lines
@@ -483,6 +493,15 @@ def compile_filter_config(
         return FilterCompilation((), (), {}, ())
     if type(document.get("version")) is not int or document["version"] != 1:
         raise SourceRuleError("line 1, field version: expected integer version 1")
+    try:
+        timezone_name = validate_timezone(
+            document.get("timezone", DEFAULT_TIMEZONE), field="timezone"
+        )
+        global_schedule = normalize_schedule(
+            document.get("schedule", "continuous"), field="schedule"
+        )
+    except ScheduleError as exc:
+        raise SourceRuleError(str(exc)) from None
     scope_name = document.get("profile", "all")
     if not isinstance(scope_name, str) or not scope_name:
         raise SourceRuleError("line 1, field profile: expected all or a channel profile name")
@@ -507,7 +526,9 @@ def compile_filter_config(
     if len(raw_rules) > MAX_RULES:
         raise SourceRuleError("line 1, field rules: too many rules")
     if not raw_rules:
-        return FilterCompilation((), tuple(sorted(referenced_profile_ids, key=int)), {}, ())
+        return FilterCompilation(
+            (), tuple(sorted(referenced_profile_ids, key=int)), {}, (), timezone_name, {}
+        )
 
     account_names, account_ids, ambiguous_account_names = _account_index(accounts)
     resolved_rules = []
@@ -519,9 +540,20 @@ def compile_filter_config(
             raw_rule,
             line=line,
             field=f"rules[{index - 1}]",
-            allowed={"channels", "include", "exclude", "priority"},
+            allowed={"channels", "include", "exclude", "priority", "schedule"},
             required={"channels"},
         )
+        try:
+            rule_schedule = (
+                normalize_schedule(
+                    rule["schedule"],
+                    line=line,
+                    field=f"rules[{index - 1}].schedule",
+                )
+                if "schedule" in rule else global_schedule
+            )
+        except ScheduleError as exc:
+            raise SourceRuleError(f"rule {index}: {exc}") from None
         selector = _rule_call(index, _mapping,
             rule["channels"],
             line=line,
@@ -546,7 +578,7 @@ def compile_filter_config(
                 account_ids=account_ids,
                 ambiguous_account_names=ambiguous_account_names,
             )
-            all_rule = (index, selected, policy)
+            all_rule = (index, selected, policy, rule_schedule)
             continue
         overlap = occupied & selected
         if overlap:
@@ -559,22 +591,24 @@ def compile_filter_config(
             account_ids=account_ids,
             ambiguous_account_names=ambiguous_account_names,
         )
-        resolved_rules.append((index, selected, policy))
+        resolved_rules.append((index, selected, policy, rule_schedule))
 
     selected_ids = set(all_rule[1]) if all_rule is not None else set()
-    effective: dict[str, tuple[int, SourcePolicy | None]] = {}
+    effective: dict[str, tuple[int, SourcePolicy | None, RecordingSchedule]] = {}
     if all_rule is not None:
         for channel_uuid in all_rule[1]:
-            effective[channel_uuid] = (all_rule[0], all_rule[2])
-    for index, channel_ids, policy in resolved_rules:
+            effective[channel_uuid] = (all_rule[0], all_rule[2], all_rule[3])
+    for index, channel_ids, policy, rule_schedule in resolved_rules:
         selected_ids.update(channel_ids)
         for channel_uuid in channel_ids:
-            effective[channel_uuid] = (index, policy)
+            effective[channel_uuid] = (index, policy, rule_schedule)
 
     source_policies: dict[str, SourcePolicy] = {}
+    channel_schedules: dict[str, RecordingSchedule] = {}
     preview_by_uuid: dict[str, dict[str, Any]] = {}
     for channel_uuid in sorted(selected_ids):
-        _rule_index, policy = effective[channel_uuid]
+        _rule_index, policy, channel_schedule = effective[channel_uuid]
+        channel_schedules[channel_uuid] = channel_schedule
         streams = streams_by_channel.get(channel_uuid, ())
         baseline = _ordered_assigned(streams, account_ids)
         ranked = rank_candidates(policy, streams) if policy is not None else baseline
@@ -599,6 +633,7 @@ def compile_filter_config(
             "channel_group": str(channel.get("group") or ""),
             "candidates": candidate_views,
             "source_override": channel_uuid in source_policies,
+            "recording_schedule": channel_schedule.to_snapshot(),
             "warning": (
                 "This override uses a dedicated worker and may need another provider or tuner slot."
                 if channel_uuid in source_policies else None
@@ -609,6 +644,8 @@ def compile_filter_config(
         profile_ids=tuple(sorted(referenced_profile_ids, key=int)),
         source_policies=source_policies,
         channels=tuple(preview_by_uuid[channel] for channel in sorted(preview_by_uuid)),
+        timezone=timezone_name,
+        channel_schedules=channel_schedules,
     )
 
 

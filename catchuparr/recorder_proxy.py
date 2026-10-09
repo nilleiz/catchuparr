@@ -62,6 +62,34 @@ def _active_configuration():
     return load_active_configuration()
 
 
+def _close_database_connections() -> None:
+    """Release a safe, existing default ORM connection before a long stream."""
+    try:
+        from django.db import connections
+    except ImportError:
+        return
+    try:
+        initialized = connections.all(initialized_only=True)
+    except Exception:
+        return
+    default = next(
+        (connection for connection in initialized if connection.alias == "default"),
+        None,
+    )
+    if (
+        default is None
+        or default.connection is None
+        or default.in_atomic_block
+    ):
+        return
+    try:
+        autocommit = default.get_autocommit()
+    except Exception:
+        return
+    if autocommit:
+        default.close()
+
+
 def _policy_for_channel(active: Mapping[str, Any], channel_uuid: str) -> SourcePolicy | None:
     encoded = active.get("source_policies", {}).get(str(channel_uuid))
     if encoded is None:
@@ -136,7 +164,13 @@ def ranked_source_candidates(
         return None
     from .configuration import source_catalog
 
-    catalog = source_catalog()
+    try:
+        catalog = source_catalog()
+    finally:
+        # The returned catalog is fully materialized. Do not retain a pooled
+        # Django connection in a task supervisor or a request thread that may
+        # now spend minutes consuming a transport stream.
+        _close_database_connections()
     current_accounts = {
         str(account["id"]) for account in catalog.accounts if account.get("id") is not None
     }
@@ -406,10 +440,15 @@ def stream_recorder_view(request, channel_uuid: str):
         logger.exception("Could not verify Dispatcharr Proxy profile")
         return HttpResponse("Recorder source proxy is unavailable", status=503)
 
-    response = open_managed_source(request, str(binding["worker_id"]), binding)
-    if 300 <= int(getattr(response, "status_code", 200)) < 400 or "Location" in response:
-        return HttpResponse("Recorder source proxy cannot redirect", status=502)
-    return response
+    try:
+        response = open_managed_source(request, str(binding["worker_id"]), binding)
+        if 300 <= int(getattr(response, "status_code", 200)) < 400 or "Location" in response:
+            return HttpResponse("Recorder source proxy cannot redirect", status=502)
+        return response
+    finally:
+        # The internal response is a long-lived stream. Release database
+        # connections after all setup ORM reads and before the TS body starts.
+        _close_database_connections()
 
 
 def stop_recorder_attempt(redis_client, attempt: RecorderProxyAttempt, lease) -> bool:

@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,8 @@ from typing import Any
 from .runtime import PLUGIN_KEY, parse_settings
 
 ACTIVE_CONFIG_NAME = ".catchuparr-active-settings.json"
-ACTIVE_CONFIG_VERSION = 2
+ACTIVE_CONFIG_VERSION = 3
+SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, ACTIVE_CONFIG_VERSION})
 RESET_REQUIRED_NAME = ".catchuparr-configuration-reset-required"
 
 
@@ -149,6 +151,12 @@ def compile_draft(
     if any(key in settings for key in ("channel_uuids", "source_rules")):
         raise ValueError("legacy channel selection was removed; validate and apply filter_config")
     parsed_settings = parse_settings(settings)
+    recording_enabled = settings.get("recording_enabled", True)
+    if type(recording_enabled) is not bool:
+        raise ValueError("recording_enabled must be boolean")
+    from .logging_utils import normalize_log_level
+
+    log_level = normalize_log_level(settings.get("log_level", "INFO"))
     catalog = catalog or source_catalog()
     from .source_rules import compile_filter_config
 
@@ -199,6 +207,15 @@ def compile_draft(
         "channel_uuids": list(compiled.channel_uuids),
         "channel_profile_ids": list(compiled.profile_ids),
         "source_policies": encoded,
+        "recording_schedule": {
+            "timezone": compiled.timezone,
+            "channels": {
+                channel_uuid: compiled.channel_schedules[channel_uuid].to_snapshot()
+                for channel_uuid in compiled.channel_uuids
+            },
+        },
+        "recording_enabled": recording_enabled,
+        "log_level": log_level,
     }, catalog, previews
 
 
@@ -217,22 +234,36 @@ def validate_configuration(settings: dict, catalog: SourceCatalog | None = None)
 
 
 def apply_configuration(
-    settings: dict,
+    settings: dict | None = None,
     catalog: SourceCatalog | None = None,
     active_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Compile fully before atomically replacing the active source config."""
-    active, _, previews = compile_draft(settings, catalog)
+    """Compile under the shared lock before atomically replacing the active config."""
     path = Path(active_path) if active_path is not None else active_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _config_lock(path, exclusive=True):
+        if settings is None:
+            with _current_settings_transaction() as current_settings:
+                return _apply_configuration_locked(current_settings, catalog, path)
+        return _apply_configuration_locked(settings, catalog, path)
+
+
+def _apply_configuration_locked(
+    settings: dict,
+    catalog: SourceCatalog | None,
+    path: Path,
+) -> dict[str, Any]:
+    active, _, previews = compile_draft(settings, catalog)
     document = {
         "version": ACTIVE_CONFIG_VERSION,
         "settings": active["settings"],
         "channel_uuids": active["channel_uuids"],
         "channel_profile_ids": active["channel_profile_ids"],
         "source_policies": active["source_policies"],
+        "recording_schedule": active["recording_schedule"],
     }
     _validate_active_document(document)
-    _atomic_json_replace(path, document)
+    _atomic_json_replace_locked(path, document)
     _remove_reset_required_marker(path)
     return {
         "applied": True,
@@ -244,6 +275,25 @@ def apply_configuration(
         ),
         "channels": previews,
     }
+
+
+@contextmanager
+def _current_settings_transaction():
+    """Yield the current persisted draft while its row remains locked."""
+    try:
+        from apps.plugins.models import PluginConfig
+        from django.db import transaction
+    except (ImportError, ModuleNotFoundError):
+        raise ValueError("Dispatcharr settings are unavailable for Apply") from None
+    with transaction.atomic():
+        row = (
+            PluginConfig.objects.select_for_update()
+            .filter(key=PLUGIN_KEY)
+            .first()
+        )
+        if row is None or not isinstance(row.settings, dict):
+            raise ValueError("Catchuparr settings are unavailable for Apply")
+        yield dict(row.settings)
 
 
 def active_settings_path() -> Path:
@@ -275,28 +325,33 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
 
 
 def load_active_configuration(active_path: Path | None = None) -> dict[str, Any] | None:
-    """Load a v2 applied snapshot, or None before the first valid Apply."""
+    """Load an applied v2/v3 snapshot, or None before the first valid Apply."""
     path = Path(active_path) if active_path is not None else active_settings_path()
     try:
         with _config_lock(path, exclusive=False):
             data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or set(data) != {
-            "version", "settings", "channel_uuids", "channel_profile_ids", "source_policies"
-        }:
-            raise ValueError("Active Catchuparr configuration is invalid")
-        if (
-            type(data.get("version")) is not int
-            or data.get("version") != ACTIVE_CONFIG_VERSION
-            or not isinstance(data.get("source_policies"), dict)
-            or not isinstance(data.get("settings"), dict)
-        ):
+        if not isinstance(data, dict):
             raise ValueError("Active Catchuparr configuration is invalid")
         _validate_active_document(data)
+        channel_ids = data["channel_uuids"]
+        if data["version"] == 2:
+            from .schedule import CONTINUOUS_SCHEDULE, DEFAULT_TIMEZONE
+
+            recording_schedule = {
+                "timezone": DEFAULT_TIMEZONE,
+                "channels": {
+                    channel: CONTINUOUS_SCHEDULE.to_snapshot() for channel in channel_ids
+                },
+            }
+        else:
+            recording_schedule = data["recording_schedule"]
         return {
             **data["settings"],
-            "channel_uuids": "\n".join(data["channel_uuids"]),
+            "channel_uuids": "\n".join(channel_ids),
             "channel_profile_ids": list(data["channel_profile_ids"]),
             "source_policies": data["source_policies"],
+            "recording_schedule": recording_schedule,
+            "version": data["version"],
         }
     except FileNotFoundError:
         return None
@@ -320,7 +375,10 @@ def reset_legacy_configuration(active_path: Path | None = None) -> bool:
             # Corrupt state is not classified as a known legacy snapshot.
             current = None
         current_version = current.get("version") if isinstance(current, dict) else None
-        applied_v2 = type(current_version) is int and current_version == ACTIVE_CONFIG_VERSION
+        applied_snapshot = (
+            type(current_version) is int
+            and current_version in SUPPORTED_ACTIVE_CONFIG_VERSIONS
+        )
         legacy_snapshot = type(current_version) is int and current_version == 1
 
         try:
@@ -342,13 +400,13 @@ def reset_legacy_configuration(active_path: Path | None = None) -> bool:
             settings = dict(row.settings or {}) if row is not None else None
             old_fields = {"channel_uuids", "source_rules"}
             legacy_draft = settings is not None and bool(old_fields.intersection(settings))
-            if applied_v2:
+            if applied_snapshot:
                 if legacy_draft:
                     for key in old_fields:
                         settings.pop(key, None)
                     row.settings = settings
                     row.save(update_fields=["settings"])
-                # A v2 snapshot is proof that a fresh Apply succeeded. Clear
+                # A supported applied snapshot is proof that a fresh Apply succeeded. Clear
                 # an apply-required marker left by a process crash between the
                 # atomic snapshot replace and marker removal.
                 _remove_reset_required_marker(path)
@@ -402,7 +460,19 @@ def _validate_active_document(data: dict[str, Any]) -> None:
     """Reject malformed persisted policy data before any recorder can use it."""
     from .runtime import parse_settings
 
+    version = data.get("version")
+    if type(version) is not int or version not in SUPPORTED_ACTIVE_CONFIG_VERSIONS:
+        raise ValueError("Active Catchuparr configuration version is invalid")
+    expected_fields = {
+        "version", "settings", "channel_uuids", "channel_profile_ids", "source_policies"
+    }
+    if version == 3:
+        expected_fields.add("recording_schedule")
+    if set(data) != expected_fields:
+        raise ValueError("Active Catchuparr configuration fields are invalid")
     settings = data["settings"]
+    if not isinstance(settings, dict) or not isinstance(data.get("source_policies"), dict):
+        raise ValueError("Active Catchuparr configuration is invalid")
     allowed_settings = {"archive_root", "retention_hours", "max_storage_gib", "playback_user_id"}
     if set(settings) - allowed_settings:
         raise ValueError("Active Catchuparr settings contain unknown fields")
@@ -458,6 +528,8 @@ def _validate_active_document(data: dict[str, Any]) -> None:
             raise ValueError("Active Catchuparr playback user ID is invalid")
     parse_settings(settings)
     channels = set(normalized_channels)
+    if version == 3:
+        _validate_recording_schedule(data.get("recording_schedule"), normalized_channels)
     policies = data["source_policies"]
     for raw_channel, policy in policies.items():
         try:
@@ -508,6 +580,25 @@ def _validate_active_document(data: dict[str, Any]) -> None:
             raise ValueError("Active Catchuparr source policy has no filter or ranking")
 
 
+def _validate_recording_schedule(value: Any, channel_uuids: list[str]) -> None:
+    from .schedule import ScheduleError, schedule_from_snapshot, validate_timezone
+
+    if not isinstance(value, dict) or set(value) != {"timezone", "channels"}:
+        raise ValueError("Active Catchuparr recording schedule is invalid")
+    try:
+        validate_timezone(value["timezone"])
+    except ScheduleError:
+        raise ValueError("Active Catchuparr recording timezone is invalid") from None
+    schedules = value["channels"]
+    if not isinstance(schedules, dict) or set(schedules) != set(channel_uuids):
+        raise ValueError("Active Catchuparr recording schedule channels are invalid")
+    for snapshot in schedules.values():
+        try:
+            schedule_from_snapshot(snapshot)
+        except ScheduleError:
+            raise ValueError("Active Catchuparr channel schedule is invalid") from None
+
+
 def _validate_account_id_list(values, field_name: str) -> list[str]:
     if not isinstance(values, list):
         raise ValueError(f"Active Catchuparr {field_name} are invalid")
@@ -531,24 +622,28 @@ def _validate_account_id(value, field_name: str) -> str:
 def _atomic_json_replace(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _config_lock(path, exclusive=True):
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        _atomic_json_replace_locked(path, value)
+
+
+def _atomic_json_replace_locked(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(value, output, sort_keys=True, separators=(",", ":"))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-                json.dump(value, output, sort_keys=True, separators=(",", ":"))
-                output.write("\n")
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(directory_fd)
         finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 class _config_lock:

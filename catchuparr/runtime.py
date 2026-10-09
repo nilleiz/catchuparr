@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .compatibility import (
@@ -14,7 +15,6 @@ from .compatibility import (
     is_supported_dispatcharr_version,
 )
 
-logger = logging.getLogger(__name__)
 PLUGIN_KEY = "catchuparr"
 RECONCILE_TASK = "catchuparr.reconcile"
 RECONCILE_SCHEDULE = "catchuparr-recorder-reconcile"
@@ -52,7 +52,7 @@ def parse_settings(settings: dict) -> Config:
     return Config(tuple(dict.fromkeys(values)), root, retention_hours, max_gib * 1024**3)
 
 
-def load_config() -> Config | None:
+def load_config(active_snapshot: dict | None = None) -> Config | None:
     from apps.plugins.models import PluginConfig
 
     from .configuration import load_active_configuration
@@ -60,7 +60,7 @@ def load_config() -> Config | None:
     plugin = PluginConfig.objects.filter(key=PLUGIN_KEY, enabled=True).first()
     if plugin is None:
         return None
-    active = load_active_configuration()
+    active = active_snapshot if active_snapshot is not None else load_active_configuration()
     if active is None:
         return None
     return parse_settings(active)
@@ -94,10 +94,61 @@ def validate_configuration(settings: dict) -> dict:
     return validate(settings)
 
 
-def apply_configuration(settings: dict) -> dict:
+def apply_configuration(settings: dict | None = None) -> dict:
     from .configuration import apply_configuration as apply
+    from .logging_utils import event
 
-    return apply(settings)
+    result = apply(settings)
+    event(
+        "configuration_applied",
+        channel_count=result["selected_channel_count"],
+        source_policy_count=result["source_policy_count"],
+    )
+    return result
+
+
+def apply_recorder_control() -> dict:
+    from .logging_utils import event
+    from .recorder_control import apply_recorder_control as apply
+
+    state = apply()
+    event("control_applied", paused=state.paused, control_generation=state.generation)
+    _enqueue_recorder_reconcile()
+    return {"paused": state.paused, "generation": state.generation}
+
+
+def pause_recorders() -> dict:
+    from .logging_utils import event
+    from .recorder_control import pause_recorders as pause
+
+    state = pause()
+    event("control_paused", paused=True, control_generation=state.generation)
+    _enqueue_recorder_reconcile()
+    return {"paused": state.paused, "generation": state.generation}
+
+
+def resume_recorders() -> dict:
+    from .logging_utils import event
+    from .recorder_control import resume_recorders as resume
+
+    state = resume()
+    event("control_resumed", paused=False, control_generation=state.generation)
+    _enqueue_recorder_reconcile()
+    return {"paused": state.paused, "generation": state.generation}
+
+
+def _enqueue_recorder_reconcile() -> None:
+    from .logging_utils import error
+
+    try:
+        require_supported_version()
+        from .tasks import reconcile_recorders
+
+        reconcile_recorders.apply_async(queue="dvr")
+    except Exception:
+        # The durable control or configuration change is already authoritative;
+        # the regular periodic task can retry this best-effort wake-up.
+        error("schedule_install_failed")
 
 
 def active_configuration(settings: dict) -> dict:
@@ -122,10 +173,18 @@ def require_supported_version() -> None:
 
 def bootstrap() -> None:
     """Register tasks/routes only for the inspected Dispatcharr version."""
+    from .logging_utils import apply_log_level, error, event
+
+    try:
+        from .configuration import load_draft_settings
+
+        apply_log_level(load_draft_settings().get("log_level", "INFO"))
+    except Exception:
+        apply_log_level("INFO")
     try:
         require_supported_version()
-    except RuntimeError as exc:
-        logger.error("Catchuparr runtime disabled: %s", exc)
+    except RuntimeError:
+        event("runtime_disabled", logging.ERROR, reason="version")
         return
     from .configuration import reset_legacy_configuration
 
@@ -139,21 +198,21 @@ def bootstrap() -> None:
 
             install_routes()
         except Exception:
-            logger.exception("Catchuparr route installation failed")
+            error("route_install_failed")
         try:
             from .xc_runtime import install_xc_integration
 
             result = install_xc_integration()
             if not result.installed:
-                logger.warning("Catchuparr XC hooks were not installed: %s", result.reason)
+                event("runtime_disabled", logging.WARNING, reason="xc_hooks")
         except Exception:
-            logger.exception("Catchuparr XC hook installation failed")
+            error("xc_install_failed")
     try:
         _ensure_schedule()
     except Exception:
         # Migrations may not have completed during first discovery. An admin
         # reconcile action can retry; never start uncoordinated recorders.
-        logger.exception("Catchuparr periodic reconciliation was not installed")
+        error("schedule_install_failed")
 
 
 def _ensure_schedule() -> None:
@@ -178,14 +237,16 @@ def _ensure_schedule() -> None:
 
 
 def shutdown() -> None:
+    from .logging_utils import error, event
+
     try:
         from .xc_runtime import uninstall_xc_integration
 
         result = uninstall_xc_integration()
         if not result.installed:
-            logger.warning("Catchuparr XC hooks were not removed: %s", result.reason)
+            event("runtime_disabled", logging.WARNING, reason="xc_uninstall")
     except Exception:
-        logger.exception("Failed to remove Catchuparr XC hooks")
+        error("xc_uninstall_failed")
     try:
         from django_celery_beat.models import PeriodicTask
 
@@ -193,13 +254,13 @@ def shutdown() -> None:
             name__in=(RECONCILE_SCHEDULE, SNAPSHOT_SCHEDULE)
         ).update(enabled=False)
     except Exception:
-        logger.exception("Failed to disable Catchuparr scheduler")
+        error("scheduler_disable_failed")
     try:
         from .views import uninstall_routes
 
         uninstall_routes()
     except Exception:
-        logger.exception("Failed to remove Catchuparr routes")
+        error("route_uninstall_failed")
 
 
 def reconcile() -> None:
@@ -213,6 +274,8 @@ def reconcile() -> None:
 
 def status(settings: dict) -> dict:
     from .engine.store import ArchiveStore
+    from .recorder_control import RecorderControlError, load_recorder_control
+    from .schedule import ScheduleError, schedule_from_snapshot, schedule_is_active
 
     config = parse_settings(settings)
     store = ArchiveStore(config.archive_root)
@@ -234,6 +297,14 @@ def status(settings: dict) -> dict:
         redis.ping()
     except Exception:
         redis = None
+    control_state = None
+    try:
+        control_state = load_recorder_control()
+    except RecorderControlError:
+        pass
+    schedule_config = settings.get("recording_schedule", {})
+    timezone_name = schedule_config.get("timezone") if isinstance(schedule_config, dict) else None
+    schedules = schedule_config.get("channels") if isinstance(schedule_config, dict) else None
     channels = []
     for channel in config.channel_uuids:
         stats = store.channel_stats(channel)
@@ -244,12 +315,21 @@ def status(settings: dict) -> dict:
                 recorder_running = bool(redis.exists(f"catchuparr:recorder:{channel}"))
             except Exception:
                 recorder_running = None
-        channels.append({
+        channel_status = {
             "uuid": channel,
             "name": names.get(channel),
             **stats,
             "recorder_running": recorder_running,
-        })
+        }
+        if isinstance(schedules, dict) and isinstance(timezone_name, str):
+            try:
+                schedule = schedule_from_snapshot(schedules[channel])
+                channel_status["recording_scheduled"] = schedule_is_active(
+                    schedule, timezone_name, datetime.now(timezone.utc)
+                )
+            except (KeyError, ScheduleError, ValueError):
+                channel_status["recording_scheduled"] = None
+        channels.append(channel_status)
     from .configuration import configuration_reset_required
 
     result = {
@@ -258,7 +338,11 @@ def status(settings: dict) -> dict:
         "retention_hours": config.retention_hours,
         "max_storage_bytes": config.max_storage_bytes,
         "indexed_storage_bytes": store.indexed_size_bytes(),
+        "recording_control_available": control_state is not None,
     }
+    if control_state is not None:
+        result["recording_enabled"] = control_state.recording_enabled
+        result["control_generation"] = control_state.generation
     if configuration_reset_required():
         result["configuration_status"] = (
             "Previous channel selection was cleared. Validate and apply filter_config to resume recording."

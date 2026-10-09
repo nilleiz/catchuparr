@@ -94,10 +94,10 @@ Enable sanitized diagnostics only for a test and disable them afterward.
 Review collected output before sharing; never publish raw URLs, session tokens,
 personal EPG data or real-world request timestamps.
 
-## 0.2.1 YAML filter engine (in progress)
+## 0.2.1 YAML filter engine (included in the 0.3.0 candidate)
 
-The unified YAML engine replaces the unreleased 0.2.0 configuration interface.
-The implementation passed 232 local unit tests, Ruff, compileall and package
+The unified YAML engine replaced the unreleased 0.2.0 configuration interface.
+Its implementation passed 232 local unit tests, Ruff, compileall and package
 build. Independent review covered the YAML schema, enabled Channel Profile
 memberships, source-policy enforcement, snapshot validation, automatic legacy
 filter reset and isolated task tests.
@@ -110,9 +110,8 @@ capacity and runtime failover, indexed media gaps and connection cleanup.
 Native profile creation automatically supplies memberships; fixtures disable
 these before enabling their intended synthetic members.
 
-Required CI, Dev configuration/source-selection acceptance and real-player
-regression remain open gates. No 0.2.1 player acceptance or release is claimed.
-Earlier results below describe the previous candidate.
+The engine is included in 0.3.0 below. The earlier 0.2.1 package was never
+released and has no separate player-acceptance claim.
 
 ## Historical 0.2.0 candidate evidence (unreleased)
 
@@ -169,3 +168,21 @@ dedicated worker subject to native provider capacity. This dedicated-connection
 behavior is the approved 0.2.0 candidate scope; safe reuse of native live
 workers remains deferred. See the
 [roadmap](roadmap.md) for the remaining acceptance requirements.
+
+## 0.3.0 schedule and recorder-control candidate (unreleased)
+
+The 0.3.0 manifest and package candidate add weekly recording windows, a durable
+global recording pause/resume control, configuration-generation fencing and
+scoped `[Catchuparr]` logs. The full synthetic native integration probe passed
+on pinned Dispatcharr 0.31.0 and 0.32.0. Both runs covered schedule validation
+and application, pause/resume while recording, natural schedule closure, stale
+queued-job rejection, restricted-source recording and failover, preservation
+of a concurrent native live stream, useful-media/gap checks, reservation
+release and native worker teardown. Synthetic sources and media were used.
+
+The local suite passed 299 tests after the playback-grace test was changed to a
+shared fake clock. Ruff, compileall and package-build checks passed. Required CI
+and real-player acceptance remain open; these server-side tests do not establish
+EPG or player behavior. The candidate is not published. See the
+[0.3.0 candidate guide](candidate-0.3.0.md) for configuration and upgrade
+behavior.
