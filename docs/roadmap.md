@@ -17,7 +17,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | --- | --- | --- | --- |
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
-| 0.3.1 | Short forms for weekly schedule day groups | Low | Planned |
+| 0.3.1 | Weekly schedule day groups and timezone defaults | Low | Planned |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
@@ -105,10 +105,11 @@ versions passed for the current candidate. Independent review, CI and Dev/player
 acceptance remain pending before release. Real-player regression must verify
 start, stop, restart and archived playback outside the active window.
 
-## 0.3.1 — schedule day-group shorthand
+## 0.3.1 — schedule shorthand and timezone defaults
 
 This is a planned follow-up to 0.3.0. It does not change the 0.3.0 schedule
-contract or continuous-recording default.
+contract or continuous-recording default; the timezone-default change applies
+to 0.3.1 only.
 
 ### Proposed behavior
 
@@ -124,13 +125,23 @@ contract or continuous-recording default.
 - In an explicit weekly schedule, a day with no entry after expansion remains
   off. A missing schedule keeps the existing 0.3.0 continuous behavior.
 - Keep existing explicit weekday schedules valid without changes.
+- For 0.3.1, resolve the schedule timezone in this order: explicit YAML timezone,
+  valid container `TZ`, then the detectable system timezone. A valid YAML value
+  takes precedence; an invalid explicit YAML value fails with a clear
+  validation error. If YAML is omitted and a supplied `TZ` is invalid, fail
+  clearly; if no `TZ` is supplied, require a detectable valid system timezone.
+  Do not assume the host timezone or fall back to a fixed `Europe/Berlin` value.
+- Plan the Dev Compose interface to pass through an optional `TZ` setting and
+  remove any hardcoded `Europe/Berlin` default. This is a roadmap item only;
+  existing Dev environment configuration is unchanged here.
 
 ### Acceptance
 
 Add tests for `daily` combined with `weekdays` and `weekend`, explicit-day
 replacement of group windows, unaffected days in the same group, days with no
-matching entry, window overlap normalization, and DST gaps and repeated local
-times under the configured timezone.
+matching entry, window overlap normalization, environment timezone selection,
+system timezone detection, explicit YAML precedence, invalid/undetectable
+timezone errors, and DST gaps and repeated local times under the resolved zone.
 
 ## 0.4.0 — recorder visibility
 
