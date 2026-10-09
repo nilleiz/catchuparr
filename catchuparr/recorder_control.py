@@ -11,7 +11,7 @@ from typing import Any
 
 CONTROL_STATE_NAME = ".catchuparr-recorder-control.json"
 CONTROL_DENY_NAME = ".catchuparr-recorder-control-deny"
-CONTROL_STATE_VERSION = 1
+CONTROL_STATE_VERSION = 2
 
 
 class RecorderControlError(ValueError):
@@ -22,14 +22,22 @@ class RecorderControlError(ValueError):
 class RecorderControlState:
     paused: bool
     generation: int
+    configuration_generation: str | None = None
 
     @property
     def recording_enabled(self) -> bool:
         return not self.paused
 
     def to_json(self) -> dict[str, Any]:
+        if self.configuration_generation is not None:
+            return {
+                "version": CONTROL_STATE_VERSION,
+                "paused": self.paused,
+                "generation": self.generation,
+                "configuration_generation": self.configuration_generation,
+            }
         return {
-            "version": CONTROL_STATE_VERSION,
+            "version": 1,
             "paused": self.paused,
             "generation": self.generation,
         }
@@ -144,18 +152,63 @@ def _load_or_initialize_locked(
     return _parse_state(raw)
 
 
-def _parse_state(raw: Any) -> RecorderControlState:
+def _configuration_control_state_locked(
+    sidecar: Path,
+    *,
+    recording_enabled: bool,
+    configuration_generation: str,
+) -> RecorderControlState:
+    """Write the control half of a unified Apply while its deny marker is held."""
+    if type(recording_enabled) is not bool:
+        raise RecorderControlError("recording_enabled must be boolean")
     if (
-        not isinstance(raw, dict)
-        or set(raw) != {"version", "paused", "generation"}
-        or type(raw.get("version")) is not int
-        or raw.get("version") != CONTROL_STATE_VERSION
+        not isinstance(configuration_generation, str)
+        or len(configuration_generation) != 64
+        or any(character not in "0123456789abcdef" for character in configuration_generation)
+    ):
+        raise RecorderControlError("applied configuration generation is invalid")
+    current = _load_or_initialize_locked(sidecar, allow_pending=True)
+    paused = not recording_enabled
+    changed = (
+        current.paused != paused
+        or current.configuration_generation != configuration_generation
+    )
+    updated = RecorderControlState(
+        paused=paused,
+        generation=current.generation + (1 if changed else 0),
+        configuration_generation=configuration_generation,
+    )
+    try:
+        _atomic_replace_sidecar(sidecar, updated)
+    except OSError:
+        raise RecorderControlError("configuration control state could not be saved") from None
+    return updated
+
+
+def _parse_state(raw: Any) -> RecorderControlState:
+    if not isinstance(raw, dict):
+        raise RecorderControlError("recorder control state is invalid")
+    version = raw.get("version")
+    expected = {"version", "paused", "generation"}
+    if version == 2:
+        expected.add("configuration_generation")
+    if (
+        type(version) is not int
+        or version not in {1, CONTROL_STATE_VERSION}
+        or set(raw) != expected
         or type(raw.get("paused")) is not bool
         or type(raw.get("generation")) is not int
-        or raw.get("generation") < 0
+        or raw["generation"] < 0
     ):
         raise RecorderControlError("recorder control state is invalid")
-    return RecorderControlState(raw["paused"], raw["generation"])
+    config_generation = raw.get("configuration_generation")
+    if version == 2 and (
+        not isinstance(config_generation, str)
+        or len(config_generation) != 64
+        or any(character not in "0123456789abcdef" for character in config_generation)
+    ):
+        raise RecorderControlError("recorder control state is invalid")
+    return RecorderControlState(raw["paused"], raw["generation"], config_generation)
 
 
 def _transition_locked(
@@ -182,6 +235,7 @@ def _transition_locked(
     updated = RecorderControlState(
         paused=paused,
         generation=current.generation + (1 if advance_generation else 0),
+        configuration_generation=current.configuration_generation,
     )
     try:
         _atomic_replace_sidecar(sidecar, updated)
@@ -209,7 +263,11 @@ def _force_paused_locked(
     if current.paused and not marker_pending:
         return current
     generation = current.generation + (0 if current.paused else 1)
-    paused = RecorderControlState(paused=True, generation=generation)
+    paused = RecorderControlState(
+        paused=True,
+        generation=generation,
+        configuration_generation=current.configuration_generation,
+    )
     try:
         _write_deny_marker(sidecar)
         _atomic_replace_sidecar(sidecar, paused)

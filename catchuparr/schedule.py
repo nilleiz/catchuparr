@@ -90,8 +90,9 @@ def resolve_timezone(
         return validate_timezone(explicit_timezone)
 
     env = os.environ if environ is None else environ
-    if "TZ" in env:
-        return validate_timezone(env.get("TZ"), field="TZ")
+    environment_timezone = env.get("TZ")
+    if environment_timezone:
+        return validate_timezone(environment_timezone, field="TZ")
 
     system_timezone_file = timezone_file or Path("/etc/timezone")
     try:

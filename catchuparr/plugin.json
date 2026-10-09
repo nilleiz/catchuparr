@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local rolling catch-up archive and start-over for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -10,7 +10,7 @@
       "label": "Channel and source filter (YAML)",
       "type": "text",
       "default": "",
-      "help_text": "Use version: 1, optional profile (defaults to all), and rules with channels selected by numbers, names, groups, or a Dispatcharr channel profile. Include/exclude filters apply only to assigned M3U sources. Optional timezone defaults to Europe/Berlin; schedule is continuous or a weekday map of start/end HH:MM windows. A rule schedule replaces the global schedule; schedule: {} means off. End times are exclusive and overnight windows belong to their start day. Validate before Apply; blank YAML selects no channels. Filtered sources may need another provider slot."
+      "help_text": "Use version: 1 and rules with channels selected by numbers, names, groups, or an enabled Dispatcharr channel profile. Include/exclude filters apply only to assigned M3U sources. Schedule keys support daily, weekdays, weekend, and explicit weekdays; explicit days override groups, which override daily. Timezone is the YAML timezone, otherwise valid container TZ, otherwise detected container system zone. One Apply validates and activates every setting; blank YAML selects no channels. Filtered sources may need another provider slot."
     },
     {
       "id": "archive_root",
@@ -39,11 +39,18 @@
       "help_text": "Set the Dispatcharr user ID before creating an access token."
     },
     {
+      "id": "public_base_url",
+      "label": "Public base URL for token links",
+      "type": "string",
+      "default": "",
+      "help_text": "Optional absolute http(s) URL reachable by playback clients. It may include a path prefix, but no credentials, query, or fragment. Apply this with the rest of the settings before creating a token; token creation requires it."
+    },
+    {
       "id": "recording_enabled",
       "label": "Recording enabled",
       "type": "boolean",
       "default": true,
-      "help_text": "Saving this setting does not change recording until Apply recorder control. Pause and Resume actions update it immediately."
+      "help_text": "Apply configuration validates and activates this setting with the rest of the configuration. Pause and Resume remain immediate recording controls."
     },
     {
       "id": "log_level",
@@ -66,7 +73,7 @@
     },
     {
       "id": "create_access_token",
-      "label": "Create M3U access token",
+      "label": "Create M3U/XMLTV access token",
       "button_label": "Create token"
     },
     {
@@ -78,11 +85,6 @@
       "id": "apply_configuration",
       "label": "Apply configuration",
       "button_label": "Apply configuration"
-    },
-    {
-      "id": "apply_recorder_control",
-      "label": "Apply recorder control",
-      "button_label": "Apply recording setting"
     },
     {
       "id": "pause_recorders",

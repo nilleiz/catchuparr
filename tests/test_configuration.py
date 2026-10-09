@@ -4,7 +4,7 @@ import tempfile
 import threading
 import types
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +16,7 @@ from catchuparr.configuration import (
     apply_configuration,
     configuration_reset_required,
     load_active_configuration,
+    load_applied_state,
     load_draft_settings,
     reset_legacy_configuration,
     source_catalog,
@@ -88,9 +89,9 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("Synthetic Provider", serialized)
         self.assertNotIn("Synthetic Channel", serialized)
         self.assertNotIn("filter_config", serialized)
-        self.assertNotIn("url", serialized.lower())
+        self.assertNotIn("https://provider.invalid", serialized)
 
-    def test_v3_snapshot_contains_stable_per_channel_schedule(self):
+    def test_v4_snapshot_contains_settings_and_stable_per_channel_schedule(self):
         settings = dict(
             self.settings,
             filter_config=(
@@ -102,7 +103,9 @@ class ConfigurationTests(unittest.TestCase):
         apply_configuration(settings, self.catalog, self.active_path)
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
         active = load_active_configuration(self.active_path)
-        self.assertEqual(3, snapshot["version"])
+        self.assertEqual(4, snapshot["version"])
+        self.assertEqual(True, snapshot["settings"]["recording_enabled"])
+        self.assertEqual("INFO", snapshot["settings"]["log_level"])
         self.assertEqual(
             {
                 "timezone": "UTC",
@@ -114,12 +117,257 @@ class ConfigurationTests(unittest.TestCase):
             snapshot["recording_schedule"],
         )
         self.assertEqual(snapshot["recording_schedule"], active["recording_schedule"])
+        sidecar = json.loads(
+            (self.active_path.parent / ".catchuparr-recorder-control.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(2, sidecar["version"])
+        self.assertFalse(sidecar["paused"])
+        applied, control = load_applied_state(self.active_path)
+        self.assertEqual(active["recording_enabled"], applied["recording_enabled"])
+        self.assertEqual(snapshot["settings"]["recording_enabled"], applied["recording_enabled"])
+        self.assertEqual(
+            configuration.active_configuration_generation(applied),
+            control.configuration_generation,
+        )
+
+    def test_v4_control_snapshot_mismatch_fails_closed(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        sidecar_path = self.active_path.parent / ".catchuparr-recorder-control.json"
+        sidecar_path.write_text(
+            json.dumps({"version": 1, "paused": False, "generation": 0}),
+            encoding="utf-8",
+        )
+
+        from catchuparr.recorder_control import RecorderControlError
+
+        with self.assertRaisesRegex(RecorderControlError, "do not match"):
+            load_applied_state(self.active_path)
+
+    def test_apply_activates_recording_and_log_settings_together(self):
+        settings = dict(self.settings, recording_enabled=False, log_level="WARNING")
+        apply_configuration(settings, self.catalog, self.active_path)
+
+        snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+        active, control = load_applied_state(self.active_path)
+        self.assertFalse(snapshot["settings"]["recording_enabled"])
+        self.assertEqual("WARNING", snapshot["settings"]["log_level"])
+        self.assertTrue(control.paused)
+        self.assertFalse(active["recording_enabled"])
+
+    def test_public_base_url_is_normalized_and_applied_with_other_settings(self):
+        settings = dict(
+            self.settings,
+            public_base_url="https://media.example.test/dispatcharr/",
+        )
+        apply_configuration(settings, self.catalog, self.active_path)
+
+        active = load_active_configuration(self.active_path)
+        self.assertEqual(
+            "https://media.example.test/dispatcharr",
+            active["public_base_url"],
+        )
+
+    def test_invalid_public_base_urls_fail_validation_without_activation(self):
+        for base_url in (
+            "ftp://media.example.test",
+            "https://user:pass@media.example.test",
+            "https://media.example.test/?token=x",
+            "https://media.example.test/#fragment",
+            "https://media.example.test:bad",
+            "https://media.example.test/a/../b",
+            "https://media.example.test/%2e%2e/b",
+        ):
+            with self.subTest(base_url=base_url):
+                with self.assertRaisesRegex(ValueError, "public_base_url"):
+                    validate_configuration(
+                        dict(self.settings, public_base_url=base_url),
+                        self.catalog,
+                    )
+                self.assertFalse(self.active_path.exists())
+
+    def test_v4_required_settings_are_strict(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        valid_document = json.loads(self.active_path.read_text(encoding="utf-8"))
+        for key, value in (
+            ("recording_enabled", None),
+            ("recording_enabled", "false"),
+            ("log_level", "info"),
+            ("log_level", "TRACE"),
+            ("public_base_url", None),
+            ("public_base_url", "https://user:pass@media.example.test"),
+        ):
+            with self.subTest(key=key, value=value):
+                document = json.loads(json.dumps(valid_document))
+                if value is None:
+                    document["settings"].pop(key)
+                else:
+                    document["settings"][key] = value
+                self.active_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, key):
+                    load_active_configuration(self.active_path)
+
+    def test_archive_root_apply_preserves_old_archive_without_copying_or_deleting(self):
+        old_root = Path(self.settings["archive_root"])
+        first = apply_configuration(self.settings, self.catalog, self.active_path)
+        sentinel = old_root / "archive.sqlite3"
+        sentinel.write_bytes(b"synthetic archive and token database")
+        next_root = self.root / "next-archive"
+        result = apply_configuration(
+            dict(self.settings, archive_root=str(next_root)),
+            self.catalog,
+            self.active_path,
+        )
+
+        self.assertFalse(first["archive_root_changed"])
+        self.assertTrue(result["archive_root_changed"])
+        self.assertIn("not moved or deleted", result["archive_notice"])
+        self.assertEqual(b"synthetic archive and token database", sentinel.read_bytes())
+        self.assertTrue(next_root.is_dir())
+        self.assertEqual([], list(next_root.iterdir()))
+
+    def test_control_write_failure_restores_active_and_control_pair(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        previous_active = self.active_path.read_bytes()
+        sidecar_path = self.active_path.parent / ".catchuparr-recorder-control.json"
+        previous_control = sidecar_path.read_bytes()
+        updated = dict(self.settings, retention_hours=48)
+
+        from catchuparr import recorder_control
+        from catchuparr.recorder_control import RecorderControlError
+
+        with patch.object(
+            recorder_control,
+            "_atomic_replace_sidecar",
+            side_effect=OSError("synthetic sidecar write failure"),
+        ), self.assertRaisesRegex(RecorderControlError, "previous configuration was restored"):
+            apply_configuration(updated, self.catalog, self.active_path)
+
+        self.assertEqual(previous_active, self.active_path.read_bytes())
+        self.assertEqual(previous_control, sidecar_path.read_bytes())
+        self.assertFalse(
+            (self.active_path.parent / ".catchuparr-recorder-control-deny").exists()
+        )
+        active, control = load_applied_state(self.active_path)
+        self.assertEqual(24, active["retention_hours"])
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
+        )
+
+    def test_database_commit_failure_restores_both_applied_files(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        previous_active = self.active_path.read_bytes()
+        sidecar_path = self.active_path.parent / ".catchuparr-recorder-control.json"
+        previous_control = sidecar_path.read_bytes()
+        row = types.SimpleNamespace(settings=dict(self.settings, retention_hours=48))
+        modules = self._django_config_modules(row)
+
+        @contextmanager
+        def fail_commit():
+            yield
+            raise RuntimeError("synthetic DB commit failure")
+
+        modules["django.db"].transaction = types.SimpleNamespace(atomic=fail_commit)
+        with patch.dict(sys.modules, modules), self.assertRaisesRegex(
+            RuntimeError, "DB commit failure"
+        ):
+            apply_configuration(None, self.catalog, self.active_path)
+
+        self.assertEqual(previous_active, self.active_path.read_bytes())
+        self.assertEqual(previous_control, sidecar_path.read_bytes())
+        self.assertFalse(
+            (self.active_path.parent / ".catchuparr-recorder-control-deny").exists()
+        )
+        active, control = load_applied_state(self.active_path)
+        self.assertEqual(24, active["retention_hours"])
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
+        )
+
+    def test_applied_state_reader_waits_for_both_files_during_apply(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        updated = dict(self.settings, retention_hours=48)
+        from catchuparr import recorder_control
+
+        entered_control_write = threading.Event()
+        allow_control_write = threading.Event()
+        reader_done = threading.Event()
+        observed = []
+        failures = []
+        real_control_write = recorder_control._configuration_control_state_locked
+
+        def pause_between_file_writes(*args, **kwargs):
+            entered_control_write.set()
+            if not allow_control_write.wait(2):
+                raise RuntimeError("synthetic Apply synchronization timed out")
+            return real_control_write(*args, **kwargs)
+
+        def writer():
+            try:
+                apply_configuration(updated, self.catalog, self.active_path)
+            except Exception as exc:
+                failures.append(exc)
+
+        def reader():
+            try:
+                observed.append(load_applied_state(self.active_path))
+            except Exception as exc:
+                failures.append(exc)
+            finally:
+                reader_done.set()
+
+        with patch.object(
+            recorder_control,
+            "_configuration_control_state_locked",
+            side_effect=pause_between_file_writes,
+        ):
+            writer_thread = threading.Thread(target=writer)
+            writer_thread.start()
+            self.assertTrue(entered_control_write.wait(2))
+            reader_thread = threading.Thread(target=reader)
+            reader_thread.start()
+            self.assertFalse(reader_done.wait(0.05))
+            allow_control_write.set()
+            writer_thread.join(2)
+            reader_thread.join(2)
+
+        self.assertFalse(writer_thread.is_alive())
+        self.assertFalse(reader_thread.is_alive())
+        self.assertEqual([], failures)
+        self.assertEqual(1, len(observed))
+        active, control = observed[0]
+        self.assertEqual(48, active["retention_hours"])
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
+        )
+
+    def test_v3_snapshot_remains_readable_without_v4_settings(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+        snapshot["version"] = 3
+        snapshot["settings"].pop("recording_enabled")
+        snapshot["settings"].pop("log_level")
+        snapshot["settings"].pop("public_base_url")
+        self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+        active = load_active_configuration(self.active_path)
+
+        self.assertEqual(3, active["version"])
+        self.assertNotIn("recording_enabled", active)
+        self.assertNotIn("log_level", active)
 
     def test_v2_snapshot_loads_as_continuous_without_rewriting_or_resetting(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
         snapshot["version"] = 2
         snapshot.pop("recording_schedule")
+        snapshot["settings"].pop("recording_enabled")
+        snapshot["settings"].pop("log_level")
+        snapshot["settings"].pop("public_base_url")
         self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
         original = self.active_path.read_bytes()
         row = types.SimpleNamespace(settings={"filter_config": self.settings["filter_config"]})
@@ -168,7 +416,7 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
                 validate_configuration(dict(self.settings, **{key: value}), self.catalog)
 
-    def test_malformed_v3_schedule_fails_closed(self):
+    def test_malformed_v4_schedule_fails_closed(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         document = json.loads(self.active_path.read_text(encoding="utf-8"))
         document["recording_schedule"]["channels"].pop(CHANNEL_A)
@@ -574,20 +822,17 @@ class ConfigurationTests(unittest.TestCase):
             settings = load_draft_settings({"filter_config": "unsaved"})
         self.assertEqual("saved YAML", settings["filter_config"])
 
-    def test_runtime_draft_fallback_never_selects_old_channel_ids(self):
-        with patch("catchuparr.configuration.load_active_configuration", return_value=None), patch(
+    def test_runtime_without_apply_uses_safe_defaults_not_draft_settings(self):
+        with patch("catchuparr.configuration.load_applied_state", return_value=(None, types.SimpleNamespace(paused=False, generation=0))), patch(
             "catchuparr.configuration.reset_legacy_configuration", return_value=False
         ), patch(
             "catchuparr.configuration.load_draft_settings",
-            return_value={
-                "channel_uuids": CHANNEL_A,
-                "source_rules": "old",
-                "archive_root": str(self.root / "archive"),
-            },
+            side_effect=AssertionError("runtime must not read the unsaved draft"),
         ):
             settings = load_runtime_settings()
         self.assertEqual("", settings["channel_uuids"])
         self.assertNotIn("source_rules", settings)
+        self.assertFalse(settings["recording_enabled"])
 
 
 if __name__ == "__main__":

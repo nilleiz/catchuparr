@@ -13,7 +13,6 @@ from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
 
 from .schedule import (
-    DEFAULT_TIMEZONE,
     RecordingSchedule,
     ScheduleError,
     normalize_schedule,
@@ -47,7 +46,7 @@ class FilterCompilation:
     profile_ids: tuple[str, ...]
     source_policies: dict[str, SourcePolicy]
     channels: tuple[dict[str, Any], ...]
-    timezone: str = DEFAULT_TIMEZONE
+    timezone: str
     channel_schedules: dict[str, RecordingSchedule] = field(default_factory=dict)
 
 

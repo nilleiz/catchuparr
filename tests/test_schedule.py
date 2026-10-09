@@ -208,6 +208,14 @@ class ScheduleTests(unittest.TestCase):
                     localtime_path=root / "missing-localtime",
                 ),
             )
+            self.assertEqual(
+                "Asia/Tokyo",
+                resolve_timezone(
+                    environ={"TZ": ""},
+                    timezone_file=timezone_file,
+                    localtime_path=root / "missing-localtime",
+                ),
+            )
 
     def test_system_timezone_can_be_detected_from_localtime_symlink(self):
         zone_root = Path(TZPATH[0])

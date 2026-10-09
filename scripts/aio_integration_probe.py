@@ -10,6 +10,7 @@ import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, quote, urlsplit
 
 from django.core.cache import cache
 from django.test import RequestFactory
@@ -156,8 +157,8 @@ def probe_source_configuration(channel, root):
     active_path = root / "synthetic-active-settings.json"
     apply_configuration(settings, active_path=active_path)
     active = load_active_configuration(active_path)
-    require(active is not None and active.get("version") == 3,
-            "Apply must persist a v3 active snapshot")
+    require(active is not None and active.get("version") == 4,
+            "Apply must persist a v4 active snapshot")
     require(active["recording_schedule"] == {
         "timezone": "UTC",
         "channels": {
@@ -290,7 +291,6 @@ def probe():
     from catchuparr import runtime, views
     from catchuparr.compatibility import is_supported_dispatcharr_version
     from catchuparr.engine.store import ArchiveStore
-    from catchuparr.security import AccessTokenStore
 
     native_server = require_native_stream_runtime()
 
@@ -365,6 +365,8 @@ def probe():
             "max_storage_gib": 1,
             "recording_enabled": True,
             "log_level": "INFO",
+            "playback_user_id": user.id,
+            "public_base_url": "https://media.example.test/dispatcharr",
         },
     )
     runtime.bootstrap()
@@ -372,7 +374,16 @@ def probe():
     initial_settings = PluginConfig.objects.get(key="catchuparr").settings
     require(runtime.validate_configuration(initial_settings)["valid"],
             "Synthetic YAML profile config did not validate")
-    runtime.apply_configuration(initial_settings)
+    runtime.apply_configuration()
+    from catchuparr.configuration import load_active_configuration
+
+    active = load_active_configuration()
+    require(active is not None and active.get("version") == 4,
+            "One Apply must persist a v4 active snapshot")
+    require(
+        active.get("recording_enabled") is True and active.get("log_level") == "INFO",
+        "One Apply must activate the global recorder and logging settings",
+    )
     from django.urls import resolve
 
     require(resolve("/catchuparr/m3u").url_name == "catchuparr-m3u")
@@ -422,7 +433,24 @@ def probe():
         store.add_segment(str(closed_channel.uuid), source,
                           closed_start + timedelta(seconds=offset),
                           closed_start + timedelta(seconds=offset + 10))
-    token = AccessTokenStore(root).create(str(user.id))
+    token_result = runtime.create_access_token(active)
+    token = token_result["access_token"]
+    encoded_token = quote(token, safe="")
+    expected_playlist_url = (
+        "https://media.example.test/dispatcharr/catchuparr/m3u"
+        f"?access_token={encoded_token}"
+    )
+    expected_xmltv_url = (
+        "https://media.example.test/dispatcharr/catchuparr/xmltv"
+        f"?access_token={encoded_token}"
+    )
+    require(
+        token_result["playlist_url"] == expected_playlist_url
+        and token_result["xmltv_url"] == expected_xmltv_url
+        and token_result["message"]
+        == f"M3U playlist URL: {expected_playlist_url}\nXMLTV EPG URL: {expected_xmltv_url}",
+        "Token confirmation did not return both labeled links for the same token",
+    )
     factory = RequestFactory()
 
     def request(path, params=None, **headers):
@@ -447,14 +475,14 @@ def probe():
     require(views.m3u_view(request("/catchuparr/m3u")).status_code == 401)
     playlist = views.m3u_view(request("/catchuparr/m3u", {"access_token": token}))
     require(playlist.status_code == 200, f"Playlist status {playlist.status_code}")
+    xmltv = views.xmltv_view(request("/catchuparr/xmltv", {"access_token": token}))
+    require(xmltv.status_code == 200, f"XMLTV status {xmltv.status_code}")
     text = playlist.content.decode()
     require('catchup-timezone="UTC"' in text)
     require("duration={duration}" in text)
     require(str(channel.uuid) in text and str(private_channel.uuid) not in text)
     params = {"access_token": token, "channel_id": str(channel.uuid),
               "utc": str(start.timestamp()), "duration": "12"}
-    from urllib.parse import parse_qs, urlsplit
-
     expired = views.archive_view(request(
         "/catchuparr/archive",
         dict(params, utc=str((start - timedelta(hours=2)).timestamp())),
