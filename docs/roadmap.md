@@ -17,7 +17,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | --- | --- | --- | --- |
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
-| 0.3.1 | Weekly schedule day groups and timezone defaults | Low | Planned |
+| 0.3.1 | Weekly schedule day groups, timezone defaults and unified Apply | Low | Planned |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
@@ -134,6 +134,18 @@ to 0.3.1 only.
 - Plan the Dev Compose interface to pass through an optional `TZ` setting and
   remove any hardcoded `Europe/Berlin` default. This is a roadmap item only;
   existing Dev environment configuration is unchanged here.
+- Provide one unified configuration Apply for the complete settings draft:
+  filter YAML and schedules, timezone, global recording-enabled value, log
+  level, archive path, retention, storage limit and playback user. Do not add
+  separate settings Apply actions for individual fields or groups. Pause and
+  Resume may remain immediate operational actions, not a second settings Apply.
+- Validate the full draft before activation. A validation or persistence error
+  must not partially activate fields or a new configuration generation. During
+  implementation, inspect the native plugin Save/Apply callback semantics and
+  establish how PluginConfig fields, the active snapshot and recorder-control
+  sidecar are coordinated. Use staging/rollback under a common lock or fail
+  closed on mixed state; document cross-store atomicity only after it is
+  demonstrated.
 
 ### Acceptance
 
@@ -142,6 +154,11 @@ replacement of group windows, unaffected days in the same group, days with no
 matching entry, window overlap normalization, environment timezone selection,
 system timezone detection, explicit YAML precedence, invalid/undetectable
 timezone errors, and DST gaps and repeated local times under the resolved zone.
+Verify that one Apply validates and activates all settings together; invalid
+YAML and simulated multi-setting persistence failures leave the prior active
+configuration intact. Test pause/resume control-generation fencing against a
+concurrent Apply, shared configuration-generation checks, and rejection of
+stale queued recorder tasks.
 
 ## 0.4.0 — recorder visibility
 
