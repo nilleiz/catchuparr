@@ -152,6 +152,45 @@ def _merge_intervals(
     return tuple((start, end) for start, end in merged)
 
 
+def _normalize_windows(
+    windows: Any,
+    *,
+    line: int,
+    field: str,
+) -> tuple[tuple[int, int], ...]:
+    """Validate and normalize one supplied window list relative to a day."""
+    if not isinstance(windows, list):
+        raise ScheduleError(f"line {line}, field {field}: expected a list of windows")
+
+    normalized: list[tuple[int, int]] = []
+    for index, window in enumerate(windows):
+        window_field = f"{field}[{index}]"
+        if not isinstance(window, Mapping) or set(window) != {"start", "end"}:
+            raise ScheduleError(
+                f"line {line}, field {window_field}: expected only start and end"
+            )
+        start = _parse_clock(
+            window["start"],
+            allow_day_end=False,
+            line=line,
+            field=f"{window_field}.start",
+        )
+        end = _parse_clock(
+            window["end"],
+            allow_day_end=True,
+            line=line,
+            field=f"{window_field}.end",
+        )
+        if start == end:
+            raise ScheduleError(
+                f"line {line}, field {window_field}: start and end must differ"
+            )
+        if end < start:
+            end += MINUTES_PER_DAY
+        normalized.append((start, end))
+    return tuple(normalized)
+
+
 def normalize_schedule(
     value: Any,
     *,
@@ -174,51 +213,33 @@ def normalize_schedule(
         if not isinstance(day, str) or day not in allowed_keys:
             raise ScheduleError(f"line {line}, field {field}: unknown weekday or day group")
 
-    expanded: dict[str, Any] = {}
+    validated = {
+        schedule_key: _normalize_windows(
+            windows,
+            line=line,
+            field=f"{field}.{schedule_key}",
+        )
+        for schedule_key, windows in value.items()
+    }
+
+    expanded: dict[str, str] = {}
     if "daily" in value:
         for day in _DAYS:
-            expanded[day] = value["daily"]
+            expanded[day] = "daily"
     for group, days in _DAY_GROUPS.items():
         if group in value:
             for day in days:
-                expanded[day] = value[group]
+                expanded[day] = group
     for day in _DAYS:
         if day in value:
-            expanded[day] = value[day]
+            expanded[day] = day
 
     intervals: list[tuple[int, int]] = []
-    for day, windows in expanded.items():
-        day_field = f"{field}.{day}"
-        if not isinstance(windows, list):
-            raise ScheduleError(f"line {line}, field {day_field}: expected a list of windows")
+    for day, schedule_key in expanded.items():
         day_offset = _DAYS[day] * MINUTES_PER_DAY
-        for index, window in enumerate(windows):
-            window_field = f"{day_field}[{index}]"
-            if not isinstance(window, Mapping) or set(window) != {"start", "end"}:
-                raise ScheduleError(
-                    f"line {line}, field {window_field}: expected only start and end"
-                )
-            start = _parse_clock(
-                window["start"],
-                allow_day_end=False,
-                line=line,
-                field=f"{window_field}.start",
-            )
-            end = _parse_clock(
-                window["end"],
-                allow_day_end=True,
-                line=line,
-                field=f"{window_field}.end",
-            )
-            if start == end:
-                raise ScheduleError(
-                    f"line {line}, field {window_field}: start and end must differ"
-                )
-
+        for start, end in validated[schedule_key]:
             start_abs = day_offset + start
             end_abs = day_offset + end
-            if end < start:
-                end_abs += MINUTES_PER_DAY
             if end_abs <= MINUTES_PER_WEEK:
                 intervals.append((start_abs, end_abs))
             else:

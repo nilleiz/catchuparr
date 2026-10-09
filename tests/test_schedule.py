@@ -132,6 +132,31 @@ class ScheduleTests(unittest.TestCase):
             schedule.intervals,
         )
 
+    def test_shadowed_schedule_groups_are_still_validated(self):
+        invalid = (
+            {
+                "daily": "not a list",
+                "weekdays": [],
+                "weekend": [],
+            },
+            {
+                "daily": [{"start": "07:00", "end": "08:00", "unknown": True}],
+                "weekdays": [],
+                "weekend": [],
+            },
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ScheduleError):
+                normalize_schedule(value)
+
+    def test_valid_empty_groups_replace_daily_windows(self):
+        schedule = normalize_schedule({
+            "daily": [{"start": "07:00", "end": "08:00"}],
+            "weekdays": [],
+            "weekend": [],
+        })
+        self.assertEqual(RecordingSchedule("weekly", ()), schedule)
+
     def test_rejects_unknown_day_groups(self):
         with self.assertRaisesRegex(ScheduleError, "day group"):
             normalize_schedule({"workdays": [{"start": "08:00", "end": "09:00"}]})
