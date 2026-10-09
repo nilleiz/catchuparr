@@ -284,32 +284,41 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertFalse(settings["recording_enabled"])
         self.assertEqual(48, settings["retention_hours"])
 
-    def test_runtime_apply_returns_explicit_committed_but_paused_warning(self):
+    def test_runtime_apply_returns_explicit_recovery_required_result(self):
         from catchuparr import runtime
+        configuration = importlib.import_module("catchuparr.configuration")
+        logging_utils = importlib.import_module("catchuparr.logging_utils")
         from catchuparr.recorder_control import RecorderControlError
 
         result = {
-            "applied": True,
+            "applied": False,
+            "activation_pending": True,
+            "recovery_required": True,
             "selected_channel_count": 2,
             "source_policy_count": 1,
             "recording_paused": True,
-            "warning": "Settings were applied, but recording remains paused while cleanup is retried.",
-            "message": "2 channel(s) selected. Settings were applied, but recording remains paused while cleanup is retried.",
+            "warning": "Apply did not complete; the previous settings remain active and recorder admission is denied until activation recovery succeeds.",
+            "message": "Apply did not complete; the previous settings remain active and recorder admission is denied until activation recovery succeeds.",
         }
-        with patch("catchuparr.configuration.apply_configuration", return_value=result), patch(
-            "catchuparr.configuration.load_applied_state",
+        with patch.object(configuration, "apply_configuration", return_value=result) as apply, patch.object(
+            configuration,
+            "load_applied_state",
             side_effect=RecorderControlError("synthetic pending deny marker"),
-        ), patch(
-            "catchuparr.configuration.load_active_configuration",
+        ), patch.object(
+            configuration,
+            "load_active_configuration",
             return_value={"log_level": "INFO"},
-        ), patch("catchuparr.logging_utils.apply_log_level"), patch(
-            "catchuparr.logging_utils.event"
+        ), patch.object(logging_utils, "apply_log_level"), patch.object(
+            logging_utils, "event"
         ) as event:
             returned = runtime.apply_configuration()
 
-        self.assertTrue(returned["applied"])
+        apply.assert_called_once_with(None)
+        self.assertFalse(returned["applied"])
+        self.assertTrue(returned["activation_pending"])
+        self.assertTrue(returned["recovery_required"])
         self.assertTrue(returned["recording_paused"])
-        self.assertIn("remains paused", returned["warning"])
+        self.assertIn("previous settings remain active", returned["warning"])
         event.assert_called_once_with(
             "configuration_applied",
             channel_count=2,
