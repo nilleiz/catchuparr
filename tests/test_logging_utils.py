@@ -47,6 +47,26 @@ class LoggingUtilsTests(unittest.TestCase):
         self.assertNotIn("SyntheticProvider", captured.output[0])
         self.assertNotIn("synthetic.invalid", captured.output[0])
 
+    def test_activation_events_are_allowlisted_and_accept_only_fixed_state(self):
+        logging_utils._error_windows.pop("configuration_recovery_failed", None)
+        with self.assertLogs("catchuparr", level="WARNING") as captured:
+            event(
+                "configuration_outcome_unknown",
+                logging.WARNING,
+                outcome_unknown=True,
+                recovery_required=True,
+                url="https://synthetic.invalid/private-token",
+            )
+            error("configuration_recovery_failed")
+        messages = [record.getMessage() for record in captured.records]
+        self.assertIn(
+            "[Catchuparr] configuration_outcome_unknown outcome_unknown=true recovery_required=true",
+            messages,
+        )
+        self.assertIn("[Catchuparr] configuration_recovery_failed", messages)
+        self.assertTrue(all("synthetic.invalid" not in message for message in messages))
+        self.assertTrue(all("private-token" not in message for message in messages))
+
     def test_repeated_errors_are_summarized_after_a_bounded_window(self):
         with patch("catchuparr.logging_utils.time.monotonic", side_effect=[0.0, 1.0, 301.0]):
             with self.assertLogs("catchuparr", level="WARNING") as captured:

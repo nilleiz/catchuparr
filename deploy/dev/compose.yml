@@ -11,6 +11,7 @@ services:
       DISPATCHARR_ENV: aio
       DISPATCHARR_LOG_LEVEL: info
       DISPATCHARR_PLUGINS_DIR: /data/plugins
+      TZ: ${TZ-}
       CATCHUPARR_TRACE_REQUESTS: ${CATCHUPARR_TRACE_REQUESTS:-0}
       PUID: '1000'
       PGID: '1000'

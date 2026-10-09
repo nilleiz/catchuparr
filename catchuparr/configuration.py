@@ -7,7 +7,10 @@ changes recorder behavior until Apply succeeds.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -20,9 +23,14 @@ from typing import Any
 from .runtime import PLUGIN_KEY, parse_settings
 
 ACTIVE_CONFIG_NAME = ".catchuparr-active-settings.json"
-ACTIVE_CONFIG_VERSION = 3
-SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, ACTIVE_CONFIG_VERSION})
+ACTIVE_CONFIG_VERSION = 4
+SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, ACTIVE_CONFIG_VERSION})
 RESET_REQUIRED_NAME = ".catchuparr-configuration-reset-required"
+ACTIVATION_STATE_NAME = ".catchuparr-configuration-activation.json"
+ACTIVATION_BACKUP_NAME = ".catchuparr-configuration-activation-previous.json"
+ACTIVATION_COMMIT_NAME = ".catchuparr-configuration-activation-commit.json"
+ACTIVATION_UNCERTAIN_NAME = ".catchuparr-configuration-activation-uncertain.json"
+ACTIVATION_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -150,7 +158,7 @@ def compile_draft(
     """Validate base fields and compile YAML filters into stable catalog IDs."""
     if any(key in settings for key in ("channel_uuids", "source_rules")):
         raise ValueError("legacy channel selection was removed; validate and apply filter_config")
-    parsed_settings = parse_settings(settings)
+    parsed_settings = _applicable_settings(settings)
     recording_enabled = settings.get("recording_enabled", True)
     if type(recording_enabled) is not bool:
         raise ValueError("recording_enabled must be boolean")
@@ -195,15 +203,10 @@ def compile_draft(
         }
         for preview in compiled.channels
     ]
-    parsed = {
-        "archive_root": str(parsed_settings.archive_root),
-        "retention_hours": parsed_settings.retention_hours,
-        "max_storage_gib": parsed_settings.max_storage_bytes // 1024**3,
-    }
-    if "playback_user_id" in settings:
-        parsed["playback_user_id"] = settings["playback_user_id"]
+    parsed_settings["recording_enabled"] = recording_enabled
+    parsed_settings["log_level"] = log_level
     return {
-        "settings": parsed,
+        "settings": parsed_settings,
         "channel_uuids": list(compiled.channel_uuids),
         "channel_profile_ids": list(compiled.profile_ids),
         "source_policies": encoded,
@@ -238,21 +241,68 @@ def apply_configuration(
     catalog: SourceCatalog | None = None,
     active_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Compile under the shared lock before atomically replacing the active config."""
+    """Compile under the shared activation lock before replacing applied state."""
     path = Path(active_path) if active_path is not None else active_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _config_lock(path, exclusive=True):
         if settings is None:
-            with _current_settings_transaction() as current_settings:
-                return _apply_configuration_locked(current_settings, catalog, path)
-        return _apply_configuration_locked(settings, catalog, path)
+            prepared = None
+            try:
+                with _current_settings_transaction() as current_settings:
+                    result, prepared = _apply_configuration_locked(
+                        current_settings, catalog, path
+                    )
+            except Exception:
+                if prepared is not None:
+                    prepared.rollback()
+                raise
+        else:
+            result, prepared = _apply_configuration_locked(settings, catalog, path)
+        prepared.commit()
+        if prepared.activation_pending_warning:
+            result["applied"] = False
+            result["activation_pending"] = True
+            result["recovery_required"] = True
+            result["recording_paused"] = True
+            warning = (
+                "Apply did not complete; the previous settings remain active and recorder admission "
+                "is denied until activation recovery succeeds."
+            )
+            result["warning"] = warning
+            result["message"] = warning
+            return result
+        if prepared.activation_outcome_unknown_warning:
+            result["applied"] = False
+            result["outcome_unknown"] = True
+            result["activation_pending"] = True
+            result["recovery_required"] = True
+            result["recording_paused"] = True
+            warning = (
+                "Apply outcome is unknown; configuration reads remain on the previous validated "
+                "snapshot and recorder admission is denied until recovery succeeds."
+            )
+            result["warning"] = warning
+            result["message"] = warning
+            return result
+        warnings = []
+        if prepared.recording_paused_warning:
+            result["recording_paused"] = True
+            warnings.append("recording remains paused while recovery is retried")
+        if prepared.activation_cleanup_warning:
+            result["activation_cleanup_pending"] = True
+            warnings.append("activation cleanup remains pending and will be retried")
+        if warnings:
+            warning = f"Settings were applied, but {'; '.join(warnings)}."
+            result["warning"] = warning
+            result["message"] = f"{result['message']} {warning}"
+        return result
 
 
 def _apply_configuration_locked(
     settings: dict,
     catalog: SourceCatalog | None,
     path: Path,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], "_PreparedActivation"]:
     active, _, previews = compile_draft(settings, catalog)
     document = {
         "version": ACTIVE_CONFIG_VERSION,
@@ -263,8 +313,19 @@ def _apply_configuration_locked(
         "recording_schedule": active["recording_schedule"],
     }
     _validate_active_document(document)
-    _atomic_json_replace_locked(path, document)
-    _remove_reset_required_marker(path)
+    _prevalidate_archive_root(document["settings"]["archive_root"])
+    try:
+        previous_active = _load_active_configuration_locked(path)
+    except ValueError:
+        # A validated Apply is also the recovery path for a malformed active
+        # snapshot. The old archive location is unknown in that case.
+        previous_active = None
+    archive_root_changed = bool(
+        previous_active is not None
+        and Path(previous_active["archive_root"]).expanduser().resolve()
+        != Path(document["settings"]["archive_root"]).expanduser().resolve()
+    )
+    prepared = _prepare_document_with_control_locked(path, document)
     return {
         "applied": True,
         "selected_channel_count": len(active["channel_uuids"]),
@@ -273,8 +334,651 @@ def _apply_configuration_locked(
             "No channels are selected." if not active["channel_uuids"]
             else f"{len(active['channel_uuids'])} channel(s) selected."
         ),
+        "archive_root_changed": archive_root_changed,
+        "archive_notice": (
+            "Existing archive data and access tokens remain at the previous archive path; "
+            "they were not moved or deleted."
+            if archive_root_changed else None
+        ),
         "channels": previews,
+    }, prepared
+
+
+def _prevalidate_archive_root(raw_path: str) -> None:
+    """Confirm the applied archive location can be written without touching old data."""
+    path = Path(raw_path).expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".catchuparr-apply-check.", dir=path)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(b"ok\n")
+                output.flush()
+                os.fsync(output.fileno())
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        raise ValueError("archive_root is not accessible for recording and playback") from None
+
+
+class _PreparedActivation:
+    """Keep admission denied until storage and the DB transaction both finish."""
+
+    def __init__(
+        self,
+        active_path: Path,
+        sidecar: Path,
+        previous_active: bytes | None,
+        previous_control: bytes | None,
+        marker_was_present: bool,
+        activation_id: str,
+    ):
+        self.active_path = active_path
+        self.sidecar = sidecar
+        self.previous_active = previous_active
+        self.previous_control = previous_control
+        self.marker_was_present = marker_was_present
+        self.activation_id = activation_id
+        self.finished = False
+        self.recording_paused_warning = False
+        self.activation_cleanup_warning = False
+        self.activation_pending_warning = False
+        self.activation_outcome_unknown_warning = False
+
+    def commit(self) -> None:
+        if self.finished:
+            return
+        from .recorder_control import RecorderControlError
+
+        try:
+            _write_activation_commit_locked(self.active_path, self.activation_id)
+        except OSError:
+            restored = self.rollback()
+            if restored:
+                raise RecorderControlError(
+                    "configuration commit durability could not be confirmed; previous settings were restored"
+                ) from None
+            # The pending journal and deny marker remain authoritative if a
+            # visible commit record could not be removed after a write error.
+            self.finished = True
+            self.activation_pending_warning = True
+            self.recording_paused_warning = True
+            return
+        self.finished = True
+        try:
+            _write_activation_uncertain_locked(self.active_path, self.activation_id)
+        except Exception:
+            # The committed journal has not been attempted. Its pending state
+            # and durable backup still keep the previous complete bundle active.
+            self.activation_pending_warning = True
+            self.recording_paused_warning = True
+            return
+        try:
+            _write_activation_state_locked(
+                self.active_path, "committed", self.activation_id
+            )
+        except Exception:
+            # The replacement may or may not have reached stable storage.
+            # Never infer the result from the file currently visible here.
+            # The durable guard keeps readers on the validated backup until
+            # explicit recovery validates the surviving complete bundle.
+            self.activation_outcome_unknown_warning = True
+            self.recording_paused_warning = True
+            return
+        try:
+            _remove_activation_uncertain_locked(self.active_path)
+        except Exception:
+            if _activation_uncertain_exists(self.active_path):
+                self.activation_outcome_unknown_warning = True
+                self.recording_paused_warning = True
+                return
+            # The committed journal was durably written, and the guard is
+            # absent in this process. Keep the journal and deny marker so a
+            # later recovery can finish cleanup without reviving recorder work.
+            self.recording_paused_warning = True
+            self.activation_cleanup_warning = True
+            return
+        try:
+            from .recorder_control import _clear_deny_marker_durably
+
+            _clear_deny_marker_durably(self.sidecar)
+        except Exception:
+            # Keep the committed snapshot authoritative, but retain the
+            # activation journal as an admission gate until the unlink is
+            # durably confirmed.
+            self.recording_paused_warning = True
+            self.activation_cleanup_warning = True
+            return
+        try:
+            _remove_reset_required_marker(self.active_path)
+        except Exception:
+            self.activation_cleanup_warning = True
+        if not _cleanup_committed_activation_locked(self.active_path):
+            self.activation_cleanup_warning = True
+            try:
+                if _read_activation_state_locked(self.active_path) is not None:
+                    self.recording_paused_warning = True
+            except Exception:
+                self.recording_paused_warning = True
+
+    def rollback(self) -> bool:
+        if self.finished:
+            return True
+        try:
+            _remove_activation_commit_locked(self.active_path)
+        except Exception:
+            return False
+        active_restored = _restore_file_bytes_locked(self.active_path, self.previous_active)
+        control_restored = _restore_file_bytes_locked(self.sidecar, self.previous_control)
+        restored = active_restored and control_restored
+        if restored:
+            try:
+                _restore_control_deny_marker(self.sidecar, self.marker_was_present)
+            except Exception:
+                restored = False
+        if restored:
+            try:
+                _remove_activation_state_locked(self.active_path)
+                _remove_activation_backup_locked(self.active_path)
+            except Exception:
+                restored = False
+        self.finished = restored
+        return restored
+
+
+def _prepare_document_with_control_locked(
+    path: Path, document: dict[str, Any]
+) -> _PreparedActivation:
+    """Coordinate active and control files behind one fail-closed marker."""
+    from .recorder_control import (
+        RecorderControlError,
+        _configuration_control_state_locked,
+        _deny_marker_exists,
+        _write_deny_marker,
+        control_deny_path,
+        control_state_path,
+    )
+
+    sidecar = control_state_path(path)
+    _recover_interrupted_activation_locked(path)
+    previous_active = _read_file_bytes(path)
+    previous_control = _read_file_bytes(sidecar)
+    marker_was_present = _deny_marker_exists(control_deny_path(path))
+    activation_id = str(uuid.uuid4())
+    backup = {
+        "version": ACTIVATION_STATE_VERSION,
+        "activation_id": activation_id,
+        "active": _encode_optional_bytes(previous_active),
+        "control": _encode_optional_bytes(previous_control),
+        "control_deny_present": marker_was_present,
     }
+    _write_activation_backup_locked(path, backup)
+    _write_activation_state_locked(path, "pending", activation_id)
+    try:
+        _write_deny_marker(sidecar)
+    except OSError:
+        _remove_activation_state_locked(path)
+        _remove_activation_backup_locked(path)
+        raise RecorderControlError("configuration activation could not deny recorder admission") from None
+
+    active = _active_configuration_view(document)
+    generation = active_configuration_generation(active)
+    prepared = _PreparedActivation(
+        path, sidecar, previous_active, previous_control, marker_was_present,
+        activation_id,
+    )
+    try:
+        _atomic_json_replace_locked(path, document)
+        _configuration_control_state_locked(
+            sidecar,
+            recording_enabled=document["settings"]["recording_enabled"],
+            configuration_generation=generation,
+            recovering_pending=marker_was_present,
+        )
+    except Exception:
+        restored = prepared.rollback()
+        if restored:
+            raise RecorderControlError(
+                "configuration activation failed; the previous configuration was restored"
+            ) from None
+        raise RecorderControlError(
+            "configuration activation failed; recorder admission remains denied"
+        ) from None
+    return prepared
+
+
+def _read_file_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _activation_state_path(path: Path) -> Path:
+    return path.with_name(ACTIVATION_STATE_NAME)
+
+
+def _activation_backup_path(path: Path) -> Path:
+    return path.with_name(ACTIVATION_BACKUP_NAME)
+
+
+def _activation_commit_path(path: Path) -> Path:
+    return path.with_name(ACTIVATION_COMMIT_NAME)
+
+
+def _activation_uncertain_path(path: Path) -> Path:
+    return path.with_name(ACTIVATION_UNCERTAIN_NAME)
+
+
+def _activation_uncertain_exists(path: Path) -> bool:
+    try:
+        _activation_uncertain_path(path).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable guard is still a guard. Readers must fail closed.
+        return True
+    return True
+
+
+def _encode_optional_bytes(value: bytes | None) -> str | None:
+    return base64.b64encode(value).decode("ascii") if value is not None else None
+
+
+def _decode_optional_bytes(value: Any) -> bytes | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Configuration activation backup is invalid")
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("Configuration activation backup is invalid") from None
+
+
+def _write_activation_backup_locked(path: Path, backup: dict[str, Any]) -> None:
+    _atomic_json_replace_locked(_activation_backup_path(path), backup)
+
+
+def _read_activation_backup_locked(path: Path) -> dict[str, Any]:
+    backup_path = _activation_backup_path(path)
+    try:
+        raw = json.loads(backup_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Configuration activation backup is unavailable") from None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {
+            "version", "activation_id", "active", "control", "control_deny_present"
+        }
+        or type(raw.get("version")) is not int
+        or raw["version"] != ACTIVATION_STATE_VERSION
+        or not _valid_activation_id(raw.get("activation_id"))
+        or type(raw.get("control_deny_present")) is not bool
+    ):
+        raise ValueError("Configuration activation backup is invalid")
+    return {
+        "activation_id": raw["activation_id"],
+        "active": _decode_optional_bytes(raw["active"]),
+        "control": _decode_optional_bytes(raw["control"]),
+        "control_deny_present": raw["control_deny_present"],
+    }
+
+
+def _valid_activation_id(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _read_activation_state_locked(path: Path) -> tuple[str, str] | None:
+    state_path = _activation_state_path(path)
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Configuration activation state is unreadable") from None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "state", "activation_id"}
+        or type(raw.get("version")) is not int
+        or raw["version"] != ACTIVATION_STATE_VERSION
+        or raw.get("state") not in {"pending", "committed"}
+        or not _valid_activation_id(raw.get("activation_id"))
+    ):
+        raise ValueError("Configuration activation state is invalid")
+    return raw["state"], raw["activation_id"]
+
+
+def _write_activation_state_locked(path: Path, state: str, activation_id: str) -> None:
+    if state not in {"pending", "committed"} or not _valid_activation_id(activation_id):
+        raise ValueError("Configuration activation state is invalid")
+    _atomic_json_replace_locked(
+        _activation_state_path(path),
+        {
+            "version": ACTIVATION_STATE_VERSION,
+            "state": state,
+            "activation_id": activation_id,
+        },
+    )
+
+
+def _write_activation_commit_locked(path: Path, activation_id: str) -> None:
+    _atomic_json_replace_locked(
+        _activation_commit_path(path),
+        {"version": ACTIVATION_STATE_VERSION, "activation_id": activation_id},
+    )
+
+
+def _write_activation_uncertain_locked(path: Path, activation_id: str) -> None:
+    if not _valid_activation_id(activation_id):
+        raise ValueError("Configuration activation guard is invalid")
+    _atomic_json_replace_locked(
+        _activation_uncertain_path(path),
+        {"version": ACTIVATION_STATE_VERSION, "activation_id": activation_id},
+    )
+
+
+def _read_activation_uncertain_locked(path: Path) -> str | None:
+    marker = _activation_uncertain_path(path)
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("Configuration activation outcome is unresolved") from None
+    try:
+        raw = json.loads(marker.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Configuration activation outcome is unresolved") from None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "activation_id"}
+        or type(raw.get("version")) is not int
+        or raw["version"] != ACTIVATION_STATE_VERSION
+        or not _valid_activation_id(raw.get("activation_id"))
+    ):
+        raise ValueError("Configuration activation outcome is unresolved")
+    return raw["activation_id"]
+
+
+def _read_activation_commit_locked(path: Path) -> str | None:
+    try:
+        raw = json.loads(_activation_commit_path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "activation_id"}
+        or type(raw.get("version")) is not int
+        or raw["version"] != ACTIVATION_STATE_VERSION
+        or not _valid_activation_id(raw.get("activation_id"))
+    ):
+        return None
+    return raw["activation_id"]
+
+
+def _activation_commit_matches(
+    path: Path, activation_state: tuple[str, str] | None
+) -> bool:
+    return (
+        activation_state is not None
+        and activation_state[0] == "committed"
+        and _read_activation_commit_locked(path) == activation_state[1]
+    )
+
+
+def _remove_durable_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _remove_activation_state_locked(path: Path) -> None:
+    _remove_durable_file(_activation_state_path(path))
+
+
+def _remove_activation_backup_locked(path: Path) -> None:
+    _remove_durable_file(_activation_backup_path(path))
+
+
+def _remove_activation_commit_locked(path: Path) -> None:
+    _remove_durable_file(_activation_commit_path(path))
+
+
+def _remove_activation_uncertain_locked(path: Path) -> None:
+    _remove_durable_file(_activation_uncertain_path(path))
+
+
+def _restore_control_deny_marker(sidecar: Path, present: bool) -> None:
+    from .recorder_control import (
+        _clear_deny_marker_durably,
+        _write_deny_marker,
+    )
+
+    if present:
+        _write_deny_marker(sidecar)
+    else:
+        _clear_deny_marker_durably(sidecar)
+
+
+def _configuration_bundle_valid(
+    active_bytes: bytes | None,
+    control_bytes: bytes | None,
+    *,
+    require_applied: bool = False,
+) -> bool:
+    try:
+        active = _active_configuration_from_bytes(active_bytes)
+        if control_bytes is None:
+            control = None
+        else:
+            raw_control = json.loads(control_bytes.decode("utf-8"))
+            from .recorder_control import _parse_state
+
+            control = _parse_state(raw_control)
+    except Exception:
+        return False
+    if active is None:
+        return not require_applied
+    if require_applied and active.get("version", 0) < 4:
+        return False
+    if active.get("version", 0) >= 4:
+        if control is None:
+            return False
+        if control.configuration_generation != active_configuration_generation(active):
+            return False
+    return True
+
+
+def _committed_bundle_valid(path: Path, activation_id: str) -> bool:
+    from .recorder_control import control_state_path
+
+    if _read_activation_commit_locked(path) != activation_id:
+        return False
+    active_bytes = _read_file_bytes(path)
+    control_bytes = _read_file_bytes(control_state_path(path))
+    return _configuration_bundle_valid(
+        active_bytes, control_bytes, require_applied=True
+    )
+
+
+def _fsync_existing_file_and_parent(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _confirm_committed_bundle_durability(path: Path) -> None:
+    from .recorder_control import control_state_path
+
+    for candidate in (
+        path,
+        control_state_path(path),
+        _activation_state_path(path),
+        _activation_commit_path(path),
+    ):
+        _fsync_existing_file_and_parent(candidate)
+
+
+def _restore_activation_backup_locked(path: Path, backup: dict[str, Any]) -> bool:
+    from .recorder_control import control_state_path
+
+    if not _configuration_bundle_valid(backup["active"], backup["control"]):
+        return False
+    sidecar = control_state_path(path)
+    active_restored = _restore_file_bytes_locked(path, backup["active"])
+    control_restored = _restore_file_bytes_locked(sidecar, backup["control"])
+    if not active_restored or not control_restored:
+        return False
+    try:
+        _restore_control_deny_marker(sidecar, backup["control_deny_present"])
+    except Exception:
+        return False
+    return _configuration_bundle_valid(
+        _read_file_bytes(path), _read_file_bytes(sidecar)
+    )
+
+
+def _recover_interrupted_activation_locked(path: Path) -> None:
+    try:
+        uncertain_id = _read_activation_uncertain_locked(path)
+    except ValueError:
+        raise ValueError("Configuration activation outcome remains unresolved") from None
+    state = _read_activation_state_locked(path)
+    if state is None:
+        if uncertain_id is not None or _activation_uncertain_exists(path):
+            raise ValueError("Configuration activation journal is unavailable")
+        _remove_activation_backup_locked(path)
+        _remove_activation_commit_locked(path)
+        return
+    _state_name, activation_id = state
+    backup = _read_activation_backup_locked(path)
+    if backup["activation_id"] != activation_id:
+        raise ValueError("Configuration activation backup does not match its journal")
+    if uncertain_id is not None and uncertain_id != activation_id:
+        raise ValueError("Configuration activation guard does not match its journal")
+    committed = _activation_commit_matches(path, state)
+    if committed and _committed_bundle_valid(path, activation_id):
+        try:
+            _confirm_committed_bundle_durability(path)
+        except OSError:
+            raise ValueError("Committed configuration durability could not be confirmed") from None
+        try:
+            from .recorder_control import _clear_deny_marker_durably, control_state_path
+
+            _clear_deny_marker_durably(control_state_path(path))
+        except Exception:
+            raise ValueError("Committed configuration still has recorder admission denied") from None
+        if uncertain_id is not None:
+            try:
+                _remove_activation_uncertain_locked(path)
+            except Exception:
+                raise ValueError("Configuration activation outcome remains unresolved") from None
+            if _activation_uncertain_exists(path):
+                raise ValueError("Configuration activation outcome remains unresolved")
+    elif not _restore_activation_backup_locked(path, backup):
+        raise ValueError("Interrupted configuration activation could not be restored")
+    elif uncertain_id is not None:
+        try:
+            _remove_activation_uncertain_locked(path)
+        except Exception:
+            raise ValueError("Configuration activation outcome remains unresolved") from None
+        if _activation_uncertain_exists(path):
+            raise ValueError("Configuration activation outcome remains unresolved")
+    _remove_activation_state_locked(path)
+    _remove_activation_backup_locked(path)
+    _remove_activation_commit_locked(path)
+
+
+def _cleanup_committed_activation_locked(path: Path) -> bool:
+    try:
+        _remove_activation_state_locked(path)
+    except Exception:
+        return False
+    try:
+        _remove_activation_backup_locked(path)
+    except Exception:
+        return False
+    try:
+        _remove_activation_commit_locked(path)
+    except Exception:
+        return False
+    return True
+
+
+def _active_configuration_from_bytes(contents: bytes | None) -> dict[str, Any] | None:
+    if contents is None:
+        return None
+    try:
+        data = json.loads(contents.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Active Catchuparr configuration is invalid") from None
+    if not isinstance(data, dict):
+        raise ValueError("Active Catchuparr configuration is invalid")
+    _validate_active_document(data)
+    return _active_configuration_view(data)
+
+
+def _restore_file_bytes_locked(path: Path, contents: bytes | None) -> bool:
+    if contents is None:
+        try:
+            path.unlink(missing_ok=True)
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return True
+        except OSError:
+            return False
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.restore.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(contents)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 @contextmanager
@@ -302,14 +1006,23 @@ def active_settings_path() -> Path:
 
 
 def _applicable_settings(settings: dict) -> dict[str, Any]:
-    """Persist only known non-secret runtime and plugin action settings."""
+    """Validate and persist all non-secret settings activated by Apply."""
     if any(key in settings for key in ("channel_uuids", "source_rules")):
         raise ValueError("legacy channel selection was removed; use filter_config")
     parsed = parse_settings(settings)
+    from .logging_utils import normalize_log_level
+    from .runtime import normalize_public_base_url
+
+    recording_enabled = settings.get("recording_enabled", True)
+    if type(recording_enabled) is not bool:
+        raise ValueError("recording_enabled must be boolean")
     applicable: dict[str, Any] = {
         "archive_root": str(parsed.archive_root),
         "retention_hours": parsed.retention_hours,
         "max_storage_gib": parsed.max_storage_bytes // 1024**3,
+        "recording_enabled": recording_enabled,
+        "log_level": normalize_log_level(settings.get("log_level", "INFO")),
+        "public_base_url": normalize_public_base_url(settings.get("public_base_url", "")),
     }
     raw_user_id = settings.get("playback_user_id")
     if isinstance(raw_user_id, bool):
@@ -325,36 +1038,130 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
 
 
 def load_active_configuration(active_path: Path | None = None) -> dict[str, Any] | None:
-    """Load an applied v2/v3 snapshot, or None before the first valid Apply."""
+    """Load a validated applied snapshot, or None before the first valid Apply."""
     path = Path(active_path) if active_path is not None else active_settings_path()
     try:
         with _config_lock(path, exclusive=False):
-            data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("Active Catchuparr configuration is invalid")
-        _validate_active_document(data)
-        channel_ids = data["channel_uuids"]
-        if data["version"] == 2:
-            from .schedule import CONTINUOUS_SCHEDULE, DEFAULT_TIMEZONE
-
-            recording_schedule = {
-                "timezone": DEFAULT_TIMEZONE,
-                "channels": {
-                    channel: CONTINUOUS_SCHEDULE.to_snapshot() for channel in channel_ids
-                },
-            }
-        else:
-            recording_schedule = data["recording_schedule"]
-        return {
-            **data["settings"],
-            "channel_uuids": "\n".join(channel_ids),
-            "channel_profile_ids": list(data["channel_profile_ids"]),
-            "source_policies": data["source_policies"],
-            "recording_schedule": recording_schedule,
-            "version": data["version"],
-        }
+            return _load_active_configuration_locked(path)
     except FileNotFoundError:
         return None
+
+
+def recover_interrupted_activation(active_path: Path | None = None) -> None:
+    """Resolve a surviving activation only after validating a complete bundle."""
+    path = Path(active_path) if active_path is not None else active_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _config_lock(path, exclusive=True):
+        _recover_interrupted_activation_locked(path)
+
+
+def load_applied_state(
+    active_path: Path | None = None,
+) -> tuple[dict[str, Any] | None, Any]:
+    """Read one validated snapshot/control pair under their shared lock."""
+    from .recorder_control import (
+        RecorderControlError,
+        _deny_marker_exists,
+        _load_or_initialize_locked,
+        control_deny_path,
+        control_state_path,
+    )
+
+    path = Path(active_path) if active_path is not None else active_settings_path()
+    with _config_lock(path, exclusive=True):
+        if _activation_uncertain_exists(path):
+            raise RecorderControlError(
+                "configuration activation outcome is unknown or incomplete; "
+                "recorder admission is denied"
+            )
+        try:
+            activation_state = _read_activation_state_locked(path)
+        except ValueError:
+            raise RecorderControlError("configuration activation state is invalid") from None
+        if activation_state is not None and not _activation_commit_matches(path, activation_state):
+            raise RecorderControlError("configuration activation is incomplete")
+        if activation_state is not None and activation_state[0] == "committed":
+            raise RecorderControlError("configuration activation cleanup is pending; recorder admission is denied")
+        active = _load_active_configuration_locked(path)
+        sidecar = control_state_path(path)
+        if active is not None and active.get("version", 0) >= 4:
+            # A v4 Apply always commits its bound control sidecar under the same
+            # lock. Missing state means a partial activation and is not repaired
+            # by assuming recording is enabled.
+            _deny_marker_exists(control_deny_path(path))
+            if not sidecar.exists():
+                raise RecorderControlError("applied recorder control state is missing")
+        control = _load_or_initialize_locked(sidecar)
+        if active is not None and active.get("version", 0) >= 4:
+            active_generation = active_configuration_generation(active)
+            if control.configuration_generation != active_generation:
+                raise RecorderControlError("applied configuration and control state do not match")
+        return active, control
+
+
+def _load_active_configuration_locked(path: Path) -> dict[str, Any] | None:
+    if _activation_uncertain_exists(path):
+        try:
+            uncertain_id = _read_activation_uncertain_locked(path)
+            state = _read_activation_state_locked(path)
+        except ValueError:
+            # If the guard itself is unreadable, use the previous bundle only
+            # when its journal independently identifies it.
+            uncertain_id = None
+            state = _read_activation_state_locked(path)
+        backup = _read_activation_backup_locked(path)
+        if state is None or backup["activation_id"] != state[1]:
+            raise ValueError("Configuration activation outcome is unresolved") from None
+        if uncertain_id is not None and uncertain_id != state[1]:
+            raise ValueError("Configuration activation outcome is unresolved")
+        if not _configuration_bundle_valid(backup["active"], backup["control"]):
+            raise ValueError("Previous configuration bundle is invalid")
+        return _active_configuration_from_bytes(backup["active"])
+    activation_state = _read_activation_state_locked(path)
+    if activation_state is not None and not _activation_commit_matches(path, activation_state):
+        backup = _read_activation_backup_locked(path)
+        if backup["activation_id"] != activation_state[1]:
+            raise ValueError("Configuration activation backup does not match its journal")
+        if not _configuration_bundle_valid(backup["active"], backup["control"]):
+            raise ValueError("Previous configuration bundle is invalid")
+        return _active_configuration_from_bytes(backup["active"])
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("Active Catchuparr configuration is invalid")
+    _validate_active_document(data)
+    return _active_configuration_view(data)
+
+
+def _active_configuration_view(data: dict[str, Any]) -> dict[str, Any]:
+    channel_ids = data["channel_uuids"]
+    if data["version"] == 2:
+        from .schedule import CONTINUOUS_SCHEDULE, DEFAULT_TIMEZONE
+
+        recording_schedule = {
+            "timezone": DEFAULT_TIMEZONE,
+            "channels": {
+                channel: CONTINUOUS_SCHEDULE.to_snapshot() for channel in channel_ids
+            },
+        }
+    else:
+        recording_schedule = data["recording_schedule"]
+    return {
+        **data["settings"],
+        "channel_uuids": "\n".join(channel_ids),
+        "channel_profile_ids": list(data["channel_profile_ids"]),
+        "source_policies": data["source_policies"],
+        "recording_schedule": recording_schedule,
+        "version": data["version"],
+    }
+
+
+def active_configuration_generation(active: dict[str, Any]) -> str:
+    """Return the stable generation used to bind control and queued tasks."""
+    serialized = json.dumps(active, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def configuration_reset_required(active_path: Path | None = None) -> bool:
@@ -466,14 +1273,23 @@ def _validate_active_document(data: dict[str, Any]) -> None:
     expected_fields = {
         "version", "settings", "channel_uuids", "channel_profile_ids", "source_policies"
     }
-    if version == 3:
+    if version >= 3:
         expected_fields.add("recording_schedule")
     if set(data) != expected_fields:
         raise ValueError("Active Catchuparr configuration fields are invalid")
     settings = data["settings"]
     if not isinstance(settings, dict) or not isinstance(data.get("source_policies"), dict):
         raise ValueError("Active Catchuparr configuration is invalid")
-    allowed_settings = {"archive_root", "retention_hours", "max_storage_gib", "playback_user_id"}
+    allowed_settings = {
+        "archive_root",
+        "retention_hours",
+        "max_storage_gib",
+        "playback_user_id",
+    }
+    if version >= 4:
+        allowed_settings.update(
+            {"recording_enabled", "log_level", "public_base_url"}
+        )
     if set(settings) - allowed_settings:
         raise ValueError("Active Catchuparr settings contain unknown fields")
     channel_uuids = data.get("channel_uuids")
@@ -526,9 +1342,28 @@ def _validate_active_document(data: dict[str, Any]) -> None:
             or int(user_id) <= 0
         ):
             raise ValueError("Active Catchuparr playback user ID is invalid")
+    if version >= 4:
+        if type(settings.get("recording_enabled")) is not bool:
+            raise ValueError("Active Catchuparr recording_enabled is invalid")
+        from .logging_utils import normalize_log_level
+
+        try:
+            normalized_level = normalize_log_level(settings.get("log_level"))
+        except ValueError:
+            raise ValueError("Active Catchuparr log_level is invalid") from None
+        if normalized_level != settings.get("log_level"):
+            raise ValueError("Active Catchuparr log_level is not normalized")
+        from .runtime import normalize_public_base_url
+
+        try:
+            normalized_url = normalize_public_base_url(settings.get("public_base_url"))
+        except ValueError:
+            raise ValueError("Active Catchuparr public_base_url is invalid") from None
+        if normalized_url != settings.get("public_base_url"):
+            raise ValueError("Active Catchuparr public_base_url is not normalized")
     parse_settings(settings)
     channels = set(normalized_channels)
-    if version == 3:
+    if version >= 3:
         _validate_recording_schedule(data.get("recording_schedule"), normalized_channels)
     policies = data["source_policies"]
     for raw_channel, policy in policies.items():

@@ -22,9 +22,10 @@ See the [release roadmap](docs/roadmap.md), [installation and development](docs/
 [0.1.4](https://github.com/nilleiz/catchuparr/releases/tag/v0.1.4); XC player
 validation remains open.
 
-The unreleased 0.3.0 candidate combines channel/source filters with weekly
-recording schedules, global pause/resume controls and sanitized logging. Its
-synthetic native integration checks passed on Dispatcharr 0.31.0 and 0.32.0;
-CI and real-player acceptance remain open. See the
-[0.3.0 candidate guide](docs/candidate-0.3.0.md) and
+The 0.3.1 candidate combines channel/source filters, weekly recording
+schedules, unified configuration Apply, global pause/resume controls and
+sanitized logging. The preceding recorder-engine baseline passed synthetic
+native integration on Dispatcharr 0.31.0 and 0.32.0. The 0.3.1-specific review,
+CI, integration and real-player acceptance remain release gates. See the
+[0.3.1 candidate guide](docs/candidate-0.3.1.md) and
 [validation status](docs/validation.md).

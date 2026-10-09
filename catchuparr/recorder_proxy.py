@@ -30,6 +30,7 @@ class RecorderProxyAttempt:
     stream_id: str
     account_id: str
     config_generation: str
+    control_generation: int
     capability_key: str
     input_url: str
     capability: str = field(repr=False)
@@ -57,9 +58,9 @@ def _decode(value):
 
 
 def _active_configuration():
-    from .configuration import load_active_configuration
+    from .configuration import load_applied_state
 
-    return load_active_configuration()
+    return load_applied_state()[0]
 
 
 def _close_database_connections() -> None:
@@ -248,6 +249,7 @@ def issue_recorder_attempt(
     channel_uuid: str,
     candidate: Mapping[str, Any],
     config_generation: str,
+    control_generation: int,
     internal_base_url: str,
 ) -> RecorderProxyAttempt:
     """Issue an HMAC-signed one-recorder capability and store only its digest."""
@@ -264,6 +266,8 @@ def issue_recorder_attempt(
     account_id = str(candidate.get("account_id") or "")
     if not stream_id or not account_id:
         raise ValueError("assigned recorder source is invalid")
+    if type(control_generation) is not int or control_generation < 0:
+        raise ValueError("recorder control generation is invalid")
     attempt_id = uuid.uuid4().hex
     worker_id = make_worker_id(
         str(channel_uuid), stream_id, config_generation, int(fence), attempt_id
@@ -272,6 +276,7 @@ def issue_recorder_attempt(
         "account_id": account_id,
         "channel_uuid": str(channel_uuid),
         "config_generation": str(config_generation),
+        "control_generation": str(control_generation),
         "lease_fence": str(int(fence)),
         "lease_key": str(lease_key),
         "lease_value": str(lease_value),
@@ -312,6 +317,7 @@ def issue_recorder_attempt(
         stream_id=stream_id,
         account_id=account_id,
         config_generation=str(config_generation),
+        control_generation=control_generation,
         capability_key=key,
         input_url=f"{internal_base_url.rstrip('/')}/catchuparr/recorder/{channel_uuid}",
         capability=token,
@@ -380,7 +386,11 @@ def capability_binding_current(redis_client, binding: Mapping[str, Any]) -> bool
         fence, _owner = current_lease.split(":", 1)
         if int(fence) != int(binding["lease_fence"]):
             return False
-        active = _active_configuration()
+        from .configuration import load_applied_state
+
+        active, control = load_applied_state()
+        if control.paused or control.generation != int(binding["control_generation"]):
+            return False
         if active is None or configuration_generation(active) != str(binding["config_generation"]):
             return False
         return candidate_is_current(

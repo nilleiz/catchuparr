@@ -19,6 +19,41 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _issue_media_probe_attempt(
+    redis_client,
+    lease,
+    *,
+    channel_uuid: str,
+    candidate: dict,
+    active_path: Path,
+    internal_base_url: str,
+):
+    """Issue using the current validated snapshot/control pair, never cached state."""
+    from catchuparr.configuration import load_applied_state
+    from catchuparr.recorder_proxy import (
+        configuration_generation,
+        issue_recorder_attempt,
+    )
+
+    active, control = load_applied_state(active_path)
+    _require(active is not None, "Applied recorder configuration is unavailable")
+    _require(not control.paused, "Recorder control is paused during capability issue")
+    config_generation = configuration_generation(active)
+    _require(
+        control.configuration_generation == config_generation,
+        "Applied recorder control is not bound to the current configuration",
+    )
+    return issue_recorder_attempt(
+        redis_client,
+        lease,
+        channel_uuid=channel_uuid,
+        candidate=candidate,
+        config_generation=config_generation,
+        control_generation=control.generation,
+        internal_base_url=internal_base_url,
+    )
+
+
 _NATIVE_LIVE_A_INVARIANT_NAMES = (
     "owner_read_ok",
     "owner_present",
@@ -768,6 +803,7 @@ def probe_actual_recorder_media(root: Path) -> None:
         active_settings_path,
         apply_configuration,
         load_active_configuration,
+        load_applied_state,
     )
     from catchuparr.engine.leases import RedisRecorderLease
     from catchuparr.engine.store import ArchiveStore
@@ -775,7 +811,6 @@ def probe_actual_recorder_media(root: Path) -> None:
     from catchuparr.recorder_proxy import (
         capability_binding_current,
         configuration_generation,
-        issue_recorder_attempt,
         ranked_source_candidates,
         stop_recorder_attempt,
         verify_recorder_capability,
@@ -924,8 +959,6 @@ def probe_actual_recorder_media(root: Path) -> None:
             candidates is not None and [str(item.get("id")) for item in candidates] == [str(source_b.id)],
             "Applied include-only rule did not leave only source B",
         )
-        generation = configuration_generation(active)
-
         redis_client = RedisClient.get_client()
         redis_client.ping()
         store = ArchiveStore(root)
@@ -965,11 +998,11 @@ def probe_actual_recorder_media(root: Path) -> None:
         client = Client(raise_request_exception=False)
 
         def issue(candidate):
-            attempt = issue_recorder_attempt(
+            attempt = _issue_media_probe_attempt(
                 redis_client, lease,
                 channel_uuid=str(channel.uuid),
                 candidate=candidate,
-                config_generation=generation,
+                active_path=active_path,
                 internal_base_url="http://127.0.0.1",
             )
             attempts.append(attempt)
@@ -1304,9 +1337,44 @@ def probe_actual_recorder_media(root: Path) -> None:
             "Stale generation capability changed provider profile capacity",
         )
         apply_configuration(settings, active_path=active_path)
+        restored_active, restored_control = load_applied_state(active_path)
         _require(
-            capability_binding_current(redis_client, generation_binding),
-            "Generation-check capability did not become valid after restoring its configuration",
+            restored_active is not None
+            and not restored_control.paused
+            and restored_control.configuration_generation
+            == configuration_generation(restored_active),
+            "Restored recorder configuration/control pair is not current",
+        )
+        _require(
+            not capability_binding_current(redis_client, generation_binding),
+            "Old capability became valid after a configuration restore advanced control generation",
+        )
+        stale_restored = client.get(
+            route_path, HTTP_HOST="localhost",
+            HTTP_X_CATCHUPARR_RECORDER=generation_attempt.capability,
+        )
+        _require(
+            stale_restored.status_code == 403,
+            "Old capability was accepted after restoring the prior configuration",
+        )
+        stale_restored.close()
+        restored_attempt = issue({"id": str(source_b.id), "account_id": str(account_b.id)})
+        restored_binding = verify_recorder_capability(
+            redis_client, restored_attempt.capability,
+        )
+        _require(
+            restored_attempt.control_generation == restored_control.generation
+            and restored_binding is not None
+            and capability_binding_current(redis_client, restored_binding),
+            "Fresh restored-state capability did not bind to the current control generation",
+        )
+        _require(
+            source_server.snapshot()[0] == counts_before_generation_change
+            and {
+                profile.id: _profile_count(redis_client, profile.id, profile_connections_key)
+                for profile in created_profiles
+            } == counters_before_generation_change,
+            "Capability generation checks changed provider source or capacity state",
         )
 
         # Keep another otherwise-valid capability, then replace only its owner lease.
