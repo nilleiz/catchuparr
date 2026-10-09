@@ -380,35 +380,80 @@ class ConfigurationTests(unittest.TestCase):
             apply_configuration(dict(self.settings, retention_hours=2), self.catalog, self.active_path)
 
         self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
-        with self.assertRaises(RecorderControlError):
-            load_applied_state(self.active_path)
+        active, control = load_applied_state(self.active_path)
+        self.assertEqual(24, active["retention_hours"])
         self.assertEqual(
-            "pending",
-            json.loads(
-                (self.active_path.parent / configuration.ACTIVATION_STATE_NAME).read_text()
-            )["state"],
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
+        )
+        self.assertFalse((self.active_path.parent / configuration.ACTIVATION_STATE_NAME).exists())
+
+    def test_durable_commit_record_is_authoritative_with_pending_journal(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        with patch.object(configuration, "_cleanup_committed_activation_locked"):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+        self.assertTrue(result["applied"])
+        state_path = self.active_path.parent / configuration.ACTIVATION_STATE_NAME
+        commit_path = self.active_path.parent / configuration.ACTIVATION_COMMIT_NAME
+        journal = json.loads(state_path.read_text(encoding="utf-8"))
+        commit = json.loads(commit_path.read_text(encoding="utf-8"))
+        self.assertEqual("pending", journal["state"])
+        self.assertEqual(journal["activation_id"], commit["activation_id"])
+
+        # Simulate restart recovery with the journal still carrying its prior
+        # pending label even though the matching commit record was durable.
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        active, control = load_applied_state(self.active_path)
+        self.assertEqual(2, active["retention_hours"])
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
         )
 
-    def test_durable_commit_record_allows_state_cleanup_after_state_fsync_error(self):
-        apply_configuration(self.settings, self.catalog, self.active_path)
-        write_state = configuration._write_activation_state_locked
+        from catchuparr.recorder_control import load_recorder_control
 
-        def write_state_then_report_fsync_error(path, state, activation_id):
-            write_state(path, state, activation_id)
-            if state == "committed":
-                raise OSError("synthetic state-directory fsync failure")
+        recovered = load_recorder_control(self.active_path)
+        self.assertFalse(recovered.paused)
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertFalse(state_path.exists())
+        self.assertFalse(commit_path.exists())
+
+    def test_deny_cleanup_failure_reports_applied_but_paused_and_retries(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        from catchuparr import recorder_control
+        from catchuparr.recorder_control import RecorderControlError
 
         with patch.object(
-            configuration,
-            "_write_activation_state_locked",
-            side_effect=write_state_then_report_fsync_error,
+            recorder_control,
+            "_clear_deny_marker",
+            side_effect=RecorderControlError("synthetic deny-marker cleanup failure"),
         ):
             result = apply_configuration(
                 dict(self.settings, retention_hours=2), self.catalog, self.active_path
             )
 
         self.assertTrue(result["applied"])
+        self.assertTrue(result["recording_paused"])
+        self.assertIn("remains paused", result["warning"])
+        self.assertIn(result["warning"], result["message"])
         self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        deny_path = recorder_control.control_deny_path(self.active_path)
+        state_path = self.active_path.parent / configuration.ACTIVATION_STATE_NAME
+        commit_path = self.active_path.parent / configuration.ACTIVATION_COMMIT_NAME
+        self.assertTrue(deny_path.exists())
+        self.assertTrue(state_path.exists())
+        self.assertTrue(commit_path.exists())
+        with self.assertRaisesRegex(RecorderControlError, "pending control transition"):
+            load_applied_state(self.active_path)
+
+        recovered = recorder_control.load_recorder_control(self.active_path)
+        self.assertFalse(recovered.paused)
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertFalse(deny_path.exists())
+        self.assertFalse(state_path.exists())
+        self.assertFalse(commit_path.exists())
 
     def test_reset_marker_cleanup_failure_does_not_report_apply_failure(self):
         marker = self.active_path.parent / RESET_REQUIRED_NAME

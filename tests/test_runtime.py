@@ -260,6 +260,63 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertTrue(result["channels"][0]["recording_scheduled"])
         self.assertIn("segments", result["channels"][0])
 
+    def test_runtime_state_denies_recording_when_applied_control_is_unavailable(self):
+        from catchuparr import runtime
+        from catchuparr.recorder_control import RecorderControlError
+
+        active = {
+            "archive_root": "/tmp/synthetic-active-root",
+            "retention_hours": 48,
+            "max_storage_gib": 12,
+            "recording_enabled": True,
+            "log_level": "INFO",
+            "channel_uuids": "",
+            "channel_profile_ids": [],
+            "source_policies": {},
+        }
+        with patch("catchuparr.configuration.reset_legacy_configuration"), patch(
+            "catchuparr.configuration.load_applied_state",
+            side_effect=RecorderControlError("synthetic pending deny marker"),
+        ), patch("catchuparr.configuration.load_active_configuration", return_value=active):
+            settings, control = runtime.load_runtime_state()
+
+        self.assertIsNone(control)
+        self.assertFalse(settings["recording_enabled"])
+        self.assertEqual(48, settings["retention_hours"])
+
+    def test_runtime_apply_returns_explicit_committed_but_paused_warning(self):
+        from catchuparr import runtime
+        from catchuparr.recorder_control import RecorderControlError
+
+        result = {
+            "applied": True,
+            "selected_channel_count": 2,
+            "source_policy_count": 1,
+            "recording_paused": True,
+            "warning": "Settings were applied, but recording remains paused while cleanup is retried.",
+            "message": "2 channel(s) selected. Settings were applied, but recording remains paused while cleanup is retried.",
+        }
+        with patch("catchuparr.configuration.apply_configuration", return_value=result), patch(
+            "catchuparr.configuration.load_applied_state",
+            side_effect=RecorderControlError("synthetic pending deny marker"),
+        ), patch(
+            "catchuparr.configuration.load_active_configuration",
+            return_value={"log_level": "INFO"},
+        ), patch("catchuparr.logging_utils.apply_log_level"), patch(
+            "catchuparr.logging_utils.event"
+        ) as event:
+            returned = runtime.apply_configuration()
+
+        self.assertTrue(returned["applied"])
+        self.assertTrue(returned["recording_paused"])
+        self.assertIn("remains paused", returned["warning"])
+        event.assert_called_once_with(
+            "configuration_applied",
+            channel_count=2,
+            source_policy_count=1,
+            recording_paused=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

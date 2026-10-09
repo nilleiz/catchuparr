@@ -258,6 +258,11 @@ def apply_configuration(
         else:
             result, prepared = _apply_configuration_locked(settings, catalog, path)
         prepared.commit()
+        if prepared.recording_paused_warning:
+            warning = "Settings were applied, but recording remains paused while cleanup is retried."
+            result["recording_paused"] = True
+            result["warning"] = warning
+            result["message"] = f"{result['message']} {warning}"
         return result
 
 
@@ -351,6 +356,7 @@ class _PreparedActivation:
         self.marker_was_present = marker_was_present
         self.activation_id = activation_id
         self.finished = False
+        self.recording_paused_warning = False
 
     def commit(self) -> None:
         if self.finished:
@@ -363,28 +369,23 @@ class _PreparedActivation:
             # The pending journal remains authoritative if the commit record
             # could not be confirmed durable. Do not infer durability from a
             # file that may merely be visible in the current process.
-            raise RecorderControlError(
-                "configuration commit durability could not be confirmed; previous settings remain active"
-            ) from None
-        try:
-            _write_activation_state_locked(
-                self.active_path, "committed", self.activation_id
+            restored = self.rollback()
+            message = (
+                "configuration commit durability could not be confirmed; previous settings were restored"
+                if restored else
+                "configuration commit durability could not be confirmed; recorder admission remains denied"
             )
-        except OSError:
-            state = _read_activation_state_locked(self.active_path)
-            if state != ("committed", self.activation_id):
-                raise RecorderControlError(
-                    "configuration commit could not be completed; previous settings remain active"
-                ) from None
+            raise RecorderControlError(message) from None
         self.finished = True
         try:
             from .recorder_control import _clear_deny_marker
 
             _clear_deny_marker(self.sidecar)
         except Exception:
-            # The configuration is durably committed; a leftover deny marker
-            # only pauses admission and will be handled on the next recovery.
-            pass
+            # Keep the commit journal so control recovery can retry clearing
+            # this marker and report that recording remains paused meanwhile.
+            self.recording_paused_warning = True
+            return
         try:
             _remove_reset_required_marker(self.active_path)
         except OSError:
@@ -394,6 +395,10 @@ class _PreparedActivation:
     def rollback(self) -> bool:
         if self.finished:
             return True
+        try:
+            _remove_activation_commit_locked(self.active_path)
+        except Exception:
+            return False
         active_restored = _restore_file_bytes_locked(self.active_path, self.previous_active)
         control_restored = _restore_file_bytes_locked(self.sidecar, self.previous_control)
         restored = active_restored and control_restored
@@ -406,7 +411,6 @@ class _PreparedActivation:
             try:
                 _remove_activation_state_locked(self.active_path)
                 _remove_activation_backup_locked(self.active_path)
-                _remove_activation_commit_locked(self.active_path)
             except Exception:
                 restored = False
         self.finished = restored
@@ -604,6 +608,15 @@ def _read_activation_commit_locked(path: Path) -> str | None:
     return raw["activation_id"]
 
 
+def _activation_commit_matches(
+    path: Path, activation_state: tuple[str, str] | None
+) -> bool:
+    return (
+        activation_state is not None
+        and _read_activation_commit_locked(path) == activation_state[1]
+    )
+
+
 def _remove_durable_file(path: Path) -> None:
     try:
         path.unlink()
@@ -658,25 +671,19 @@ def _recover_interrupted_activation_locked(path: Path) -> None:
         _remove_activation_backup_locked(path)
         _remove_activation_commit_locked(path)
         return
-    state_name, activation_id = state
+    _state_name, activation_id = state
     backup = _read_activation_backup_locked(path)
     if backup["activation_id"] != activation_id:
         raise ValueError("Configuration activation backup does not match its journal")
-    if state_name == "pending":
-        if not _restore_activation_backup_locked(path, backup):
-            raise ValueError("Interrupted configuration activation could not be restored")
-    elif _read_activation_commit_locked(path) != activation_id:
-        if not _restore_activation_backup_locked(path, backup):
-            raise ValueError("Unconfirmed configuration activation could not be restored")
-    else:
+    if _activation_commit_matches(path, state):
         try:
             from .recorder_control import _clear_deny_marker, control_state_path
 
             _clear_deny_marker(control_state_path(path))
         except Exception:
-            # A leftover deny marker only blocks recording. The committed
-            # snapshot remains authoritative and cleanup can be retried later.
-            pass
+            raise ValueError("Committed configuration still has recorder admission denied") from None
+    elif not _restore_activation_backup_locked(path, backup):
+        raise ValueError("Interrupted configuration activation could not be restored")
     _remove_activation_state_locked(path)
     _remove_activation_backup_locked(path)
     _remove_activation_commit_locked(path)
@@ -828,10 +835,7 @@ def load_applied_state(
             activation_state = _read_activation_state_locked(path)
         except ValueError:
             raise RecorderControlError("configuration activation state is invalid") from None
-        if activation_state is not None and (
-            activation_state[0] == "pending"
-            or _read_activation_commit_locked(path) != activation_state[1]
-        ):
+        if activation_state is not None and not _activation_commit_matches(path, activation_state):
             raise RecorderControlError("configuration activation is incomplete")
         active = _load_active_configuration_locked(path)
         sidecar = control_state_path(path)
@@ -852,10 +856,7 @@ def load_applied_state(
 
 def _load_active_configuration_locked(path: Path) -> dict[str, Any] | None:
     activation_state = _read_activation_state_locked(path)
-    if activation_state is not None and (
-        activation_state[0] == "pending"
-        or _read_activation_commit_locked(path) != activation_state[1]
-    ):
+    if activation_state is not None and not _activation_commit_matches(path, activation_state):
         backup = _read_activation_backup_locked(path)
         if backup["activation_id"] != activation_state[1]:
             raise ValueError("Configuration activation backup does not match its journal")
