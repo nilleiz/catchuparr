@@ -17,7 +17,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | --- | --- | --- | --- |
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
-| 0.3.1 | Weekly schedule day groups, timezone defaults and unified Apply | Low | Planned |
+| 0.3.1 | Weekly schedule day groups, timezone defaults, unified Apply and M3U token links | Low | Planned |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
@@ -146,6 +146,12 @@ to 0.3.1 only.
   sidecar are coordinated. Use staging/rollback under a common lock or fail
   closed on mixed state; document cross-store atomicity only after it is
   demonstrated.
+- After creating an M3U access token, show two clearly labeled links in the
+  confirmation toast: the authenticated M3U playlist URL and XMLTV EPG URL. Both
+  links use the same newly created token and its existing user permissions. Put
+  them on separate lines and make them selectable and copyable; add copy controls
+  when the toast UI supports them. Never write tokens or authenticated URLs to
+  logs or repository files.
 
 ### Acceptance
 
@@ -158,7 +164,11 @@ Verify that one Apply validates and activates all settings together; invalid
 YAML and simulated multi-setting persistence failures leave the prior active
 configuration intact. Test pause/resume control-generation fencing against a
 concurrent Apply, shared configuration-generation checks, and rejection of
-stale queued recorder tasks.
+stale queued recorder tasks. Verify token creation displays both the M3U
+playlist and XMLTV EPG links with clear labels, both links map to the same token
+and existing permissions, and the toast leaves each link selectable and copyable
+without truncation. Check that application logs contain neither the token nor
+either authenticated URL.
 
 ## 0.4.0 — recorder visibility
 
