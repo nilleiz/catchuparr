@@ -1,4 +1,5 @@
 import array
+import http.client
 import json
 import math
 import sys
@@ -35,6 +36,64 @@ class _SyntheticArchiveStore:
 
 
 class RecorderFailoverMediaTests(unittest.TestCase):
+    def test_stall_source_keeps_one_http_response_open_with_null_tail(self):
+        payload = b"b" * (188 * 64)
+        server = probe._SyntheticFailoverSourceServer(
+            {"source-b.ts": payload}, {"source-b.ts": 0.05},
+        )
+        server.set_mode("source-b.ts", "stall", repeats=1)
+        server.thread.start()
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_port, timeout=3,
+        )
+        response = None
+        try:
+            connection.request("GET", "/source-b.ts")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(len(payload)), payload)
+            null_chunk_size = 188 * probe.SOURCE_CHUNK_PACKETS
+            self.assertEqual(
+                response.read(null_chunk_size),
+                probe._null_transport_stream()[:null_chunk_size],
+            )
+
+            request_counts, active_counts = server.snapshot()
+            deadline = time.monotonic() + 1
+            stall = server.stall_snapshot()["source-b.ts"]
+            while stall["null_bytes"] == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+                stall = server.stall_snapshot()["source-b.ts"]
+            self.assertEqual(request_counts["source-b.ts"], 1)
+            self.assertEqual(active_counts["source-b.ts"], 1)
+            self.assertEqual(stall["started"], 1)
+            self.assertGreater(stall["null_bytes"], 0)
+        finally:
+            if response is not None:
+                response.close()
+            connection.close()
+            server.close()
+
+        self.assertEqual(server.snapshot()[1]["source-b.ts"], 0)
+
+    def test_recorder_attempt_summary_exposes_only_known_status_and_count(self):
+        summary = probe._recorder_attempt_summary([
+            SimpleNamespace(
+                status="media_stalled", useful_segments=2,
+                input_url="http://127.0.0.1/private-token",
+            ),
+            SimpleNamespace(status="private-value", useful_segments="bad"),
+        ])
+
+        self.assertEqual(
+            summary,
+            [
+                {"status": "media_stalled", "useful_segments": 2},
+                {"status": "other", "useful_segments": None},
+            ],
+        )
+        self.assertNotIn("private-token", json.dumps(summary))
+
     def test_decoded_tones_identify_b_c_and_d_separately(self):
         expected = {
             "Synthetic Source B": 880,
@@ -171,6 +230,63 @@ class RecorderFailoverMediaTests(unittest.TestCase):
 
 
 class RecorderFailoverBridgeTests(unittest.TestCase):
+    def test_supervisor_join_waits_without_signalling_the_task(self):
+        run = probe._RecorderTaskRun(
+            "synthetic-channel", startup_timeout=1, media_idle_timeout=1,
+        )
+
+        class FinishingThread:
+            def __init__(self):
+                self.alive_states = iter((True, True, False, False))
+                self.joined_with = []
+
+            def join(self, timeout):
+                self.joined_with.append(timeout)
+
+            def is_alive(self):
+                return next(self.alive_states)
+
+        thread = FinishingThread()
+        cooperative_sleeps = []
+        run.thread = thread
+        run.result = {"status": "stopped"}
+        run.join_after_supervisor(
+            timeout=7, cooperative_sleep=cooperative_sleeps.append,
+        )
+
+        self.assertEqual(thread.joined_with, [0])
+        self.assertEqual(len(cooperative_sleeps), 1)
+        self.assertGreater(cooperative_sleeps[0], 0)
+        self.assertLessEqual(cooperative_sleeps[0], 0.05)
+        self.assertFalse(run.stop_event.is_set())
+
+    def test_supervisor_join_keeps_timeout_bounded_without_signalling(self):
+        run = probe._RecorderTaskRun(
+            "synthetic-channel", startup_timeout=1, media_idle_timeout=1,
+        )
+
+        class StuckThread:
+            def __init__(self):
+                self.joined_with = []
+
+            def join(self, timeout):
+                self.joined_with.append(timeout)
+
+            @staticmethod
+            def is_alive():
+                return True
+
+        thread = StuckThread()
+        run.thread = thread
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "did not stop in time"):
+            run.join_after_supervisor(timeout=0.02, cooperative_sleep=time.sleep)
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(thread.joined_with)
+        self.assertTrue(all(timeout == 0 for timeout in thread.joined_with))
+        self.assertFalse(run.stop_event.is_set())
+
     def test_bridge_idle_wait_observes_handler_close(self):
         drained = threading.Event()
         server = SimpleNamespace(active_requests=lambda: int(not drained.is_set()))
