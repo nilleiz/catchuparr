@@ -178,6 +178,7 @@ class ConfigurationTests(unittest.TestCase):
             "https://media.example.test:bad",
             "https://media.example.test/a/../b",
             "https://media.example.test/%2e%2e/b",
+            "https://media.example.test/%3Cscript%3E",
         ):
             with self.subTest(base_url=base_url):
                 with self.assertRaisesRegex(ValueError, "public_base_url"):
