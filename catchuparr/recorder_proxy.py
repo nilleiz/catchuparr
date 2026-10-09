@@ -63,12 +63,31 @@ def _active_configuration():
 
 
 def _close_database_connections() -> None:
-    """Release ORM connections before recorder workers enter long-lived streams."""
+    """Release a safe, existing default ORM connection before a long stream."""
     try:
         from django.db import connections
     except ImportError:
         return
-    connections.close_all()
+    try:
+        initialized = connections.all(initialized_only=True)
+    except Exception:
+        return
+    default = next(
+        (connection for connection in initialized if connection.alias == "default"),
+        None,
+    )
+    if (
+        default is None
+        or default.connection is None
+        or default.in_atomic_block
+    ):
+        return
+    try:
+        autocommit = default.get_autocommit()
+    except Exception:
+        return
+    if autocommit:
+        default.close()
 
 
 def _policy_for_channel(active: Mapping[str, Any], channel_uuid: str) -> SourcePolicy | None:
