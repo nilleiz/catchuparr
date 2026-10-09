@@ -14,6 +14,106 @@ from catchuparr.runtime import require_supported_version, status
 
 
 class RuntimeStatusTests(unittest.TestCase):
+    def test_public_base_url_normalization_rejects_untrusted_url_parts(self):
+        from catchuparr.runtime import normalize_public_base_url
+
+        self.assertEqual(
+            "https://media.example.test/dispatcharr",
+            normalize_public_base_url("https://media.example.test/dispatcharr/"),
+        )
+        for value in (
+            "",
+            "ftp://media.example.test",
+            "https://user:pass@media.example.test",
+            "https://media.example.test/?query=1",
+            "https://media.example.test/#fragment",
+            "https://media.example.test/%2e%2e/elsewhere",
+        ):
+            if value == "":
+                continue
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "public_base_url"):
+                normalize_public_base_url(value)
+
+    def test_create_access_token_returns_two_labeled_copyable_authorized_urls(self):
+        from catchuparr import runtime
+
+        apps = types.ModuleType("apps")
+        accounts = types.ModuleType("apps.accounts")
+        models = types.ModuleType("apps.accounts.models")
+
+        class Query:
+            def filter(self, **kwargs):
+                self.kwargs = kwargs
+                return self
+
+            def exists(self):
+                return self.kwargs == {"id": 9}
+
+        models.User = type("User", (), {"objects": Query()})
+        accounts.models = models
+        apps.accounts = accounts
+
+        issued = []
+
+        class Store:
+            def __init__(self, root):
+                self.root = Path(root)
+
+            def issue(self, user_id):
+                issued.append((self.root, user_id))
+                return "synthetic/token+value"
+
+        settings = {
+            "archive_root": "/tmp/synthetic-catchuparr",
+            "playback_user_id": 9,
+            "public_base_url": "https://media.example.test/dispatcharr/",
+        }
+        with patch.dict(
+            sys.modules,
+            {
+                "apps": apps,
+                "apps.accounts": accounts,
+                "apps.accounts.models": models,
+            },
+        ), patch.object(runtime, "require_supported_version"), patch(
+            "catchuparr.security.AccessTokenStore", Store
+        ):
+            result = runtime.create_access_token(settings)
+
+        self.assertEqual(
+            "https://media.example.test/dispatcharr/catchuparr/m3u"
+            "?access_token=synthetic%2Ftoken%2Bvalue",
+            result["playlist_url"],
+        )
+        self.assertEqual(
+            "https://media.example.test/dispatcharr/catchuparr/xmltv"
+            "?access_token=synthetic%2Ftoken%2Bvalue",
+            result["xmltv_url"],
+        )
+        self.assertEqual(
+            "M3U playlist URL: "
+            + result["playlist_url"]
+            + "\nXMLTV EPG URL: "
+            + result["xmltv_url"],
+            result["message"],
+        )
+        self.assertEqual([(Path("/tmp/synthetic-catchuparr"), 9)], issued)
+
+        settings_without_base = dict(settings)
+        settings_without_base.pop("public_base_url")
+        with patch.dict(
+            sys.modules,
+            {
+                "apps": apps,
+                "apps.accounts": accounts,
+                "apps.accounts.models": models,
+            },
+        ), patch.object(runtime, "require_supported_version"), patch(
+            "catchuparr.security.AccessTokenStore", Store
+        ), self.assertRaisesRegex(ValueError, "public_base_url"):
+            runtime.create_access_token(settings_without_base)
+        self.assertEqual([(Path("/tmp/synthetic-catchuparr"), 9)], issued)
+
     def test_status_reports_last_segment_and_storage_usage(self):
         channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -31,7 +131,7 @@ class RuntimeStatusTests(unittest.TestCase):
                 "archive_root": str(store.root),
                 "retention_hours": 2,
                 "max_storage_gib": 5,
-            })
+            }, control_state=RecorderControlState(False, 0))
         self.assertEqual(segment.end_utc.isoformat(), result["channels"][0]["latest_end_utc"])
         self.assertEqual(1, result["channels"][0]["segments"])
         self.assertEqual(len(b"transport stream"), result["indexed_storage_bytes"])
@@ -72,7 +172,8 @@ class RuntimeStatusTests(unittest.TestCase):
             "apps.plugins": plugins,
             "apps.plugins.models": models,
         }), patch("catchuparr.configuration.reset_legacy_configuration", return_value=True), patch(
-            "catchuparr.configuration.load_active_configuration", return_value=None
+            "catchuparr.configuration.load_applied_state",
+            return_value=(None, RecorderControlState(False, 0)),
         ):
             from catchuparr.runtime import load_config
 
@@ -118,28 +219,22 @@ class RuntimeStatusTests(unittest.TestCase):
 
     def test_status_explains_that_apply_is_required_after_legacy_reset(self):
         configuration = importlib.import_module("catchuparr.configuration")
-        recorder_control = importlib.import_module("catchuparr.recorder_control")
         with tempfile.TemporaryDirectory() as directory, patch.object(
             configuration, "configuration_reset_required", return_value=True
-        ), patch.object(
-            recorder_control, "load_recorder_control", return_value=RecorderControlState(False, 0)
         ):
             result = status({
                 "channel_uuids": "",
                 "archive_root": directory,
                 "retention_hours": 2,
                 "max_storage_gib": 5,
-            })
+            }, control_state=RecorderControlState(False, 0))
         self.assertEqual([], result["channels"])
         self.assertIn("cleared", result["configuration_status"])
         self.assertIn("apply filter_config", result["configuration_status"])
 
     def test_status_exposes_recording_control_without_affecting_archive_stats(self):
         channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "catchuparr.recorder_control.load_recorder_control",
-            return_value=RecorderControlState(True, 8),
-        ):
+        with tempfile.TemporaryDirectory() as directory:
             result = status({
                 "channel_uuids": channel,
                 "archive_root": directory,
@@ -149,7 +244,7 @@ class RuntimeStatusTests(unittest.TestCase):
                     "timezone": "UTC",
                     "channels": {channel: {"mode": "continuous"}},
                 },
-            })
+            }, control_state=RecorderControlState(True, 8))
         self.assertFalse(result["recording_enabled"])
         self.assertEqual(8, result["control_generation"])
         self.assertTrue(result["recording_control_available"])

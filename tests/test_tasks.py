@@ -154,12 +154,11 @@ class RecorderTaskTests(unittest.TestCase):
         with _isolated_plugin_modules(fake_modules):
             tasks = importlib.import_module("catchuparr.tasks")
             with (
-                patch("catchuparr.configuration.load_active_configuration", return_value=active_a),
-                patch("catchuparr.runtime.load_config", side_effect=config_from_snapshot),
                 patch(
-                    "catchuparr.recorder_control.load_recorder_control",
-                    return_value=SimpleNamespace(paused=False, generation=9),
+                    "catchuparr.configuration.load_applied_state",
+                    return_value=(active_a, SimpleNamespace(paused=False, generation=9)),
                 ),
+                patch("catchuparr.runtime.load_config", side_effect=config_from_snapshot),
             ):
                 state = tasks._recorder_admission_state(
                     channel, configuration_generation(active_a), 9
@@ -247,8 +246,10 @@ class RecorderTaskTests(unittest.TestCase):
                         patch("catchuparr.runtime.require_supported_version"),
                         patch("catchuparr.runtime.load_config", side_effect=lambda active_snapshot=None: parse_settings(active_snapshot)),
                         patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
-                        patch("catchuparr.configuration.load_active_configuration", return_value=active),
-                        patch("catchuparr.recorder_control.load_recorder_control", side_effect=current_control),
+                        patch(
+                            "catchuparr.configuration.load_applied_state",
+                            side_effect=lambda: (active, current_control()),
+                        ),
                         patch("catchuparr.schedule.schedule_is_active", side_effect=schedule_active),
                         patch.object(lease_module, "RedisRecorderLease", FakeLease),
                         patch("catchuparr.engine.store.ArchiveStore", return_value=object()),
@@ -425,8 +426,10 @@ class RecorderTaskTests(unittest.TestCase):
             with (
                 patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
                 patch("catchuparr.runtime.load_config", return_value=config),
-                patch("catchuparr.configuration.load_active_configuration", return_value=active),
-                patch("catchuparr.recorder_control.load_recorder_control", return_value=control),
+                patch(
+                    "catchuparr.configuration.load_applied_state",
+                    return_value=(active, control),
+                ),
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
             ):
                 result = tasks.reconcile_recorders()
@@ -465,41 +468,33 @@ class RecorderTaskTests(unittest.TestCase):
             "core.utils": core_utils,
             "version": _fake_module("version", __version__="0.32.0"),
         }
+        applied_state = {"active": active, "control": SimpleNamespace(paused=False, generation=3)}
         with _isolated_plugin_modules(fake_modules):
             tasks = importlib.import_module("catchuparr.tasks")
             with (
                 patch("catchuparr.runtime.load_config", return_value=config),
                 patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
-                patch("catchuparr.configuration.load_active_configuration", return_value=active),
                 patch(
-                    "catchuparr.recorder_control.load_recorder_control",
-                    return_value=SimpleNamespace(paused=False, generation=3),
+                    "catchuparr.configuration.load_applied_state",
+                    side_effect=lambda: (applied_state["active"], applied_state["control"]),
                 ),
                 patch("catchuparr.logging_utils.event") as log_event,
             ):
                 result = tasks.record_channel("channel-1", "older-generation", 3)
                 current_generation = configuration_generation(active)
                 stale_control = tasks.record_channel("channel-1", current_generation, 2)
-                with patch(
-                    "catchuparr.recorder_control.load_recorder_control",
-                    return_value=SimpleNamespace(paused=True, generation=3),
-                ):
-                    paused = tasks.record_channel("channel-1", current_generation, 3)
+                applied_state["control"] = SimpleNamespace(paused=True, generation=3)
+                paused = tasks.record_channel("channel-1", current_generation, 3)
                 legacy = tasks.record_channel("channel-1", current_generation)
                 off_schedule = _active_configuration()
                 off_schedule["recording_schedule"]["channels"]["channel-1"] = {
                     "mode": "weekly", "intervals": []
                 }
-                with (
-                    patch("catchuparr.configuration.load_active_configuration", return_value=off_schedule),
-                    patch(
-                        "catchuparr.recorder_control.load_recorder_control",
-                        return_value=SimpleNamespace(paused=False, generation=3),
-                    ),
-                ):
-                    outside = tasks.record_channel(
-                        "channel-1", configuration_generation(off_schedule), 3
-                    )
+                applied_state["active"] = off_schedule
+                applied_state["control"] = SimpleNamespace(paused=False, generation=3)
+                outside = tasks.record_channel(
+                    "channel-1", configuration_generation(off_schedule), 3
+                )
         self.assertEqual({"status": "stale_configuration"}, result)
         self.assertEqual({"status": "stale_control"}, stale_control)
         self.assertEqual({"status": "recording_paused"}, paused)
@@ -566,10 +561,9 @@ class RecorderTaskTests(unittest.TestCase):
             with (
                 patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
                 patch("catchuparr.runtime.load_config", return_value=config),
-                patch("catchuparr.configuration.load_active_configuration", return_value=active),
                 patch(
-                    "catchuparr.recorder_control.load_recorder_control",
-                    return_value=SimpleNamespace(paused=False, generation=5),
+                    "catchuparr.configuration.load_applied_state",
+                    return_value=(active, SimpleNamespace(paused=False, generation=5)),
                 ),
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
             ):
@@ -620,10 +614,9 @@ class RecorderTaskTests(unittest.TestCase):
                 with (
                     patch("catchuparr.runtime.load_config", return_value=config),
                     patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
-                    patch("catchuparr.configuration.load_active_configuration", return_value=active),
                     patch(
-                        "catchuparr.recorder_control.load_recorder_control",
-                        return_value=SimpleNamespace(paused=False, generation=4),
+                        "catchuparr.configuration.load_applied_state",
+                        return_value=(active, SimpleNamespace(paused=False, generation=4)),
                     ),
                 ):
                     with self.assertRaisesRegex(RuntimeError, "DVR URL setup failed"):
@@ -707,10 +700,9 @@ class RecorderTaskTests(unittest.TestCase):
                 with (
                     patch("catchuparr.runtime.load_config", return_value=config),
                     patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
-                    patch("catchuparr.configuration.load_active_configuration", return_value=active),
                     patch(
-                        "catchuparr.recorder_control.load_recorder_control",
-                        return_value=SimpleNamespace(paused=False, generation=6),
+                        "catchuparr.configuration.load_applied_state",
+                        return_value=(active, SimpleNamespace(paused=False, generation=6)),
                     ),
                     patch("catchuparr.recorder_proxy.ranked_source_candidates", return_value=source_candidates),
                     patch(

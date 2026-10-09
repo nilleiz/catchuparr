@@ -8,9 +8,10 @@ Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q catchu
 
 Import `dist/catchuparr-<version>.zip` from Dispatcharr's Plugins page and enable it after inspecting its settings. The plugin code is installed under Dispatcharr's `/data/plugins/catchuparr`. The AIO container runs web and Celery with the same `/data/catchuparr` archive mount. During an update, stop the recorders, install the new ZIP, reload plugins, run the compatibility check, and resume the selected channels. Keep the prior ZIP and a verified application/configuration restore point until playback smoke tests pass; use the backup policy below.
 
-For the unreleased 0.3.0 candidate, use the
-[candidate guide](candidate-0.3.0.md) for YAML schedules, recorder controls,
-legacy-setting reset behavior and current acceptance status. The build command
+For the unreleased 0.3.1 candidate, use the
+[candidate guide](candidate-0.3.1.md) for YAML schedules, timezone resolution,
+unified settings Apply, recorder controls, legacy-setting reset behavior and
+current acceptance status. The 0.3.0 guide is historical. The build command
 uses the manifest version when naming the ZIP.
 
 Dispatcharr v0.31.0 and v0.32.0 accept a manual update at authenticated admin

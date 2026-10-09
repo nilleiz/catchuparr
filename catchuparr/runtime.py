@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from .compatibility import (
     SUPPORTED_DISPATCHARR_VERSION as SUPPORTED_DISPATCHARR_VERSION,
@@ -52,6 +55,71 @@ def parse_settings(settings: dict) -> Config:
     return Config(tuple(dict.fromkeys(values)), root, retention_hours, max_gib * 1024**3)
 
 
+def normalize_public_base_url(value) -> str:
+    """Validate a configured external base URL used for one-time token links."""
+    if not isinstance(value, str):
+        raise ValueError("public_base_url must be text")
+    value = value.strip()
+    if not value:
+        return ""
+    if any(character.isspace() or ord(character) < 0x20 for character in value):
+        raise ValueError("public_base_url must be an absolute http(s) base URL")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("public_base_url must be an absolute http(s) base URL") from None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "?" in value
+        or "#" in value
+        or "\\" in parsed.path
+    ):
+        raise ValueError("public_base_url must be an absolute http(s) base URL")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("public_base_url port is invalid")
+    hostname = parsed.hostname
+    if ":" in hostname:
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ipaddress.AddressValueError:
+            raise ValueError("public_base_url host is invalid") from None
+    else:
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError("public_base_url host is invalid") from None
+        labels = ascii_hostname.rstrip(".").split(".")
+        if not labels or any(
+            not label
+            or len(label) > 63
+            or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+            for label in labels
+        ):
+            raise ValueError("public_base_url host is invalid")
+    decoded_path = unquote(parsed.path)
+    if decoded_path.startswith("//") or "\\" in decoded_path:
+        raise ValueError("public_base_url path is invalid")
+    path_parts = decoded_path.split("/")
+    if any(part in {".", ".."} for part in path_parts):
+        raise ValueError("public_base_url path is invalid")
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc,
+            parsed.path.rstrip("/"),
+            "",
+            "",
+        )
+    )
+
+
 def load_config(active_snapshot: dict | None = None) -> Config | None:
     from apps.plugins.models import PluginConfig
 
@@ -61,6 +129,9 @@ def load_config(active_snapshot: dict | None = None) -> Config | None:
     if plugin is None:
         return None
     active = active_snapshot if active_snapshot is not None else load_active_configuration()
+    from .logging_utils import apply_log_level
+
+    apply_log_level(active.get("log_level", "INFO") if active else "INFO")
     if active is None:
         return None
     return parse_settings(active)
@@ -73,19 +144,64 @@ def load_plugin_settings(fallback: dict | None = None) -> dict:
     return load_draft_settings(fallback)
 
 
-def load_runtime_settings(fallback: dict | None = None) -> dict:
-    """Use applied IDs, or draft base settings with no selected channels."""
-    from .configuration import load_active_configuration, reset_legacy_configuration
+def load_runtime_settings() -> dict:
+    """Return only committed settings; an unapplied draft never reaches runtime."""
+    settings, _control = load_runtime_state()
+    return settings
+
+
+def load_runtime_state() -> tuple[dict, object]:
+    """Read applied settings while keeping archive access independent of recorder state."""
+    from .configuration import (
+        load_active_configuration,
+        load_applied_state,
+        reset_legacy_configuration,
+    )
+    from .recorder_control import RecorderControlError
 
     reset_legacy_configuration()
-    active = load_active_configuration()
+    try:
+        active, control = load_applied_state()
+    except RecorderControlError:
+        # A broken recorder sidecar denies new recording but must not disable
+        # archive playback, status, or token management.
+        active = load_active_configuration()
+        control = None
     if active is not None:
-        return active
-    draft = load_plugin_settings(fallback)
-    draft.pop("channel_uuids", None)
-    draft.pop("source_rules", None)
-    draft["channel_uuids"] = ""
-    return draft
+        runtime_settings = dict(active)
+        runtime_settings["recording_enabled"] = (
+            control.recording_enabled
+            if control is not None
+            else bool(active.get("recording_enabled", False))
+        )
+        return runtime_settings, control
+    return {
+        "archive_root": "/data/catchuparr",
+        "retention_hours": 24,
+        "max_storage_gib": 20,
+        "playback_user_id": 0,
+        "public_base_url": "",
+        "recording_enabled": False,
+        "log_level": "INFO",
+        "channel_uuids": "",
+        "channel_profile_ids": [],
+        "source_policies": {},
+    }, control
+
+
+def apply_committed_log_level(settings: dict | None = None) -> str:
+    """Reload the logger level only from the active, committed snapshot."""
+    from .configuration import load_active_configuration, load_applied_state
+    from .logging_utils import apply_log_level
+
+    if settings is not None:
+        active = settings
+    else:
+        try:
+            active, _control = load_applied_state()
+        except Exception:
+            active = load_active_configuration()
+    return apply_log_level(active.get("log_level", "INFO") if active else "INFO")
 
 
 def validate_configuration(settings: dict) -> dict:
@@ -96,25 +212,18 @@ def validate_configuration(settings: dict) -> dict:
 
 def apply_configuration(settings: dict | None = None) -> dict:
     from .configuration import apply_configuration as apply
-    from .logging_utils import event
+    from .configuration import load_applied_state
+    from .logging_utils import apply_log_level, event
 
     result = apply(settings)
+    active, _control = load_applied_state()
+    apply_log_level(active.get("log_level", "INFO") if active else "INFO")
     event(
         "configuration_applied",
         channel_count=result["selected_channel_count"],
         source_policy_count=result["source_policy_count"],
     )
     return result
-
-
-def apply_recorder_control() -> dict:
-    from .logging_utils import event
-    from .recorder_control import apply_recorder_control as apply
-
-    state = apply()
-    event("control_applied", paused=state.paused, control_generation=state.generation)
-    _enqueue_recorder_reconcile()
-    return {"paused": state.paused, "generation": state.generation}
 
 
 def pause_recorders() -> dict:
@@ -173,13 +282,13 @@ def require_supported_version() -> None:
 
 def bootstrap() -> None:
     """Register tasks/routes only for the inspected Dispatcharr version."""
-    from .logging_utils import apply_log_level, error, event
+    from .logging_utils import error, event
 
     try:
-        from .configuration import load_draft_settings
-
-        apply_log_level(load_draft_settings().get("log_level", "INFO"))
+        apply_committed_log_level()
     except Exception:
+        from .logging_utils import apply_log_level
+
         apply_log_level("INFO")
     try:
         require_supported_version()
@@ -272,9 +381,9 @@ def reconcile() -> None:
     snapshot_epg.apply_async(queue="dvr")
 
 
-def status(settings: dict) -> dict:
+def status(settings: dict, *, control_state=None) -> dict:
     from .engine.store import ArchiveStore
-    from .recorder_control import RecorderControlError, load_recorder_control
+    from .recorder_control import RecorderControlError
     from .schedule import ScheduleError, schedule_from_snapshot, schedule_is_active
 
     config = parse_settings(settings)
@@ -297,11 +406,22 @@ def status(settings: dict) -> dict:
         redis.ping()
     except Exception:
         redis = None
-    control_state = None
-    try:
-        control_state = load_recorder_control()
-    except RecorderControlError:
-        pass
+    if control_state is None:
+        try:
+            from .configuration import load_applied_state
+
+            active, control_state = load_applied_state()
+            if active is not None:
+                settings = active
+                config = parse_settings(settings)
+                store = ArchiveStore(config.archive_root)
+        except RecorderControlError:
+            from .configuration import load_active_configuration
+
+            settings = load_active_configuration() or settings
+            config = parse_settings(settings)
+            store = ArchiveStore(config.archive_root)
+            control_state = None
     schedule_config = settings.get("recording_schedule", {})
     timezone_name = schedule_config.get("timezone") if isinstance(schedule_config, dict) else None
     schedules = schedule_config.get("channels") if isinstance(schedule_config, dict) else None
@@ -341,7 +461,9 @@ def status(settings: dict) -> dict:
         "recording_control_available": control_state is not None,
     }
     if control_state is not None:
-        result["recording_enabled"] = control_state.recording_enabled
+        result["recording_enabled"] = (
+            control_state.recording_enabled and type(settings.get("version")) is int
+        )
         result["control_generation"] = control_state.generation
     if configuration_reset_required():
         result["configuration_status"] = (
@@ -359,9 +481,24 @@ def create_access_token(settings: dict) -> dict:
     from .security import AccessTokenStore
 
     config = parse_settings(settings)
+    base_url = normalize_public_base_url(settings.get("public_base_url", ""))
+    if not base_url:
+        raise ValueError("Set public_base_url before creating an access token")
     user_id = int(settings.get("playback_user_id") or 0)
     if user_id <= 0 or not User.objects.filter(id=user_id).exists():
         raise ValueError("Set playback_user_id to an existing Dispatcharr user ID")
     token = AccessTokenStore(config.archive_root).issue(user_id)
-    # The admin action returns this one-time value; only its digest is stored.
-    return {"user_id": user_id, "access_token": token, "warning": "Copy once; URL is sensitive"}
+    encoded_token = quote(token, safe="")
+    playlist_url = f"{base_url}/catchuparr/m3u?access_token={encoded_token}"
+    xmltv_url = f"{base_url}/catchuparr/xmltv?access_token={encoded_token}"
+    # The admin action returns the one-time token and both authorized links;
+    # only its digest is stored. Plain text stays selectable in the action toast.
+    message = f"M3U playlist URL: {playlist_url}\nXMLTV EPG URL: {xmltv_url}"
+    return {
+        "user_id": user_id,
+        "access_token": token,
+        "playlist_url": playlist_url,
+        "xmltv_url": xmltv_url,
+        "message": message,
+        "warning": "Copy once; authenticated links are sensitive",
+    }
