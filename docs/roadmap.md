@@ -15,13 +15,16 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 
 | Release | Feature | Relative effort | Status |
 | --- | --- | --- | --- |
-| 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | In progress; supersedes unreleased 0.2.0 |
-| 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Planned |
+| 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
+| 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
-0.2.0 candidate will not be published as the next release.
+0.2.0 candidate is superseded and will not be published.
+
+The 0.2.1 filter engine is included in the 0.3.0 candidate. The 0.3.0 package
+has not been released.
 
 ## Settings contract
 
@@ -52,15 +55,19 @@ identities, never a separate user selection.
   changes require another Apply. Old queued tasks recheck current configuration.
 - Strict YAML parsing rejects duplicate/unknown keys, invalid types, custom tags,
   anchors, aliases and merges, with a 64 KiB input limit and useful field errors.
-- Unit, package and both pinned native AIO checks gate the Dev candidate.
-  Recording selection, source enforcement and real-player regression gate release.
+- The Dev candidate is installed. Recording selection, source enforcement and
+  real-player regression remain release-acceptance gates.
 
-See [the YAML candidate guide](candidate-0.2.1.md) for the exact syntax and
-installation/rollback procedure.
+See [the 0.3.0 candidate guide](candidate-0.3.0.md) for the current syntax,
+schedule, control, installation and rollback notes.
 
-## Next intermediate step — repository content cleanup
+## Intermediate step — repository content cleanup (completed)
 
-Move local working instructions outside tracked content, remove public orchestration details and prepare a separate historical cleanup preview. Shared-history rewriting, tag replacement and published-asset changes require approval of the concrete result. Preserve technical diagnostics and reproducible validation. No plugin release is required.
+Tracked repository content was cleaned up and the approved historical rewrite
+was completed. GitHub may retain pull-request refs or cached objects under its
+own hosting rules; these are outside the repository's controls. Technical
+diagnostics and reproducible validation remain preserved. No plugin release
+was required for this content step.
 
 ## 0.4.0 — playback Stats
 
@@ -92,7 +99,10 @@ REST and WebSocket agree. Test HLS/XC, reloads, seeks, pause, replacement/grace 
 
 ### Acceptance
 
-Synthetic clock tests cover weekdays, midnight, multiple/overlapping windows, DST changes and reboot inside/outside windows. Dev verifies start, stop, restart and archived playback outside the active window, with real-player regression.
+Synthetic schedule/control tests and full native integration on both pinned AIO
+versions passed for the current candidate. Independent review, CI and Dev/player
+acceptance remain pending before release. Real-player regression must verify
+start, stop, restart and archived playback outside the active window.
 
 ## 0.4.0 — recorder visibility
 
