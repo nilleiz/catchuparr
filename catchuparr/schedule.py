@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import TZPATH, ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
 MINUTES_PER_DAY = 24 * 60
@@ -22,6 +24,11 @@ _DAYS = {
     "saturday": 5,
     "sunday": 6,
 }
+_DAY_GROUPS = {
+    "weekdays": ("monday", "tuesday", "wednesday", "thursday", "friday"),
+    "weekend": ("saturday", "sunday"),
+}
+_TIMEZONE_UNSET = object()
 _CLOCK = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 _END_CLOCK = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$|^24:00$")
 
@@ -65,6 +72,57 @@ def validate_timezone(
     return value
 
 
+def resolve_timezone(
+    explicit_timezone: Any = _TIMEZONE_UNSET,
+    *,
+    environ: Mapping[str, str] | None = None,
+    timezone_file: Path | None = None,
+    localtime_path: Path | None = None,
+) -> str:
+    """Resolve one applied timezone from YAML, container TZ, or system files.
+
+    A configured YAML value is authoritative and does not depend on the host
+    environment. Otherwise a present ``TZ`` must be a valid IANA name. When
+    ``TZ`` is absent, use the system's IANA timezone file or localtime symlink;
+    never infer a fixed offset or silently choose a project-specific zone.
+    """
+    if explicit_timezone is not _TIMEZONE_UNSET:
+        return validate_timezone(explicit_timezone)
+
+    env = os.environ if environ is None else environ
+    if "TZ" in env:
+        return validate_timezone(env.get("TZ"), field="TZ")
+
+    system_timezone_file = timezone_file or Path("/etc/timezone")
+    try:
+        value = system_timezone_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        value = ""
+    except OSError:
+        raise ScheduleError("field system timezone: timezone file could not be read") from None
+    if value:
+        return validate_timezone(value, field="system timezone")
+
+    system_localtime = localtime_path or Path("/etc/localtime")
+    try:
+        resolved_localtime = system_localtime.resolve(strict=True)
+    except OSError:
+        resolved_localtime = None
+    if resolved_localtime is not None:
+        for root in TZPATH:
+            try:
+                zone_name = resolved_localtime.relative_to(Path(root).resolve()).as_posix()
+            except (OSError, ValueError):
+                continue
+            try:
+                return validate_timezone(zone_name, field="system timezone")
+            except ScheduleError:
+                continue
+    raise ScheduleError(
+        "field system timezone: could not determine an IANA timezone; set timezone or TZ"
+    )
+
+
 def _parse_clock(
     value: Any,
     *,
@@ -99,16 +157,36 @@ def normalize_schedule(
     line: int = 1,
     field: str = "schedule",
 ) -> RecordingSchedule:
-    """Compile `continuous` or a weekday map into canonical week-minute ranges."""
+    """Compile `continuous` or a weekly map into canonical week-minute ranges.
+
+    The planned ``daily``, ``weekdays`` and ``weekend`` keys expand before
+    explicit weekday keys, so each more specific entry replaces the complete
+    window list for the days it covers.
+    """
     if value == "continuous":
         return CONTINUOUS_SCHEDULE
     if not isinstance(value, Mapping):
         raise ScheduleError(f"line {line}, field {field}: expected continuous or a weekday mapping")
 
+    allowed_keys = set(_DAYS) | set(_DAY_GROUPS) | {"daily"}
+    for day in value:
+        if not isinstance(day, str) or day not in allowed_keys:
+            raise ScheduleError(f"line {line}, field {field}: unknown weekday or day group")
+
+    expanded: dict[str, Any] = {}
+    if "daily" in value:
+        for day in _DAYS:
+            expanded[day] = value["daily"]
+    for group, days in _DAY_GROUPS.items():
+        if group in value:
+            for day in days:
+                expanded[day] = value[group]
+    for day in _DAYS:
+        if day in value:
+            expanded[day] = value[day]
+
     intervals: list[tuple[int, int]] = []
-    for day, windows in value.items():
-        if not isinstance(day, str) or day not in _DAYS:
-            raise ScheduleError(f"line {line}, field {field}: unknown weekday")
+    for day, windows in expanded.items():
         day_field = f"{field}.{day}"
         if not isinstance(windows, list):
             raise ScheduleError(f"line {line}, field {day_field}: expected a list of windows")

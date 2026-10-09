@@ -17,7 +17,7 @@ from .schedule import (
     RecordingSchedule,
     ScheduleError,
     normalize_schedule,
-    validate_timezone,
+    resolve_timezone,
 )
 
 MAX_FILTER_CONFIG_BYTES = 64 * 1024
@@ -490,12 +490,13 @@ def compile_filter_config(
     """Validate YAML and resolve eligible channels/policies to stable catalog IDs."""
     document, rule_lines = _load_document(text)
     if document is None:
-        return FilterCompilation((), (), {}, ())
+        return FilterCompilation((), (), {}, (), timezone=resolve_timezone())
     if type(document.get("version")) is not int or document["version"] != 1:
         raise SourceRuleError("line 1, field version: expected integer version 1")
     try:
-        timezone_name = validate_timezone(
-            document.get("timezone", DEFAULT_TIMEZONE), field="timezone"
+        timezone_name = (
+            resolve_timezone(document["timezone"])
+            if "timezone" in document else resolve_timezone()
         )
         global_schedule = normalize_schedule(
             document.get("schedule", "continuous"), field="schedule"
