@@ -13,10 +13,12 @@ import threading
 import time
 import types
 import uuid
+from collections.abc import Mapping
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
+from typing import Callable
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 STARTUP_TIMEOUT = 45.0
@@ -33,6 +35,23 @@ SYNTHETIC_SOURCE_TONES = {
 }
 TONE_MATCH_TOLERANCE_HZ = 45
 TONE_SAMPLE_RATE = 48_000
+FAILOVER_DIAGNOSTIC_PREFIX = "CATCHUPARR_AIO_FAILOVER_TIMEOUT "
+FAILOVER_DIAGNOSTIC_MAX_BYTES = 8192
+_SOURCE_ROLE_NAMES = {
+    "b": "Synthetic Source B",
+    "c": "Synthetic Source C",
+    "d": "Synthetic Source D",
+}
+_NATIVE_STATE_CATEGORIES = frozenset(
+    {
+        "active", "buffering", "connecting", "error", "initializing",
+        "stopped", "stopping", "waiting_for_clients",
+    }
+)
+_MAX_NATIVE_WORKER_RECORDS_SCANNED = 256
+_NATIVE_DIAGNOSTIC_RECORD_FIELDS = frozenset(
+    {"channel_uuid", "created_at", "stream_id", "worker_id"}
+)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -44,19 +63,324 @@ def _recorder_attempt_summary(results: list[object]) -> list[dict[str, object]]:
     """Return bounded status/count fields without exposing URLs or identifiers."""
     known_statuses = {"exited", "no_media", "media_stalled", "stopped"}
     summaries = []
-    for result in results:
-        status = getattr(result, "status", None)
+    if not isinstance(results, (list, tuple)):
+        return summaries
+    for result in results[:16]:
+        try:
+            status = getattr(result, "status", None)
+        except Exception:
+            status = None
         if not isinstance(status, str) or status not in known_statuses:
             status = "other"
         try:
             useful_segments = max(0, int(getattr(result, "useful_segments", -1)))
-        except (TypeError, ValueError):
+        except Exception:
             useful_segments = None
         summaries.append({
             "status": status,
             "useful_segments": useful_segments,
         })
     return summaries
+
+
+def _count_category(value) -> str:
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return "unavailable"
+    if count <= 0:
+        return "zero"
+    if count == 1:
+        return "one"
+    return "many"
+
+
+def _state_category(value) -> str:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return "other"
+    if not isinstance(value, str):
+        return "missing" if value is None else "other"
+    normalized = value.casefold()
+    return normalized if normalized in _NATIVE_STATE_CATEGORIES else "other"
+
+
+def _safe_count(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return count
+
+
+def _native_source_role_observations(
+    redis_client,
+    records: list[dict[str, str]],
+    source_stream_ids: Mapping[str, str],
+    *,
+    redis_keys,
+    metadata_state_field,
+    native_server,
+) -> dict[str, dict[str, object]]:
+    """Collect fixed categories for synthetic roles without exposing native IDs."""
+    from catchuparr.adapters.recorder_proxy import is_managed_worker_id
+
+    observations: dict[str, dict[str, object]] = {}
+    for role in ("a", "b", "c", "d"):
+        stream_id = source_stream_ids.get(role)
+        matching = [
+            record for record in records
+            if isinstance(record, dict) and record.get("stream_id") == stream_id
+        ] if isinstance(stream_id, str) else []
+        try:
+            matching.sort(key=lambda record: float(record.get("created_at", "0")))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        selected = matching[-1] if matching else None
+        worker_id = selected.get("worker_id") if isinstance(selected, dict) else None
+        if not is_managed_worker_id(worker_id):
+            observations[role] = {
+                "worker_records": len(matching),
+                "owner_present": None,
+                "owner_matches_local": None,
+                "metadata_exists": None,
+                "stopping": None,
+                "client_count": "unavailable",
+                "state": "unavailable",
+                "manager_running": None,
+            }
+            continue
+
+        metadata_key = redis_keys.channel_metadata(worker_id)
+        owner_key = redis_keys.channel_owner(worker_id)
+        stopping_key = redis_keys.channel_stopping(worker_id)
+        clients_key = redis_keys.clients(worker_id)
+        try:
+            metadata_exists = bool(redis_client.exists(metadata_key))
+        except Exception:
+            metadata_exists = None
+        try:
+            stopping = bool(redis_client.exists(stopping_key))
+        except Exception:
+            stopping = None
+        try:
+            client_count = _count_category(redis_client.scard(clients_key))
+        except Exception:
+            client_count = "unavailable"
+        try:
+            owner = redis_client.get(owner_key)
+            owner_present = owner is not None
+        except Exception:
+            owner = None
+            owner_present = None
+        local_worker_id = getattr(native_server, "worker_id", None)
+        if owner is None or local_worker_id is None:
+            owner_matches_local = None
+        else:
+            if isinstance(owner, bytes):
+                try:
+                    owner = owner.decode("utf-8")
+                except UnicodeDecodeError:
+                    owner = None
+            owner_matches_local = owner == local_worker_id if owner is not None else None
+        try:
+            state = _state_category(
+                redis_client.hget(metadata_key, metadata_state_field)
+                if metadata_exists else None
+            ) if metadata_exists is not None else "unavailable"
+        except Exception:
+            state = "unavailable"
+
+        try:
+            if native_server is None:
+                manager_running = None
+            else:
+                thread = native_server._get_stream_thread(worker_id)
+                manager_running = bool(thread is not None and thread.is_alive())
+        except Exception:
+            manager_running = None
+        observations[role] = {
+            "worker_records": len(matching),
+            "owner_present": owner_present,
+            "owner_matches_local": owner_matches_local,
+            "metadata_exists": metadata_exists,
+            "stopping": stopping,
+            "client_count": client_count,
+            "state": state,
+            "manager_running": manager_running,
+        }
+    return observations
+
+
+def _native_source_observations(
+    redis_client, channel_uuid: str, source_stream_ids: Mapping[str, str],
+) -> dict[str, dict[str, object]]:
+    unavailable = {
+        role: {
+            "worker_records": 0,
+            "owner_present": None,
+            "owner_matches_local": None,
+            "metadata_exists": None,
+            "stopping": None,
+            "client_count": "unavailable",
+            "state": "unavailable",
+            "manager_running": None,
+        }
+        for role in ("a", "b", "c", "d")
+    }
+    try:
+        from apps.proxy.live_proxy.constants import ChannelMetadataField
+        from apps.proxy.live_proxy.redis_keys import RedisKeys
+        from apps.proxy.live_proxy.server import ProxyServer
+
+        from catchuparr.adapters.recorder_proxy import (
+            PLUGIN_REDIS_PREFIX,
+            is_managed_worker_id,
+            worker_id_key,
+        )
+
+        records = []
+        pattern = f"{PLUGIN_REDIS_PREFIX}worker:*"
+        scanned = 0
+        for raw_key in redis_client.scan_iter(match=pattern):
+            if scanned >= _MAX_NATIVE_WORKER_RECORDS_SCANNED:
+                break
+            scanned += 1
+            key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
+            worker_id = key.rsplit(":", 1)[-1]
+            if not is_managed_worker_id(worker_id):
+                continue
+            raw_record = redis_client.hgetall(worker_id_key(worker_id))
+            record = {}
+            for raw_field, raw_value in raw_record.items():
+                field = raw_field.decode("utf-8") if isinstance(raw_field, bytes) else str(raw_field)
+                if field not in _NATIVE_DIAGNOSTIC_RECORD_FIELDS:
+                    continue
+                value = raw_value.decode("utf-8") if isinstance(raw_value, bytes) else str(raw_value)
+                record[field] = value
+            if record and record.get("channel_uuid") == str(channel_uuid):
+                records.append(record)
+        native_server = getattr(ProxyServer, "_instance", None)
+        return _native_source_role_observations(
+            redis_client,
+            records,
+            source_stream_ids,
+            redis_keys=RedisKeys,
+            metadata_state_field=ChannelMetadataField.STATE,
+            native_server=native_server,
+        )
+    except Exception:
+        return unavailable
+
+
+def _runtime_timeout_diagnostic(
+    run,
+    source_server,
+    source_baseline,
+    stall_baseline,
+    verified_segments,
+    redis_client,
+    channel_uuid: str,
+    source_stream_ids: Mapping[str, str],
+) -> dict[str, object]:
+    """Build a bounded, allowlisted snapshot from already observed probe state."""
+    try:
+        attempts = _recorder_attempt_summary(run.results)
+    except Exception:
+        attempts = []
+
+    source_deltas = {}
+    try:
+        request_counts, active_counts = source_server.snapshot()
+        for role in ("a", "b", "c", "d"):
+            source_name = f"source-{role}.ts"
+            base_requests = _safe_count(source_baseline[0].get(source_name))
+            current_requests = _safe_count(request_counts.get(source_name))
+            base_active = _safe_count(source_baseline[1].get(source_name))
+            current_active = _safe_count(active_counts.get(source_name))
+            source_deltas[role] = {
+                "request_delta": (
+                    current_requests - base_requests
+                    if current_requests is not None and base_requests is not None else None
+                ),
+                "active_delta": (
+                    current_active - base_active
+                    if current_active is not None and base_active is not None else None
+                ),
+            }
+    except Exception:
+        source_deltas = {
+            role: {"request_delta": None, "active_delta": None}
+            for role in ("a", "b", "c", "d")
+        }
+
+    stall = {
+        "started_delta": None,
+        "duration_ms": None,
+        "null_bytes_delta": None,
+    }
+    try:
+        current_stall = source_server.stall_snapshot().get("source-b.ts", {})
+        base_started = _safe_count(stall_baseline.get("started"))
+        current_started = _safe_count(current_stall.get("started"))
+        base_bytes = _safe_count(stall_baseline.get("null_bytes"))
+        current_bytes = _safe_count(current_stall.get("null_bytes"))
+        try:
+            duration_delta = float(current_stall.get("duration_seconds", 0)) - float(
+                stall_baseline.get("duration_seconds", 0)
+            )
+            duration_ms = round(duration_delta * 1000)
+        except (TypeError, ValueError, OverflowError):
+            duration_ms = None
+        stall = {
+            "started_delta": (
+                current_started - base_started
+                if current_started is not None and base_started is not None else None
+            ),
+            "duration_ms": duration_ms,
+            "null_bytes_delta": (
+                current_bytes - base_bytes
+                if current_bytes is not None and base_bytes is not None else None
+            ),
+        }
+    except Exception:
+        pass
+
+    indexed_counts = {
+        role: len(verified_segments.get(source_name, ()))
+        for role, source_name in _SOURCE_ROLE_NAMES.items()
+    }
+    try:
+        native = _native_source_observations(
+            redis_client, channel_uuid, source_stream_ids
+        )
+    except Exception:
+        native = {}
+    return {
+        "attempts": attempts,
+        "source_deltas": source_deltas,
+        "b_stall": stall,
+        "indexed_segments": indexed_counts,
+        "native": native,
+    }
+
+
+def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
+    payload = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+    if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
+        payload = '{"diagnostic":"omitted"}'
+    print(FAILOVER_DIAGNOSTIC_PREFIX + payload, file=sys.stderr, flush=True)
+
+
+def _cleanup_failed_recorder_run(run: _RecorderTaskRun) -> None:
+    """Keep the existing bounded stop/join cleanup for wait failures."""
+    run.stop()
+    if run.thread is not None:
+        run.thread.join(20)
 
 
 def _make_paced_transport_stream(
@@ -778,14 +1102,26 @@ def _wait_for_source_segments(
     source_name: str,
     minimum: int,
     timeout: float,
+    timeout_diagnostic: Callable[[dict[str, list]], dict[str, object]] | None = None,
 ) -> list:
     deadline = time.monotonic() + timeout
+    last_verified: dict[str, list] = {}
     while time.monotonic() < deadline:
         _require(run.thread is not None and run.thread.is_alive(), "Recorder task ended before media was indexed")
-        identified = _verified_segments(store, channel_uuid, ffmpeg, ffprobe).get(source_name, [])
+        last_verified = _verified_segments(store, channel_uuid, ffmpeg, ffprobe)
+        identified = last_verified.get(source_name, [])
         if len(identified) >= minimum:
             return identified
         time.sleep(0.2)
+    if timeout_diagnostic is not None:
+        try:
+            diagnostic = timeout_diagnostic(last_verified)
+            if isinstance(diagnostic, dict):
+                _emit_timeout_diagnostic(diagnostic)
+        except Exception:
+            # Diagnostics are best-effort. Preserve the original timeout and
+            # let the caller run its existing recorder cleanup path.
+            pass
     raise RuntimeError("Synthetic recorder did not index expected source media in time")
 
 
@@ -1180,9 +1516,7 @@ def probe_recorder_failover(root: Path) -> None:
             startup_run.stop()
             startup_run.join()
         except Exception:
-            startup_run.stop()
-            if startup_run.thread is not None:
-                startup_run.thread.join(20)
+            _cleanup_failed_recorder_run(startup_run)
             raise
         _require(
             startup_run.results[-1].status == "stopped"
@@ -1248,9 +1582,7 @@ def probe_recorder_failover(root: Path) -> None:
             capacity_run.stop()
             capacity_run.join()
         except Exception:
-            capacity_run.stop()
-            if capacity_run.thread is not None:
-                capacity_run.thread.join(20)
+            _cleanup_failed_recorder_run(capacity_run)
             raise
         _require(
             capacity_run.results[-1].status == "stopped"
@@ -1292,6 +1624,19 @@ def probe_recorder_failover(root: Path) -> None:
         )
         runtime_run.start()
         harnesses.append(runtime_run)
+
+        def runtime_timeout_diagnostic(verified_segments):
+            return _runtime_timeout_diagnostic(
+                runtime_run,
+                source_server,
+                runtime_baseline,
+                runtime_stall_baseline,
+                verified_segments,
+                redis_client,
+                str(runtime_channel.uuid),
+                {label: str(streams[label].id) for label in ("a", "b", "c", "d")},
+            )
+
         try:
             _wait_for_source_segments(
                 runtime_run,
@@ -1302,13 +1647,12 @@ def probe_recorder_failover(root: Path) -> None:
                 "Synthetic Source D",
                 minimum=1,
                 timeout=150,
+                timeout_diagnostic=runtime_timeout_diagnostic,
             )
             runtime_run.stop()
             runtime_run.join()
         except Exception:
-            runtime_run.stop()
-            if runtime_run.thread is not None:
-                runtime_run.thread.join(20)
+            _cleanup_failed_recorder_run(runtime_run)
             raise
         identified_runtime = _verified_segments(
             runtime_store, str(runtime_channel.uuid), ffmpeg, ffprobe

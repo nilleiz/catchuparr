@@ -1,5 +1,7 @@
 import array
+import contextlib
 import http.client
+import io
 import json
 import math
 import sys
@@ -93,6 +95,119 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("private-token", json.dumps(summary))
+
+    def test_recorder_attempt_summary_omits_unknown_status_and_raising_properties(self):
+        class SensitiveAttempt:
+            input_url = "http://user:password@synthetic.invalid/private-token"
+
+            @property
+            def status(self):
+                raise RuntimeError("Bearer secret-token")
+
+            @property
+            def useful_segments(self):
+                raise RuntimeError("http://user:password@synthetic.invalid/private-token")
+
+        summary = probe._recorder_attempt_summary([
+            SimpleNamespace(
+                status="https://user:password@synthetic.invalid/private-token",
+                useful_segments=1,
+            ),
+            SensitiveAttempt(),
+        ])
+        serialized = json.dumps(summary)
+
+        self.assertEqual(
+            summary,
+            [
+                {"status": "other", "useful_segments": 1},
+                {"status": "other", "useful_segments": None},
+            ],
+        )
+        for private_value in ("synthetic.invalid", "password", "private-token", "secret-token"):
+            self.assertNotIn(private_value, serialized)
+
+    def test_native_failure_observations_are_categories_without_native_values(self):
+        worker_a = "catchuparr-r" + "a" * 40
+
+        class FakeRedis:
+            def __init__(self):
+                self.values = {
+                    f"metadata:{worker_a}": True,
+                    f"stopping:{worker_a}": False,
+                    f"owner:{worker_a}": b"native-worker-secret",
+                    f"state:{worker_a}": b"https://user:password@synthetic.invalid/token",
+                    f"clients:{worker_a}": 7,
+                }
+
+            def exists(self, key):
+                return self.values.get(key, False)
+
+            def get(self, key):
+                return self.values.get(key)
+
+            def hget(self, key, _field):
+                return self.values.get(f"state:{key.removeprefix('metadata:')}")
+
+            def scard(self, key):
+                return self.values.get(key, 0)
+
+        class FakeKeys:
+            channel_metadata = staticmethod(lambda worker_id: f"metadata:{worker_id}")
+            channel_owner = staticmethod(lambda worker_id: f"owner:{worker_id}")
+            channel_stopping = staticmethod(lambda worker_id: f"stopping:{worker_id}")
+            clients = staticmethod(lambda worker_id: f"clients:{worker_id}")
+
+        class FakeThread:
+            @staticmethod
+            def is_alive():
+                return True
+
+        class FakeNativeServer:
+            worker_id = "different-native-worker"
+
+            @staticmethod
+            def _get_stream_thread(worker_id):
+                return FakeThread() if worker_id.endswith("a" * 40) else None
+
+        observations = probe._native_source_role_observations(
+            FakeRedis(),
+            [{
+                "channel_uuid": "synthetic-channel",
+                "stream_id": "synthetic-stream-a",
+                "worker_id": worker_a,
+                "created_at": "1",
+            }],
+            {"a": "synthetic-stream-a", "b": "synthetic-stream-b"},
+            redis_keys=FakeKeys,
+            metadata_state_field="state",
+            native_server=FakeNativeServer(),
+        )
+        serialized = json.dumps(observations)
+
+        self.assertEqual(
+            observations["a"],
+            {
+                "worker_records": 1,
+                "owner_present": True,
+                "owner_matches_local": False,
+                "metadata_exists": True,
+                "stopping": False,
+                "client_count": "many",
+                "state": "other",
+                "manager_running": True,
+            },
+        )
+        self.assertEqual(observations["b"]["worker_records"], 0)
+        for private_value in (
+            worker_a,
+            "native-worker-secret",
+            "synthetic-stream-a",
+            "synthetic.invalid",
+            "password",
+            "token",
+        ):
+            self.assertNotIn(private_value, serialized)
 
     def test_decoded_tones_identify_b_c_and_d_separately(self):
         expected = {
@@ -230,6 +345,203 @@ class RecorderFailoverMediaTests(unittest.TestCase):
 
 
 class RecorderFailoverBridgeTests(unittest.TestCase):
+    def test_d_media_timeout_emits_bounded_existing_observations_and_keeps_error(self):
+        verified = {
+            "Synthetic Source B": [object(), object()],
+            "Synthetic Source D": [],
+        }
+
+        class SourceServer:
+            @staticmethod
+            def snapshot():
+                return (
+                    {
+                        "source-a.ts": 3,
+                        "source-b.ts": 5,
+                        "source-c.ts": 7,
+                        "source-d.ts": 9,
+                    },
+                    {
+                        "source-a.ts": 0,
+                        "source-b.ts": 1,
+                        "source-c.ts": 0,
+                        "source-d.ts": 0,
+                    },
+                )
+
+            @staticmethod
+            def stall_snapshot():
+                return {
+                    "source-b.ts": {
+                        "started": 4,
+                        "duration_seconds": 3.25,
+                        "null_bytes": 4096,
+                    },
+                }
+
+        run = SimpleNamespace(
+            thread=SimpleNamespace(is_alive=lambda: True),
+            results=[SimpleNamespace(status="media_stalled", useful_segments=2)],
+        )
+        baseline = (
+            {
+                "source-a.ts": 1,
+                "source-b.ts": 2,
+                "source-c.ts": 7,
+                "source-d.ts": 8,
+            },
+            {
+                "source-a.ts": 0,
+                "source-b.ts": 0,
+                "source-c.ts": 0,
+                "source-d.ts": 0,
+            },
+        )
+        stall_baseline = {
+            "started": 3,
+            "duration_seconds": 1.0,
+            "null_bytes": 1024,
+        }
+        diagnostic = {
+            "attempts": [{"status": "media_stalled", "useful_segments": 2}],
+            "source_deltas": {
+                role: {"request_delta": 1, "active_delta": 0}
+                for role in ("a", "b", "c", "d")
+            },
+            "b_stall": {
+                "started_delta": 1,
+                "duration_ms": 2250,
+                "null_bytes_delta": 3072,
+            },
+            "indexed_segments": {"b": 2, "c": 0, "d": 0},
+            "native": {"a": {"state": "active"}},
+        }
+        callback_verified = []
+
+        def build_diagnostic(indexed):
+            callback_verified.append(indexed)
+            with patch.object(
+                probe, "_native_source_observations", return_value=diagnostic["native"],
+            ):
+                return probe._runtime_timeout_diagnostic(
+                    run,
+                    SourceServer(),
+                    baseline,
+                    stall_baseline,
+                    indexed,
+                    object(),
+                    "synthetic-channel",
+                    {},
+                )
+
+        stderr = io.StringIO()
+        with (
+            patch.object(probe, "_verified_segments", return_value=verified) as verify,
+            patch.object(probe.time, "monotonic", side_effect=(0.0, 0.0, 2.0)),
+            patch.object(probe.time, "sleep"),
+            contextlib.redirect_stderr(stderr),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^Synthetic recorder did not index expected source media in time$",
+            ):
+                probe._wait_for_source_segments(
+                    run,
+                    object(),
+                    "synthetic-channel",
+                    "ffmpeg",
+                    "ffprobe",
+                    "Synthetic Source D",
+                    minimum=1,
+                    timeout=1,
+                    timeout_diagnostic=build_diagnostic,
+                )
+
+        self.assertEqual(verify.call_count, 1)
+        self.assertEqual(callback_verified, [verified])
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(probe.FAILOVER_DIAGNOSTIC_PREFIX))
+        self.assertLessEqual(
+            len(lines[0].encode("utf-8")),
+            len(probe.FAILOVER_DIAGNOSTIC_PREFIX.encode("utf-8"))
+            + probe.FAILOVER_DIAGNOSTIC_MAX_BYTES,
+        )
+        emitted = json.loads(lines[0][len(probe.FAILOVER_DIAGNOSTIC_PREFIX):])
+        self.assertEqual(emitted["attempts"], diagnostic["attempts"])
+        self.assertEqual(emitted["indexed_segments"], {"b": 2, "c": 0, "d": 0})
+        self.assertEqual(emitted["source_deltas"]["b"], {"request_delta": 3, "active_delta": 1})
+        self.assertEqual(
+            emitted["b_stall"],
+            {"started_delta": 1, "duration_ms": 2250, "null_bytes_delta": 3072},
+        )
+        self.assertEqual(emitted["native"], diagnostic["native"])
+
+    def test_d_media_timeout_diagnostic_failure_keeps_original_timeout(self):
+        class FakeThread:
+            def __init__(self):
+                self.join_timeouts = []
+
+            @staticmethod
+            def is_alive():
+                return True
+
+            def join(self, timeout):
+                self.join_timeouts.append(timeout)
+
+        class FakeRun:
+            def __init__(self):
+                self.thread = FakeThread()
+                self.stop_calls = 0
+
+            def stop(self):
+                self.stop_calls += 1
+
+        run = FakeRun()
+        stderr = io.StringIO()
+
+        def fail_to_build(_verified):
+            raise RuntimeError("https://user:password@synthetic.invalid/private-token")
+
+        with (
+            patch.object(probe, "_verified_segments", return_value={}),
+            patch.object(probe.time, "monotonic", side_effect=(0.0, 0.0, 2.0)),
+            patch.object(probe.time, "sleep"),
+            contextlib.redirect_stderr(stderr),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^Synthetic recorder did not index expected source media in time$",
+            ):
+                try:
+                    probe._wait_for_source_segments(
+                        run,
+                        object(),
+                        "synthetic-channel",
+                        "ffmpeg",
+                        "ffprobe",
+                        "Synthetic Source D",
+                        minimum=1,
+                        timeout=1,
+                        timeout_diagnostic=fail_to_build,
+                    )
+                except RuntimeError:
+                    probe._cleanup_failed_recorder_run(run)
+                    raise
+
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(run.stop_calls, 1)
+        self.assertEqual(run.thread.join_timeouts, [20])
+
+    def test_timeout_diagnostic_is_capped_when_snapshot_is_oversized(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            probe._emit_timeout_diagnostic({"fixed": "x" * probe.FAILOVER_DIAGNOSTIC_MAX_BYTES * 2})
+        self.assertEqual(
+            stderr.getvalue(),
+            probe.FAILOVER_DIAGNOSTIC_PREFIX + '{"diagnostic":"omitted"}\n',
+        )
+
     def test_supervisor_join_waits_without_signalling_the_task(self):
         run = probe._RecorderTaskRun(
             "synthetic-channel", startup_timeout=1, media_idle_timeout=1,
