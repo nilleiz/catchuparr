@@ -62,6 +62,7 @@ def load_recorder_control(active_path: Path | None = None) -> RecorderControlSta
     active = Path(active_path) if active_path is not None else _default_active_path()
     sidecar = control_state_path(active)
     with _config_lock(active, exclusive=True):
+        _recover_configuration_activation_locked(active)
         return _load_or_initialize_locked(sidecar)
 
 
@@ -72,6 +73,7 @@ def apply_recorder_control(active_path: Path | None = None) -> RecorderControlSt
     active = Path(active_path) if active_path is not None else _default_active_path()
     sidecar = control_state_path(active)
     with _config_lock(active, exclusive=True):
+        _recover_configuration_activation_locked(active)
         current = _load_or_initialize_locked(sidecar, allow_pending=True)
         try:
             enabled = _read_recording_enabled_setting()
@@ -99,6 +101,7 @@ def _set_recording_enabled(enabled: bool, active_path: Path | None) -> RecorderC
     active = Path(active_path) if active_path is not None else _default_active_path()
     sidecar = control_state_path(active)
     with _config_lock(active, exclusive=True):
+        _recover_configuration_activation_locked(active)
         current = _load_or_initialize_locked(sidecar, allow_pending=True)
         target_paused = not enabled
         if target_paused:
@@ -123,6 +126,18 @@ def _default_active_path() -> Path:
     from .configuration import active_settings_path
 
     return active_settings_path()
+
+
+def _recover_configuration_activation_locked(active: Path) -> None:
+    """Recover an interrupted Apply before changing the control generation."""
+    from .configuration import _recover_interrupted_activation_locked
+
+    try:
+        _recover_interrupted_activation_locked(active)
+    except Exception:
+        raise RecorderControlError(
+            "configuration activation recovery failed; recorder admission remains denied"
+        ) from None
 
 
 def _load_or_initialize_locked(

@@ -342,6 +342,89 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(recovered.paused)
         self.assertEqual(pending.generation + 1, recovered.generation)
 
+    def test_pause_resume_during_pending_apply_fences_old_generation(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        _active, initial = load_applied_state(self.active_path)
+        from catchuparr import recorder_control
+
+        updated = dict(self.settings, retention_hours=2)
+        with patch.object(configuration._PreparedActivation, "commit"):
+            apply_configuration(updated, self.catalog, self.active_path)
+
+        with patch.object(recorder_control, "_write_recording_enabled_setting"):
+            paused = recorder_control.pause_recorders(self.active_path)
+            resumed = recorder_control.resume_recorders(self.active_path)
+        self.assertTrue(paused.paused)
+        self.assertFalse(resumed.paused)
+        self.assertGreater(resumed.generation, initial.generation)
+
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        _active, final = load_applied_state(self.active_path)
+        self.assertFalse(final.paused)
+        self.assertEqual(resumed.generation, final.generation)
+        self.assertNotEqual(initial.generation, final.generation)
+
+    def test_unconfirmed_commit_record_keeps_old_settings_authoritative(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        write_commit = configuration._write_activation_commit_locked
+
+        def write_commit_then_fail(path, activation_id):
+            write_commit(path, activation_id)
+            raise OSError("synthetic directory-fsync failure after commit record replace")
+
+        from catchuparr.recorder_control import RecorderControlError
+
+        with patch.object(
+            configuration, "_write_activation_commit_locked", side_effect=write_commit_then_fail
+        ), self.assertRaisesRegex(RecorderControlError, "durability could not be confirmed"):
+            apply_configuration(dict(self.settings, retention_hours=2), self.catalog, self.active_path)
+
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        with self.assertRaises(RecorderControlError):
+            load_applied_state(self.active_path)
+        self.assertEqual(
+            "pending",
+            json.loads(
+                (self.active_path.parent / configuration.ACTIVATION_STATE_NAME).read_text()
+            )["state"],
+        )
+
+    def test_durable_commit_record_allows_state_cleanup_after_state_fsync_error(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        write_state = configuration._write_activation_state_locked
+
+        def write_state_then_report_fsync_error(path, state, activation_id):
+            write_state(path, state, activation_id)
+            if state == "committed":
+                raise OSError("synthetic state-directory fsync failure")
+
+        with patch.object(
+            configuration,
+            "_write_activation_state_locked",
+            side_effect=write_state_then_report_fsync_error,
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+
+    def test_reset_marker_cleanup_failure_does_not_report_apply_failure(self):
+        marker = self.active_path.parent / RESET_REQUIRED_NAME
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("apply-required\n", encoding="utf-8")
+        with patch.object(
+            configuration,
+            "_remove_reset_required_marker",
+            side_effect=OSError("synthetic marker cleanup failure"),
+        ):
+            result = apply_configuration(self.settings, self.catalog, self.active_path)
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertTrue(marker.exists())
+
     def test_applied_state_reader_waits_for_both_files_during_apply(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         updated = dict(self.settings, retention_hours=48)

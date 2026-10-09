@@ -28,6 +28,7 @@ SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, ACTIVE_CONFIG_VERSION})
 RESET_REQUIRED_NAME = ".catchuparr-configuration-reset-required"
 ACTIVATION_STATE_NAME = ".catchuparr-configuration-activation.json"
 ACTIVATION_BACKUP_NAME = ".catchuparr-configuration-activation-previous.json"
+ACTIVATION_COMMIT_NAME = ".catchuparr-configuration-activation-commit.json"
 ACTIVATION_STATE_VERSION = 1
 
 
@@ -341,31 +342,53 @@ class _PreparedActivation:
         previous_active: bytes | None,
         previous_control: bytes | None,
         marker_was_present: bool,
+        activation_id: str,
     ):
         self.active_path = active_path
         self.sidecar = sidecar
         self.previous_active = previous_active
         self.previous_control = previous_control
         self.marker_was_present = marker_was_present
+        self.activation_id = activation_id
         self.finished = False
 
     def commit(self) -> None:
         if self.finished:
             return
-        from .recorder_control import _clear_deny_marker
+        from .recorder_control import RecorderControlError
 
-        _clear_deny_marker(self.sidecar)
         try:
-            _write_activation_state_locked(self.active_path, "committed")
+            _write_activation_commit_locked(self.active_path, self.activation_id)
         except OSError:
-            # An atomic replace may have completed before a directory fsync
-            # failed. The committed marker is authoritative only if it can be
-            # read back; otherwise the pending marker keeps the old settings
-            # visible to non-recorder consumers.
-            if _read_activation_state_locked(self.active_path) != "committed":
-                raise
+            # The pending journal remains authoritative if the commit record
+            # could not be confirmed durable. Do not infer durability from a
+            # file that may merely be visible in the current process.
+            raise RecorderControlError(
+                "configuration commit durability could not be confirmed; previous settings remain active"
+            ) from None
+        try:
+            _write_activation_state_locked(
+                self.active_path, "committed", self.activation_id
+            )
+        except OSError:
+            state = _read_activation_state_locked(self.active_path)
+            if state != ("committed", self.activation_id):
+                raise RecorderControlError(
+                    "configuration commit could not be completed; previous settings remain active"
+                ) from None
         self.finished = True
-        _remove_reset_required_marker(self.active_path)
+        try:
+            from .recorder_control import _clear_deny_marker
+
+            _clear_deny_marker(self.sidecar)
+        except Exception:
+            # The configuration is durably committed; a leftover deny marker
+            # only pauses admission and will be handled on the next recovery.
+            pass
+        try:
+            _remove_reset_required_marker(self.active_path)
+        except OSError:
+            pass
         _cleanup_committed_activation_locked(self.active_path)
 
     def rollback(self) -> bool:
@@ -383,6 +406,7 @@ class _PreparedActivation:
             try:
                 _remove_activation_state_locked(self.active_path)
                 _remove_activation_backup_locked(self.active_path)
+                _remove_activation_commit_locked(self.active_path)
             except Exception:
                 restored = False
         self.finished = restored
@@ -407,14 +431,16 @@ def _prepare_document_with_control_locked(
     previous_active = _read_file_bytes(path)
     previous_control = _read_file_bytes(sidecar)
     marker_was_present = _deny_marker_exists(control_deny_path(path))
+    activation_id = str(uuid.uuid4())
     backup = {
         "version": ACTIVATION_STATE_VERSION,
+        "activation_id": activation_id,
         "active": _encode_optional_bytes(previous_active),
         "control": _encode_optional_bytes(previous_control),
         "control_deny_present": marker_was_present,
     }
     _write_activation_backup_locked(path, backup)
-    _write_activation_state_locked(path, "pending")
+    _write_activation_state_locked(path, "pending", activation_id)
     try:
         _write_deny_marker(sidecar)
     except OSError:
@@ -425,7 +451,8 @@ def _prepare_document_with_control_locked(
     active = _active_configuration_view(document)
     generation = active_configuration_generation(active)
     prepared = _PreparedActivation(
-        path, sidecar, previous_active, previous_control, marker_was_present
+        path, sidecar, previous_active, previous_control, marker_was_present,
+        activation_id,
     )
     try:
         _atomic_json_replace_locked(path, document)
@@ -462,6 +489,10 @@ def _activation_backup_path(path: Path) -> Path:
     return path.with_name(ACTIVATION_BACKUP_NAME)
 
 
+def _activation_commit_path(path: Path) -> Path:
+    return path.with_name(ACTIVATION_COMMIT_NAME)
+
+
 def _encode_optional_bytes(value: bytes | None) -> str | None:
     return base64.b64encode(value).decode("ascii") if value is not None else None
 
@@ -489,20 +520,33 @@ def _read_activation_backup_locked(path: Path) -> dict[str, Any]:
         raise ValueError("Configuration activation backup is unavailable") from None
     if (
         not isinstance(raw, dict)
-        or set(raw) != {"version", "active", "control", "control_deny_present"}
+        or set(raw) != {
+            "version", "activation_id", "active", "control", "control_deny_present"
+        }
         or type(raw.get("version")) is not int
         or raw["version"] != ACTIVATION_STATE_VERSION
+        or not _valid_activation_id(raw.get("activation_id"))
         or type(raw.get("control_deny_present")) is not bool
     ):
         raise ValueError("Configuration activation backup is invalid")
     return {
+        "activation_id": raw["activation_id"],
         "active": _decode_optional_bytes(raw["active"]),
         "control": _decode_optional_bytes(raw["control"]),
         "control_deny_present": raw["control_deny_present"],
     }
 
 
-def _read_activation_state_locked(path: Path) -> str | None:
+def _valid_activation_id(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _read_activation_state_locked(path: Path) -> tuple[str, str] | None:
     state_path = _activation_state_path(path)
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
@@ -512,22 +556,52 @@ def _read_activation_state_locked(path: Path) -> str | None:
         raise ValueError("Configuration activation state is unreadable") from None
     if (
         not isinstance(raw, dict)
-        or set(raw) != {"version", "state"}
+        or set(raw) != {"version", "state", "activation_id"}
         or type(raw.get("version")) is not int
         or raw["version"] != ACTIVATION_STATE_VERSION
         or raw.get("state") not in {"pending", "committed"}
+        or not _valid_activation_id(raw.get("activation_id"))
     ):
         raise ValueError("Configuration activation state is invalid")
-    return raw["state"]
+    return raw["state"], raw["activation_id"]
 
 
-def _write_activation_state_locked(path: Path, state: str) -> None:
-    if state not in {"pending", "committed"}:
+def _write_activation_state_locked(path: Path, state: str, activation_id: str) -> None:
+    if state not in {"pending", "committed"} or not _valid_activation_id(activation_id):
         raise ValueError("Configuration activation state is invalid")
     _atomic_json_replace_locked(
         _activation_state_path(path),
-        {"version": ACTIVATION_STATE_VERSION, "state": state},
+        {
+            "version": ACTIVATION_STATE_VERSION,
+            "state": state,
+            "activation_id": activation_id,
+        },
     )
+
+
+def _write_activation_commit_locked(path: Path, activation_id: str) -> None:
+    _atomic_json_replace_locked(
+        _activation_commit_path(path),
+        {"version": ACTIVATION_STATE_VERSION, "activation_id": activation_id},
+    )
+
+
+def _read_activation_commit_locked(path: Path) -> str | None:
+    try:
+        raw = json.loads(_activation_commit_path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "activation_id"}
+        or type(raw.get("version")) is not int
+        or raw["version"] != ACTIVATION_STATE_VERSION
+        or not _valid_activation_id(raw.get("activation_id"))
+    ):
+        return None
+    return raw["activation_id"]
 
 
 def _remove_durable_file(path: Path) -> None:
@@ -548,6 +622,10 @@ def _remove_activation_state_locked(path: Path) -> None:
 
 def _remove_activation_backup_locked(path: Path) -> None:
     _remove_durable_file(_activation_backup_path(path))
+
+
+def _remove_activation_commit_locked(path: Path) -> None:
+    _remove_durable_file(_activation_commit_path(path))
 
 
 def _restore_control_deny_marker(sidecar: Path, present: bool) -> None:
@@ -577,13 +655,31 @@ def _restore_activation_backup_locked(path: Path, backup: dict[str, Any]) -> boo
 def _recover_interrupted_activation_locked(path: Path) -> None:
     state = _read_activation_state_locked(path)
     if state is None:
+        _remove_activation_backup_locked(path)
+        _remove_activation_commit_locked(path)
         return
-    if state == "pending":
-        backup = _read_activation_backup_locked(path)
+    state_name, activation_id = state
+    backup = _read_activation_backup_locked(path)
+    if backup["activation_id"] != activation_id:
+        raise ValueError("Configuration activation backup does not match its journal")
+    if state_name == "pending":
         if not _restore_activation_backup_locked(path, backup):
             raise ValueError("Interrupted configuration activation could not be restored")
+    elif _read_activation_commit_locked(path) != activation_id:
+        if not _restore_activation_backup_locked(path, backup):
+            raise ValueError("Unconfirmed configuration activation could not be restored")
+    else:
+        try:
+            from .recorder_control import _clear_deny_marker, control_state_path
+
+            _clear_deny_marker(control_state_path(path))
+        except Exception:
+            # A leftover deny marker only blocks recording. The committed
+            # snapshot remains authoritative and cleanup can be retried later.
+            pass
     _remove_activation_state_locked(path)
     _remove_activation_backup_locked(path)
+    _remove_activation_commit_locked(path)
 
 
 def _cleanup_committed_activation_locked(path: Path) -> None:
@@ -593,6 +689,10 @@ def _cleanup_committed_activation_locked(path: Path) -> None:
         return
     try:
         _remove_activation_backup_locked(path)
+    except OSError:
+        pass
+    try:
+        _remove_activation_commit_locked(path)
     except OSError:
         pass
 
@@ -728,7 +828,10 @@ def load_applied_state(
             activation_state = _read_activation_state_locked(path)
         except ValueError:
             raise RecorderControlError("configuration activation state is invalid") from None
-        if activation_state == "pending":
+        if activation_state is not None and (
+            activation_state[0] == "pending"
+            or _read_activation_commit_locked(path) != activation_state[1]
+        ):
             raise RecorderControlError("configuration activation is incomplete")
         active = _load_active_configuration_locked(path)
         sidecar = control_state_path(path)
@@ -749,8 +852,13 @@ def load_applied_state(
 
 def _load_active_configuration_locked(path: Path) -> dict[str, Any] | None:
     activation_state = _read_activation_state_locked(path)
-    if activation_state == "pending":
+    if activation_state is not None and (
+        activation_state[0] == "pending"
+        or _read_activation_commit_locked(path) != activation_state[1]
+    ):
         backup = _read_activation_backup_locked(path)
+        if backup["activation_id"] != activation_state[1]:
+            raise ValueError("Configuration activation backup does not match its journal")
         return _active_configuration_from_bytes(backup["active"])
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
