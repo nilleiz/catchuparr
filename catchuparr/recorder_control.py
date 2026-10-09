@@ -346,6 +346,23 @@ def _clear_deny_marker(sidecar: Path) -> None:
         pass
 
 
+def _clear_deny_marker_durably(sidecar: Path) -> None:
+    """Clear admission deny only after the directory update is confirmed durable."""
+    marker = control_deny_path(sidecar)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise RecorderControlError("recorder admission deny state could not be cleared") from None
+    try:
+        _fsync_directory(marker.parent)
+    except OSError:
+        # Configuration activation keeps its own durable journal as an
+        # admission gate until this confirmation succeeds.
+        raise RecorderControlError("recorder admission deny state durability could not be confirmed") from None
+
+
 def _fsync_directory(path: Path) -> None:
     directory_fd = os.open(path, os.O_RDONLY)
     try:

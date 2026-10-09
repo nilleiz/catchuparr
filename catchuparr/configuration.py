@@ -410,13 +410,13 @@ class _PreparedActivation:
             self.recording_paused_warning = True
             return
         try:
-            from .recorder_control import _clear_deny_marker
+            from .recorder_control import _clear_deny_marker_durably
 
-            _clear_deny_marker(self.sidecar)
+            _clear_deny_marker_durably(self.sidecar)
         except Exception:
-            # The active/control pair is durable, but until the deny marker is
-            # cleared the previous snapshot remains authoritative.
-            self.activation_pending_warning = True
+            # Keep the committed snapshot authoritative, but retain the
+            # activation journal as an admission gate until the unlink is
+            # durably confirmed.
             self.recording_paused_warning = True
             self.activation_cleanup_warning = True
             return
@@ -426,6 +426,11 @@ class _PreparedActivation:
             self.activation_cleanup_warning = True
         if not _cleanup_committed_activation_locked(self.active_path):
             self.activation_cleanup_warning = True
+            try:
+                if _read_activation_state_locked(self.active_path) is not None:
+                    self.recording_paused_warning = True
+            except Exception:
+                self.recording_paused_warning = True
 
     def rollback(self) -> bool:
         if self.finished:
@@ -650,17 +655,7 @@ def _activation_commit_matches(
         activation_state is not None
         and activation_state[0] == "committed"
         and _read_activation_commit_locked(path) == activation_state[1]
-        and _activation_deny_marker_clear(path)
     )
-
-
-def _activation_deny_marker_clear(path: Path) -> bool:
-    from .recorder_control import _deny_marker_exists, control_deny_path
-
-    try:
-        return not _deny_marker_exists(control_deny_path(path))
-    except Exception:
-        return False
 
 
 def _remove_durable_file(path: Path) -> None:
@@ -723,9 +718,9 @@ def _recover_interrupted_activation_locked(path: Path) -> None:
         raise ValueError("Configuration activation backup does not match its journal")
     if _activation_commit_matches(path, state):
         try:
-            from .recorder_control import _clear_deny_marker, control_state_path
+            from .recorder_control import _clear_deny_marker_durably, control_state_path
 
-            _clear_deny_marker(control_state_path(path))
+            _clear_deny_marker_durably(control_state_path(path))
         except Exception:
             raise ValueError("Committed configuration still has recorder admission denied") from None
     elif not _restore_activation_backup_locked(path, backup):
@@ -884,6 +879,8 @@ def load_applied_state(
             raise RecorderControlError("configuration activation state is invalid") from None
         if activation_state is not None and not _activation_commit_matches(path, activation_state):
             raise RecorderControlError("configuration activation is incomplete")
+        if activation_state is not None and activation_state[0] == "committed":
+            raise RecorderControlError("configuration activation cleanup is pending; recorder admission is denied")
         active = _load_active_configuration_locked(path)
         sidecar = control_state_path(path)
         if active is not None and active.get("version", 0) >= 4:
