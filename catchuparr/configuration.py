@@ -29,6 +29,7 @@ RESET_REQUIRED_NAME = ".catchuparr-configuration-reset-required"
 ACTIVATION_STATE_NAME = ".catchuparr-configuration-activation.json"
 ACTIVATION_BACKUP_NAME = ".catchuparr-configuration-activation-previous.json"
 ACTIVATION_COMMIT_NAME = ".catchuparr-configuration-activation-commit.json"
+ACTIVATION_UNCERTAIN_NAME = ".catchuparr-configuration-activation-uncertain.json"
 ACTIVATION_STATE_VERSION = 1
 
 
@@ -270,6 +271,19 @@ def apply_configuration(
             result["warning"] = warning
             result["message"] = warning
             return result
+        if prepared.activation_outcome_unknown_warning:
+            result["applied"] = False
+            result["outcome_unknown"] = True
+            result["activation_pending"] = True
+            result["recovery_required"] = True
+            result["recording_paused"] = True
+            warning = (
+                "Apply outcome is unknown; configuration reads remain on the previous validated "
+                "snapshot and recorder admission is denied until recovery succeeds."
+            )
+            result["warning"] = warning
+            result["message"] = warning
+            return result
         warnings = []
         if prepared.recording_paused_warning:
             result["recording_paused"] = True
@@ -377,6 +391,7 @@ class _PreparedActivation:
         self.recording_paused_warning = False
         self.activation_cleanup_warning = False
         self.activation_pending_warning = False
+        self.activation_outcome_unknown_warning = False
 
     def commit(self) -> None:
         if self.finished:
@@ -399,15 +414,37 @@ class _PreparedActivation:
             return
         self.finished = True
         try:
+            _write_activation_uncertain_locked(self.active_path, self.activation_id)
+        except Exception:
+            # The committed journal has not been attempted. Its pending state
+            # and durable backup still keep the previous complete bundle active.
+            self.activation_pending_warning = True
+            self.recording_paused_warning = True
+            return
+        try:
             _write_activation_state_locked(
                 self.active_path, "committed", self.activation_id
             )
         except Exception:
-            # A committed journal state is the final activation acknowledgement.
-            # Keep the old snapshot authoritative and admission denied until
-            # recovery can confirm this transition.
-            self.activation_pending_warning = True
+            # The replacement may or may not have reached stable storage.
+            # Never infer the result from the file currently visible here.
+            # The durable guard keeps readers on the validated backup until
+            # explicit recovery validates the surviving complete bundle.
+            self.activation_outcome_unknown_warning = True
             self.recording_paused_warning = True
+            return
+        try:
+            _remove_activation_uncertain_locked(self.active_path)
+        except Exception:
+            if _activation_uncertain_exists(self.active_path):
+                self.activation_outcome_unknown_warning = True
+                self.recording_paused_warning = True
+                return
+            # The committed journal was durably written, and the guard is
+            # absent in this process. Keep the journal and deny marker so a
+            # later recovery can finish cleanup without reviving recorder work.
+            self.recording_paused_warning = True
+            self.activation_cleanup_warning = True
             return
         try:
             from .recorder_control import _clear_deny_marker_durably
@@ -537,6 +574,21 @@ def _activation_commit_path(path: Path) -> Path:
     return path.with_name(ACTIVATION_COMMIT_NAME)
 
 
+def _activation_uncertain_path(path: Path) -> Path:
+    return path.with_name(ACTIVATION_UNCERTAIN_NAME)
+
+
+def _activation_uncertain_exists(path: Path) -> bool:
+    try:
+        _activation_uncertain_path(path).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable guard is still a guard. Readers must fail closed.
+        return True
+    return True
+
+
 def _encode_optional_bytes(value: bytes | None) -> str | None:
     return base64.b64encode(value).decode("ascii") if value is not None else None
 
@@ -630,6 +682,38 @@ def _write_activation_commit_locked(path: Path, activation_id: str) -> None:
     )
 
 
+def _write_activation_uncertain_locked(path: Path, activation_id: str) -> None:
+    if not _valid_activation_id(activation_id):
+        raise ValueError("Configuration activation guard is invalid")
+    _atomic_json_replace_locked(
+        _activation_uncertain_path(path),
+        {"version": ACTIVATION_STATE_VERSION, "activation_id": activation_id},
+    )
+
+
+def _read_activation_uncertain_locked(path: Path) -> str | None:
+    marker = _activation_uncertain_path(path)
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("Configuration activation outcome is unresolved") from None
+    try:
+        raw = json.loads(marker.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Configuration activation outcome is unresolved") from None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "activation_id"}
+        or type(raw.get("version")) is not int
+        or raw["version"] != ACTIVATION_STATE_VERSION
+        or not _valid_activation_id(raw.get("activation_id"))
+    ):
+        raise ValueError("Configuration activation outcome is unresolved")
+    return raw["activation_id"]
+
+
 def _read_activation_commit_locked(path: Path) -> str | None:
     try:
         raw = json.loads(_activation_commit_path(path).read_text(encoding="utf-8"))
@@ -682,18 +766,93 @@ def _remove_activation_commit_locked(path: Path) -> None:
     _remove_durable_file(_activation_commit_path(path))
 
 
+def _remove_activation_uncertain_locked(path: Path) -> None:
+    _remove_durable_file(_activation_uncertain_path(path))
+
+
 def _restore_control_deny_marker(sidecar: Path, present: bool) -> None:
-    from .recorder_control import _clear_deny_marker, _write_deny_marker
+    from .recorder_control import (
+        _clear_deny_marker_durably,
+        _write_deny_marker,
+    )
 
     if present:
         _write_deny_marker(sidecar)
     else:
-        _clear_deny_marker(sidecar)
+        _clear_deny_marker_durably(sidecar)
+
+
+def _configuration_bundle_valid(
+    active_bytes: bytes | None,
+    control_bytes: bytes | None,
+    *,
+    require_applied: bool = False,
+) -> bool:
+    try:
+        active = _active_configuration_from_bytes(active_bytes)
+        if control_bytes is None:
+            control = None
+        else:
+            raw_control = json.loads(control_bytes.decode("utf-8"))
+            from .recorder_control import _parse_state
+
+            control = _parse_state(raw_control)
+    except Exception:
+        return False
+    if active is None:
+        return not require_applied
+    if require_applied and active.get("version", 0) < 4:
+        return False
+    if active.get("version", 0) >= 4:
+        if control is None:
+            return False
+        if control.configuration_generation != active_configuration_generation(active):
+            return False
+    return True
+
+
+def _committed_bundle_valid(path: Path, activation_id: str) -> bool:
+    from .recorder_control import control_state_path
+
+    if _read_activation_commit_locked(path) != activation_id:
+        return False
+    active_bytes = _read_file_bytes(path)
+    control_bytes = _read_file_bytes(control_state_path(path))
+    return _configuration_bundle_valid(
+        active_bytes, control_bytes, require_applied=True
+    )
+
+
+def _fsync_existing_file_and_parent(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _confirm_committed_bundle_durability(path: Path) -> None:
+    from .recorder_control import control_state_path
+
+    for candidate in (
+        path,
+        control_state_path(path),
+        _activation_state_path(path),
+        _activation_commit_path(path),
+    ):
+        _fsync_existing_file_and_parent(candidate)
 
 
 def _restore_activation_backup_locked(path: Path, backup: dict[str, Any]) -> bool:
     from .recorder_control import control_state_path
 
+    if not _configuration_bundle_valid(backup["active"], backup["control"]):
+        return False
     sidecar = control_state_path(path)
     active_restored = _restore_file_bytes_locked(path, backup["active"])
     control_restored = _restore_file_bytes_locked(sidecar, backup["control"])
@@ -703,12 +862,20 @@ def _restore_activation_backup_locked(path: Path, backup: dict[str, Any]) -> boo
         _restore_control_deny_marker(sidecar, backup["control_deny_present"])
     except Exception:
         return False
-    return True
+    return _configuration_bundle_valid(
+        _read_file_bytes(path), _read_file_bytes(sidecar)
+    )
 
 
 def _recover_interrupted_activation_locked(path: Path) -> None:
+    try:
+        uncertain_id = _read_activation_uncertain_locked(path)
+    except ValueError:
+        raise ValueError("Configuration activation outcome remains unresolved") from None
     state = _read_activation_state_locked(path)
     if state is None:
+        if uncertain_id is not None or _activation_uncertain_exists(path):
+            raise ValueError("Configuration activation journal is unavailable")
         _remove_activation_backup_locked(path)
         _remove_activation_commit_locked(path)
         return
@@ -716,15 +883,36 @@ def _recover_interrupted_activation_locked(path: Path) -> None:
     backup = _read_activation_backup_locked(path)
     if backup["activation_id"] != activation_id:
         raise ValueError("Configuration activation backup does not match its journal")
-    if _activation_commit_matches(path, state):
+    if uncertain_id is not None and uncertain_id != activation_id:
+        raise ValueError("Configuration activation guard does not match its journal")
+    committed = _activation_commit_matches(path, state)
+    if committed and _committed_bundle_valid(path, activation_id):
+        try:
+            _confirm_committed_bundle_durability(path)
+        except OSError:
+            raise ValueError("Committed configuration durability could not be confirmed") from None
         try:
             from .recorder_control import _clear_deny_marker_durably, control_state_path
 
             _clear_deny_marker_durably(control_state_path(path))
         except Exception:
             raise ValueError("Committed configuration still has recorder admission denied") from None
+        if uncertain_id is not None:
+            try:
+                _remove_activation_uncertain_locked(path)
+            except Exception:
+                raise ValueError("Configuration activation outcome remains unresolved") from None
+            if _activation_uncertain_exists(path):
+                raise ValueError("Configuration activation outcome remains unresolved")
     elif not _restore_activation_backup_locked(path, backup):
         raise ValueError("Interrupted configuration activation could not be restored")
+    elif uncertain_id is not None:
+        try:
+            _remove_activation_uncertain_locked(path)
+        except Exception:
+            raise ValueError("Configuration activation outcome remains unresolved") from None
+        if _activation_uncertain_exists(path):
+            raise ValueError("Configuration activation outcome remains unresolved")
     _remove_activation_state_locked(path)
     _remove_activation_backup_locked(path)
     _remove_activation_commit_locked(path)
@@ -859,6 +1047,14 @@ def load_active_configuration(active_path: Path | None = None) -> dict[str, Any]
         return None
 
 
+def recover_interrupted_activation(active_path: Path | None = None) -> None:
+    """Resolve a surviving activation only after validating a complete bundle."""
+    path = Path(active_path) if active_path is not None else active_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _config_lock(path, exclusive=True):
+        _recover_interrupted_activation_locked(path)
+
+
 def load_applied_state(
     active_path: Path | None = None,
 ) -> tuple[dict[str, Any] | None, Any]:
@@ -873,6 +1069,11 @@ def load_applied_state(
 
     path = Path(active_path) if active_path is not None else active_settings_path()
     with _config_lock(path, exclusive=True):
+        if _activation_uncertain_exists(path):
+            raise RecorderControlError(
+                "configuration activation outcome is unknown or incomplete; "
+                "recorder admission is denied"
+            )
         try:
             activation_state = _read_activation_state_locked(path)
         except ValueError:
@@ -899,11 +1100,30 @@ def load_applied_state(
 
 
 def _load_active_configuration_locked(path: Path) -> dict[str, Any] | None:
+    if _activation_uncertain_exists(path):
+        try:
+            uncertain_id = _read_activation_uncertain_locked(path)
+            state = _read_activation_state_locked(path)
+        except ValueError:
+            # If the guard itself is unreadable, use the previous bundle only
+            # when its journal independently identifies it.
+            uncertain_id = None
+            state = _read_activation_state_locked(path)
+        backup = _read_activation_backup_locked(path)
+        if state is None or backup["activation_id"] != state[1]:
+            raise ValueError("Configuration activation outcome is unresolved") from None
+        if uncertain_id is not None and uncertain_id != state[1]:
+            raise ValueError("Configuration activation outcome is unresolved")
+        if not _configuration_bundle_valid(backup["active"], backup["control"]):
+            raise ValueError("Previous configuration bundle is invalid")
+        return _active_configuration_from_bytes(backup["active"])
     activation_state = _read_activation_state_locked(path)
     if activation_state is not None and not _activation_commit_matches(path, activation_state):
         backup = _read_activation_backup_locked(path)
         if backup["activation_id"] != activation_state[1]:
             raise ValueError("Configuration activation backup does not match its journal")
+        if not _configuration_bundle_valid(backup["active"], backup["control"]):
+            raise ValueError("Previous configuration bundle is invalid")
         return _active_configuration_from_bytes(backup["active"])
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
