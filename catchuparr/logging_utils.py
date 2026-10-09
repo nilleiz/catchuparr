@@ -13,6 +13,10 @@ ERROR_WINDOW_SECONDS = 300.0
 
 _EVENTS = frozenset({
     "configuration_applied",
+    "configuration_activation_pending",
+    "configuration_outcome_unknown",
+    "configuration_recovery_required",
+    "configuration_recovery_failed",
     "control_applied",
     "control_paused",
     "control_resumed",
@@ -35,7 +39,7 @@ _EVENTS = frozenset({
 _STATE_KEYS = frozenset({
     "generation", "config_generation", "control_generation", "channel_count",
     "source_policy_count", "queued", "paused", "enabled", "count", "level",
-    "reason",
+    "reason", "activation_pending", "outcome_unknown", "recovery_required",
 })
 _SAFE_REASONS = frozenset({
     "version", "proxy_api", "cleanup_guard", "xc_hooks", "xc_uninstall", "log_level",
