@@ -350,24 +350,41 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
             "Synthetic Source B": [object(), object()],
             "Synthetic Source D": [],
         }
+        baseline = (
+            {
+                "source-a.ts": 1,
+                "source-b.ts": 2,
+                "source-c.ts": 7,
+                "source-d.ts": 8,
+            },
+            {
+                "source-a.ts": 0,
+                "source-b.ts": 0,
+                "source-c.ts": 0,
+                "source-d.ts": 0,
+            },
+        )
+        current = (
+            {
+                "source-a.ts": 3,
+                "source-b.ts": 5,
+                "source-c.ts": 7,
+                "source-d.ts": 9,
+            },
+            {
+                "source-a.ts": 0,
+                "source-b.ts": 1,
+                "source-c.ts": 0,
+                "source-d.ts": 0,
+            },
+        )
 
         class SourceServer:
-            @staticmethod
-            def snapshot():
-                return (
-                    {
-                        "source-a.ts": 3,
-                        "source-b.ts": 5,
-                        "source-c.ts": 7,
-                        "source-d.ts": 9,
-                    },
-                    {
-                        "source-a.ts": 0,
-                        "source-b.ts": 1,
-                        "source-c.ts": 0,
-                        "source-d.ts": 0,
-                    },
-                )
+            def __init__(self):
+                self._snapshots = iter((baseline, current))
+
+            def snapshot(self):
+                return next(self._snapshots)
 
             @staticmethod
             def stall_snapshot():
@@ -383,20 +400,8 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
             thread=SimpleNamespace(is_alive=lambda: True),
             results=[SimpleNamespace(status="media_stalled", useful_segments=2)],
         )
-        baseline = (
-            {
-                "source-a.ts": 1,
-                "source-b.ts": 2,
-                "source-c.ts": 7,
-                "source-d.ts": 8,
-            },
-            {
-                "source-a.ts": 0,
-                "source-b.ts": 0,
-                "source-c.ts": 0,
-                "source-d.ts": 0,
-            },
-        )
+        source_server = SourceServer()
+        request_baseline, active_baseline = source_server.snapshot()
         stall_baseline = {
             "started": 3,
             "duration_seconds": 1.0,
@@ -417,22 +422,25 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
             "native": {"a": {"state": "active"}},
         }
         callback_verified = []
+        diagnostic_context = patch.object(
+            probe, "_native_source_observations", return_value=diagnostic["native"],
+        )
 
         def build_diagnostic(indexed):
             callback_verified.append(indexed)
-            with patch.object(
-                probe, "_native_source_observations", return_value=diagnostic["native"],
-            ):
-                return probe._runtime_timeout_diagnostic(
-                    run,
-                    SourceServer(),
-                    baseline,
-                    stall_baseline,
-                    indexed,
-                    object(),
-                    "synthetic-channel",
-                    {},
-                )
+            with diagnostic_context:
+                return timeout_callback(indexed)
+
+        timeout_callback = probe._make_runtime_timeout_diagnostic_callback(
+            run,
+            source_server,
+            request_baseline,
+            active_baseline,
+            stall_baseline,
+            object(),
+            "synthetic-channel",
+            {},
+        )
 
         stderr = io.StringIO()
         with (
@@ -470,7 +478,15 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
         emitted = json.loads(lines[0][len(probe.FAILOVER_DIAGNOSTIC_PREFIX):])
         self.assertEqual(emitted["attempts"], diagnostic["attempts"])
         self.assertEqual(emitted["indexed_segments"], {"b": 2, "c": 0, "d": 0})
-        self.assertEqual(emitted["source_deltas"]["b"], {"request_delta": 3, "active_delta": 1})
+        self.assertEqual(
+            emitted["source_deltas"],
+            {
+                "a": {"request_delta": 2, "active_delta": 0},
+                "b": {"request_delta": 3, "active_delta": 1},
+                "c": {"request_delta": 0, "active_delta": 0},
+                "d": {"request_delta": 1, "active_delta": 0},
+            },
+        )
         self.assertEqual(
             emitted["b_stall"],
             {"started_delta": 1, "duration_ms": 2250, "null_bytes_delta": 3072},
