@@ -22,6 +22,14 @@ class RuntimeStatusTests(unittest.TestCase):
             normalize_public_base_url("https://media.example.test/dispatcharr/"),
         )
         for value in (
+            "https://media.example.test",
+            "https://media.example.test/",
+        ):
+            with self.subTest(value=value):
+                normalized = normalize_public_base_url(value)
+                self.assertEqual("https://media.example.test", normalized)
+                self.assertEqual(normalized, normalize_public_base_url(normalized))
+        for value in (
             "",
             "ftp://media.example.test",
             "https://user:pass@media.example.test",

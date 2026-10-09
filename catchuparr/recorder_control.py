@@ -157,6 +157,7 @@ def _configuration_control_state_locked(
     *,
     recording_enabled: bool,
     configuration_generation: str,
+    recovering_pending: bool = False,
 ) -> RecorderControlState:
     """Write the control half of a unified Apply while its deny marker is held."""
     if type(recording_enabled) is not bool:
@@ -172,6 +173,7 @@ def _configuration_control_state_locked(
     changed = (
         current.paused != paused
         or current.configuration_generation != configuration_generation
+        or recovering_pending
     )
     updated = RecorderControlState(
         paused=paused,

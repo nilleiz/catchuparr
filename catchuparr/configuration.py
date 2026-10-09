@@ -7,6 +7,8 @@ changes recorder behavior until Apply succeeds.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import fcntl
 import hashlib
 import json
@@ -24,6 +26,9 @@ ACTIVE_CONFIG_NAME = ".catchuparr-active-settings.json"
 ACTIVE_CONFIG_VERSION = 4
 SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, ACTIVE_CONFIG_VERSION})
 RESET_REQUIRED_NAME = ".catchuparr-configuration-reset-required"
+ACTIVATION_STATE_NAME = ".catchuparr-configuration-activation.json"
+ACTIVATION_BACKUP_NAME = ".catchuparr-configuration-activation-previous.json"
+ACTIVATION_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -350,20 +355,34 @@ class _PreparedActivation:
         from .recorder_control import _clear_deny_marker
 
         _clear_deny_marker(self.sidecar)
+        try:
+            _write_activation_state_locked(self.active_path, "committed")
+        except OSError:
+            # An atomic replace may have completed before a directory fsync
+            # failed. The committed marker is authoritative only if it can be
+            # read back; otherwise the pending marker keeps the old settings
+            # visible to non-recorder consumers.
+            if _read_activation_state_locked(self.active_path) != "committed":
+                raise
         self.finished = True
         _remove_reset_required_marker(self.active_path)
+        _cleanup_committed_activation_locked(self.active_path)
 
     def rollback(self) -> bool:
         if self.finished:
             return True
-        from .recorder_control import _clear_deny_marker
-
         active_restored = _restore_file_bytes_locked(self.active_path, self.previous_active)
         control_restored = _restore_file_bytes_locked(self.sidecar, self.previous_control)
-        restored = active_restored and control_restored and not self.marker_was_present
+        restored = active_restored and control_restored
         if restored:
             try:
-                _clear_deny_marker(self.sidecar)
+                _restore_control_deny_marker(self.sidecar, self.marker_was_present)
+            except Exception:
+                restored = False
+        if restored:
+            try:
+                _remove_activation_state_locked(self.active_path)
+                _remove_activation_backup_locked(self.active_path)
             except Exception:
                 restored = False
         self.finished = restored
@@ -384,12 +403,23 @@ def _prepare_document_with_control_locked(
     )
 
     sidecar = control_state_path(path)
+    _recover_interrupted_activation_locked(path)
     previous_active = _read_file_bytes(path)
     previous_control = _read_file_bytes(sidecar)
     marker_was_present = _deny_marker_exists(control_deny_path(path))
+    backup = {
+        "version": ACTIVATION_STATE_VERSION,
+        "active": _encode_optional_bytes(previous_active),
+        "control": _encode_optional_bytes(previous_control),
+        "control_deny_present": marker_was_present,
+    }
+    _write_activation_backup_locked(path, backup)
+    _write_activation_state_locked(path, "pending")
     try:
         _write_deny_marker(sidecar)
     except OSError:
+        _remove_activation_state_locked(path)
+        _remove_activation_backup_locked(path)
         raise RecorderControlError("configuration activation could not deny recorder admission") from None
 
     active = _active_configuration_view(document)
@@ -403,6 +433,7 @@ def _prepare_document_with_control_locked(
             sidecar,
             recording_enabled=document["settings"]["recording_enabled"],
             configuration_generation=generation,
+            recovering_pending=marker_was_present,
         )
     except Exception:
         restored = prepared.rollback()
@@ -421,6 +452,162 @@ def _read_file_bytes(path: Path) -> bytes | None:
         return path.read_bytes()
     except FileNotFoundError:
         return None
+
+
+def _activation_state_path(path: Path) -> Path:
+    return path.with_name(ACTIVATION_STATE_NAME)
+
+
+def _activation_backup_path(path: Path) -> Path:
+    return path.with_name(ACTIVATION_BACKUP_NAME)
+
+
+def _encode_optional_bytes(value: bytes | None) -> str | None:
+    return base64.b64encode(value).decode("ascii") if value is not None else None
+
+
+def _decode_optional_bytes(value: Any) -> bytes | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Configuration activation backup is invalid")
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("Configuration activation backup is invalid") from None
+
+
+def _write_activation_backup_locked(path: Path, backup: dict[str, Any]) -> None:
+    _atomic_json_replace_locked(_activation_backup_path(path), backup)
+
+
+def _read_activation_backup_locked(path: Path) -> dict[str, Any]:
+    backup_path = _activation_backup_path(path)
+    try:
+        raw = json.loads(backup_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Configuration activation backup is unavailable") from None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "active", "control", "control_deny_present"}
+        or type(raw.get("version")) is not int
+        or raw["version"] != ACTIVATION_STATE_VERSION
+        or type(raw.get("control_deny_present")) is not bool
+    ):
+        raise ValueError("Configuration activation backup is invalid")
+    return {
+        "active": _decode_optional_bytes(raw["active"]),
+        "control": _decode_optional_bytes(raw["control"]),
+        "control_deny_present": raw["control_deny_present"],
+    }
+
+
+def _read_activation_state_locked(path: Path) -> str | None:
+    state_path = _activation_state_path(path)
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Configuration activation state is unreadable") from None
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "state"}
+        or type(raw.get("version")) is not int
+        or raw["version"] != ACTIVATION_STATE_VERSION
+        or raw.get("state") not in {"pending", "committed"}
+    ):
+        raise ValueError("Configuration activation state is invalid")
+    return raw["state"]
+
+
+def _write_activation_state_locked(path: Path, state: str) -> None:
+    if state not in {"pending", "committed"}:
+        raise ValueError("Configuration activation state is invalid")
+    _atomic_json_replace_locked(
+        _activation_state_path(path),
+        {"version": ACTIVATION_STATE_VERSION, "state": state},
+    )
+
+
+def _remove_durable_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _remove_activation_state_locked(path: Path) -> None:
+    _remove_durable_file(_activation_state_path(path))
+
+
+def _remove_activation_backup_locked(path: Path) -> None:
+    _remove_durable_file(_activation_backup_path(path))
+
+
+def _restore_control_deny_marker(sidecar: Path, present: bool) -> None:
+    from .recorder_control import _clear_deny_marker, _write_deny_marker
+
+    if present:
+        _write_deny_marker(sidecar)
+    else:
+        _clear_deny_marker(sidecar)
+
+
+def _restore_activation_backup_locked(path: Path, backup: dict[str, Any]) -> bool:
+    from .recorder_control import control_state_path
+
+    sidecar = control_state_path(path)
+    active_restored = _restore_file_bytes_locked(path, backup["active"])
+    control_restored = _restore_file_bytes_locked(sidecar, backup["control"])
+    if not active_restored or not control_restored:
+        return False
+    try:
+        _restore_control_deny_marker(sidecar, backup["control_deny_present"])
+    except Exception:
+        return False
+    return True
+
+
+def _recover_interrupted_activation_locked(path: Path) -> None:
+    state = _read_activation_state_locked(path)
+    if state is None:
+        return
+    if state == "pending":
+        backup = _read_activation_backup_locked(path)
+        if not _restore_activation_backup_locked(path, backup):
+            raise ValueError("Interrupted configuration activation could not be restored")
+    _remove_activation_state_locked(path)
+    _remove_activation_backup_locked(path)
+
+
+def _cleanup_committed_activation_locked(path: Path) -> None:
+    try:
+        _remove_activation_state_locked(path)
+    except OSError:
+        return
+    try:
+        _remove_activation_backup_locked(path)
+    except OSError:
+        pass
+
+
+def _active_configuration_from_bytes(contents: bytes | None) -> dict[str, Any] | None:
+    if contents is None:
+        return None
+    try:
+        data = json.loads(contents.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Active Catchuparr configuration is invalid") from None
+    if not isinstance(data, dict):
+        raise ValueError("Active Catchuparr configuration is invalid")
+    _validate_active_document(data)
+    return _active_configuration_view(data)
 
 
 def _restore_file_bytes_locked(path: Path, contents: bytes | None) -> bool:
@@ -537,6 +724,12 @@ def load_applied_state(
 
     path = Path(active_path) if active_path is not None else active_settings_path()
     with _config_lock(path, exclusive=True):
+        try:
+            activation_state = _read_activation_state_locked(path)
+        except ValueError:
+            raise RecorderControlError("configuration activation state is invalid") from None
+        if activation_state == "pending":
+            raise RecorderControlError("configuration activation is incomplete")
         active = _load_active_configuration_locked(path)
         sidecar = control_state_path(path)
         if active is not None and active.get("version", 0) >= 4:
@@ -555,6 +748,10 @@ def load_applied_state(
 
 
 def _load_active_configuration_locked(path: Path) -> dict[str, Any] | None:
+    activation_state = _read_activation_state_locked(path)
+    if activation_state == "pending":
+        backup = _read_activation_backup_locked(path)
+        return _active_configuration_from_bytes(backup["active"])
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
