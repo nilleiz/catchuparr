@@ -231,12 +231,39 @@ def apply_configuration(settings: dict | None = None) -> dict:
             raise
         active = load_active_configuration()
     apply_log_level(active.get("log_level", "INFO") if active else "INFO")
-    event(
-        "configuration_applied",
-        channel_count=result["selected_channel_count"],
-        source_policy_count=result["source_policy_count"],
-        recording_paused=bool(result.get("recording_paused", False)),
-    )
+    event_fields = {
+        "recording_paused": bool(result.get("recording_paused", False)),
+    }
+    if result.get("applied") is True:
+        event(
+            "configuration_applied",
+            channel_count=result["selected_channel_count"],
+            source_policy_count=result["source_policy_count"],
+            **event_fields,
+        )
+    elif result.get("outcome_unknown") is True:
+        event(
+            "configuration_outcome_unknown",
+            logging.WARNING,
+            outcome_unknown=True,
+            recovery_required=True,
+            **event_fields,
+        )
+    elif result.get("activation_pending") is True:
+        event(
+            "configuration_activation_pending",
+            logging.WARNING,
+            activation_pending=True,
+            recovery_required=bool(result.get("recovery_required", True)),
+            **event_fields,
+        )
+    else:
+        event(
+            "configuration_recovery_required",
+            logging.WARNING,
+            recovery_required=True,
+            **event_fields,
+        )
     return result
 
 

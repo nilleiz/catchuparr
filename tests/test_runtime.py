@@ -1,4 +1,5 @@
 import importlib
+import logging
 import sys
 import tempfile
 import types
@@ -320,10 +321,122 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertTrue(returned["recording_paused"])
         self.assertIn("previous settings remain active", returned["warning"])
         event.assert_called_once_with(
+            "configuration_activation_pending",
+            logging.WARNING,
+            activation_pending=True,
+            recovery_required=True,
+            recording_paused=True,
+        )
+
+    def test_runtime_apply_emits_success_only_for_confirmed_apply(self):
+        from catchuparr import runtime
+        configuration = importlib.import_module("catchuparr.configuration")
+        logging_utils = importlib.import_module("catchuparr.logging_utils")
+        result = {
+            "applied": True,
+            "selected_channel_count": 2,
+            "source_policy_count": 1,
+            "recording_paused": False,
+        }
+        with patch.object(configuration, "apply_configuration", return_value=result), patch.object(
+            configuration,
+            "load_applied_state",
+            return_value=({"log_level": "INFO"}, object()),
+        ), patch.object(logging_utils, "apply_log_level"), patch.object(
+            logging_utils, "event"
+        ) as event:
+            returned = runtime.apply_configuration()
+
+        self.assertTrue(returned["applied"])
+        event.assert_called_once_with(
             "configuration_applied",
             channel_count=2,
             source_policy_count=1,
-            recording_paused=True,
+            recording_paused=False,
+        )
+
+    def test_runtime_apply_logs_unknown_and_recovery_required_without_success_event(self):
+        from catchuparr import runtime
+        configuration = importlib.import_module("catchuparr.configuration")
+        logging_utils = importlib.import_module("catchuparr.logging_utils")
+        from catchuparr.recorder_control import RecorderControlError
+
+        cases = (
+            (
+                {
+                    "applied": False,
+                    "outcome_unknown": True,
+                    "activation_pending": True,
+                    "recovery_required": True,
+                    "recording_paused": True,
+                },
+                "configuration_outcome_unknown",
+                {"outcome_unknown": True, "recovery_required": True},
+            ),
+            (
+                {"applied": False, "recovery_required": True, "recording_paused": True},
+                "configuration_recovery_required",
+                {"recovery_required": True},
+            ),
+        )
+        for result, expected_event, event_flags in cases:
+            with self.subTest(expected_event=expected_event):
+                with patch.object(
+                    configuration, "apply_configuration", return_value=result
+                ), patch.object(
+                    configuration,
+                    "load_applied_state",
+                    side_effect=RecorderControlError("synthetic denied state"),
+                ), patch.object(
+                    configuration,
+                    "load_active_configuration",
+                    return_value={"log_level": "INFO"},
+                ), patch.object(logging_utils, "apply_log_level"), patch.object(
+                    logging_utils, "event"
+                ) as event:
+                    returned = runtime.apply_configuration()
+
+                self.assertFalse(returned["applied"])
+                event.assert_called_once_with(
+                    expected_event,
+                    logging.WARNING,
+                    recording_paused=True,
+                    **event_flags,
+                )
+                self.assertNotEqual("configuration_applied", event.call_args.args[0])
+
+    def test_bootstrap_logs_allowlisted_recovery_failure(self):
+        from catchuparr import runtime
+        configuration = importlib.import_module("catchuparr.configuration")
+        celery = types.ModuleType("celery")
+
+        def fake_shared_task(**_kwargs):
+            def decorate(function):
+                return function
+
+            return decorate
+
+        celery.shared_task = fake_shared_task
+
+        with patch.dict(sys.modules, {"celery": celery}), patch.object(
+            runtime, "apply_committed_log_level"
+        ), patch.object(
+            runtime, "require_supported_version"
+        ), patch.object(
+            configuration,
+            "recover_interrupted_activation",
+            side_effect=RuntimeError("synthetic recovery failure"),
+        ), patch.object(
+            configuration, "reset_legacy_configuration"
+        ) as reset, patch.object(runtime, "_ensure_schedule"), patch.object(
+            sys, "argv", ["celery"]
+        ), self.assertLogs("catchuparr", level="ERROR") as captured:
+            runtime.bootstrap()
+
+        reset.assert_not_called()
+        self.assertIn(
+            "[Catchuparr] configuration_recovery_failed",
+            [record.getMessage() for record in captured.records],
         )
 
 
