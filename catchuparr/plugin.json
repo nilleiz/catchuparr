@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Local rolling catch-up archive and start-over for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -10,7 +10,7 @@
       "label": "Channel and source filter (YAML)",
       "type": "text",
       "default": "",
-      "help_text": "Use version: 1, optional profile (defaults to all), and rules with channels selected by numbers, names, groups, or a Dispatcharr channel profile. Include/exclude filters apply only to assigned M3U sources. Validate before Apply; blank YAML selects no channels. Filtered sources may need another provider slot."
+      "help_text": "Use version: 1, optional profile (defaults to all), and rules with channels selected by numbers, names, groups, or a Dispatcharr channel profile. Include/exclude filters apply only to assigned M3U sources. Optional timezone defaults to Europe/Berlin; schedule is continuous or a weekday map of start/end HH:MM windows. A rule schedule replaces the global schedule; schedule: {} means off. End times are exclusive and overnight windows belong to their start day. Validate before Apply; blank YAML selects no channels. Filtered sources may need another provider slot."
     },
     {
       "id": "archive_root",
@@ -37,6 +37,20 @@
       "type": "number",
       "default": 0,
       "help_text": "Set the Dispatcharr user ID before creating an access token."
+    },
+    {
+      "id": "recording_enabled",
+      "label": "Recording enabled",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Saving this setting does not change recording until Apply recorder control. Pause and Resume actions update it immediately."
+    },
+    {
+      "id": "log_level",
+      "label": "Catchuparr log level",
+      "type": "string",
+      "default": "INFO",
+      "help_text": "DEBUG, INFO, WARNING, or ERROR. Applies to Catchuparr logs only."
     }
   ],
   "actions": [
@@ -64,6 +78,21 @@
       "id": "apply_configuration",
       "label": "Apply configuration",
       "button_label": "Apply configuration"
+    },
+    {
+      "id": "apply_recorder_control",
+      "label": "Apply recorder control",
+      "button_label": "Apply recording setting"
+    },
+    {
+      "id": "pause_recorders",
+      "label": "Pause recording",
+      "button_label": "Pause"
+    },
+    {
+      "id": "resume_recorders",
+      "label": "Resume recording",
+      "button_label": "Resume"
     }
   ]
 }

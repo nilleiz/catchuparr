@@ -5,6 +5,8 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
+import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -17,6 +19,59 @@ from django.utils import timezone
 def require(condition, message="Integration check failed"):
     if not condition:
         raise RuntimeError(message)
+
+
+def require_native_stream_runtime():
+    """Verify the normal app-ready path created one full native runtime."""
+    from apps.proxy.live_proxy.runtime import should_run_live_proxy_runtime
+    from apps.proxy.live_proxy.server import ProxyServer
+    from dispatcharr.db.process_label import get_process_role
+    from django.apps import apps
+
+    require(
+        get_process_role() == "gunicorn" and should_run_live_proxy_runtime(),
+        "Synthetic shell did not select Dispatcharr's stream-worker runtime",
+    )
+    native_server = ProxyServer._instance
+    require(
+        isinstance(native_server, ProxyServer),
+        "ProxyConfig.ready did not create the native ProxyServer singleton",
+    )
+    proxy_config = apps.get_app_config("proxy")
+    require(
+        getattr(proxy_config, "live_proxy", None) is native_server,
+        "ProxyConfig.ready and ProxyServer do not share the same singleton",
+    )
+    require(
+        ProxyServer.get_instance() is native_server,
+        "Native ProxyServer singleton changed after app startup",
+    )
+    thread_names = [thread.name for thread in threading.enumerate()]
+    require(
+        thread_names.count("ts-proxy-cleanup") == 1
+        and thread_names.count("redis-event-listener") == 1,
+        "Native stream-worker cleanup and event-listener threads did not start once",
+    )
+    return native_server
+
+
+def require_native_runtime_drained(native_server):
+    """Wait naturally for every native channel thread to exit before process exit."""
+    deadline = time.monotonic() + 15
+    while (
+        native_server.stream_managers
+        or native_server.client_managers
+        or native_server._live_stream_managers
+    ) and time.monotonic() < deadline:
+        from gevent import sleep
+
+        sleep(0.05)
+    require(
+        not native_server.stream_managers
+        and not native_server.client_managers
+        and not native_server._live_stream_managers,
+        "Synthetic probe returned before native channel threads drained naturally",
+    )
 
 
 def probe_source_configuration(channel, root):
@@ -87,6 +142,10 @@ def probe_source_configuration(channel, root):
         "filter_config": (
             "version: 1\n"
             f"profile: {profile_name}\n"
+            "timezone: UTC\n"
+            "schedule:\n"
+            "  monday:\n"
+            "    - {start: '00:00', end: '24:00'}\n"
             "rules:\n"
             "  - channels: {profile: all}\n"
             "    include: [Synthetic source B]\n"
@@ -97,6 +156,14 @@ def probe_source_configuration(channel, root):
     active_path = root / "synthetic-active-settings.json"
     apply_configuration(settings, active_path=active_path)
     active = load_active_configuration(active_path)
+    require(active is not None and active.get("version") == 3,
+            "Apply must persist a v3 active snapshot")
+    require(active["recording_schedule"] == {
+        "timezone": "UTC",
+        "channels": {
+            str(channel.uuid): {"mode": "weekly", "intervals": [[0, 1440]]},
+        },
+    }, "Apply must persist a normalized per-channel schedule by stable UUID")
     require(set(active["source_policies"]) == {str(channel.uuid)},
             "Wildcard must persist policies only for enabled archive channels")
     require([row["id"] for row in ranked_source_candidates(str(channel.uuid), active)]
@@ -225,6 +292,8 @@ def probe():
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.security import AccessTokenStore
 
+    native_server = require_native_stream_runtime()
+
     # Refuse restored Dev/production databases, even if the flag was misapplied.
     require(not Channel.objects.exists(), "Integration database must have no channels")
     require(not User.objects.exists(), "Integration database must have no users")
@@ -294,6 +363,8 @@ def probe():
             "archive_root": str(root),
             "retention_hours": 1,
             "max_storage_gib": 1,
+            "recording_enabled": True,
+            "log_level": "INFO",
         },
     )
     runtime.bootstrap()
@@ -528,6 +599,7 @@ def probe():
         from aio_recorder_failover import probe_recorder_failover
 
         probe_recorder_failover(root)
+        require_native_runtime_drained(native_server)
     finally:
         runtime.shutdown()
     print(f"AIO integration passed: Dispatcharr {__version__}")

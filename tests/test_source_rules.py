@@ -56,6 +56,60 @@ class SourceRulesTests(unittest.TestCase):
         result = self.compile("version: 1\nprofile: all\nrules: []\n")
         self.assertEqual((), result.channel_uuids)
 
+    def test_schedule_defaults_continuous_and_rule_schedule_replaces_global(self):
+        inherited = self.compile(
+            "version: 1\nrules:\n  - channels: {profile: all}\n"
+        )
+        self.assertEqual("Europe/Berlin", inherited.timezone)
+        self.assertEqual(
+            {channel: {"mode": "continuous"} for channel in (CHANNEL_A, CHANNEL_B)},
+            {key: value.to_snapshot() for key, value in inherited.channel_schedules.items()},
+        )
+
+        replaced = self.compile(
+            "version: 1\ntimezone: UTC\n"
+            "schedule:\n  monday:\n    - {start: '06:00', end: '12:00'}\n"
+            "rules:\n"
+            "  - channels: {profile: all}\n"
+            "  - channels: {names: [Synthetic Channel B]}\n"
+            "    schedule: {}\n"
+        )
+        self.assertEqual("UTC", replaced.timezone)
+        self.assertEqual(
+            {"mode": "weekly", "intervals": [[360, 720]]},
+            replaced.channel_schedules[CHANNEL_A].to_snapshot(),
+        )
+        self.assertEqual(
+            {"mode": "weekly", "intervals": []},
+            replaced.channel_schedules[CHANNEL_B].to_snapshot(),
+        )
+
+    def test_schedule_supports_overnight_and_full_day_boundaries(self):
+        compiled = self.compile(
+            "version: 1\nschedule:\n"
+            "  sunday:\n    - {start: '23:00', end: '02:00'}\n"
+            "  monday:\n    - {start: '00:00', end: '24:00'}\n"
+            "rules:\n  - channels: {numbers: [1]}\n"
+        )
+        self.assertEqual(
+            {"mode": "weekly", "intervals": [[0, 1440], [10020, 10080]]},
+            compiled.channel_schedules[CHANNEL_A].to_snapshot(),
+        )
+
+    def test_invalid_schedule_fields_are_rejected(self):
+        invalid = (
+            ("version: 1\ntimezone: Unknown/Zone\nrules: []\n", "timezone"),
+            ("version: 1\nschedule:\n  monday: []\n  Mon: []\nrules: []\n", "weekday"),
+            (
+                "version: 1\nrules:\n  - channels: {numbers: [1]}\n"
+                "    schedule:\n      monday:\n        - {start: '09:00', end: '09:00'}\n",
+                "must differ",
+            ),
+        )
+        for document, message in invalid:
+            with self.subTest(message=message), self.assertRaisesRegex(SourceRuleError, message):
+                self.compile(document)
+
     def test_outer_profile_defaults_to_all(self):
         omitted = self.compile(
             "version: 1\nrules:\n  - channels: {numbers: [1]}\n"

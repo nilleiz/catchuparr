@@ -24,7 +24,7 @@ MEDIA_IDLE_TIMEOUT = 25.0
 POLL_INTERVAL = 0.2
 SOURCE_DURATION = 8.0
 SOURCE_CHUNK_PACKETS = 32
-FINITE_SOURCE_REPEATS = 4
+STALL_SOURCE_REPEATS = 4
 BRIDGE_DRAIN_TIMEOUT = 5.0
 SYNTHETIC_SOURCE_TONES = {
     "Synthetic Source B": 880,
@@ -38,6 +38,25 @@ TONE_SAMPLE_RATE = 48_000
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def _recorder_attempt_summary(results: list[object]) -> list[dict[str, object]]:
+    """Return bounded status/count fields without exposing URLs or identifiers."""
+    known_statuses = {"exited", "no_media", "media_stalled", "stopped"}
+    summaries = []
+    for result in results:
+        status = getattr(result, "status", None)
+        if not isinstance(status, str) or status not in known_statuses:
+            status = "other"
+        try:
+            useful_segments = max(0, int(getattr(result, "useful_segments", -1)))
+        except (TypeError, ValueError):
+            useful_segments = None
+        summaries.append({
+            "status": status,
+            "useful_segments": useful_segments,
+        })
+    return summaries
 
 
 def _make_paced_transport_stream(
@@ -111,7 +130,7 @@ def _null_transport_stream() -> bytes:
 
 
 class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
-    """Serve paced fixture TS and one bounded finite-source failure."""
+    """Serve paced fixture TS with finite and null-only stall modes."""
 
     daemon_threads = True
     block_on_close = False
@@ -129,6 +148,10 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
         self._finite_claimed: set[str] = set()
         self._request_counts = {name: 0 for name in payloads}
         self._active_counts = {name: 0 for name in payloads}
+        self._stall_started_counts = {name: 0 for name in payloads}
+        self._stall_durations = {name: 0.0 for name in payloads}
+        self._stall_null_bytes = {name: 0 for name in payloads}
+        self.null_payload = _null_transport_stream()
         self._sockets: set[object] = set()
         owner = self
 
@@ -146,10 +169,11 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
                     owner._request_counts[name] = owner._request_counts.get(name, 0) + 1
                     finite_repeats = owner._finite_repeats.get(name, 0)
                     finite_already_claimed = name in owner._finite_claimed
-                    if mode == "finite" and not finite_already_claimed:
+                    finite_mode = mode in {"finite", "stall"}
+                    if finite_mode and not finite_already_claimed:
                         owner._finite_claimed.add(name)
-                    should_serve = mode in {"continuous", "finite"} and not (
-                        mode == "finite" and finite_already_claimed
+                    should_serve = mode in {"continuous", "finite", "stall"} and not (
+                        finite_mode and finite_already_claimed
                     )
                     if should_serve:
                         owner._active_counts[name] = owner._active_counts.get(name, 0) + 1
@@ -163,8 +187,9 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
                 self.send_header("Content-Type", "video/mp2t")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
+                stall_started_at = None
                 try:
-                    repeats = finite_repeats if mode == "finite" else None
+                    repeats = finite_repeats if mode in {"finite", "stall"} else None
                     repetition = 0
                     while repeats is None or repetition < repeats:
                         for offset in range(0, len(payload), 188 * SOURCE_CHUNK_PACKETS):
@@ -173,12 +198,34 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
                             self.wfile.flush()
                             time.sleep(len(chunk) / owner.bytes_per_second[name])
                         repetition += 1
+                    if mode == "stall":
+                        stall_started_at = time.monotonic()
+                        with owner._lock:
+                            owner._stall_started_counts[name] += 1
+                        while True:
+                            for offset in range(
+                                0,
+                                len(owner.null_payload),
+                                188 * SOURCE_CHUNK_PACKETS,
+                            ):
+                                chunk = owner.null_payload[
+                                    offset:offset + 188 * SOURCE_CHUNK_PACKETS
+                                ]
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                                with owner._lock:
+                                    owner._stall_null_bytes[name] += len(chunk)
+                                time.sleep(len(chunk) / owner.bytes_per_second[name])
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
                 finally:
                     with owner._lock:
                         owner._active_counts[name] -= 1
                         owner._sockets.discard(self.connection)
+                        if stall_started_at is not None:
+                            owner._stall_durations[name] += (
+                                time.monotonic() - stall_started_at
+                            )
 
             def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
                 name = self.path.split("?", 1)[0].lstrip("/")
@@ -205,10 +252,10 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
         return f"http://127.0.0.1:{self.server_port}"
 
     def set_mode(self, name: str, mode: str, *, repeats: int = 0) -> None:
-        if mode not in {"continuous", "finite", "unavailable"}:
+        if mode not in {"continuous", "finite", "stall", "unavailable"}:
             raise ValueError("invalid synthetic source mode")
-        if mode == "finite" and repeats < 1:
-            raise ValueError("finite synthetic source requires repeats")
+        if mode in {"finite", "stall"} and repeats < 1:
+            raise ValueError("finite or stall synthetic source requires repeats")
         with self._lock:
             self._modes[name] = mode
             self._finite_repeats[name] = int(repeats)
@@ -217,6 +264,17 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
     def snapshot(self) -> tuple[dict[str, int], dict[str, int]]:
         with self._lock:
             return dict(self._request_counts), dict(self._active_counts)
+
+    def stall_snapshot(self) -> dict[str, dict[str, float | int]]:
+        with self._lock:
+            return {
+                name: {
+                    "started": self._stall_started_counts[name],
+                    "duration_seconds": self._stall_durations[name],
+                    "null_bytes": self._stall_null_bytes[name],
+                }
+                for name in self.payloads
+            }
 
     def close(self) -> None:
         if self.thread.is_alive():
@@ -490,13 +548,41 @@ class _RecorderTaskRun:
         self._lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self._patchers = []
+        self.expected_generation: str | None = None
+        self.expected_control_generation: int | None = None
 
-    def start(self) -> None:
+    def start(self, task_args: tuple | list | None = None) -> None:
         from unittest.mock import patch
 
         from catchuparr import tasks
+        from catchuparr.configuration import load_active_configuration
         from catchuparr.engine import recorder as recorder_engine
         from catchuparr.engine.recorder import FFmpegCopyRecorder
+        from catchuparr.recorder_control import load_recorder_control
+        from catchuparr.recorder_proxy import configuration_generation
+
+        active = load_active_configuration()
+        control = load_recorder_control()
+        _require(active is not None, "Synthetic recorder task requires an applied snapshot")
+        _require(not control.paused, "Synthetic recorder task requires recording to be resumed")
+        if task_args is None:
+            task_args = (
+                self.channel_uuid,
+                configuration_generation(active),
+                control.generation,
+            )
+        _require(
+            len(task_args) == 3 and str(task_args[0]) == self.channel_uuid,
+            "Synthetic recorder task received unexpected reconciliation arguments",
+        )
+        self.expected_generation = task_args[1]
+        self.expected_control_generation = task_args[2]
+        _require(
+            isinstance(self.expected_generation, str)
+            and self.expected_generation == configuration_generation(active)
+            and self.expected_control_generation == control.generation,
+            "Synthetic recorder task arguments do not match current applied generations",
+        )
 
         original_run_candidate = FFmpegCopyRecorder.run_candidate
         original_popen = subprocess.Popen
@@ -544,7 +630,11 @@ class _RecorderTaskRun:
 
         def invoke() -> None:
             try:
-                self.result = tasks.record_channel.run(self.channel_uuid)
+                self.result = tasks.record_channel.run(
+                    self.channel_uuid,
+                    self.expected_generation,
+                    self.expected_control_generation,
+                )
             except Exception as exc:
                 with self._lock:
                     self.failures.append(f"task:{type(exc).__name__}")
@@ -559,10 +649,27 @@ class _RecorderTaskRun:
     def stop(self) -> None:
         self.stop_event.set()
 
-    def join(self, timeout: float = 15.0) -> None:
+    def join(self, timeout: float = 15.0, *, cooperative_sleep=None) -> None:
         self.stop_event.set()
+        self._join_and_validate(timeout, cooperative_sleep=cooperative_sleep)
+
+    def join_after_supervisor(
+        self, timeout: float = 20.0, *, cooperative_sleep=None,
+    ) -> None:
+        """Wait for a pause/config/schedule fence to stop the task naturally."""
+        self._join_and_validate(timeout, cooperative_sleep=cooperative_sleep)
+
+    def _join_and_validate(self, timeout: float, *, cooperative_sleep=None) -> None:
         if self.thread is not None:
-            self.thread.join(timeout)
+            sleep = cooperative_sleep or time.sleep
+            deadline = time.monotonic() + timeout
+            while self.thread.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.thread.join(0)
+                if self.thread.is_alive():
+                    sleep(min(0.05, remaining))
             _require(not self.thread.is_alive(), "Synthetic recorder task did not stop in time")
         for patcher in reversed(self._patchers):
             patcher.stop()
@@ -574,6 +681,92 @@ class _RecorderTaskRun:
                 all(process.poll() is not None for process in self.processes),
                 "Synthetic FFmpeg process remained after recorder stop",
             )
+
+
+def _probe_schedule_and_control_gates(
+    channel_uuid: str,
+    settings: dict,
+    active_path: Path,
+    redis_client,
+    source_server,
+    profiles: dict[str, object],
+    profile_count,
+) -> None:
+    """Verify real task admission rejects closed schedules and paused control."""
+    from apps.m3u.connection_pool import profile_connections_key
+
+    from catchuparr.configuration import apply_configuration, load_active_configuration
+    from catchuparr.recorder_control import (
+        load_recorder_control,
+        pause_recorders,
+        resume_recorders,
+    )
+    from catchuparr.recorder_proxy import configuration_generation
+    from catchuparr.tasks import record_channel
+
+    def assert_no_acquisition(before_counts, before_active, before_profiles):
+        _require(
+            source_server.snapshot() == (before_counts, before_active),
+            "Recorder admission gate contacted a synthetic provider source",
+        )
+        _require(
+            all(
+                profile_count(redis_client, profile.id, profile_connections_key)
+                == before_profiles[label]
+                for label, profile in profiles.items()),
+            "Recorder admission gate changed a native provider profile counter",
+        )
+        _require(
+            not redis_client.exists(f"catchuparr:recorder:{channel_uuid}"),
+            "Rejected recorder admission acquired a recorder lease",
+        )
+
+    original_yaml = settings.get("filter_config", "")
+    _require("rules:\n" in original_yaml, "Synthetic schedule gate requires a YAML rules section")
+    control = resume_recorders(active_path)
+    _require(not control.paused, "Synthetic control setup did not resume recording")
+    before_counts, before_active = source_server.snapshot()
+    before_profiles = {
+        label: profile_count(redis_client, profile.id, profile_connections_key)
+        for label, profile in profiles.items()
+    }
+
+    off_yaml = original_yaml.replace("rules:\n", "schedule: {}\nrules:\n", 1)
+    apply_configuration(dict(settings, filter_config=off_yaml), active_path=active_path)
+    off_active = load_active_configuration(active_path)
+    _require(off_active is not None, "Applied closed schedule was not readable")
+    off_control = load_recorder_control(active_path)
+    off_result = record_channel.run(
+        channel_uuid,
+        configuration_generation(off_active),
+        off_control.generation,
+    )
+    _require(
+        off_result == {"status": "outside_schedule"},
+        "Real recorder task did not reject an empty applied schedule",
+    )
+    assert_no_acquisition(before_counts, before_active, before_profiles)
+
+    apply_configuration(settings, active_path=active_path)
+    active = load_active_configuration(active_path)
+    _require(active is not None, "Restored continuous schedule was not readable")
+    paused = pause_recorders(active_path)
+    paused_result = record_channel.run(
+        channel_uuid,
+        configuration_generation(active),
+        paused.generation,
+    )
+    _require(
+        paused_result == {"status": "recording_paused"},
+        "Real recorder task did not reject paused control state",
+    )
+    assert_no_acquisition(before_counts, before_active, before_profiles)
+
+    resumed = resume_recorders(active_path)
+    _require(
+        not resumed.paused and resumed.generation > paused.generation,
+        "Resume did not publish a newer recording-control generation",
+    )
 
 
 def _wait_for_source_segments(
@@ -676,6 +869,7 @@ def probe_recorder_failover(root: Path) -> None:
         reserve_profile_slot,
     )
     from apps.m3u.models import M3UAccount
+    from apps.plugins.models import PluginConfig
     from core.models import CoreSettings, StreamProfile
     from core.utils import RedisClient
 
@@ -688,6 +882,7 @@ def probe_recorder_failover(root: Path) -> None:
         load_active_configuration,
     )
     from catchuparr.engine.store import ArchiveStore
+    from catchuparr.recorder_control import control_deny_path, control_state_path
     from catchuparr.recorder_proxy import configuration_generation, ranked_source_candidates
 
     ffmpeg = shutil.which("ffmpeg")
@@ -702,6 +897,10 @@ def probe_recorder_failover(root: Path) -> None:
     archive_root.mkdir(parents=True, exist_ok=True)
 
     active_path = active_settings_path()
+    plugin_config = PluginConfig.objects.get(key="catchuparr")
+    original_settings = dict(plugin_config.settings or {})
+    recording_enabled_was_set = "recording_enabled" in original_settings
+    original_recording_enabled = original_settings.get("recording_enabled")
     active_existed = active_path.exists()
     active_bytes = active_path.read_bytes() if active_existed else None
     active_lock_path = active_path.with_suffix(active_path.suffix + ".lock")
@@ -710,6 +909,12 @@ def probe_recorder_failover(root: Path) -> None:
     reset_marker_path = active_path.with_name(".catchuparr-configuration-reset-required")
     reset_marker_existed = reset_marker_path.exists()
     reset_marker_bytes = reset_marker_path.read_bytes() if reset_marker_existed else None
+    control_path = control_state_path(active_path)
+    control_existed = control_path.exists()
+    control_bytes = control_path.read_bytes() if control_existed else None
+    control_deny = control_deny_path(active_path)
+    control_deny_existed = control_deny.exists()
+    control_deny_bytes = control_deny.read_bytes() if control_deny_existed else None
 
     source_server = None
     bridge = None
@@ -905,6 +1110,18 @@ def probe_recorder_failover(root: Path) -> None:
             label: _key_dump(redis_client, profile_credential_release_key(profile.id))
             for label, profile in profiles.items()
         }
+        _probe_schedule_and_control_gates(
+            str(channels["startup"].uuid),
+            settings,
+            active_path,
+            redis_client,
+            source_server,
+            profiles,
+            _profile_count,
+        )
+        active = load_active_configuration(active_path)
+        _require(active is not None, "Recorder gate probe did not restore the active config")
+        generation = configuration_generation(active)
         bridge = _DjangoHTTPBridge()
         bridge.start()
         channel_tasks.get_dvr_stream_base_url = lambda: bridge.base_url
@@ -1063,8 +1280,9 @@ def probe_recorder_failover(root: Path) -> None:
         runtime_channel = channels["runtime"]
         runtime_store = ArchiveStore(archive_root)
         runtime_baseline, _ = source_server.snapshot()
+        runtime_stall_baseline = source_server.stall_snapshot()["source-b.ts"]
         source_server.set_mode(
-            "source-b.ts", "finite", repeats=FINITE_SOURCE_REPEATS
+            "source-b.ts", "stall", repeats=STALL_SOURCE_REPEATS
         )
         source_server.set_mode("source-d.ts", "continuous")
         runtime_run = _RecorderTaskRun(
@@ -1101,15 +1319,59 @@ def probe_recorder_failover(root: Path) -> None:
             not identified_runtime.get("Synthetic Source C"),
             "Runtime fallback archived media from excluded source C",
         )
-        _require(len(b_segments) >= 2, "Finite B source did not create two useful archive segments")
+        _require(len(b_segments) >= 2, "Stalled B source did not create two useful archive segments")
         _require(bool(d_segments), "Runtime fallback did not preserve indexed D media")
+        runtime_counts, runtime_active_counts = source_server.snapshot()
+        runtime_stall = source_server.stall_snapshot()["source-b.ts"]
+        runtime_results = runtime_run.results
+        runtime_diagnostics = {
+            "attempts": _recorder_attempt_summary(runtime_results),
+            "source_request_delta": {
+                label: runtime_counts[f"source-{label}.ts"]
+                - runtime_baseline[f"source-{label}.ts"]
+                for label in ("a", "b", "c", "d")
+            },
+            "source_active": {
+                label: runtime_active_counts[f"source-{label}.ts"]
+                for label in ("a", "b", "c", "d")
+            },
+            "indexed_segments": {"b": len(b_segments), "d": len(d_segments)},
+            "source_b_stall": {
+                "started_delta": runtime_stall["started"] - runtime_stall_baseline["started"],
+                "duration_ms": round(
+                    (runtime_stall["duration_seconds"]
+                     - runtime_stall_baseline["duration_seconds"]) * 1000
+                ),
+                "null_bytes": runtime_stall["null_bytes"]
+                - runtime_stall_baseline["null_bytes"],
+            },
+        }
+        runtime_progressed = (
+            len(runtime_results) >= 3
+            and runtime_results[0].status == "no_media"
+            and runtime_results[1].status == "media_stalled"
+            and runtime_results[1].useful_segments >= 2
+            and runtime_results[-1].status == "stopped"
+            and runtime_results[-1].useful_segments > 0
+        )
         _require(
-            runtime_run.results[0].status == "no_media"
-            and runtime_run.results[1].status == "media_stalled"
-            and runtime_run.results[1].useful_segments >= 2
-            and runtime_run.results[-1].status == "stopped"
-            and runtime_run.results[-1].useful_segments > 0,
-            "Runtime fallback did not progress through A failure, B stall, and D success",
+            runtime_stall["started"] == runtime_stall_baseline["started"] + 1
+            and runtime_stall["null_bytes"] > runtime_stall_baseline["null_bytes"]
+            and runtime_stall["duration_seconds"]
+            - runtime_stall_baseline["duration_seconds"]
+            >= MEDIA_IDLE_TIMEOUT * 0.8,
+            "Runtime B did not stay on one null-only stall connection through the idle deadline; "
+            f"diagnostics={json.dumps(runtime_diagnostics, sort_keys=True)}",
+        )
+        _require(
+            runtime_counts["source-b.ts"] == runtime_baseline["source-b.ts"] + 1,
+            "Runtime B stall reopened its provider connection before fallback; "
+            f"diagnostics={json.dumps(runtime_diagnostics, sort_keys=True)}",
+        )
+        _require(
+            runtime_progressed,
+            "Runtime fallback did not progress through A failure, B stall, and D success; "
+            f"diagnostics={json.dumps(runtime_diagnostics, sort_keys=True)}",
         )
         first_d = min(d_segments, key=lambda item: item.start_utc)
         last_b = max(b_segments, key=lambda item: item.end_utc)
@@ -1124,7 +1386,7 @@ def probe_recorder_failover(root: Path) -> None:
             max(item.end_utc for item in d_segments),
         )
         _require(bool(coverage.gaps), "Runtime source stall was not reported as a coverage gap")
-        counts, active_counts = source_server.snapshot()
+        counts, active_counts = runtime_counts, runtime_active_counts
         _require(counts["source-a.ts"] > runtime_baseline["source-a.ts"], "Runtime A candidate was not attempted")
         _require(counts["source-b.ts"] > runtime_baseline["source-b.ts"], "Runtime B candidate was not attempted")
         _require(counts["source-d.ts"] > runtime_baseline["source-d.ts"], "Runtime D fallback was not attempted")
@@ -1190,8 +1452,20 @@ def probe_recorder_failover(root: Path) -> None:
             _restore_file(active_path, active_existed, active_bytes)
             _restore_file(active_lock_path, active_lock_existed, active_lock_bytes)
             _restore_file(reset_marker_path, reset_marker_existed, reset_marker_bytes)
+            _restore_file(control_path, control_existed, control_bytes)
+            _restore_file(control_deny, control_deny_existed, control_deny_bytes)
         except Exception:
             cleanup_errors.append("active configuration snapshot")
+        try:
+            current_settings = dict(plugin_config.settings or {})
+            if recording_enabled_was_set:
+                current_settings["recording_enabled"] = original_recording_enabled
+            else:
+                current_settings.pop("recording_enabled", None)
+            plugin_config.settings = current_settings
+            plugin_config.save(update_fields=("settings",))
+        except Exception:
+            cleanup_errors.append("recording control setting")
         for channel_profile in reversed(created_channel_profiles):
             try:
                 channel_profile.delete()

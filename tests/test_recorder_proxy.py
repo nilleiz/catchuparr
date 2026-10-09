@@ -209,6 +209,33 @@ def _pipeline_connection_pool_module():
 
 
 class RecorderProxyTests(unittest.TestCase):
+    def test_configuration_generation_includes_applied_schedule(self):
+        active = {
+            "channel_uuids": "00000000-0000-0000-0000-000000000001",
+            "source_policies": {},
+            "recording_schedule": {
+                "timezone": "UTC",
+                "channels": {
+                    "00000000-0000-0000-0000-000000000001": {"mode": "continuous"}
+                },
+            },
+        }
+        scheduled = {
+            **active,
+            "recording_schedule": {
+                "timezone": "UTC",
+                "channels": {
+                    "00000000-0000-0000-0000-000000000001": {
+                        "mode": "weekly", "intervals": []
+                    }
+                },
+            },
+        }
+        self.assertNotEqual(
+            recorder_proxy.configuration_generation(active),
+            recorder_proxy.configuration_generation(scheduled),
+        )
+
     def test_provider_urls_are_redacted_from_messages_and_exceptions(self):
         try:
             raise RuntimeError("provider rejected https://user:secret@example.invalid/live")

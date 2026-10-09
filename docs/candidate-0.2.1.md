@@ -1,7 +1,10 @@
-# 0.2.1 YAML filter candidate
+# Superseded 0.2.1 YAML filter candidate
 
-This is an unreleased implementation target. Required CI, native integration
-and isolated real-player acceptance must pass before publication.
+The 0.2.1 package was never released. Its YAML filter engine is included in
+the unreleased 0.3.0 candidate, which adds schedules and recorder controls.
+Use the [current 0.3.0 candidate guide](candidate-0.3.0.md) for installation
+and acceptance status. The schema notes below are retained as historical
+reference.
 
 ## Configuration
 

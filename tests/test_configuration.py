@@ -90,6 +90,92 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("filter_config", serialized)
         self.assertNotIn("url", serialized.lower())
 
+    def test_v3_snapshot_contains_stable_per_channel_schedule(self):
+        settings = dict(
+            self.settings,
+            filter_config=(
+                "version: 1\ntimezone: UTC\nschedule: {}\n"
+                "rules:\n  - channels: {profile: all}\n"
+                "    schedule: continuous\n"
+            ),
+        )
+        apply_configuration(settings, self.catalog, self.active_path)
+        snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+        active = load_active_configuration(self.active_path)
+        self.assertEqual(3, snapshot["version"])
+        self.assertEqual(
+            {
+                "timezone": "UTC",
+                "channels": {
+                    CHANNEL_A: {"mode": "continuous"},
+                    CHANNEL_B: {"mode": "continuous"},
+                },
+            },
+            snapshot["recording_schedule"],
+        )
+        self.assertEqual(snapshot["recording_schedule"], active["recording_schedule"])
+
+    def test_v2_snapshot_loads_as_continuous_without_rewriting_or_resetting(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+        snapshot["version"] = 2
+        snapshot.pop("recording_schedule")
+        self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        original = self.active_path.read_bytes()
+        row = types.SimpleNamespace(settings={"filter_config": self.settings["filter_config"]})
+        row.save = lambda **_kwargs: None
+
+        with patch.dict(sys.modules, self._django_config_modules(row)):
+            active = load_active_configuration(self.active_path)
+            self.assertFalse(reset_legacy_configuration(self.active_path))
+
+        self.assertEqual(original, self.active_path.read_bytes())
+        self.assertEqual(2, active["version"])
+        self.assertEqual(
+            {
+                "timezone": "Europe/Berlin",
+                "channels": {
+                    CHANNEL_A: {"mode": "continuous"},
+                    CHANNEL_B: {"mode": "continuous"},
+                },
+            },
+            active["recording_schedule"],
+        )
+
+    def test_apply_reads_current_saved_settings_under_the_file_lock(self):
+        persisted = dict(
+            self.settings,
+            filter_config=(
+                "version: 1\nrules:\n"
+                "  - channels: {names: [Synthetic Channel B]}\n"
+                "    schedule: {}\n"
+            ),
+        )
+        row = types.SimpleNamespace(settings=persisted)
+        row.save = lambda **_kwargs: None
+        with patch.dict(sys.modules, self._django_config_modules(row)):
+            result = apply_configuration(None, self.catalog, self.active_path)
+        active = load_active_configuration(self.active_path)
+        self.assertEqual(1, result["selected_channel_count"])
+        self.assertEqual(CHANNEL_B, active["channel_uuids"])
+        self.assertEqual(
+            {"mode": "weekly", "intervals": []},
+            active["recording_schedule"]["channels"][CHANNEL_B],
+        )
+
+    def test_invalid_recorder_control_and_log_level_settings_are_rejected(self):
+        for key, value in (("recording_enabled", "false"), ("log_level", "TRACE")):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                validate_configuration(dict(self.settings, **{key: value}), self.catalog)
+
+    def test_malformed_v3_schedule_fails_closed(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        document = json.loads(self.active_path.read_text(encoding="utf-8"))
+        document["recording_schedule"]["channels"].pop(CHANNEL_A)
+        self.active_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "schedule channels"):
+            load_active_configuration(self.active_path)
+
     def test_blank_yaml_validates_zero_and_applies_no_recording_channels(self):
         settings = dict(self.settings, filter_config="\n  \n")
         result = validate_configuration(settings, self.catalog)

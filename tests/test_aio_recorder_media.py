@@ -35,6 +35,25 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_live_a_invariant_diagnostic_reports_each_boolean_without_values(self):
+        all_true = dict.fromkeys(probe._NATIVE_LIVE_A_INVARIANT_NAMES, True)
+        self.assertTrue(all(probe._native_live_a_invariant_flags(**all_true).values()))
+
+        for failed_name in probe._NATIVE_LIVE_A_INVARIANT_NAMES:
+            observations = dict(all_true)
+            observations[failed_name] = False
+            flags = probe._native_live_a_invariant_flags(**observations)
+            self.assertEqual(
+                [name for name, passed in flags.items() if not passed],
+                [failed_name],
+            )
+            message = probe._native_live_a_invariant_message(
+                "after_pause_private_cleanup", flags,
+            )
+            self.assertIn("after_pause_private_cleanup", message)
+            self.assertIn(f'"{failed_name}": false', message)
+            self.assertNotIn("synthetic-owner-value", message)
+
     def test_live_route_tone_assertion_requires_expected_source(self):
         probe._assert_tone_matches(441, 440, "Synthetic live A")
         with self.assertRaisesRegex(RuntimeError, "unexpected synthetic source tone"):
@@ -126,6 +145,82 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertTrue(response.assert_not_reading)
         self.assertEqual(force_calls, [])
 
+    def test_live_reader_session_owns_one_reader_through_idempotent_close(self):
+        buffer = _FakeBuffer([b"x" * 188], next_index=1)
+
+        class Response:
+            def __init__(self):
+                self.close_count = 0
+
+            def stream(self):
+                chunks, _next_index = buffer.get_optimized_client_data(0)
+                yield from chunks
+
+            @property
+            def streaming_content(self):
+                return self.stream()
+
+            def close(self):
+                self.close_count += 1
+
+        response = Response()
+        reader_type = probe._NativeLiveMediaReader
+        constructed = []
+
+        def construct_reader(iterator, tracker):
+            reader = reader_type(iterator, tracker)
+            constructed.append(reader)
+            return reader
+
+        with patch.object(
+            probe, "_NativeLiveMediaReader", side_effect=construct_reader,
+        ) as reader_factory:
+            session = probe._NativeLiveReaderSession(response, buffer)
+            self.assertEqual(reader_factory.call_count, 1)
+            self.assertIs(session.reader, constructed[0])
+            session.close()
+            session.close()
+
+        self.assertFalse(session.reader.thread.is_alive())
+        self.assertEqual(response.close_count, 1)
+        self.assertEqual(reader_factory.call_count, 1)
+
+    def test_live_reader_session_reacquires_buffer_after_native_initialization(self):
+        preinit_buffer = _FakeBuffer([], next_index=0)
+        initialized_buffer = _FakeBuffer([], next_index=0)
+
+        class NativeServer:
+            def __init__(self):
+                self.current_buffer = preinit_buffer
+
+            def get_buffer(self, worker_id, *, profile):
+                self.lookup = (worker_id, profile)
+                return self.current_buffer
+
+        class Response:
+            streaming_content = iter(())
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        native_server = NativeServer()
+        preinit_lookup = native_server.get_buffer("synthetic-worker", profile=None)
+        native_server.current_buffer = initialized_buffer
+        response = Response()
+
+        session, bound_buffer = probe._create_native_live_reader_session(
+            response, native_server, "synthetic-worker",
+        )
+        self.assertIsNot(preinit_lookup, initialized_buffer)
+        self.assertIs(bound_buffer, initialized_buffer)
+        self.assertIs(session.tracker.buffer, initialized_buffer)
+        self.assertEqual(native_server.lookup, ("synthetic-worker", None))
+        session.close()
+        self.assertTrue(response.closed)
+
     def test_blocked_live_reader_stops_native_channel_before_response_close(self):
         class Tracker:
             last_yielded_index = None
@@ -214,6 +309,67 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertIs(found_manager, manager)
         self.assertIs(found_client_manager, client_manager)
         self.assertEqual(redis.reads, 2)
+
+    def test_native_client_wait_waits_for_one_registered_local_and_redis_client(self):
+        local_counts = iter((0, 1))
+        redis_counts = iter((0, 1))
+        manager = SimpleNamespace(get_client_count=lambda: next(local_counts))
+        server = SimpleNamespace(client_managers={"worker": manager})
+
+        class ClientRedis:
+            @staticmethod
+            def scard(_key):
+                return next(redis_counts)
+
+        class Keys:
+            @staticmethod
+            def clients(_worker_id):
+                return "clients"
+
+        probe._wait_for_native_client_count(
+            ClientRedis(), server, Keys, "worker", 1, timeout=1,
+            reject_excess=True,
+        )
+
+    def test_native_client_wait_rejects_extra_clients_during_registration(self):
+        manager = SimpleNamespace(get_client_count=lambda: 2)
+        server = SimpleNamespace(client_managers={"worker": manager})
+
+        class ClientRedis:
+            @staticmethod
+            def scard(_key):
+                return 2
+
+        class Keys:
+            @staticmethod
+            def clients(_worker_id):
+                return "clients"
+
+        with self.assertRaisesRegex(RuntimeError, "more clients"):
+            probe._wait_for_native_client_count(
+                ClientRedis(), server, Keys, "worker", 1, timeout=1,
+                reject_excess=True,
+            )
+
+    def test_native_client_wait_allows_bounded_two_to_one_disconnect(self):
+        local_counts = iter((2, 1))
+        redis_counts = iter((2, 1))
+        manager = SimpleNamespace(get_client_count=lambda: next(local_counts))
+        server = SimpleNamespace(client_managers={"worker": manager})
+
+        class ClientRedis:
+            @staticmethod
+            def scard(_key):
+                return next(redis_counts)
+
+        class Keys:
+            @staticmethod
+            def clients(_worker_id):
+                return "clients"
+
+        probe._wait_for_native_client_count(
+            ClientRedis(), server, Keys, "worker", 1, timeout=1,
+        )
 
     def test_native_active_wait_does_not_accept_connecting(self):
         redis = _FakeRedis(state_after_reads=10**9)
