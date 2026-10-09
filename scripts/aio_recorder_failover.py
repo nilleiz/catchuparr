@@ -280,7 +280,8 @@ def _native_source_observations(
 def _runtime_timeout_diagnostic(
     run,
     source_server,
-    source_baseline,
+    request_baseline,
+    active_baseline,
     stall_baseline,
     verified_segments,
     redis_client,
@@ -298,9 +299,9 @@ def _runtime_timeout_diagnostic(
         request_counts, active_counts = source_server.snapshot()
         for role in ("a", "b", "c", "d"):
             source_name = f"source-{role}.ts"
-            base_requests = _safe_count(source_baseline[0].get(source_name))
+            base_requests = _safe_count(request_baseline.get(source_name))
             current_requests = _safe_count(request_counts.get(source_name))
-            base_active = _safe_count(source_baseline[1].get(source_name))
+            base_active = _safe_count(active_baseline.get(source_name))
             current_active = _safe_count(active_counts.get(source_name))
             source_deltas[role] = {
                 "request_delta": (
@@ -367,6 +368,32 @@ def _runtime_timeout_diagnostic(
         "indexed_segments": indexed_counts,
         "native": native,
     }
+
+
+def _make_runtime_timeout_diagnostic_callback(
+    run,
+    source_server,
+    request_baseline,
+    active_baseline,
+    stall_baseline,
+    redis_client,
+    channel_uuid: str,
+    source_stream_ids: Mapping[str, str],
+) -> Callable[[dict[str, list]], dict[str, object]]:
+    def build(verified_segments):
+        return _runtime_timeout_diagnostic(
+            run,
+            source_server,
+            request_baseline,
+            active_baseline,
+            stall_baseline,
+            verified_segments,
+            redis_client,
+            channel_uuid,
+            source_stream_ids,
+        )
+
+    return build
 
 
 def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
@@ -1611,7 +1638,7 @@ def probe_recorder_failover(root: Path) -> None:
         # recorder must preserve its B segments and mark the later D fallback.
         runtime_channel = channels["runtime"]
         runtime_store = ArchiveStore(archive_root)
-        runtime_baseline, _ = source_server.snapshot()
+        runtime_baseline, runtime_active_baseline = source_server.snapshot()
         runtime_stall_baseline = source_server.stall_snapshot()["source-b.ts"]
         source_server.set_mode(
             "source-b.ts", "stall", repeats=STALL_SOURCE_REPEATS
@@ -1625,17 +1652,16 @@ def probe_recorder_failover(root: Path) -> None:
         runtime_run.start()
         harnesses.append(runtime_run)
 
-        def runtime_timeout_diagnostic(verified_segments):
-            return _runtime_timeout_diagnostic(
-                runtime_run,
-                source_server,
-                runtime_baseline,
-                runtime_stall_baseline,
-                verified_segments,
-                redis_client,
-                str(runtime_channel.uuid),
-                {label: str(streams[label].id) for label in ("a", "b", "c", "d")},
-            )
+        runtime_timeout_diagnostic = _make_runtime_timeout_diagnostic_callback(
+            runtime_run,
+            source_server,
+            runtime_baseline,
+            runtime_active_baseline,
+            runtime_stall_baseline,
+            redis_client,
+            str(runtime_channel.uuid),
+            {label: str(streams[label].id) for label in ("a", "b", "c", "d")},
+        )
 
         try:
             _wait_for_source_segments(
