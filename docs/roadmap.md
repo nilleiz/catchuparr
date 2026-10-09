@@ -17,6 +17,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | --- | --- | --- | --- |
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
+| 0.3.1 | Short forms for weekly schedule day groups | Low | Planned |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
@@ -103,6 +104,33 @@ Synthetic schedule/control tests and full native integration on both pinned AIO
 versions passed for the current candidate. Independent review, CI and Dev/player
 acceptance remain pending before release. Real-player regression must verify
 start, stop, restart and archived playback outside the active window.
+
+## 0.3.1 — schedule day-group shorthand
+
+This is a planned follow-up to 0.3.0. It does not change the 0.3.0 schedule
+contract or continuous-recording default.
+
+### Proposed behavior
+
+- Accept `daily` for Monday through Sunday, `weekdays` for Monday through Friday,
+  and `weekend` for Saturday and Sunday. Each key takes the same window list as
+  an explicit day and applies that list to every day in its group.
+- Expand the group keys into the existing per-day schedule before applying the
+  existing timezone, overnight-window and DST rules.
+- When entries overlap, use this planned replacement order for each day:
+  `daily`, then its matching group (`weekdays` or `weekend`), then that day's
+  explicit entry. A more-specific entry replaces the entire window list for
+  that day; other days in the group keep their group windows.
+- In an explicit weekly schedule, a day with no entry after expansion remains
+  off. A missing schedule keeps the existing 0.3.0 continuous behavior.
+- Keep existing explicit weekday schedules valid without changes.
+
+### Acceptance
+
+Add tests for `daily` combined with `weekdays` and `weekend`, explicit-day
+replacement of group windows, unaffected days in the same group, days with no
+matching entry, window overlap normalization, and DST gaps and repeated local
+times under the configured timezone.
 
 ## 0.4.0 — recorder visibility
 
