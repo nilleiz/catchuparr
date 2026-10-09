@@ -388,7 +388,7 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertFalse((self.active_path.parent / configuration.ACTIVATION_STATE_NAME).exists())
 
-    def test_visible_commit_record_with_failed_rollback_remains_unconfirmed(self):
+    def test_visible_commit_record_with_failed_rollback_keeps_pending_authority(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         write_commit = configuration._write_activation_commit_locked
 
@@ -400,7 +400,14 @@ class ConfigurationTests(unittest.TestCase):
             if configuration._activation_commit_path(path).exists():
                 raise OSError("synthetic persistent commit-removal failure")
 
-        from catchuparr.recorder_control import RecorderControlError, load_recorder_control
+        write_state = configuration._write_activation_state_locked
+
+        def fail_emergency_state_update(path, state, activation_id):
+            if state != "pending":
+                raise OSError("synthetic persistent journal-write failure")
+            write_state(path, state, activation_id)
+
+        from catchuparr.recorder_control import load_recorder_control
 
         with patch.object(
             configuration,
@@ -410,18 +417,29 @@ class ConfigurationTests(unittest.TestCase):
             configuration,
             "_remove_activation_commit_locked",
             side_effect=fail_commit_removal,
-        ), self.assertRaisesRegex(RecorderControlError, "admission remains denied"):
-            apply_configuration(dict(self.settings, retention_hours=2), self.catalog, self.active_path)
+        ), patch.object(
+            configuration,
+            "_write_activation_state_locked",
+            side_effect=fail_emergency_state_update,
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
 
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["activation_pending"])
+        self.assertTrue(result["recovery_required"])
         journal = json.loads(
             (self.active_path.parent / configuration.ACTIVATION_STATE_NAME).read_text(
                 encoding="utf-8"
             )
         )
-        self.assertEqual("unconfirmed", journal["state"])
+        self.assertEqual("pending", journal["state"])
         self.assertTrue(configuration._activation_commit_path(self.active_path).exists())
         self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
-        with self.assertRaises(RecorderControlError):
+        from catchuparr.recorder_control import RecorderControlError
+
+        with self.assertRaisesRegex(RecorderControlError, "incomplete"):
             load_applied_state(self.active_path)
 
         recovered = load_recorder_control(self.active_path)
@@ -432,7 +450,7 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertFalse(configuration._activation_commit_path(self.active_path).exists())
 
-    def test_durable_commit_record_is_authoritative_with_pending_journal(self):
+    def test_pending_journal_keeps_old_authority_with_matching_commit_record(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         with patch.object(configuration, "_cleanup_committed_activation_locked"):
             result = apply_configuration(
@@ -450,25 +468,23 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual("pending", journal["state"])
         self.assertEqual(journal["activation_id"], commit["activation_id"])
 
-        # Simulate restart recovery with the journal still carrying its prior
-        # pending label even though the matching commit record was durable.
-        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
-        active, control = load_applied_state(self.active_path)
-        self.assertEqual(2, active["retention_hours"])
-        self.assertEqual(
-            configuration.active_configuration_generation(active),
-            control.configuration_generation,
-        )
+        # A matching record is insufficient until the journal's committed
+        # state is durably published.
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        from catchuparr.recorder_control import RecorderControlError
+
+        with self.assertRaisesRegex(RecorderControlError, "incomplete"):
+            load_applied_state(self.active_path)
 
         from catchuparr.recorder_control import load_recorder_control
 
         recovered = load_recorder_control(self.active_path)
         self.assertFalse(recovered.paused)
-        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
         self.assertFalse(state_path.exists())
         self.assertFalse(commit_path.exists())
 
-    def test_journal_transition_failure_after_durable_commit_is_applied_and_retried(self):
+    def test_journal_transition_failure_keeps_previous_pair_and_requires_recovery(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         write_state = configuration._write_activation_state_locked
 
@@ -486,11 +502,12 @@ class ConfigurationTests(unittest.TestCase):
                 dict(self.settings, retention_hours=2), self.catalog, self.active_path
             )
 
-        self.assertTrue(result["applied"])
-        self.assertTrue(result["activation_cleanup_pending"])
-        self.assertNotIn("recording_paused", result)
-        self.assertIn("cleanup remains pending", result["warning"])
-        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["activation_pending"])
+        self.assertTrue(result["recovery_required"])
+        self.assertTrue(result["recording_paused"])
+        self.assertIn("previous settings remain active", result["warning"])
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
         state_path = self.active_path.parent / configuration.ACTIVATION_STATE_NAME
         commit_path = self.active_path.parent / configuration.ACTIVATION_COMMIT_NAME
         journal = json.loads(state_path.read_text(encoding="utf-8"))
@@ -498,21 +515,17 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual("pending", journal["state"])
         self.assertEqual(journal["activation_id"], commit["activation_id"])
 
-        from catchuparr.recorder_control import load_recorder_control
+        from catchuparr.recorder_control import RecorderControlError, load_recorder_control
 
-        active, control = load_applied_state(self.active_path)
-        self.assertEqual(2, active["retention_hours"])
-        self.assertEqual(
-            configuration.active_configuration_generation(active),
-            control.configuration_generation,
-        )
+        with self.assertRaisesRegex(RecorderControlError, "incomplete"):
+            load_applied_state(self.active_path)
         recovered = load_recorder_control(self.active_path)
         self.assertFalse(recovered.paused)
-        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
         self.assertFalse(state_path.exists())
         self.assertFalse(commit_path.exists())
 
-    def test_deny_cleanup_failure_reports_applied_but_paused_and_retries(self):
+    def test_deny_cleanup_failure_keeps_previous_settings_and_requires_recovery(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         from catchuparr import recorder_control
         from catchuparr.recorder_control import RecorderControlError
@@ -526,23 +539,25 @@ class ConfigurationTests(unittest.TestCase):
                 dict(self.settings, retention_hours=2), self.catalog, self.active_path
             )
 
-        self.assertTrue(result["applied"])
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["activation_pending"])
+        self.assertTrue(result["recovery_required"])
         self.assertTrue(result["recording_paused"])
-        self.assertIn("remains paused", result["warning"])
+        self.assertIn("previous settings remain active", result["warning"])
         self.assertIn(result["warning"], result["message"])
-        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
         deny_path = recorder_control.control_deny_path(self.active_path)
         state_path = self.active_path.parent / configuration.ACTIVATION_STATE_NAME
         commit_path = self.active_path.parent / configuration.ACTIVATION_COMMIT_NAME
         self.assertTrue(deny_path.exists())
         self.assertTrue(state_path.exists())
         self.assertTrue(commit_path.exists())
-        with self.assertRaisesRegex(RecorderControlError, "pending control transition"):
+        with self.assertRaisesRegex(RecorderControlError, "incomplete"):
             load_applied_state(self.active_path)
 
         recovered = recorder_control.load_recorder_control(self.active_path)
         self.assertFalse(recovered.paused)
-        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
         self.assertFalse(deny_path.exists())
         self.assertFalse(state_path.exists())
         self.assertFalse(commit_path.exists())

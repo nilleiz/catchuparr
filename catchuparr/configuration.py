@@ -258,6 +258,18 @@ def apply_configuration(
         else:
             result, prepared = _apply_configuration_locked(settings, catalog, path)
         prepared.commit()
+        if prepared.activation_pending_warning:
+            result["applied"] = False
+            result["activation_pending"] = True
+            result["recovery_required"] = True
+            result["recording_paused"] = True
+            warning = (
+                "Apply did not complete; the previous settings remain active and recorder admission "
+                "is denied until activation recovery succeeds."
+            )
+            result["warning"] = warning
+            result["message"] = warning
+            return result
         warnings = []
         if prepared.recording_paused_warning:
             result["recording_paused"] = True
@@ -364,6 +376,7 @@ class _PreparedActivation:
         self.finished = False
         self.recording_paused_warning = False
         self.activation_cleanup_warning = False
+        self.activation_pending_warning = False
 
     def commit(self) -> None:
         if self.finished:
@@ -373,41 +386,37 @@ class _PreparedActivation:
         try:
             _write_activation_commit_locked(self.active_path, self.activation_id)
         except OSError:
-            # The pending journal remains authoritative if the commit record
-            # could not be confirmed durable. Do not infer durability from a
-            # file that may merely be visible in the current process.
             restored = self.rollback()
-            message = (
-                "configuration commit durability could not be confirmed; previous settings were restored"
-                if restored else
-                "configuration commit durability could not be confirmed; recorder admission remains denied"
-            )
-            raise RecorderControlError(message) from None
+            if restored:
+                raise RecorderControlError(
+                    "configuration commit durability could not be confirmed; previous settings were restored"
+                ) from None
+            # The pending journal and deny marker remain authoritative if a
+            # visible commit record could not be removed after a write error.
+            self.finished = True
+            self.activation_pending_warning = True
+            self.recording_paused_warning = True
+            return
         self.finished = True
         try:
             _write_activation_state_locked(
                 self.active_path, "committed", self.activation_id
             )
         except Exception:
-            # The durable commit record is authoritative even if the journal
-            # transition fails. Clear the deny marker when possible so the
-            # committed snapshot remains available; recovery will finish the
-            # journal cleanup later.
-            self.activation_cleanup_warning = True
-            try:
-                from .recorder_control import _clear_deny_marker
-
-                _clear_deny_marker(self.sidecar)
-            except Exception:
-                self.recording_paused_warning = True
+            # A committed journal state is the final activation acknowledgement.
+            # Keep the old snapshot authoritative and admission denied until
+            # recovery can confirm this transition.
+            self.activation_pending_warning = True
+            self.recording_paused_warning = True
             return
         try:
             from .recorder_control import _clear_deny_marker
 
             _clear_deny_marker(self.sidecar)
         except Exception:
-            # Keep the commit journal so control recovery can retry clearing
-            # this marker and report that recording remains paused meanwhile.
+            # The active/control pair is durable, but until the deny marker is
+            # cleared the previous snapshot remains authoritative.
+            self.activation_pending_warning = True
             self.recording_paused_warning = True
             self.activation_cleanup_warning = True
             return
@@ -424,12 +433,6 @@ class _PreparedActivation:
         try:
             _remove_activation_commit_locked(self.active_path)
         except Exception:
-            try:
-                _write_activation_state_locked(
-                    self.active_path, "unconfirmed", self.activation_id
-                )
-            except Exception:
-                pass
             return False
         active_restored = _restore_file_bytes_locked(self.active_path, self.previous_active)
         control_restored = _restore_file_bytes_locked(self.sidecar, self.previous_control)
@@ -595,7 +598,7 @@ def _read_activation_state_locked(path: Path) -> tuple[str, str] | None:
         or set(raw) != {"version", "state", "activation_id"}
         or type(raw.get("version")) is not int
         or raw["version"] != ACTIVATION_STATE_VERSION
-        or raw.get("state") not in {"pending", "committed", "unconfirmed"}
+        or raw.get("state") not in {"pending", "committed"}
         or not _valid_activation_id(raw.get("activation_id"))
     ):
         raise ValueError("Configuration activation state is invalid")
@@ -603,7 +606,7 @@ def _read_activation_state_locked(path: Path) -> tuple[str, str] | None:
 
 
 def _write_activation_state_locked(path: Path, state: str, activation_id: str) -> None:
-    if state not in {"pending", "committed", "unconfirmed"} or not _valid_activation_id(activation_id):
+    if state not in {"pending", "committed"} or not _valid_activation_id(activation_id):
         raise ValueError("Configuration activation state is invalid")
     _atomic_json_replace_locked(
         _activation_state_path(path),
@@ -645,9 +648,19 @@ def _activation_commit_matches(
 ) -> bool:
     return (
         activation_state is not None
-        and activation_state[0] != "unconfirmed"
+        and activation_state[0] == "committed"
         and _read_activation_commit_locked(path) == activation_state[1]
+        and _activation_deny_marker_clear(path)
     )
+
+
+def _activation_deny_marker_clear(path: Path) -> bool:
+    from .recorder_control import _deny_marker_exists, control_deny_path
+
+    try:
+        return not _deny_marker_exists(control_deny_path(path))
+    except Exception:
+        return False
 
 
 def _remove_durable_file(path: Path) -> None:
