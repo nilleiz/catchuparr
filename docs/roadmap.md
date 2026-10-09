@@ -17,6 +17,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | --- | --- | --- | --- |
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
+| 0.3.1 | Weekly schedule day groups, timezone defaults, unified Apply and M3U token links | Low | Planned |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
@@ -103,6 +104,71 @@ Synthetic schedule/control tests and full native integration on both pinned AIO
 versions passed for the current candidate. Independent review, CI and Dev/player
 acceptance remain pending before release. Real-player regression must verify
 start, stop, restart and archived playback outside the active window.
+
+## 0.3.1 — schedule shorthand and timezone defaults
+
+This is a planned follow-up to 0.3.0. It does not change the 0.3.0 schedule
+contract or continuous-recording default; the timezone-default change applies
+to 0.3.1 only.
+
+### Proposed behavior
+
+- Accept `daily` for Monday through Sunday, `weekdays` for Monday through Friday,
+  and `weekend` for Saturday and Sunday. Each key takes the same window list as
+  an explicit day and applies that list to every day in its group.
+- Expand the group keys into the existing per-day schedule before applying the
+  existing timezone, overnight-window and DST rules.
+- When entries overlap, use this planned replacement order for each day:
+  `daily`, then its matching group (`weekdays` or `weekend`), then that day's
+  explicit entry. A more-specific entry replaces the entire window list for
+  that day; other days in the group keep their group windows.
+- In an explicit weekly schedule, a day with no entry after expansion remains
+  off. A missing schedule keeps the existing 0.3.0 continuous behavior.
+- Keep existing explicit weekday schedules valid without changes.
+- For 0.3.1, resolve the schedule timezone in this order: explicit YAML timezone,
+  valid container `TZ`, then the detectable system timezone. A valid YAML value
+  takes precedence; an invalid explicit YAML value fails with a clear
+  validation error. If YAML is omitted and a supplied `TZ` is invalid, fail
+  clearly; if no `TZ` is supplied, require a detectable valid system timezone.
+  Do not assume the host timezone or fall back to a fixed `Europe/Berlin` value.
+- Plan the Dev Compose interface to pass through an optional `TZ` setting and
+  remove any hardcoded `Europe/Berlin` default. This is a roadmap item only;
+  existing Dev environment configuration is unchanged here.
+- Provide one unified configuration Apply for the complete settings draft:
+  filter YAML and schedules, timezone, global recording-enabled value, log
+  level, archive path, retention, storage limit and playback user. Do not add
+  separate settings Apply actions for individual fields or groups. Pause and
+  Resume may remain immediate operational actions, not a second settings Apply.
+- Validate the full draft before activation. A validation or persistence error
+  must not partially activate fields or a new configuration generation. During
+  implementation, inspect the native plugin Save/Apply callback semantics and
+  establish how PluginConfig fields, the active snapshot and recorder-control
+  sidecar are coordinated. Use staging/rollback under a common lock or fail
+  closed on mixed state; document cross-store atomicity only after it is
+  demonstrated.
+- After creating an M3U access token, show two clearly labeled links in the
+  confirmation toast: the authenticated M3U playlist URL and XMLTV EPG URL. Both
+  links use the same newly created token and its existing user permissions. Put
+  them on separate lines and make them selectable and copyable; add copy controls
+  when the toast UI supports them. Never write tokens or authenticated URLs to
+  logs or repository files.
+
+### Acceptance
+
+Add tests for `daily` combined with `weekdays` and `weekend`, explicit-day
+replacement of group windows, unaffected days in the same group, days with no
+matching entry, window overlap normalization, environment timezone selection,
+system timezone detection, explicit YAML precedence, invalid/undetectable
+timezone errors, and DST gaps and repeated local times under the resolved zone.
+Verify that one Apply validates and activates all settings together; invalid
+YAML and simulated multi-setting persistence failures leave the prior active
+configuration intact. Test pause/resume control-generation fencing against a
+concurrent Apply, shared configuration-generation checks, and rejection of
+stale queued recorder tasks. Verify token creation displays both the M3U
+playlist and XMLTV EPG links with clear labels, both links map to the same token
+and existing permissions, and the toast leaves each link selectable and copyable
+without truncation. Check that application logs contain neither the token nor
+either authenticated URL.
 
 ## 0.4.0 — recorder visibility
 
