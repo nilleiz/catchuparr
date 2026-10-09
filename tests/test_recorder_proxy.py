@@ -86,6 +86,48 @@ class FakeRedis:
         raise AssertionError("unexpected Redis script")
 
 
+class FakeDatabaseConnection:
+    def __init__(
+        self,
+        alias="default",
+        *,
+        opened=True,
+        in_atomic_block=False,
+        autocommit=True,
+        on_close=None,
+    ):
+        self.alias = alias
+        self.connection = object() if opened else None
+        self.in_atomic_block = in_atomic_block
+        self._autocommit = autocommit
+        self.on_commit_callbacks = []
+        self.on_close = on_close
+        self.close_calls = 0
+
+    def get_autocommit(self):
+        return self._autocommit
+
+    def close(self):
+        self.close_calls += 1
+        if self.on_close is not None:
+            self.on_close()
+
+
+class FakeDatabaseConnections:
+    def __init__(self, initialized):
+        self.initialized = initialized
+        self.all_calls = []
+        self.alias_lookups = 0
+
+    def all(self, *, initialized_only=False):
+        self.all_calls.append(initialized_only)
+        return list(self.initialized) if initialized_only else []
+
+    def __getitem__(self, _alias):
+        self.alias_lookups += 1
+        raise AssertionError("connection helper must not initialize an alias")
+
+
 class PipelineFakeRedis(FakeRedis):
     def __init__(self):
         super().__init__()
@@ -369,6 +411,10 @@ class RecorderProxyTests(unittest.TestCase):
     def test_ranked_source_candidates_releases_database_after_materializing_catalog(self):
         channel_uuid = "00000000-0000-0000-0000-000000000001"
         events = []
+        default_connection = FakeDatabaseConnection(
+            on_close=lambda: events.append("close_default")
+        )
+        connections = FakeDatabaseConnections([default_connection])
         configuration_module = types.ModuleType("catchuparr.configuration")
         catalog = SourceCatalog(
             channels=({"uuid": channel_uuid, "number": "1", "name": "Synthetic", "group": ""},),
@@ -384,9 +430,7 @@ class RecorderProxyTests(unittest.TestCase):
         django_module = types.ModuleType("django")
         django_module.__path__ = []
         django_db_module = types.ModuleType("django.db")
-        django_db_module.connections = SimpleNamespace(
-            close_all=lambda: events.append("close_all")
-        )
+        django_db_module.connections = connections
         django_module.db = django_db_module
         active = {
             "source_policies": {
@@ -406,7 +450,9 @@ class RecorderProxyTests(unittest.TestCase):
         }):
             candidates = recorder_proxy.ranked_source_candidates(channel_uuid, active)
 
-        self.assertEqual(["catalog", "close_all"], events)
+        self.assertEqual(["catalog", "close_default"], events)
+        self.assertEqual([True], connections.all_calls)
+        self.assertEqual(0, connections.alias_lookups)
         self.assertEqual(["44"], [candidate["id"] for candidate in candidates])
 
         def failed_catalog():
@@ -421,7 +467,41 @@ class RecorderProxyTests(unittest.TestCase):
             "django.db": django_db_module,
         }), self.assertRaisesRegex(RuntimeError, "synthetic catalog failure"):
             recorder_proxy.ranked_source_candidates(channel_uuid, active)
-        self.assertEqual(["catalog_failed", "close_all"], events)
+        self.assertEqual(["catalog_failed", "close_default"], events)
+
+    def test_database_release_skips_transactions_other_aliases_and_unopened_connections(self):
+        atomic_connection = FakeDatabaseConnection(
+            in_atomic_block=True, on_close=lambda: self.fail("atomic connection was closed")
+        )
+        manual_connection = FakeDatabaseConnection(
+            autocommit=False, on_close=lambda: self.fail("manual transaction was closed")
+        )
+        other_alias = FakeDatabaseConnection(
+            alias="analytics", on_close=lambda: self.fail("other alias was closed")
+        )
+        unopened = FakeDatabaseConnection(
+            opened=False, on_close=lambda: self.fail("unopened connection was touched")
+        )
+        atomic_connection.on_commit_callbacks.append(lambda: None)
+        connections = FakeDatabaseConnections(
+            [atomic_connection, manual_connection, other_alias, unopened]
+        )
+        django_module = types.ModuleType("django")
+        django_module.__path__ = []
+        django_db_module = types.ModuleType("django.db")
+        django_db_module.connections = connections
+        django_module.db = django_db_module
+
+        with patch.dict(sys.modules, {"django": django_module, "django.db": django_db_module}):
+            recorder_proxy._close_database_connections()
+
+        self.assertEqual([True], connections.all_calls)
+        self.assertEqual(0, connections.alias_lookups)
+        self.assertEqual(0, atomic_connection.close_calls)
+        self.assertEqual(0, manual_connection.close_calls)
+        self.assertEqual(0, other_alias.close_calls)
+        self.assertEqual(0, unopened.close_calls)
+        self.assertEqual(1, len(atomic_connection.on_commit_callbacks))
 
     def test_streaming_route_releases_orm_connections_before_returning_response(self):
         events = []
@@ -446,9 +526,10 @@ class RecorderProxyTests(unittest.TestCase):
         django_http_module = types.ModuleType("django.http")
         django_http_module.HttpResponse = FakeHttpResponse
         django_db_module = types.ModuleType("django.db")
-        django_db_module.connections = SimpleNamespace(
-            close_all=lambda: events.append("close_all")
+        default_connection = FakeDatabaseConnection(
+            on_close=lambda: events.append("close_default")
         )
+        django_db_module.connections = FakeDatabaseConnections([default_connection])
         django_module.http = django_http_module
         django_module.db = django_db_module
         core_module = types.ModuleType("core")
@@ -505,7 +586,7 @@ class RecorderProxyTests(unittest.TestCase):
             )
 
         self.assertIs(result, response)
-        self.assertEqual(["open_source", "close_all"], events)
+        self.assertEqual(["open_source", "close_default"], events)
 
     def test_plugin_cleanup_releases_only_its_pooled_profile_reservation(self):
         connection_pool = _connection_pool_module()
