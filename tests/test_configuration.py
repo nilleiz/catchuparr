@@ -169,6 +169,15 @@ class ConfigurationTests(unittest.TestCase):
             active["public_base_url"],
         )
 
+    def test_root_public_base_url_is_valid_and_normalized_idempotently(self):
+        for base_url in ("https://media.example.test", "https://media.example.test/"):
+            with self.subTest(base_url=base_url):
+                settings = dict(self.settings, public_base_url=base_url)
+                validate_configuration(settings, self.catalog)
+                apply_configuration(settings, self.catalog, self.active_path)
+                active = load_active_configuration(self.active_path)
+                self.assertEqual("https://media.example.test", active["public_base_url"])
+
     def test_invalid_public_base_urls_fail_validation_without_activation(self):
         for base_url in (
             "ftp://media.example.test",
@@ -287,6 +296,51 @@ class ConfigurationTests(unittest.TestCase):
             configuration.active_configuration_generation(active),
             control.configuration_generation,
         )
+
+    def test_incomplete_apply_keeps_previous_non_recorder_settings_authoritative(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        updated = dict(self.settings, retention_hours=2)
+
+        with patch.object(configuration._PreparedActivation, "commit"):
+            apply_configuration(updated, self.catalog, self.active_path)
+
+        # The active file already contains the candidate, but the durable
+        # pending marker makes the previous snapshot authoritative until Apply
+        # reaches its commit point.
+        self.assertEqual(2, json.loads(self.active_path.read_text())["settings"]["retention_hours"])
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertEqual(24, load_runtime_settings()["retention_hours"])
+        from catchuparr.recorder_control import RecorderControlError
+
+        with self.assertRaisesRegex(RecorderControlError, "incomplete"):
+            load_applied_state(self.active_path)
+
+        # A later Apply first restores the interrupted snapshot, then commits
+        # the new candidate under a fresh activation marker.
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertFalse((self.active_path.parent / configuration.ACTIVATION_STATE_NAME).exists())
+
+    def test_apply_recovery_from_pending_control_deny_advances_generation(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        active, control = load_applied_state(self.active_path)
+        from catchuparr import recorder_control
+
+        pending = recorder_control.RecorderControlState(
+            paused=False,
+            generation=control.generation + 4,
+            configuration_generation=configuration.active_configuration_generation(active),
+        )
+        recorder_control.control_state_path(self.active_path).write_text(
+            json.dumps(pending.to_json()), encoding="utf-8"
+        )
+        recorder_control._write_deny_marker(recorder_control.control_state_path(self.active_path))
+
+        apply_configuration(self.settings, self.catalog, self.active_path)
+
+        _active, recovered = load_applied_state(self.active_path)
+        self.assertFalse(recovered.paused)
+        self.assertEqual(pending.generation + 1, recovered.generation)
 
     def test_applied_state_reader_waits_for_both_files_during_apply(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
