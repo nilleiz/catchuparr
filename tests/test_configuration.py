@@ -525,42 +525,118 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(state_path.exists())
         self.assertFalse(commit_path.exists())
 
-    def test_deny_cleanup_failure_keeps_previous_settings_and_requires_recovery(self):
+    def test_deny_cleanup_failure_keeps_committed_settings_but_pauses_recording(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         from catchuparr import recorder_control
         from catchuparr.recorder_control import RecorderControlError
 
         with patch.object(
             recorder_control,
-            "_clear_deny_marker",
+            "_clear_deny_marker_durably",
             side_effect=RecorderControlError("synthetic deny-marker cleanup failure"),
         ):
             result = apply_configuration(
                 dict(self.settings, retention_hours=2), self.catalog, self.active_path
             )
 
-        self.assertFalse(result["applied"])
-        self.assertTrue(result["activation_pending"])
-        self.assertTrue(result["recovery_required"])
+        self.assertTrue(result["applied"])
         self.assertTrue(result["recording_paused"])
-        self.assertIn("previous settings remain active", result["warning"])
+        self.assertTrue(result["activation_cleanup_pending"])
+        self.assertIn("recording remains paused", result["warning"])
         self.assertIn(result["warning"], result["message"])
-        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
         deny_path = recorder_control.control_deny_path(self.active_path)
         state_path = self.active_path.parent / configuration.ACTIVATION_STATE_NAME
         commit_path = self.active_path.parent / configuration.ACTIVATION_COMMIT_NAME
         self.assertTrue(deny_path.exists())
         self.assertTrue(state_path.exists())
         self.assertTrue(commit_path.exists())
-        with self.assertRaisesRegex(RecorderControlError, "incomplete"):
+        with self.assertRaisesRegex(RecorderControlError, "cleanup is pending"):
             load_applied_state(self.active_path)
 
         recovered = recorder_control.load_recorder_control(self.active_path)
         self.assertFalse(recovered.paused)
-        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
         self.assertFalse(deny_path.exists())
         self.assertFalse(state_path.exists())
         self.assertFalse(commit_path.exists())
+
+    def test_deny_unlink_fsync_failure_keeps_committed_settings_and_blocks_recording(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        from catchuparr import recorder_control
+
+        original_fsync_directory = recorder_control._fsync_directory
+        marker = recorder_control.control_deny_path(self.active_path)
+        failed = False
+
+        def fail_once_after_marker_unlink(directory):
+            nonlocal failed
+            if Path(directory) == self.active_path.parent and not marker.exists() and not failed:
+                failed = True
+                raise OSError("synthetic directory fsync failure after deny unlink")
+            return original_fsync_directory(directory)
+
+        with patch.object(
+            recorder_control,
+            "_fsync_directory",
+            side_effect=fail_once_after_marker_unlink,
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+
+        self.assertTrue(failed)
+        self.assertTrue(result["applied"])
+        self.assertTrue(result["recording_paused"])
+        self.assertTrue(result["activation_cleanup_pending"])
+        self.assertIn("recording remains paused", result["warning"])
+        # The committed config is authoritative even though the admission
+        # marker's directory update could not be confirmed.
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        from catchuparr.recorder_control import RecorderControlError, load_recorder_control
+
+        with self.assertRaisesRegex(RecorderControlError, "cleanup is pending"):
+            load_applied_state(self.active_path)
+        recovered = load_recorder_control(self.active_path)
+        self.assertFalse(recovered.paused)
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+
+    def test_resurrected_deny_marker_does_not_roll_back_committed_settings(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        from catchuparr import recorder_control
+
+        original_fsync_directory = recorder_control._fsync_directory
+        marker = recorder_control.control_deny_path(self.active_path)
+        failed = False
+
+        def fail_once_after_marker_unlink(directory):
+            nonlocal failed
+            if Path(directory) == self.active_path.parent and not marker.exists() and not failed:
+                failed = True
+                raise OSError("synthetic directory fsync failure after deny unlink")
+            return original_fsync_directory(directory)
+
+        with patch.object(
+            recorder_control,
+            "_fsync_directory",
+            side_effect=fail_once_after_marker_unlink,
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+
+        self.assertTrue(result["recording_paused"])
+        # Model crash recovery restoring the directory entry whose unlink did
+        # not complete durably.
+        recorder_control._write_deny_marker(self.active_path)
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        from catchuparr.recorder_control import RecorderControlError, load_recorder_control
+
+        with self.assertRaisesRegex(RecorderControlError, "cleanup is pending"):
+            load_applied_state(self.active_path)
+        recovered = load_recorder_control(self.active_path)
+        self.assertFalse(recovered.paused)
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
 
     def test_reset_marker_cleanup_failure_does_not_report_apply_failure(self):
         marker = self.active_path.parent / RESET_REQUIRED_NAME
