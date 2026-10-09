@@ -366,6 +366,147 @@ class RecorderProxyTests(unittest.TestCase):
             settings_modules["catchuparr.configuration"].source_catalog = lambda: removed
             self.assertFalse(recorder_proxy.candidate_is_current(channel_uuid, "44", "12", active))
 
+    def test_ranked_source_candidates_releases_database_after_materializing_catalog(self):
+        channel_uuid = "00000000-0000-0000-0000-000000000001"
+        events = []
+        configuration_module = types.ModuleType("catchuparr.configuration")
+        catalog = SourceCatalog(
+            channels=({"uuid": channel_uuid, "number": "1", "name": "Synthetic", "group": ""},),
+            accounts=({"id": "12", "name": "Synthetic account"},),
+            streams_by_channel={channel_uuid: ({"id": "44", "account_id": "12", "order": 0},)},
+        )
+
+        def source_catalog():
+            events.append("catalog")
+            return catalog
+
+        configuration_module.source_catalog = source_catalog
+        django_module = types.ModuleType("django")
+        django_module.__path__ = []
+        django_db_module = types.ModuleType("django.db")
+        django_db_module.connections = SimpleNamespace(
+            close_all=lambda: events.append("close_all")
+        )
+        django_module.db = django_db_module
+        active = {
+            "source_policies": {
+                channel_uuid: {
+                    "include_account_ids": ["12"],
+                    "exclude_account_ids": [],
+                    "priorities": [],
+                    "known_account_ids": ["12"],
+                }
+            }
+        }
+
+        with patch.dict(sys.modules, {
+            "catchuparr.configuration": configuration_module,
+            "django": django_module,
+            "django.db": django_db_module,
+        }):
+            candidates = recorder_proxy.ranked_source_candidates(channel_uuid, active)
+
+        self.assertEqual(["catalog", "close_all"], events)
+        self.assertEqual(["44"], [candidate["id"] for candidate in candidates])
+
+        def failed_catalog():
+            events.append("catalog_failed")
+            raise RuntimeError("synthetic catalog failure")
+
+        configuration_module.source_catalog = failed_catalog
+        events.clear()
+        with patch.dict(sys.modules, {
+            "catchuparr.configuration": configuration_module,
+            "django": django_module,
+            "django.db": django_db_module,
+        }), self.assertRaisesRegex(RuntimeError, "synthetic catalog failure"):
+            recorder_proxy.ranked_source_candidates(channel_uuid, active)
+        self.assertEqual(["catalog_failed", "close_all"], events)
+
+    def test_streaming_route_releases_orm_connections_before_returning_response(self):
+        events = []
+        binding = {"channel_uuid": "synthetic-channel", "worker_id": "synthetic-worker"}
+
+        class FakeStreamingResponse(dict):
+            status_code = 200
+
+        response = FakeStreamingResponse({"Content-Type": "video/mp2t"})
+
+        class FakeHttpResponse:
+            def __init__(self, _content="", status=200):
+                self.status_code = status
+
+        class FakeStreamProfileManager:
+            @staticmethod
+            def filter(**_kwargs):
+                return SimpleNamespace(exists=lambda: True)
+
+        django_module = types.ModuleType("django")
+        django_module.__path__ = []
+        django_http_module = types.ModuleType("django.http")
+        django_http_module.HttpResponse = FakeHttpResponse
+        django_db_module = types.ModuleType("django.db")
+        django_db_module.connections = SimpleNamespace(
+            close_all=lambda: events.append("close_all")
+        )
+        django_module.http = django_http_module
+        django_module.db = django_db_module
+        core_module = types.ModuleType("core")
+        core_module.__path__ = []
+        core_utils_module = types.ModuleType("core.utils")
+        core_utils_module.RedisClient = SimpleNamespace(get_client=lambda: object())
+        core_module.utils = core_utils_module
+        core_models_module = types.ModuleType("core.models")
+        core_models_module.PROXY_PROFILE_NAME = "Proxy"
+        core_module.models = core_models_module
+        apps_module = types.ModuleType("apps")
+        apps_module.__path__ = []
+        apps_channels_module = types.ModuleType("apps.channels")
+        apps_channels_module.__path__ = []
+        apps_channels_models = types.ModuleType("apps.channels.models")
+        apps_channels_models.StreamProfile = SimpleNamespace(
+            objects=FakeStreamProfileManager()
+        )
+        apps_module.channels = apps_channels_module
+        apps_channels_module.models = apps_channels_models
+        modules = {
+            "django": django_module,
+            "django.http": django_http_module,
+            "django.db": django_db_module,
+            "core": core_module,
+            "core.utils": core_utils_module,
+            "core.models": core_models_module,
+            "apps": apps_module,
+            "apps.channels": apps_channels_module,
+            "apps.channels.models": apps_channels_models,
+        }
+        from catchuparr import configuration, runtime
+
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(runtime, "require_supported_version"),
+            patch.object(configuration, "load_active_configuration", return_value={}),
+            patch.object(recorder_proxy, "verify_recorder_capability", return_value=binding),
+            patch.object(recorder_proxy, "capability_binding_current", return_value=True),
+            patch.object(adapter, "install_proxyserver_cleanup_hook", return_value=True),
+            patch.object(adapter, "core_api_supported", return_value=True),
+            patch.object(
+                adapter,
+                "open_managed_source",
+                side_effect=lambda *_args: (events.append("open_source"), response)[1],
+            ),
+        ):
+            result = recorder_proxy.stream_recorder_view(
+                SimpleNamespace(
+                    method="GET",
+                    headers={recorder_proxy.CAPABILITY_HEADER: "synthetic-token"},
+                ),
+                "synthetic-channel",
+            )
+
+        self.assertIs(result, response)
+        self.assertEqual(["open_source", "close_all"], events)
+
     def test_plugin_cleanup_releases_only_its_pooled_profile_reservation(self):
         connection_pool = _connection_pool_module()
         apps = types.ModuleType("apps")
