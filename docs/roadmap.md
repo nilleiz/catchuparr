@@ -16,25 +16,27 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | Release | Feature | Relative effort | Status |
 | --- | --- | --- | --- |
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
-| 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
-| 0.3.1 | Weekly schedule day groups, timezone defaults, unified Apply and M3U token links | Low | Planned |
+| 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented; superseded by the 0.3.1 candidate and not published separately |
+| 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.
 
-The 0.2.1 filter engine is included in the 0.3.0 candidate. The 0.3.0 package
-has not been released.
+The 0.2.1 filter engine is included in the 0.3.1 candidate. Version 0.3.0 was
+not published separately.
 
 ## Settings contract
 
 A single native Plugin Settings text field contains the YAML filter document.
-Archive path, retention, the global storage limit and playback user remain
-separate fields. Validate previews every planned recorder and its permitted
-source order; Apply atomically activates the complete resolved configuration.
-Saving a draft does not change active recordings. UUIDs remain internal archive
-identities, never a separate user selection.
+Archive path, retention, storage limit, playback user, public token-link base
+URL, recording-enabled state and log level remain separate fields in the same
+settings form. Validate previews the complete draft; one Apply validates and
+activates all its fields
+as one configuration generation. Saving a draft does not change active
+recordings. Pause and Resume remain immediate operational actions. UUIDs remain
+internal archive identities, never a separate user selection.
 
 ## 0.2.1 — YAML filter engine
 
@@ -59,7 +61,7 @@ identities, never a separate user selection.
 - The Dev candidate is installed. Recording selection, source enforcement and
   real-player regression remain release-acceptance gates.
 
-See [the 0.3.0 candidate guide](candidate-0.3.0.md) for the current syntax,
+See [the 0.3.1 candidate guide](candidate-0.3.1.md) for the current syntax,
 schedule, control, installation and rollback notes.
 
 ## Intermediate step — repository content cleanup (completed)
@@ -151,47 +153,45 @@ versions passed for the current candidate. Independent review, CI and Dev/player
 acceptance remain pending before release. Real-player regression must verify
 start, stop, restart and archived playback outside the active window.
 
-## 0.3.1 — schedule shorthand and timezone defaults
+## 0.3.1 — schedule shorthand, timezone resolution and unified Apply
 
-This is a planned follow-up to 0.3.0. It does not change the 0.3.0 schedule
-contract or continuous-recording default; the timezone-default change applies
-to 0.3.1 only.
+This is the current implementation candidate. It preserves the existing
+continuous-recording default for a missing schedule and adds the following
+behavior. Version 0.3.0 was not published separately.
 
-### Proposed behavior
+### Candidate behavior
 
 - Accept `daily` for Monday through Sunday, `weekdays` for Monday through Friday,
   and `weekend` for Saturday and Sunday. Each key takes the same window list as
   an explicit day and applies that list to every day in its group.
 - Expand the group keys into the existing per-day schedule before applying the
-  existing timezone, overnight-window and DST rules.
-- When entries overlap, use this planned replacement order for each day:
+  timezone, overnight-window and DST rules.
+- When entries overlap, use this replacement order for each day:
   `daily`, then its matching group (`weekdays` or `weekend`), then that day's
   explicit entry. A more-specific entry replaces the entire window list for
   that day; other days in the group keep their group windows.
 - In an explicit weekly schedule, a day with no entry after expansion remains
   off. A missing schedule keeps the existing 0.3.0 continuous behavior.
 - Keep existing explicit weekday schedules valid without changes.
-- For 0.3.1, resolve the schedule timezone in this order: explicit YAML timezone,
+- Resolve the schedule timezone in this order: explicit YAML timezone,
   valid container `TZ`, then the detectable system timezone. A valid YAML value
   takes precedence; an invalid explicit YAML value fails with a clear
   validation error. If YAML is omitted and a supplied `TZ` is invalid, fail
   clearly; if no `TZ` is supplied, require a detectable valid system timezone.
   Do not assume the host timezone or fall back to a fixed `Europe/Berlin` value.
-- Plan the Dev Compose interface to pass through an optional `TZ` setting and
-  remove any hardcoded `Europe/Berlin` default. This is a roadmap item only;
-  existing Dev environment configuration is unchanged here.
+- The development Compose file accepts an optional `TZ` pass-through and does
+  not set a fixed timezone by default.
 - Provide one unified configuration Apply for the complete settings draft:
   filter YAML and schedules, timezone, global recording-enabled value, log
-  level, archive path, retention, storage limit and playback user. Do not add
+  level, archive path, retention, storage limit, playback user and optional
+  public base URL for token links. Do not add
   separate settings Apply actions for individual fields or groups. Pause and
   Resume may remain immediate operational actions, not a second settings Apply.
 - Validate the full draft before activation. A validation or persistence error
-  must not partially activate fields or a new configuration generation. During
-  implementation, inspect the native plugin Save/Apply callback semantics and
-  establish how PluginConfig fields, the active snapshot and recorder-control
-  sidecar are coordinated. Use staging/rollback under a common lock or fail
-  closed on mixed state; document cross-store atomicity only after it is
-  demonstrated.
+  must not partially activate fields or a new configuration generation. The
+  database draft and filesystem state are separate stores; activation uses the
+  shared lock, staging/rollback and fail-closed admission marker, and does not
+  claim a single database/filesystem transaction.
 - After creating an M3U access token, show two clearly labeled links in the
   confirmation toast: the authenticated M3U playlist URL and XMLTV EPG URL. Both
   links use the same newly created token and its existing user permissions. Put
@@ -199,10 +199,10 @@ to 0.3.1 only.
   when the toast UI supports them. Never write tokens or authenticated URLs to
   logs or repository files.
 
-### Planned 0.3.1 examples and workflow
+### 0.3.1 examples and workflow
 
-The following day-group syntax is planned for 0.3.1; it is not part of the 0.3.0
-candidate. A more-specific day replaces that day's full group list.
+The following day-group syntax is part of the 0.3.1 candidate. A more-specific
+day replaces that day's full group list.
 
 ```yaml
 version: 1
@@ -233,19 +233,20 @@ Here `daily` supplies the baseline, `weekdays` replaces it Monday through
 Friday, and `weekend` replaces it Saturday and Sunday. The explicit Monday list
 then replaces Monday's weekday list. Other weekdays keep the `weekdays` list;
 Saturday and Sunday keep the `weekend` list. Overnight windows still belong to
-their start day, and normalized overlaps or adjacent intervals merge. In 0.3.1,
-an explicit YAML timezone wins over container `TZ`; when the YAML field is
+their start day, and normalized overlaps or adjacent intervals merge. An
+explicit YAML timezone wins over container `TZ`; when the YAML field is
 omitted, a valid container `TZ` is used, then the detectable system timezone.
-Invalid or unavailable timezone resolution fails clearly. In 0.3.0, the
-candidate continues to use its existing `Europe/Berlin` default.
+Invalid or unavailable timezone resolution fails clearly. Previously applied
+legacy snapshots keep their stored timezone until a successful new Apply.
 
-For the planned 0.3.1 unified settings workflow, edit one complete draft, validate
+For the 0.3.1 unified settings workflow, set the optional public base URL if
+creating token links, then edit one complete draft, validate
 the resolved preview, then choose **Apply configuration** once. That Apply
 activates YAML filters, schedules, timezone, recording-enabled, logging and the
 other settings together; saving alone does not activate the draft, and a failed
 validation or persistence operation must not leave a partial configuration.
-Pause and Resume may stay immediate operational actions. Token creation remains
-a separate action; its planned confirmation toast presents both links, for
+Pause and Resume remain immediate operational actions. Token creation remains
+a separate action; its confirmation presents both links, for
 example:
 
 ```text
@@ -253,14 +254,14 @@ M3U playlist URL: [copyable authenticated link]
 XMLTV EPG URL: [copyable authenticated link]
 ```
 
-Both links must use the same created token and its existing user permissions.
-This is a planned layout, not a claim about the current UI; never log the token
-or either authenticated URL.
+Both links use the same created token and its existing user permissions. Never
+log the token or either authenticated URL.
 
 ### Acceptance
 
-Add tests for `daily` combined with `weekdays` and `weekend`, explicit-day
-replacement of group windows, unaffected days in the same group, days with no
+The implementation tests `daily` combined with `weekdays` and `weekend`,
+explicit-day replacement of group windows, unaffected days in the same group,
+days with no
 matching entry, window overlap normalization, environment timezone selection,
 system timezone detection, explicit YAML precedence, invalid/undetectable
 timezone errors, and DST gaps and repeated local times under the resolved zone.
@@ -268,8 +269,8 @@ Verify that one Apply validates and activates all settings together; invalid
 YAML and simulated multi-setting persistence failures leave the prior active
 configuration intact. Test pause/resume control-generation fencing against a
 concurrent Apply, shared configuration-generation checks, and rejection of
-stale queued recorder tasks. Documentation must label examples as current
-0.3.0 behavior or planned 0.3.1 behavior, and show global and per-rule multiple
+stale queued recorder tasks. Documentation distinguishes historical 0.3.0
+behavior from the 0.3.1 candidate, and shows global and per-rule multiple
 windows, overnight ownership, interval merging and whole-schedule override. It
 must also show `daily`, `weekdays`, `weekend` and an explicit-day override, the
 explicit-YAML versus environment/system timezone resolution, and the single-Apply

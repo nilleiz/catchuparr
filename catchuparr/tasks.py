@@ -13,19 +13,26 @@ def reconcile_recorders():
     from apps.channels.models import Channel
     from core.utils import RedisClient
 
-    from .configuration import load_active_configuration, reset_legacy_configuration
+    from .configuration import load_applied_state, reset_legacy_configuration
     from .engine.store import ArchiveStore
-    from .recorder_control import RecorderControlError, load_recorder_control
+    from .logging_utils import apply_log_level
+    from .recorder_control import RecorderControlError
     from .recorder_proxy import configuration_generation
     from .runtime import load_config, require_supported_version
     from .schedule import ScheduleError, schedule_from_snapshot, schedule_is_active
 
     require_supported_version()
     reset_legacy_configuration()
-    config = load_config()
     queued = 0
     redis = RedisClient.get_client()
-    active = load_active_configuration() if config is not None else None
+    try:
+        active, control = load_applied_state()
+    except RecorderControlError:
+        from .configuration import load_active_configuration
+
+        active, control = load_active_configuration(), None
+    apply_log_level(active.get("log_level", "INFO") if active else "INFO")
+    config = load_config(active_snapshot=active) if active is not None else None
     if config is not None and active is not None:
         generation = configuration_generation(active)
         desired = set(config.channel_uuids)
@@ -33,10 +40,6 @@ def reconcile_recorders():
             str(value)
             for value in Channel.objects.filter(uuid__in=desired).values_list("uuid", flat=True)
         )
-        try:
-            control = load_recorder_control()
-        except RecorderControlError:
-            control = None
         if control is not None and not control.paused:
             schedules = active.get("recording_schedule", {})
             timezone_name = schedules.get("timezone") if isinstance(schedules, dict) else None
@@ -76,13 +79,16 @@ def snapshot_epg():
     from apps.channels.managers import with_effective_values
     from apps.channels.models import Channel
 
-    from .configuration import reset_legacy_configuration
+    from .configuration import load_active_configuration, reset_legacy_configuration
     from .engine.store import ArchiveStore
+    from .logging_utils import apply_log_level
     from .runtime import load_config, require_supported_version
 
     require_supported_version()
     reset_legacy_configuration()
-    config = load_config()
+    active = load_active_configuration()
+    apply_log_level(active.get("log_level", "INFO") if active else "INFO")
+    config = load_config(active_snapshot=active) if active is not None else None
     if config is None:
         return {"saved": 0}
     store = ArchiveStore(config.archive_root)
@@ -241,6 +247,7 @@ def record_channel(
                     channel_uuid=channel_uuid,
                     candidate=candidate,
                     config_generation=generation,
+                    control_generation=expected_control_generation,
                     internal_base_url=proxy_base_url,
                 )
                 with attempt_state_lock:
@@ -316,15 +323,15 @@ def _active_schedule(active, channel_uuid):
 
 
 def _recorder_admission_state(channel_uuid, expected_generation, expected_control_generation):
-    from .configuration import load_active_configuration
-    from .logging_utils import error, event
-    from .recorder_control import RecorderControlError, load_recorder_control
+    from .configuration import load_applied_state
+    from .logging_utils import apply_log_level, error, event
+    from .recorder_control import RecorderControlError
     from .recorder_proxy import configuration_generation
     from .runtime import load_config
     from .schedule import ScheduleError, schedule_is_active
 
     try:
-        control = load_recorder_control()
+        active, control = load_applied_state()
     except RecorderControlError:
         error("control_state_invalid")
         return {"status": "control_unavailable"}
@@ -333,10 +340,10 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
     if control.generation != expected_control_generation:
         event("recorder_stale_job")
         return {"status": "stale_control"}
-    active = load_active_configuration()
     if active is None:
         event("recorder_disabled")
         return {"status": "disabled"}
+    apply_log_level(active.get("log_level", "INFO"))
     config = load_config(active_snapshot=active)
     if config is None or channel_uuid not in config.channel_uuids:
         event("recorder_disabled")

@@ -1,6 +1,8 @@
+import tempfile
 import unittest
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from pathlib import Path
+from zoneinfo import TZPATH, ZoneInfo
 
 from catchuparr.schedule import (
     CONTINUOUS_SCHEDULE,
@@ -9,6 +11,7 @@ from catchuparr.schedule import (
     RecordingSchedule,
     ScheduleError,
     normalize_schedule,
+    resolve_timezone,
     schedule_from_snapshot,
     schedule_is_active,
     validate_timezone,
@@ -92,6 +95,72 @@ class ScheduleTests(unittest.TestCase):
             schedule, "Europe/Berlin", datetime(2026, 1, 5, 2, 0, tzinfo=berlin)
         ))
 
+    def test_day_groups_expand_before_specific_weekday_replacements(self):
+        schedule = normalize_schedule({
+            "daily": [{"start": "07:00", "end": "08:00"}],
+            "weekdays": [
+                {"start": "18:00", "end": "19:00"},
+                {"start": "19:00", "end": "20:00"},
+            ],
+            "weekend": [
+                {"start": "10:00", "end": "11:00"},
+                {"start": "11:00", "end": "12:00"},
+            ],
+            "monday": [{"start": "06:00", "end": "09:00"}],
+        })
+        self.assertEqual(
+            (
+                (360, 540),
+                (2520, 2640),
+                (3960, 4080),
+                (5400, 5520),
+                (6840, 6960),
+                (7800, 7920),
+                (9240, 9360),
+            ),
+            schedule.intervals,
+        )
+
+    def test_daily_windows_apply_to_days_without_more_specific_entries(self):
+        schedule = normalize_schedule({
+            "daily": [{"start": "07:00", "end": "08:00"}],
+            "monday": [{"start": "06:00", "end": "09:00"}],
+        })
+        self.assertEqual(
+            ((360, 540), (1860, 1920), (3300, 3360), (4740, 4800),
+             (6180, 6240), (7620, 7680), (9060, 9120)),
+            schedule.intervals,
+        )
+
+    def test_shadowed_schedule_groups_are_still_validated(self):
+        invalid = (
+            {
+                "daily": "not a list",
+                "weekdays": [],
+                "weekend": [],
+            },
+            {
+                "daily": [{"start": "07:00", "end": "08:00", "unknown": True}],
+                "weekdays": [],
+                "weekend": [],
+            },
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ScheduleError):
+                normalize_schedule(value)
+
+    def test_valid_empty_groups_replace_daily_windows(self):
+        schedule = normalize_schedule({
+            "daily": [{"start": "07:00", "end": "08:00"}],
+            "weekdays": [],
+            "weekend": [],
+        })
+        self.assertEqual(RecordingSchedule("weekly", ()), schedule)
+
+    def test_rejects_unknown_day_groups(self):
+        with self.assertRaisesRegex(ScheduleError, "day group"):
+            normalize_schedule({"workdays": [{"start": "08:00", "end": "09:00"}]})
+
     def test_dst_fold_is_active_on_both_repeated_wall_clock_occurrences(self):
         schedule = normalize_schedule({
             "sunday": [{"start": "02:00", "end": "03:00"}],
@@ -138,6 +207,73 @@ class ScheduleTests(unittest.TestCase):
             validate_timezone("Synthetic/Unknown")
         with self.assertRaises(ScheduleError):
             validate_timezone(42)
+
+    def test_resolves_timezone_by_yaml_then_environment_then_system(self):
+        self.assertEqual(
+            "Etc/UTC",
+            resolve_timezone("Etc/UTC", environ={"TZ": "Synthetic/Invalid"}),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            timezone_file = root / "timezone"
+            timezone_file.write_text("Asia/Tokyo\n", encoding="utf-8")
+            self.assertEqual(
+                "America/Chicago",
+                resolve_timezone(
+                    environ={"TZ": "America/Chicago"},
+                    timezone_file=timezone_file,
+                    localtime_path=root / "missing-localtime",
+                ),
+            )
+            self.assertEqual(
+                "Asia/Tokyo",
+                resolve_timezone(
+                    environ={},
+                    timezone_file=timezone_file,
+                    localtime_path=root / "missing-localtime",
+                ),
+            )
+            self.assertEqual(
+                "Asia/Tokyo",
+                resolve_timezone(
+                    environ={"TZ": ""},
+                    timezone_file=timezone_file,
+                    localtime_path=root / "missing-localtime",
+                ),
+            )
+
+    def test_system_timezone_can_be_detected_from_localtime_symlink(self):
+        zone_root = Path(TZPATH[0])
+        zone_file = zone_root / "Etc" / "UTC"
+        if not zone_file.is_file():
+            self.skipTest("system IANA timezone database is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            localtime = Path(directory) / "localtime"
+            localtime.symlink_to(zone_file)
+            self.assertEqual(
+                "Etc/UTC",
+                resolve_timezone(
+                    environ={},
+                    timezone_file=Path(directory) / "missing-timezone",
+                    localtime_path=localtime,
+                ),
+            )
+
+    def test_invalid_timezone_inputs_and_undetectable_system_timezone_fail(self):
+        with self.assertRaisesRegex(ScheduleError, "unknown IANA timezone"):
+            resolve_timezone("Synthetic/Invalid", environ={"TZ": "Etc/UTC"})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "timezone").write_text("Synthetic/Invalid\n", encoding="utf-8")
+            with self.assertRaisesRegex(ScheduleError, "unknown IANA timezone"):
+                resolve_timezone(
+                    environ={}, timezone_file=root / "timezone", localtime_path=root / "missing"
+                )
+            with self.assertRaisesRegex(ScheduleError, "TZ"):
+                resolve_timezone(
+                    environ={}, timezone_file=root / "missing-timezone",
+                    localtime_path=root / "missing-localtime",
+                )
 
     def test_active_snapshot_round_trip_and_strict_normalization(self):
         schedule = normalize_schedule({

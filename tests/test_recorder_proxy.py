@@ -317,6 +317,7 @@ class RecorderProxyTests(unittest.TestCase):
                 channel_uuid="00000000-0000-0000-0000-000000000001",
                 candidate={"id": "44", "account_id": "12"},
                 config_generation="generation-1",
+                control_generation=5,
                 internal_base_url="http://dispatcharr",
             )
             valid = recorder_proxy.verify_recorder_capability(redis, attempt.capability)
@@ -347,6 +348,7 @@ class RecorderProxyTests(unittest.TestCase):
         binding = {
             "channel_uuid": "00000000-0000-0000-0000-000000000001",
             "config_generation": recorder_proxy.configuration_generation(active),
+            "control_generation": "8",
             "lease_fence": "7",
             "lease_key": lease_key,
             "lease_value": "7:owner-secret",
@@ -358,9 +360,10 @@ class RecorderProxyTests(unittest.TestCase):
         redis.set(recorder_proxy.CAPABILITY_PREFIX + "digest", json.dumps({
             **binding, "capability_digest": "digest"
         }))
-        with patch.object(recorder_proxy, "_active_configuration", return_value=active), patch.object(
-            recorder_proxy, "candidate_is_current", return_value=True
-        ):
+        with patch(
+            "catchuparr.configuration.load_applied_state",
+            return_value=(active, SimpleNamespace(paused=False, generation=8)),
+        ), patch.object(recorder_proxy, "candidate_is_current", return_value=True):
             self.assertTrue(recorder_proxy.capability_binding_current(redis, binding))
             self.assertFalse(
                 recorder_proxy.capability_binding_current(
@@ -369,6 +372,38 @@ class RecorderProxyTests(unittest.TestCase):
             )
             redis.set(lease_key, "8:new-owner")
             self.assertFalse(recorder_proxy.capability_binding_current(redis, binding))
+
+    def test_capability_is_invalidated_by_pause_or_control_generation_change(self):
+        redis = FakeRedis()
+        lease_key = "catchuparr:recorder:00000000-0000-0000-0000-000000000001"
+        redis.set(lease_key, "7:owner-secret")
+        active = {
+            "channel_uuids": "00000000-0000-0000-0000-000000000001",
+            "source_policies": {},
+        }
+        binding = {
+            "channel_uuid": "00000000-0000-0000-0000-000000000001",
+            "config_generation": recorder_proxy.configuration_generation(active),
+            "control_generation": "8",
+            "lease_fence": "7",
+            "lease_key": lease_key,
+            "lease_value": "7:owner-secret",
+            "stream_id": "44",
+            "account_id": "12",
+            "worker_id": adapter.make_worker_id("channel", "44", "gen", 7, "a"),
+            "capability_digest": "digest",
+        }
+        redis.set(recorder_proxy.CAPABILITY_PREFIX + "digest", json.dumps(binding))
+        with patch.object(recorder_proxy, "candidate_is_current", return_value=True):
+            for control in (
+                SimpleNamespace(paused=True, generation=8),
+                SimpleNamespace(paused=False, generation=9),
+            ):
+                with patch(
+                    "catchuparr.configuration.load_applied_state",
+                    return_value=(active, control),
+                ):
+                    self.assertFalse(recorder_proxy.capability_binding_current(redis, binding))
 
     def test_candidate_policy_filters_current_assignments_and_rejects_removed_source(self):
         channel_uuid = "00000000-0000-0000-0000-000000000001"

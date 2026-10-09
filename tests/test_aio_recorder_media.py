@@ -35,6 +35,84 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_media_probe_attempt_uses_current_applied_control_generation(self):
+        from catchuparr import recorder_proxy
+
+        active = {"version": 4, "channel_uuids": "synthetic-channel"}
+        generation = recorder_proxy.configuration_generation(active)
+        controls = (
+            SimpleNamespace(
+                paused=False, generation=12, configuration_generation=generation,
+            ),
+            SimpleNamespace(
+                paused=False, generation=14, configuration_generation=generation,
+            ),
+        )
+        redis_client = object()
+        lease = object()
+        active_path = probe.Path("/synthetic/active.json")
+        candidate = {"id": "23", "account_id": "7"}
+
+        with patch(
+            "catchuparr.configuration.load_applied_state",
+            side_effect=[(active, controls[0]), (active, controls[1])],
+        ) as load_applied_state, patch(
+            "catchuparr.recorder_proxy.issue_recorder_attempt",
+            autospec=True,
+            side_effect=lambda *_args, **_kwargs: "attempt",
+        ) as issue:
+            for control in controls:
+                self.assertEqual(
+                    "attempt",
+                    probe._issue_media_probe_attempt(
+                        redis_client,
+                        lease,
+                        channel_uuid="synthetic-channel",
+                        candidate=candidate,
+                        active_path=active_path,
+                        internal_base_url="http://127.0.0.1",
+                    ),
+                )
+
+        self.assertEqual(load_applied_state.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["control_generation"] for call in issue.call_args_list],
+            [12, 14],
+        )
+        self.assertTrue(all(call.kwargs["config_generation"] == generation for call in issue.call_args_list))
+
+    def test_media_probe_attempt_rejects_paused_or_mismatched_control_state(self):
+        from catchuparr import recorder_proxy
+
+        active = {"version": 4, "channel_uuids": "synthetic-channel"}
+        generation = recorder_proxy.configuration_generation(active)
+        invalid_controls = (
+            SimpleNamespace(
+                paused=True, generation=12, configuration_generation=generation,
+            ),
+            SimpleNamespace(
+                paused=False, generation=12, configuration_generation="stale-generation",
+            ),
+        )
+        with patch(
+            "catchuparr.configuration.load_applied_state",
+            side_effect=[(active, control) for control in invalid_controls],
+        ), patch(
+            "catchuparr.recorder_proxy.issue_recorder_attempt",
+            autospec=True,
+        ) as issue:
+            for _ in invalid_controls:
+                with self.assertRaises(RuntimeError):
+                    probe._issue_media_probe_attempt(
+                        object(),
+                        object(),
+                        channel_uuid="synthetic-channel",
+                        candidate={"id": "23", "account_id": "7"},
+                        active_path=probe.Path("/synthetic/active.json"),
+                        internal_base_url="http://127.0.0.1",
+                    )
+        issue.assert_not_called()
+
     def test_live_a_invariant_diagnostic_reports_each_boolean_without_values(self):
         all_true = dict.fromkeys(probe._NATIVE_LIVE_A_INVARIANT_NAMES, True)
         self.assertTrue(all(probe._native_live_a_invariant_flags(**all_true).values()))

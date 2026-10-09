@@ -237,6 +237,24 @@ class RecorderControlTests(unittest.TestCase):
         self.assertEqual(first_resume, repeated_resume)
         self.assertTrue(database.row.settings["recording_enabled"])
 
+    def test_pause_resume_preserve_applied_configuration_binding(self):
+        configuration_generation = "a" * 64
+        self._write_state(
+            RecorderControlState(False, 5, configuration_generation=configuration_generation)
+        )
+        database = _FakeDatabase({"recording_enabled": True})
+
+        with database.patch():
+            paused = pause_recorders(self.active_path)
+            resumed = resume_recorders(self.active_path)
+
+        self.assertEqual(6, paused.generation)
+        self.assertTrue(paused.paused)
+        self.assertEqual(7, resumed.generation)
+        self.assertFalse(resumed.paused)
+        self.assertEqual(configuration_generation, resumed.configuration_generation)
+        self.assertEqual(2, self._read_json_state()["version"])
+
     def test_database_failure_after_pause_keeps_durable_pause_and_rolls_back_setting(self):
         database = _FakeDatabase({"recording_enabled": True})
         database.fail_save = True

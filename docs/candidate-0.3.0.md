@@ -1,4 +1,10 @@
-# 0.3.0 recording-schedule candidate
+# 0.3.0 recording-schedule candidate (superseded)
+
+This guide records the earlier 0.3.0 candidate and its configuration behavior.
+For the current 0.3.1 candidate, use [candidate-0.3.1.md](candidate-0.3.1.md).
+In particular, 0.3.1 changes timezone resolution and combines settings in one
+Apply operation; do not use the historical instructions below for a current
+installation.
 
 This is an unreleased candidate. The manifest and generated ZIP use version
 `0.3.0`. Synthetic native integration passed on Dispatcharr 0.31.0 and 0.32.0.

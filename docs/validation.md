@@ -94,7 +94,7 @@ Enable sanitized diagnostics only for a test and disable them afterward.
 Review collected output before sharing; never publish raw URLs, session tokens,
 personal EPG data or real-world request timestamps.
 
-## 0.2.1 YAML filter engine (included in the 0.3.0 candidate)
+## 0.2.1 YAML filter engine (included in the 0.3.1 candidate)
 
 The unified YAML engine replaced the unreleased 0.2.0 configuration interface.
 Its implementation passed 232 local unit tests, Ruff, compileall and package
@@ -110,8 +110,8 @@ capacity and runtime failover, indexed media gaps and connection cleanup.
 Native profile creation automatically supplies memberships; fixtures disable
 these before enabling their intended synthetic members.
 
-The engine is included in 0.3.0 below. The earlier 0.2.1 package was never
-released and has no separate player-acceptance claim.
+The engine is included in the 0.3.1 candidate. The earlier 0.2.1 package was
+never released and has no separate player-acceptance claim.
 
 ## Historical 0.2.0 candidate evidence (unreleased)
 
@@ -169,20 +169,33 @@ behavior is the approved 0.2.0 candidate scope; safe reuse of native live
 workers remains deferred. See the
 [roadmap](roadmap.md) for the remaining acceptance requirements.
 
-## 0.3.0 schedule and recorder-control candidate (unreleased)
+## 0.3.0 schedule and recorder-control candidate (superseded)
 
-The 0.3.0 manifest and package candidate add weekly recording windows, a durable
-global recording pause/resume control, configuration-generation fencing and
-scoped `[Catchuparr]` logs. The full synthetic native integration probe passed
-on pinned Dispatcharr 0.31.0 and 0.32.0. Both runs covered schedule validation
-and application, pause/resume while recording, natural schedule closure, stale
-queued-job rejection, restricted-source recording and failover, preservation
-of a concurrent native live stream, useful-media/gap checks, reservation
-release and native worker teardown. Synthetic sources and media were used.
+The 0.3.0 candidate added weekly recording windows, durable global recording
+pause/resume, configuration-generation fencing and scoped `[Catchuparr]` logs.
+The full synthetic native integration probe passed on pinned Dispatcharr
+0.31.0 and 0.32.0. This version is superseded by 0.3.1; see its current
+validation status below.
 
 The local suite passed 299 tests after the playback-grace test was changed to a
-shared fake clock. Ruff, compileall and package-build checks passed. Required CI
-and real-player acceptance remain open; these server-side tests do not establish
-EPG or player behavior. The candidate is not published. See the
-[0.3.0 candidate guide](candidate-0.3.0.md) for configuration and upgrade
-behavior.
+shared fake clock. Ruff, compileall and package-build checks passed. See the
+[historical 0.3.0 guide](candidate-0.3.0.md) only for its former behavior.
+
+## 0.3.1 unified configuration candidate
+
+The 0.3.1 candidate adds `daily`, `weekdays` and `weekend` schedule groups,
+explicit-day precedence, environment/system timezone resolution, and one Apply
+operation for all settings. Pause and Resume remain immediate controls. It also
+returns labeled M3U and XMLTV links when an access token is created, using the
+applied public base URL setting. Candidate
+verification includes schedule/DST tests, configuration rollback and
+generation-fencing tests, privacy checks for token handling, package validation
+and native integration in the pinned AIO versions. The 0.3.1-specific full
+acceptance run is pending; prior 0.3.0 native results are not counted as a pass
+for the new unified configuration path.
+
+Independent review, required CI, isolated Dev verification and real-player
+acceptance remain release gates. This is a candidate status, not a publication
+or player-compatibility claim. See the
+[0.3.1 candidate guide](candidate-0.3.1.md) for current behavior and upgrade
+notes.
