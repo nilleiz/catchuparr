@@ -28,6 +28,7 @@ class RuntimeStatusTests(unittest.TestCase):
             "https://media.example.test/?query=1",
             "https://media.example.test/#fragment",
             "https://media.example.test/%2e%2e/elsewhere",
+            "https://media.example.test/%3Cscript%3E",
         ):
             if value == "":
                 continue

@@ -104,7 +104,11 @@ def normalize_public_base_url(value) -> str:
         ):
             raise ValueError("public_base_url host is invalid")
     decoded_path = unquote(parsed.path)
-    if decoded_path.startswith("//") or "\\" in decoded_path:
+    if (
+        decoded_path.startswith("//")
+        or "\\" in decoded_path
+        or re.fullmatch(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*", decoded_path) is None
+    ):
         raise ValueError("public_base_url path is invalid")
     path_parts = decoded_path.split("/")
     if any(part in {".", ".."} for part in path_parts):
