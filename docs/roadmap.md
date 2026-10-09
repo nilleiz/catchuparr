@@ -98,6 +98,52 @@ REST and WebSocket agree. Test HLS/XC, reloads, seeks, pause, replacement/grace 
 - Validate previews schedules; Apply activates selection, source policies and schedules atomically. A missing schedule records continuously; an explicitly empty weekly schedule records nothing.
 - Add consistent `[Catchuparr]` logging using Dispatcharr formatting, configurable level (default INFO), sanitized events and bounded repeated failures.
 
+### Existing 0.3.0 schedule example
+
+The following syntax is available in the 0.3.0 candidate. It demonstrates multiple
+windows in both the global schedule and a per-rule override. It does not use the
+planned 0.3.1 day-group or timezone-default behavior.
+
+```yaml
+version: 1
+timezone: Europe/Berlin
+schedule:
+  monday:
+    - start: "06:00"
+      end: "08:00"
+    - start: "08:00"
+      end: "09:00"
+    - start: "20:00"
+      end: "22:00"
+  sunday:
+    - start: "23:30"
+      end: "01:00"
+rules:
+  - channels:
+      numbers: [100]
+    include: ["Synthetic M3U A"]
+    schedule:
+      monday:
+        - start: "07:00"
+          end: "08:30"
+        - start: "08:00"
+          end: "09:30"
+        - start: "20:00"
+          end: "21:30"
+      sunday:
+        - start: "00:00"
+          end: "02:00"
+        - start: "23:30"
+          end: "01:00"
+```
+
+Adjacent or overlapping windows merge within each schedule: the global Monday
+windows from 06:00 through 09:00 form one interval, and the rule's Monday
+windows from 07:00 through 09:30 form one interval, alongside their later
+windows. For channel 100, the rule schedule replaces the global schedule as a
+whole; its unlisted days remain off. Other selected channels continue to use the
+global schedule. The Sunday overnight interval belongs to Sunday, its start day.
+
 ### Acceptance
 
 Synthetic schedule/control tests and full native integration on both pinned AIO
@@ -153,6 +199,64 @@ to 0.3.1 only.
   when the toast UI supports them. Never write tokens or authenticated URLs to
   logs or repository files.
 
+### Planned 0.3.1 examples and workflow
+
+The following day-group syntax is planned for 0.3.1; it is not part of the 0.3.0
+candidate. A more-specific day replaces that day's full group list.
+
+```yaml
+version: 1
+timezone: Etc/UTC  # Explicit YAML timezone takes precedence.
+schedule:
+  daily:
+    - start: "07:00"
+      end: "08:00"
+    - start: "20:00"
+      end: "22:00"
+  weekdays:
+    - start: "18:00"
+      end: "22:00"
+  weekend:
+    - start: "10:00"
+      end: "13:00"
+    - start: "23:00"
+      end: "01:00"
+  monday:
+    - start: "06:00"
+      end: "09:00"
+rules:
+  - channels:
+      numbers: [100]  # Synthetic channel selector.
+```
+
+Here `daily` supplies the baseline, `weekdays` replaces it Monday through
+Friday, and `weekend` replaces it Saturday and Sunday. The explicit Monday list
+then replaces Monday's weekday list. Other weekdays keep the `weekdays` list;
+Saturday and Sunday keep the `weekend` list. Overnight windows still belong to
+their start day, and normalized overlaps or adjacent intervals merge. In 0.3.1,
+an explicit YAML timezone wins over container `TZ`; when the YAML field is
+omitted, a valid container `TZ` is used, then the detectable system timezone.
+Invalid or unavailable timezone resolution fails clearly. In 0.3.0, the
+candidate continues to use its existing `Europe/Berlin` default.
+
+For the planned 0.3.1 unified settings workflow, edit one complete draft, validate
+the resolved preview, then choose **Apply configuration** once. That Apply
+activates YAML filters, schedules, timezone, recording-enabled, logging and the
+other settings together; saving alone does not activate the draft, and a failed
+validation or persistence operation must not leave a partial configuration.
+Pause and Resume may stay immediate operational actions. Token creation remains
+a separate action; its planned confirmation toast presents both links, for
+example:
+
+```text
+M3U playlist URL: [copyable authenticated link]
+XMLTV EPG URL: [copyable authenticated link]
+```
+
+Both links must use the same created token and its existing user permissions.
+This is a planned layout, not a claim about the current UI; never log the token
+or either authenticated URL.
+
 ### Acceptance
 
 Add tests for `daily` combined with `weekdays` and `weekend`, explicit-day
@@ -164,11 +268,16 @@ Verify that one Apply validates and activates all settings together; invalid
 YAML and simulated multi-setting persistence failures leave the prior active
 configuration intact. Test pause/resume control-generation fencing against a
 concurrent Apply, shared configuration-generation checks, and rejection of
-stale queued recorder tasks. Verify token creation displays both the M3U
-playlist and XMLTV EPG links with clear labels, both links map to the same token
-and existing permissions, and the toast leaves each link selectable and copyable
-without truncation. Check that application logs contain neither the token nor
-either authenticated URL.
+stale queued recorder tasks. Documentation must label examples as current
+0.3.0 behavior or planned 0.3.1 behavior, and show global and per-rule multiple
+windows, overnight ownership, interval merging and whole-schedule override. It
+must also show `daily`, `weekdays`, `weekend` and an explicit-day override, the
+explicit-YAML versus environment/system timezone resolution, and the single-Apply
+workflow. Verify token creation displays both the M3U playlist and XMLTV EPG
+links with clear labels, both links map to the same token and existing
+permissions, and the toast leaves each link selectable and copyable without
+truncation. Check that application logs contain neither the token nor either
+authenticated URL.
 
 ## 0.4.0 — recorder visibility
 
