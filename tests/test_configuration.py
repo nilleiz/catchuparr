@@ -388,6 +388,50 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertFalse((self.active_path.parent / configuration.ACTIVATION_STATE_NAME).exists())
 
+    def test_visible_commit_record_with_failed_rollback_remains_unconfirmed(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        write_commit = configuration._write_activation_commit_locked
+
+        def write_commit_then_fail(path, activation_id):
+            write_commit(path, activation_id)
+            raise OSError("synthetic commit-directory fsync failure")
+
+        def fail_commit_removal(path):
+            if configuration._activation_commit_path(path).exists():
+                raise OSError("synthetic persistent commit-removal failure")
+
+        from catchuparr.recorder_control import RecorderControlError, load_recorder_control
+
+        with patch.object(
+            configuration,
+            "_write_activation_commit_locked",
+            side_effect=write_commit_then_fail,
+        ), patch.object(
+            configuration,
+            "_remove_activation_commit_locked",
+            side_effect=fail_commit_removal,
+        ), self.assertRaisesRegex(RecorderControlError, "admission remains denied"):
+            apply_configuration(dict(self.settings, retention_hours=2), self.catalog, self.active_path)
+
+        journal = json.loads(
+            (self.active_path.parent / configuration.ACTIVATION_STATE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("unconfirmed", journal["state"])
+        self.assertTrue(configuration._activation_commit_path(self.active_path).exists())
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        with self.assertRaises(RecorderControlError):
+            load_applied_state(self.active_path)
+
+        recovered = load_recorder_control(self.active_path)
+        self.assertFalse(recovered.paused)
+        self.assertEqual(24, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertFalse(
+            (self.active_path.parent / configuration.ACTIVATION_STATE_NAME).exists()
+        )
+        self.assertFalse(configuration._activation_commit_path(self.active_path).exists())
+
     def test_durable_commit_record_is_authoritative_with_pending_journal(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         with patch.object(configuration, "_cleanup_committed_activation_locked"):
@@ -399,6 +443,10 @@ class ConfigurationTests(unittest.TestCase):
         commit_path = self.active_path.parent / configuration.ACTIVATION_COMMIT_NAME
         journal = json.loads(state_path.read_text(encoding="utf-8"))
         commit = json.loads(commit_path.read_text(encoding="utf-8"))
+        configuration._write_activation_state_locked(
+            self.active_path, "pending", journal["activation_id"]
+        )
+        journal = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual("pending", journal["state"])
         self.assertEqual(journal["activation_id"], commit["activation_id"])
 
@@ -414,6 +462,50 @@ class ConfigurationTests(unittest.TestCase):
 
         from catchuparr.recorder_control import load_recorder_control
 
+        recovered = load_recorder_control(self.active_path)
+        self.assertFalse(recovered.paused)
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        self.assertFalse(state_path.exists())
+        self.assertFalse(commit_path.exists())
+
+    def test_journal_transition_failure_after_durable_commit_is_applied_and_retried(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        write_state = configuration._write_activation_state_locked
+
+        def fail_committed_state_before_replace(path, state, activation_id):
+            if state == "committed":
+                raise OSError("synthetic journal replace failure before write")
+            write_state(path, state, activation_id)
+
+        with patch.object(
+            configuration,
+            "_write_activation_state_locked",
+            side_effect=fail_committed_state_before_replace,
+        ):
+            result = apply_configuration(
+                dict(self.settings, retention_hours=2), self.catalog, self.active_path
+            )
+
+        self.assertTrue(result["applied"])
+        self.assertTrue(result["activation_cleanup_pending"])
+        self.assertNotIn("recording_paused", result)
+        self.assertIn("cleanup remains pending", result["warning"])
+        self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
+        state_path = self.active_path.parent / configuration.ACTIVATION_STATE_NAME
+        commit_path = self.active_path.parent / configuration.ACTIVATION_COMMIT_NAME
+        journal = json.loads(state_path.read_text(encoding="utf-8"))
+        commit = json.loads(commit_path.read_text(encoding="utf-8"))
+        self.assertEqual("pending", journal["state"])
+        self.assertEqual(journal["activation_id"], commit["activation_id"])
+
+        from catchuparr.recorder_control import load_recorder_control
+
+        active, control = load_applied_state(self.active_path)
+        self.assertEqual(2, active["retention_hours"])
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
+        )
         recovered = load_recorder_control(self.active_path)
         self.assertFalse(recovered.paused)
         self.assertEqual(2, load_active_configuration(self.active_path)["retention_hours"])
