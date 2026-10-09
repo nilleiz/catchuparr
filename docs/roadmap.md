@@ -224,6 +224,9 @@ schedule:
   monday:
     - start: "06:00"
       end: "09:00"
+rules:
+  - channels:
+      numbers: [100]  # Synthetic channel selector.
 ```
 
 Here `daily` supplies the baseline, `weekdays` replaces it Monday through
