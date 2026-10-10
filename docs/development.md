@@ -14,6 +14,9 @@ unified settings Apply, recorder controls, legacy-setting reset behavior and
 current acceptance status. The 0.3.0 guide is historical. The build command
 uses the manifest version when naming the ZIP.
 
+For the 0.4.0 candidate, see [its guide](candidate-0.4.0.md) for native Stats
+projection behavior, settings and remaining acceptance gates.
+
 Dispatcharr v0.31.0 and v0.32.0 accept a manual update at authenticated admin
 `POST /api/plugins/plugins/import/` with multipart field `file` and explicit
 `overwrite=true`; the response must contain `success: true` and the expected

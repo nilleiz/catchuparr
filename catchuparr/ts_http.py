@@ -458,6 +458,7 @@ class ArchiveTSPlaybackService:
             virtual_offset = 0
             renewal_interval = min(60.0, self.lease_ttl_seconds / 3)
             renew_at = time.monotonic() + renewal_interval
+            cancellation_check_at = time.monotonic() + 0.5
             try:
                 for segment, (path, file_size) in zip(segments, files):
                     file_end = virtual_offset + file_size - 1
@@ -470,6 +471,10 @@ class ArchiveTSPlaybackService:
                         with path.open("rb") as source:
                             source.seek(overlap_start - virtual_offset)
                             while remaining:
+                                if time.monotonic() >= cancellation_check_at:
+                                    if not self._response_stream_active(lease_id):
+                                        raise OSError("playback session was stopped")
+                                    cancellation_check_at = time.monotonic() + 0.5
                                 if time.monotonic() >= renew_at:
                                     if (
                                         not self._renew_lease(user, channel, lease_id, device_key, segment)
@@ -749,6 +754,15 @@ class ArchiveTSPlaybackService:
                 (expires_at, stream_id, lease_id),
             )
             return cursor.rowcount == 1
+
+    def _response_stream_active(self, lease_id: str) -> bool:
+        """Check cancellation independently from the slower lease-renewal timer."""
+        with closing(self._connect()) as db:
+            return db.execute(
+                "SELECT 1 FROM ts_playback_sessions WHERE lease_id=? "
+                "AND active=1 AND expires_at>?",
+                (lease_id, self.clock()),
+            ).fetchone() is not None
 
     def _finish_response(
         self,

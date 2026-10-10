@@ -18,7 +18,7 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented; superseded by the 0.3.1 candidate and not published separately |
 | 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Implemented candidate; independent review, CI and Dev/player acceptance remain pending |
-| 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Planned |
+| 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Implemented candidate; independent review, pinned native checks and player acceptance remain pending |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete

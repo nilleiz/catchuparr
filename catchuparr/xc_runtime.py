@@ -29,6 +29,34 @@ _TS_SERVICES_LOCK = threading.Lock()
 _CURRENT_EDGE_MAX_AGE_SECONDS = 90
 
 
+class _PlaybackHeartbeatIterator:
+    """Refresh only the display heartbeat while successful TS bytes arrive."""
+
+    def __init__(self, iterator, heartbeat, interval: float = 30.0):
+        self.iterator = iterator
+        self.heartbeat = heartbeat
+        self.interval = interval
+        self.last_heartbeat = time.monotonic()
+        self.started = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        chunk = next(self.iterator)
+        now = time.monotonic()
+        if not self.started or now - self.last_heartbeat >= self.interval:
+            self.heartbeat(not self.started)
+            self.last_heartbeat = now
+            self.started = True
+        return chunk
+
+    def close(self):
+        close = getattr(self.iterator, "close", None)
+        if close is not None:
+            close()
+
+
 def install_xc_integration():
     """Install the inspected XC hooks in a Dispatcharr web process."""
     from version import __version__ as dispatcharr_version
@@ -290,6 +318,29 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
             range_header=getattr(request, "META", {}).get("HTTP_RANGE"),
             live=start <= datetime.now(timezone.utc) < end,
         )
+        if (
+            getattr(value, "status", None) in (200, 206)
+            and str(getattr(request, "method", "GET")).upper() == "GET"
+        ):
+            try:
+                from .stats import successful_playback
+
+                def heartbeat(first_chunk: bool):
+                    return successful_playback(
+                        user.id,
+                        str(channel.uuid),
+                        device_key,
+                        heartbeat=not first_chunk,
+                        playback_lease_id=getattr(value, "lease_id", None),
+                    )
+                from .ts_http import StreamingTSHTTPResponse
+
+                if isinstance(value, StreamingTSHTTPResponse):
+                    value.body = _PlaybackHeartbeatIterator(value.body, heartbeat)
+                elif getattr(value, "body", None):
+                    heartbeat(True)
+            except Exception:
+                pass
         return _to_django_response(value, timeshift_views)
 
     def authorize_xc_m3u(request, user):

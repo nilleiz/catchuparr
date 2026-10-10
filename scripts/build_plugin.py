@@ -21,6 +21,7 @@ REQUIRED_MODULES = (
     "logging_utils.py",
     "recorder_proxy.py",
     "runtime.py",
+    "stats.py",
     "tasks.py",
     "views.py",
     "security.py",
