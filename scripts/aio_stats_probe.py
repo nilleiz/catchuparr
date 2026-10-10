@@ -37,9 +37,17 @@ def _route(path: str):
     return resolve(path)
 
 
-def _assert_admin_route(path: str, name: str, is_admin) -> None:
+def _assert_native_route_match(match, namespace: str, name: str) -> None:
+    _require(
+        match.namespace == namespace,
+        f"Resolved route is outside native namespace {namespace}",
+    )
+    _require(match.url_name == name, f"Resolved route is not native {name}")
+
+
+def _assert_admin_route(path: str, namespace: str, name: str, is_admin) -> None:
     match = _route(path)
-    _require(match.url_name == name, f"Unexpected native Stats route for {path}")
+    _assert_native_route_match(match, namespace, name)
     view_class = getattr(match.func, "cls", None)
     _require(view_class is not None, f"{path} is not the registered DRF callback")
     permissions = tuple(getattr(view_class, "permission_classes", ()))
@@ -105,11 +113,18 @@ def _assert_hook_guards(stats) -> None:
     from apps.proxy.live_proxy import channel_status
     from apps.proxy.live_proxy import urls as live_urls
     from apps.timeshift import urls as timeshift_urls
+    from django.urls import reverse
 
     _require(stats.install_stats_hooks(), "Initial real Stats hook install failed")
     _require(stats.install_stats_hooks(), "Repeated real Stats hook install failed")
-    _assert_admin_route("/api/proxy/catchup/stats/", "catchup_stats", IsAdmin)
-    _assert_admin_route("/api/proxy/catchup/stop_client/", "catchup_stop_client", IsAdmin)
+    _assert_admin_route(
+        reverse("proxy:catchup:catchup_stats"),
+        "proxy:catchup", "catchup_stats", IsAdmin,
+    )
+    _assert_admin_route(
+        reverse("proxy:catchup:catchup_stop_client"),
+        "proxy:catchup", "catchup_stop_client", IsAdmin,
+    )
 
     stream_routes = [route for route in live_urls.urlpatterns if route.name == "stream"]
     _require(bool(stream_routes), "Native live stream route was not found")
@@ -293,14 +308,13 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
         "catchup": reverse("proxy:catchup:catchup_stats"),
         "stop": reverse("proxy:catchup:catchup_stop_client"),
     }
-    _require(native_paths == {
-        "combined": "/api/proxy/stats/",
-        "catchup": "/api/proxy/catchup/stats/",
-        "stop": "/api/proxy/catchup/stop_client/",
-    }, "Native Stats routes differ from the pinned AIO URLconf")
-    _assert_admin_route(native_paths["combined"], "combined_stats", IsAdmin)
-    _assert_admin_route(native_paths["catchup"], "catchup_stats", IsAdmin)
-    _assert_admin_route(native_paths["stop"], "catchup_stop_client", IsAdmin)
+    _assert_admin_route(native_paths["combined"], "proxy", "combined_stats", IsAdmin)
+    _assert_admin_route(
+        native_paths["catchup"], "proxy:catchup", "catchup_stats", IsAdmin,
+    )
+    _assert_admin_route(
+        native_paths["stop"], "proxy:catchup", "catchup_stop_client", IsAdmin,
+    )
 
     admin = User.objects.create_user(
         username="synthetic-stats-admin",

@@ -1,11 +1,24 @@
 """Focused assertions for native Stats integration probe helpers."""
 
 import unittest
+from types import SimpleNamespace
 
-from scripts.aio_stats_probe import _assert_archive_projection, stats_options_draft
+from scripts.aio_stats_probe import (
+    _assert_archive_projection,
+    _assert_native_route_match,
+    stats_options_draft,
+)
 
 
 class AIOStatsProbeTests(unittest.TestCase):
+    def test_native_route_identity_rejects_frontend_fallback(self):
+        native = SimpleNamespace(namespace="proxy:catchup", url_name="catchup_stats")
+        frontend = SimpleNamespace(namespace="", url_name="index")
+
+        _assert_native_route_match(native, "proxy:catchup", "catchup_stats")
+        with self.assertRaisesRegex(RuntimeError, "outside native namespace"):
+            _assert_native_route_match(frontend, "proxy:catchup", "catchup_stats")
+
     def test_archive_projection_adds_one_opaque_session_and_one_connection(self):
         native = {
             "timeshift_sessions": [{"session_id": "native-session"}],
