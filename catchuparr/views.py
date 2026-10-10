@@ -521,7 +521,14 @@ def archive_view(request):
             from .stats import successful_playback
 
             logical_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
-            successful_playback(user.id, channel, logical_key)
+            successful_playback(
+                user.id,
+                channel,
+                logical_key,
+                playback_lease_id=getattr(response, "playback_lease_id", None),
+                programme_start_epoch=start_epoch,
+                client_ip=(getattr(request, "META", {}) or {}).get("REMOTE_ADDR"),
+            )
         except Exception:
             pass
     finish(response, _playlist_trace_reason(response))
@@ -691,7 +698,13 @@ def segment_view(request, channel_id: str, segment_id: str):
             from .stats import successful_playback
 
             logical_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
-            successful_playback(user.id, channel_id, logical_key)
+            successful_playback(
+                user.id,
+                channel_id,
+                logical_key,
+                playback_lease_id=getattr(response, "playback_lease_id", None),
+                client_ip=(getattr(request, "META", {}) or {}).get("REMOTE_ADDR"),
+            )
         except Exception:
             pass
     segment_start = segment_end = None

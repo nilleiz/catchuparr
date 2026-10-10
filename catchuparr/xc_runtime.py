@@ -46,7 +46,12 @@ class _PlaybackHeartbeatIterator:
         chunk = next(self.iterator)
         now = time.monotonic()
         if not self.started or now - self.last_heartbeat >= self.interval:
-            self.heartbeat(not self.started)
+            try:
+                self.heartbeat(not self.started)
+            except Exception:
+                # Stats is an optional display projection. A transient local
+                # database failure must never interrupt archive media bytes.
+                logger.warning("Archive playback Stats heartbeat failed; continuing playback")
             self.last_heartbeat = now
             self.started = True
         return chunk
@@ -332,6 +337,8 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
                         device_key,
                         heartbeat=not first_chunk,
                         playback_lease_id=getattr(value, "lease_id", None),
+                        programme_start_epoch=start.timestamp(),
+                        client_ip=(getattr(request, "META", {}) or {}).get("REMOTE_ADDR"),
                     )
                 from .ts_http import StreamingTSHTTPResponse
 

@@ -59,6 +59,16 @@ class XCRuntimeTests(unittest.TestCase):
         self.assertEqual(b"next", next(stream))
         self.assertEqual([True, False], calls)
 
+    def test_stats_heartbeat_failure_does_not_interrupt_archive_bytes(self):
+        def failed_heartbeat(_first_chunk):
+            raise OSError("local projection unavailable")
+
+        stream = _PlaybackHeartbeatIterator(iter((b"first", b"next")), failed_heartbeat, 0)
+        with patch("catchuparr.xc_runtime.logger.warning") as warning:
+            self.assertEqual(b"first", next(stream))
+            self.assertEqual(b"next", next(stream))
+        self.assertEqual(2, warning.call_count)
+
     def test_streaming_local_response_runs_core_db_connection_finalizer(self):
         class FakeStreamingHttpResponse(dict):
             def __init__(self, streaming_content, *, status):
