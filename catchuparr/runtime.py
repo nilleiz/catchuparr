@@ -437,17 +437,6 @@ def status(settings: dict, *, control_state=None) -> dict:
     config = parse_settings(settings)
     store = ArchiveStore(config.archive_root)
     try:
-        from apps.channels.models import Channel
-
-        names = {
-            str(uuid): name
-            for uuid, name in Channel.objects.filter(uuid__in=config.channel_uuids).values_list(
-                "uuid", "name"
-            )
-        }
-    except Exception:
-        names = {}
-    try:
         from core.utils import RedisClient
 
         redis = RedisClient.get_client()
@@ -470,19 +459,45 @@ def status(settings: dict, *, control_state=None) -> dict:
             config = parse_settings(settings)
             store = ArchiveStore(config.archive_root)
             control_state = None
+    try:
+        from apps.channels.models import Channel
+
+        names = {
+            str(uuid): name
+            for uuid, name in Channel.objects.filter(uuid__in=config.channel_uuids).values_list(
+                "uuid", "name"
+            )
+        }
+    except Exception:
+        names = {}
     schedule_config = settings.get("recording_schedule", {})
     timezone_name = schedule_config.get("timezone") if isinstance(schedule_config, dict) else None
     schedules = schedule_config.get("channels") if isinstance(schedule_config, dict) else None
+    now = datetime.now(timezone.utc)
+    archive_metrics = store.status_metrics(config.channel_uuids, now=now)
+    active_recorders = None
+    try:
+        from celery import current_app
+
+        active_recorders = set()
+        inspector = current_app.control.inspect(timeout=1.0)
+        active_tasks = inspector.active()
+        if active_tasks is None:
+            active_recorders = None
+        else:
+            for task_list in active_tasks.values():
+                for task in task_list:
+                    if task.get("name") != "catchuparr.record_channel":
+                        continue
+                    args = task.get("args", [])
+                    if args:
+                        active_recorders.add(str(args[0]))
+    except Exception:
+        active_recorders = None
     channels = []
     for channel in config.channel_uuids:
-        stats = store.channel_stats(channel)
-        if redis is None:
-            recorder_running = None
-        else:
-            try:
-                recorder_running = bool(redis.exists(f"catchuparr:recorder:{channel}"))
-            except Exception:
-                recorder_running = None
+        stats = archive_metrics["channels"][channel]
+        recorder_running = None if active_recorders is None else channel in active_recorders
         channel_status = {
             "uuid": channel,
             "name": names.get(channel),
@@ -493,10 +508,28 @@ def status(settings: dict, *, control_state=None) -> dict:
             try:
                 schedule = schedule_from_snapshot(schedules[channel])
                 channel_status["recording_scheduled"] = schedule_is_active(
-                    schedule, timezone_name, datetime.now(timezone.utc)
+                    schedule, timezone_name, now
                 )
             except (KeyError, ScheduleError, ValueError):
                 channel_status["recording_scheduled"] = None
+        else:
+            channel_status["recording_scheduled"] = None
+        if control_state is None:
+            channel_status["recorder_reason"] = "error_control_state_unavailable"
+        elif control_state.paused or type(settings.get("version")) is not int:
+            channel_status["recorder_reason"] = "paused"
+        elif channel_status["recording_scheduled"] is False:
+            channel_status["recorder_reason"] = "outside_schedule"
+        elif channel_status["recording_scheduled"] is None:
+            channel_status["recorder_reason"] = "error_schedule_unavailable"
+        elif recorder_running is None:
+            channel_status["recorder_reason"] = "error_recorder_state_unavailable"
+        elif recorder_running:
+            channel_status["recorder_reason"] = "running"
+        elif redis is None:
+            channel_status["recorder_reason"] = "error_redis_unavailable"
+        else:
+            channel_status["recorder_reason"] = "eligible"
         channels.append(channel_status)
     from .configuration import configuration_reset_required
 
@@ -506,6 +539,10 @@ def status(settings: dict, *, control_state=None) -> dict:
         "retention_hours": config.retention_hours,
         "max_storage_bytes": config.max_storage_bytes,
         "indexed_storage_bytes": store.indexed_size_bytes(),
+        "archive_storage_bytes": archive_metrics["archive_storage_bytes"],
+        "selected_channel_count": len(config.channel_uuids),
+        "running_recorder_count": (sum(channel["recorder_running"] is True for channel in channels)
+                                    if active_recorders is not None else None),
         "recording_control_available": control_state is not None,
     }
     if control_state is not None:
@@ -519,6 +556,15 @@ def status(settings: dict, *, control_state=None) -> dict:
         )
     elif not config.channel_uuids:
         result["configuration_status"] = "No channels are selected. Validate and apply filter_config."
+    running_count = result["running_recorder_count"]
+    running_text = "unknown" if running_count is None else str(running_count)
+    state_text = "in an unknown state" if running_count is None else "running" if running_count else "stopped"
+    result["message"] = (
+        f"Catchuparr is {state_text}: "
+        f"{running_text} of {len(channels)} selected channels recording; "
+        f"archive uses {archive_metrics['archive_storage_bytes'] / 1024**3:.2f} GiB of "
+        f"{config.max_storage_bytes / 1024**3:.2f} GiB."
+    )
     return result
 
 
