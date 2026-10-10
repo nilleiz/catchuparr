@@ -48,6 +48,47 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertEqual(1, stats["discontinuities"])
         self.assertEqual(first.path.stat().st_size * 2, self.store.indexed_size_bytes())
 
+    def test_status_metrics_measure_whole_archive_and_usable_channel_history(self):
+        first = self.add(0)
+        self.add(6)
+        self.add(18)
+        former = self.store.add_segment(
+            "former-channel", self.source,
+            self.base, self.base + timedelta(seconds=6),
+        )
+        total_before_link = self.store.status_metrics(["channel-1"])["archive_storage_bytes"]
+        outside = self.root / "outside.ts"
+        outside.write_bytes(b"private synthetic outside file")
+        (self.store.root / "outside-link").symlink_to(outside)
+        metrics = self.store.status_metrics(
+            ["channel-1"], now=self.base + timedelta(hours=5, minutes=7)
+        )
+
+        self.assertGreaterEqual(metrics["archive_storage_bytes"], first.path.stat().st_size * 4)
+        self.assertEqual(total_before_link, metrics["archive_storage_bytes"])
+        history = metrics["channels"]["channel-1"]
+        self.assertEqual("5h7m", history["history"])
+        self.assertEqual(first.start_utc.isoformat(), history["oldest_start_utc"])
+        self.assertEqual((self.base + timedelta(seconds=24)).isoformat(), history["latest_end_utc"])
+        self.assertEqual(1, len(history["gaps"]))
+        self.assertEqual(3, history["segments"])
+        self.assertEqual(former.path.stat().st_size, self.store.status_metrics(["former-channel"])["channels"]["former-channel"]["size_bytes"])
+
+    def test_status_metrics_do_not_count_missing_or_external_symlink_segments(self):
+        segment = self.add(0)
+        before = self.store.status_metrics(["channel-1"])["archive_storage_bytes"]
+        outside = self.root / "outside.ts"
+        outside.write_bytes(b"synthetic external file")
+        file_size = segment.path.stat().st_size
+        segment.path.unlink()
+        segment.path.symlink_to(outside)
+
+        metrics = self.store.status_metrics(["channel-1"])
+
+        self.assertEqual(0, metrics["channels"]["channel-1"]["segments"])
+        self.assertIsNone(metrics["channels"]["channel-1"]["oldest_start_utc"])
+        self.assertEqual(before - file_size, metrics["archive_storage_bytes"])
+
     def test_coverage_merges_adjacent_segments_and_reports_gaps(self):
         self.add(0)
         self.add(6)
