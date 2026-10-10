@@ -207,6 +207,8 @@ class ConfigurationTests(unittest.TestCase):
             ("log_level", "TRACE"),
             ("public_base_url", None),
             ("public_base_url", "https://user:pass@media.example.test"),
+            ("show_archive_playback_in_stats", "false"),
+            ("hide_recorders_in_stats", 1),
         ):
             with self.subTest(key=key, value=value):
                 document = json.loads(json.dumps(valid_document))
@@ -217,6 +219,44 @@ class ConfigurationTests(unittest.TestCase):
                 self.active_path.write_text(json.dumps(document), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, key):
                     load_active_configuration(self.active_path)
+
+    def test_stats_settings_default_true_and_change_only_through_apply(self):
+        applied = apply_configuration(self.settings, self.catalog, self.active_path)
+        self.assertTrue(applied["applied"])
+        active = load_active_configuration(self.active_path)
+        self.assertTrue(active["show_archive_playback_in_stats"])
+        self.assertTrue(active["hide_recorders_in_stats"])
+
+        for show_archive in (False, True):
+            for hide_recorders in (False, True):
+                with self.subTest(show_archive=show_archive, hide_recorders=hide_recorders):
+                    result = apply_configuration(
+                        dict(
+                            self.settings,
+                            show_archive_playback_in_stats=show_archive,
+                            hide_recorders_in_stats=hide_recorders,
+                        ),
+                        self.catalog,
+                        self.active_path,
+                    )
+                    self.assertTrue(result["applied"])
+                    active = load_active_configuration(self.active_path)
+                    self.assertEqual(
+                        show_archive,
+                        active["show_archive_playback_in_stats"],
+                    )
+                    self.assertEqual(
+                        hide_recorders,
+                        active["hide_recorders_in_stats"],
+                    )
+
+        # Existing valid v4 snapshots predate these optional fields and remain
+        # valid until the next successful unified Apply.
+        legacy = json.loads(self.active_path.read_text(encoding="utf-8"))
+        legacy["settings"].pop("show_archive_playback_in_stats")
+        legacy["settings"].pop("hide_recorders_in_stats")
+        self.active_path.write_text(json.dumps(legacy), encoding="utf-8")
+        self.assertIsNotNone(load_active_configuration(self.active_path))
 
     def test_archive_root_apply_preserves_old_archive_without_copying_or_deleting(self):
         old_root = Path(self.settings["archive_root"])
@@ -914,6 +954,8 @@ class ConfigurationTests(unittest.TestCase):
         snapshot["settings"].pop("recording_enabled")
         snapshot["settings"].pop("log_level")
         snapshot["settings"].pop("public_base_url")
+        snapshot["settings"].pop("show_archive_playback_in_stats")
+        snapshot["settings"].pop("hide_recorders_in_stats")
         self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
 
         active = load_active_configuration(self.active_path)
@@ -928,6 +970,8 @@ class ConfigurationTests(unittest.TestCase):
         snapshot["version"] = 2
         snapshot.pop("recording_schedule")
         snapshot["settings"].pop("recording_enabled")
+        snapshot["settings"].pop("show_archive_playback_in_stats")
+        snapshot["settings"].pop("hide_recorders_in_stats")
         snapshot["settings"].pop("log_level")
         snapshot["settings"].pop("public_base_url")
         self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")

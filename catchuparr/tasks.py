@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import secrets
 import threading
 from datetime import datetime, timedelta, timezone
 
 from celery import shared_task
+
+logger = logging.getLogger(__name__)
+RECORDER_CAPABILITY_HEADER = "X-Catchuparr-Recorder"
+RECORDER_CAPABILITY_TTL_SECONDS = 30
+
+
+def _issue_recorder_capability(redis, channel_uuid: str, fence: int, owner: str):
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    key = f"catchuparr:recorder:stats-cap:{digest}"
+    value = f"{channel_uuid}|{int(fence)}:{owner}"
+    if not redis.set(key, value, ex=RECORDER_CAPABILITY_TTL_SECONDS, nx=True):
+        raise RuntimeError("Unable to register recorder identity capability")
+    return key, token, digest
 
 
 @shared_task(name="catchuparr.reconcile")
@@ -168,6 +185,8 @@ def record_channel(
     fence = lease.acquire()
     if fence is None:
         return {"status": "already_running"}
+    stats_capability_key = None
+    stats_capability_digest = None
     stop_event = None
     monitor = None
     attempt_state_lock = threading.Lock()
@@ -189,6 +208,13 @@ def record_channel(
         # Dispatcharr's DVR helper accounts for modular and AIO deployments.
         proxy_base_url = get_dvr_stream_base_url().rstrip("/")
         proxy_url = f"{proxy_base_url}/proxy/ts/stream/{channel_uuid}"
+        stats_capability_key, stats_capability, stats_capability_digest = (
+            _issue_recorder_capability(redis, channel_uuid, fence, lease.owner)
+        )
+        shared_input_headers = (
+            {RECORDER_CAPABILITY_HEADER: stats_capability}
+            if candidates is None else None
+        )
 
         def supervise():
             while not stop_event.wait(10):
@@ -201,6 +227,15 @@ def record_channel(
                     ):
                         stop_event.set()
                         return
+                    if stats_capability_key is not None:
+                        if not redis.expire(
+                            stats_capability_key, RECORDER_CAPABILITY_TTL_SECONDS
+                        ):
+                            stop_event.set()
+                            return
+                        from .stats import refresh_recorder_markers
+
+                        refresh_recorder_markers(redis, stats_capability_digest)
                     current_active = current_admission["active"]
                     with attempt_state_lock:
                         current_attempt = attempt_state["attempt"]
@@ -234,6 +269,7 @@ def record_channel(
             recorder = FFmpegCopyRecorder(
                 store, channel_uuid, proxy_url, config.archive_root / "work",
                 fencing_token=fence,
+                input_headers=shared_input_headers,
                 on_error=lambda _message: error("recorder_worker_stopped"),
             )
             recorder.run_forever(stop_event)
@@ -269,7 +305,10 @@ def record_channel(
                     attempt.input_url,
                     config.archive_root / "work",
                     fencing_token=fence,
-                    input_headers=attempt.input_headers,
+                    input_headers={
+                        **attempt.input_headers,
+                        "X-Catchuparr-Stats-Recorder": stats_capability,
+                    },
                     require_media_progress=True,
                 )
                 if index:
@@ -305,6 +344,11 @@ def record_channel(
             if monitor is not None and monitor.ident is not None:
                 monitor.join(timeout=12)
         finally:
+            if stats_capability_key is not None:
+                try:
+                    redis.delete(stats_capability_key)
+                except Exception:
+                    logger.exception("Unable to remove recorder identity capability")
             lease.release()
     return {"status": "stopped"}
 

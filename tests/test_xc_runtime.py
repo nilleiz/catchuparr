@@ -22,6 +22,7 @@ from catchuparr.xc_runtime import (
     _active_hls_session_count,
     _local_playback_window,
     _make_callbacks,
+    _PlaybackHeartbeatIterator,
     _to_django_response,
     _xc_session_keys,
     active_ts_session_count,
@@ -49,6 +50,15 @@ class _FakeResponse(dict):
 
 
 class XCRuntimeTests(unittest.TestCase):
+    def test_playback_heartbeat_marks_initial_lease_then_subsequent_heartbeat(self):
+        calls = []
+        stream = _PlaybackHeartbeatIterator(
+            iter((b"first", b"next")), calls.append, interval=0
+        )
+        self.assertEqual(b"first", next(stream))
+        self.assertEqual(b"next", next(stream))
+        self.assertEqual([True, False], calls)
+
     def test_streaming_local_response_runs_core_db_connection_finalizer(self):
         class FakeStreamingHttpResponse(dict):
             def __init__(self, streaming_content, *, status):

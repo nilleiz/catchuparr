@@ -364,6 +364,13 @@ def bootstrap() -> None:
                 event("runtime_disabled", logging.WARNING, reason="xc_hooks")
         except Exception:
             error("xc_install_failed")
+        try:
+            from .stats import install_stats_hooks
+
+            if not install_stats_hooks():
+                event("runtime_disabled", logging.WARNING, reason="stats_hooks")
+        except Exception:
+            error("stats_hook_install_failed")
     try:
         _ensure_schedule()
     except Exception:
@@ -396,6 +403,13 @@ def _ensure_schedule() -> None:
 def shutdown() -> None:
     from .logging_utils import error, event
 
+    try:
+        from .stats import uninstall_stats_hooks
+
+        if not uninstall_stats_hooks():
+            event("runtime_disabled", logging.WARNING, reason="stats_uninstall")
+    except Exception:
+        error("stats_hook_uninstall_failed")
     try:
         from .xc_runtime import uninstall_xc_integration
 
