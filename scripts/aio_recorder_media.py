@@ -19,6 +19,40 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _current_orm_context_snapshot() -> dict[str, object]:
+    """Return only connection counts and transaction booleans for this context."""
+    try:
+        from django.db import connections
+
+        wrappers = connections.all()
+        initialized = connections.all(initialized_only=True)
+        default = next(
+            (wrapper for wrapper in wrappers if wrapper.alias == "default"), None,
+        )
+        default_initialized = bool(default is not None and default.connection is not None)
+        default_autocommit = None
+        if default_initialized:
+            try:
+                default_autocommit = bool(default.get_autocommit())
+            except Exception:
+                default_autocommit = None
+        return {
+            "wrapper_count": len(wrappers),
+            "initialized_count": len(initialized),
+            "default_initialized": default_initialized,
+            "default_in_atomic_block": bool(default and default.in_atomic_block),
+            "default_autocommit": default_autocommit,
+        }
+    except Exception:
+        return {
+            "wrapper_count": 0,
+            "initialized_count": 0,
+            "default_initialized": False,
+            "default_in_atomic_block": False,
+            "default_autocommit": None,
+        }
+
+
 def _issue_media_probe_attempt(
     redis_client,
     lease,
@@ -2364,6 +2398,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     profile_baselines = {}
     marker_baselines = {}
     cleanup_errors = []
+    cleanup_exception_types = []
+    primary_exception = None
 
     try:
         payload_a = _make_paced_transport_stream(
@@ -2829,9 +2865,26 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             _native_source_metadata(redis_client, metadata_key) == source_metadata,
             "Archive B changed native live A source metadata",
         )
+        try:
+            current_assignment_rows = list(
+                ChannelStream.objects.filter(channel=channel).order_by("order", "id")
+                .values_list("stream_id", "order")
+            )
+        except BaseException as error:
+            print(
+                "CATCHUPARR_DB_CONTEXT_DIAGNOSTIC "
+                + json.dumps(
+                    {
+                        "operation": "native_assignment_read",
+                        "exception_type": type(error).__name__,
+                        "db_context": _current_orm_context_snapshot(),
+                    },
+                    sort_keys=True,
+                )
+            )
+            raise
         _require(
-            list(ChannelStream.objects.filter(channel=channel).order_by("order", "id")
-                 .values_list("stream_id", "order")) == assignment_rows,
+            current_assignment_rows == assignment_rows,
             "Archive B reordered native ChannelStream rows",
         )
         active_records = [
@@ -3087,6 +3140,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Live/archive probe changed native ChannelStream rows",
         )
         print("AIO native live A remained isolated while the real recorder indexed B")
+    except BaseException as error:
+        primary_exception = error
+        raise
     finally:
         # On a startup failure, freeze the observed state before cleanup
         # changes Redis keys or native worker state. The successful path has
@@ -3257,13 +3313,28 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     channel.delete()
                 for channel_profile in created_channel_profiles:
                     channel_profile.delete()
-            except Exception:
+            except Exception as error:
                 cleanup_errors.append("synthetic-database-rows")
+                cleanup_exception_types.append(type(error).__name__)
         if not cleanup_errors:
             shutil.rmtree(archive_root, ignore_errors=True)
         shutil.rmtree(fixture_root, ignore_errors=True)
         if cleanup_errors:
             details = ", ".join(sorted(set(cleanup_errors)))
-            raise RuntimeError(
-                f"Synthetic live/archive isolation cleanup was incomplete ({details})"
-            )
+            cleanup_diagnostic = {
+                "cleanup_stages": sorted(set(cleanup_errors)),
+                "cleanup_exception_types": sorted(set(cleanup_exception_types)),
+                "db_context": _current_orm_context_snapshot(),
+            }
+            if primary_exception is not None:
+                cleanup_diagnostic["primary_exception_type"] = type(primary_exception).__name__
+                print(
+                    "CATCHUPARR_CLEANUP_AFTER_PRIMARY_FAILURE "
+                    + json.dumps(cleanup_diagnostic, sort_keys=True)
+                )
+            else:
+                raise RuntimeError(
+                    "Synthetic live/archive isolation cleanup was incomplete "
+                    f"({details}); "
+                    + json.dumps(cleanup_diagnostic, sort_keys=True)
+                )
