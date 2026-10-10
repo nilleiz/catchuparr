@@ -339,7 +339,7 @@ class ArchiveStore:
                 chunk = selected[offset:offset + 500]
                 placeholders = ",".join("?" for _ in chunk)
                 rows.extend(db.execute(
-                    "SELECT channel_id, relpath, start_utc, end_utc, discontinuity FROM segments "
+                    "SELECT channel_id, relpath, start_utc, end_utc, discontinuity, size_bytes FROM segments "
                     f"WHERE channel_id IN ({placeholders}) ORDER BY channel_id,start_utc,end_utc",
                     chunk,
                 ).fetchall())
@@ -357,6 +357,8 @@ class ArchiveStore:
             try:
                 file_size = resolved.stat().st_size
             except OSError:
+                continue
+            if file_size <= 0 or file_size != int(row["size_bytes"]):
                 continue
             timelines[channel].append(
                 (float(row["start_utc"]), float(row["end_utc"]), file_size, int(row["discontinuity"]))

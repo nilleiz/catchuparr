@@ -89,6 +89,30 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertIsNone(metrics["channels"]["channel-1"]["oldest_start_utc"])
         self.assertEqual(before - file_size, metrics["archive_storage_bytes"])
 
+    def test_status_history_skips_empty_and_truncated_indexed_files(self):
+        empty_source = self.root / "empty.ts"
+        empty_source.write_bytes(b"")
+        empty = self.store.add_segment(
+            "channel-1", empty_source,
+            self.base - timedelta(hours=3), self.base - timedelta(hours=2, minutes=59),
+        )
+        truncated = self.add(-7200)
+        truncated.path.write_bytes(b"x")
+        usable = self.store.add_segment(
+            "channel-1", self.source,
+            self.base - timedelta(hours=1), self.base,
+        )
+
+        metrics = self.store.status_metrics(["channel-1"], now=self.base)
+        history = metrics["channels"]["channel-1"]
+
+        self.assertTrue(empty.path.exists())
+        self.assertEqual("1h0m", history["history"])
+        self.assertEqual(usable.start_utc.isoformat(), history["oldest_start_utc"])
+        self.assertEqual(usable.end_utc.isoformat(), history["latest_end_utc"])
+        self.assertEqual(1, history["segments"])
+        self.assertEqual(self.source.stat().st_size, history["size_bytes"])
+
     def test_coverage_merges_adjacent_segments_and_reports_gaps(self):
         self.add(0)
         self.add(6)
