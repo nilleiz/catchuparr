@@ -2,8 +2,10 @@
 
 import ast
 import sqlite3
+import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +21,7 @@ from scripts.aio_stats_probe import (
 
 
 class AIOStatsProbeTests(unittest.TestCase):
-    def test_stats_viewer_projection_releases_current_context_orm_connection(self):
+    def test_stats_projection_uses_real_safe_database_release_guards(self):
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "archive.sqlite3"
             with sqlite3.connect(database) as db:
@@ -34,20 +36,90 @@ class AIOStatsProbeTests(unittest.TestCase):
                     ),
                 )
 
+            class FakeConnection:
+                def __init__(
+                    self,
+                    alias="default",
+                    *,
+                    opened=True,
+                    in_atomic_block=False,
+                    autocommit=True,
+                    close_error=False,
+                ):
+                    self.alias = alias
+                    self.connection = object() if opened else None
+                    self.in_atomic_block = in_atomic_block
+                    self.autocommit = autocommit
+                    self.close_error = close_error
+                    self.close_calls = 0
+
+                def get_autocommit(self):
+                    return self.autocommit
+
+                def close(self):
+                    self.close_calls += 1
+                    if self.close_error:
+                        raise RuntimeError("synthetic close failure")
+                    self.connection = None
+
+            class FakeConnections:
+                def __init__(self, values):
+                    self.values = values
+                    self.all_calls = []
+
+                def all(self, *, initialized_only=False):
+                    self.all_calls.append(initialized_only)
+                    if initialized_only:
+                        return [value for value in self.values if value.connection is not None]
+                    return self.values
+
             options = {
                 "show_archive_playback_in_stats": True,
                 "hide_recorders_in_stats": True,
             }
-            with (
-                patch.object(stats, "_options", return_value=options),
-                patch.object(stats, "_db_path", return_value=database),
-                patch.object(stats, "_viewer_row", return_value={"session_id": "ca_synthetic"}),
-                patch("catchuparr.recorder_proxy._close_database_connections") as close_db,
-            ):
-                rows = stats._active_viewers()
+            cases = (
+                ("success", FakeConnection(), False, [{"session_id": "ca_synthetic"}], 1),
+                ("query_error", FakeConnection(), True, [], 1),
+                ("atomic", FakeConnection(in_atomic_block=True), False,
+                 [{"session_id": "ca_synthetic"}], 0),
+                ("manual", FakeConnection(autocommit=False), False,
+                 [{"session_id": "ca_synthetic"}], 0),
+                ("other_alias", FakeConnection(alias="analytics"), False,
+                 [{"session_id": "ca_synthetic"}], 0),
+                ("unopened", FakeConnection(opened=False), False,
+                 [{"session_id": "ca_synthetic"}], 0),
+                ("close_error", FakeConnection(close_error=True), False,
+                 [{"session_id": "ca_synthetic"}], 1),
+            )
 
-        self.assertEqual(rows, [{"session_id": "ca_synthetic"}])
-        close_db.assert_called_once_with()
+            for name, default, query_error, expected_rows, expected_closes in cases:
+                with self.subTest(name=name):
+                    connections = FakeConnections([default])
+                    django_module = types.ModuleType("django")
+                    django_module.__path__ = []
+                    django_db_module = types.ModuleType("django.db")
+                    django_db_module.connections = connections
+                    django_module.db = django_db_module
+
+                    def viewer_row(_row):
+                        if query_error:
+                            raise sqlite3.OperationalError("synthetic metadata query failure")
+                        return {"session_id": "ca_synthetic"}
+
+                    with (
+                        patch.dict(sys.modules, {
+                            "django": django_module,
+                            "django.db": django_db_module,
+                        }),
+                        patch.object(stats, "_options", return_value=options),
+                        patch.object(stats, "_db_path", return_value=database),
+                        patch.object(stats, "_viewer_row", side_effect=viewer_row),
+                    ):
+                        rows = stats._active_viewers()
+
+                    self.assertEqual(rows, expected_rows)
+                    self.assertEqual(default.close_calls, expected_closes)
+                    self.assertEqual(connections.all_calls, [True])
 
     def test_auth_diagnostic_is_boolean_only_and_never_contains_token(self):
         token = "synthetic-secret-token"
