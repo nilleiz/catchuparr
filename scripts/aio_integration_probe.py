@@ -596,15 +596,9 @@ def probe():
         finally:
             result.close()
 
-    require(xc_playback(start.timestamp()) == b"\x47" + bytes(187))
-    require(xc_playback((start + timedelta(seconds=6)).timestamp())
-            == b"\x47" + bytes([1]) * 187, "Timestamp seek must reset byte origin")
-    require(xc_playback(closed_start.timestamp(), closed_channel.id)
-            == b"\x47" + bytes([2]) * 187,
-            "Completed minute must not require five extra minutes of archive")
-    require(xc_playback(closed_start.timestamp(), closed_channel.id, duration=None)
-            == b"\x47" + bytes([2]) * 187,
-            "Missing duration must use the actual EPG end from core helpers")
+    # Run Stats' HLS admission while the synthetic one-slot user has no
+    # outstanding native TS session.  The later XC checks intentionally open
+    # a live session, which correctly occupies that same stream-limit slot.
     sys.path.insert(0, "/tmp")
     from aio_stats_probe import probe_actual_stats
 
@@ -618,6 +612,16 @@ def probe():
         params=params,
         xc_playback=xc_playback,
     )
+
+    require(xc_playback(start.timestamp()) == b"\x47" + bytes(187))
+    require(xc_playback((start + timedelta(seconds=6)).timestamp())
+            == b"\x47" + bytes([1]) * 187, "Timestamp seek must reset byte origin")
+    require(xc_playback(closed_start.timestamp(), closed_channel.id)
+            == b"\x47" + bytes([2]) * 187,
+            "Completed minute must not require five extra minutes of archive")
+    require(xc_playback(closed_start.timestamp(), closed_channel.id, duration=None)
+            == b"\x47" + bytes([2]) * 187,
+            "Missing duration must use the actual EPG end from core helpers")
     bad_credentials = dict(xc_params, password="invalid", **{time_key: str(int(start.timestamp()))})
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", bad_credentials,
