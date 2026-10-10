@@ -292,6 +292,7 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
 
     from apps.accounts.models import User
     from apps.plugins.models import PluginConfig
+    from apps.proxy.utils import get_user_active_connections
     from core.utils import RedisClient
     from django.urls import reverse
     from rest_framework.test import APIClient
@@ -299,6 +300,7 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     from catchuparr import runtime, stats
     from catchuparr import views as archive_views
     from catchuparr.stats import DISPLAY_ID_PREFIX
+    from catchuparr.xc_runtime import _active_hls_session_count, active_ts_session_count
 
     _assert_hook_guards(stats)
     from apps.accounts.permissions import IsAdmin
@@ -336,11 +338,20 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     # viewer; fixed synthetic request metadata is asserted from the plugin DB.
     previous_active_ids = [row["session_id"] for row in stats._active_viewers()]
     selected = dict(params, channel_id=str(channel.uuid))
+    active_ts = active_ts_session_count(root, user.id)
+    active_hls = _active_hls_session_count(root, user.id)
+    native_connections = len(get_user_active_connections(user.id))
     playback_request = request(
         "/catchuparr/archive", selected, REMOTE_ADDR="198.51.100.41",
     )
     playlist = archive_views.archive_view(playback_request)
-    _require(playlist.status_code == 200, "Synthetic HLS playlist did not return 200")
+    _require(
+        playlist.status_code == 200,
+        "Synthetic HLS playlist returned HTTP "
+        f"{playlist.status_code}; fixture active_ts={active_ts}, "
+        f"active_hls={active_hls}, native_connections={native_connections}, "
+        f"stream_limit={user.stream_limit}",
+    )
     playlist_url = next(
         line for line in playlist.content.decode().splitlines()
         if line and not line.startswith("#")

@@ -1,6 +1,8 @@
 """Focused assertions for native Stats integration probe helpers."""
 
+import ast
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.aio_stats_probe import (
@@ -11,6 +13,30 @@ from scripts.aio_stats_probe import (
 
 
 class AIOStatsProbeTests(unittest.TestCase):
+    def test_hls_admission_probe_precedes_one_slot_live_xc_fixtures(self):
+        source = Path(__file__).resolve().parents[1] / "scripts/aio_integration_probe.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        probe = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "probe"
+        )
+        stats_call = next(
+            node.lineno for node in probe.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "probe_actual_stats"
+        )
+        xc_calls = [
+            node.lineno for node in ast.walk(probe)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "xc_playback"
+        ]
+
+        self.assertTrue(xc_calls)
+        self.assertLess(stats_call, min(xc_calls))
+
     def test_native_route_identity_rejects_frontend_fallback(self):
         native = SimpleNamespace(namespace="proxy:catchup", url_name="catchup_stats")
         frontend = SimpleNamespace(namespace="", url_name="index")
