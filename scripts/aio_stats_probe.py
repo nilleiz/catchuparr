@@ -20,6 +20,47 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _execution_context_key():
+    """Return an in-memory thread/greenlet identity without exposing it."""
+    from threading import get_ident
+
+    try:
+        from greenlet import getcurrent
+    except ImportError:
+        greenlet = None
+    else:
+        greenlet = getcurrent()
+    return get_ident(), greenlet
+
+
+class _NativeBasicProjectionCapture:
+    """Capture the real projection input only in the originating request context."""
+
+    def __init__(self, delegate, channel_id: str):
+        self.delegate = delegate
+        self.channel_id = str(channel_id)
+        self.context_key = _execution_context_key()
+        self.samples = []
+
+    def __call__(self, module, observed_channel, native_info):
+        result = self.delegate(module, observed_channel, native_info)
+        if (
+            _execution_context_key() == self.context_key
+            and str(observed_channel) == self.channel_id
+            and isinstance(native_info, dict)
+        ):
+            native_ids = {
+                str(item.get("client_id")) for item in native_info.get("clients", [])
+                if isinstance(item, dict) and item.get("client_id") is not None
+            }
+            projected_ids = {
+                str(item.get("client_id")) for item in result.get("clients", [])
+                if isinstance(item, dict) and item.get("client_id") is not None
+            } if isinstance(result, dict) else set()
+            self.samples.append((native_ids, projected_ids))
+        return result
+
+
 def stats_options_draft(settings: dict, *, show_archive: bool | None = None,
                         hide_recorders: bool | None = None) -> dict:
     """Copy a full recorder fixture and update only requested Stats flags."""
@@ -645,25 +686,13 @@ def probe_actual_recorder_stats(*, channel_id, redis_client, native_server,
 
         from django.urls import reverse
 
-        native_projection_samples = []
         original_visible_basic = stats._visible_basic_channel_info
-
-        def observe_native_projection(module, observed_channel, native_info):
-            result = original_visible_basic(module, observed_channel, native_info)
-            if str(observed_channel) == channel_key and isinstance(native_info, dict):
-                native_ids = {
-                    str(item.get("client_id")) for item in native_info.get("clients", [])
-                    if isinstance(item, dict) and item.get("client_id") is not None
-                }
-                projected_ids = {
-                    str(item.get("client_id")) for item in result.get("clients", [])
-                    if isinstance(item, dict) and item.get("client_id") is not None
-                } if isinstance(result, dict) else set()
-                native_projection_samples.append((native_ids, projected_ids))
-            return result
+        projection_capture = _NativeBasicProjectionCapture(
+            original_visible_basic, channel_key
+        )
 
         with mock.patch.object(
-            stats, "_visible_basic_channel_info", side_effect=observe_native_projection
+            stats, "_visible_basic_channel_info", side_effect=projection_capture
         ):
             response = client.get(reverse("proxy:combined_stats"))
         payload = _response_payload(response)
@@ -671,9 +700,9 @@ def probe_actual_recorder_stats(*, channel_id, redis_client, native_server,
         row = next((item for item in channels
                     if str(item.get("channel_id")) == channel_key), None)
         _require(isinstance(row, dict), "Native combined Stats omitted the synthetic channel")
-        _require(bool(native_projection_samples),
-                 "Native combined Stats did not pass through the live recorder filter")
-        native_top, projected_ids = native_projection_samples[-1]
+        _require(len(projection_capture.samples) == 1,
+                 "Native combined Stats did not produce exactly one request-context projection")
+        native_top, projected_ids = projection_capture.samples[0]
         visible = {
             str(item.get("client_id")) for item in row.get("clients", [])
             if isinstance(item, dict)

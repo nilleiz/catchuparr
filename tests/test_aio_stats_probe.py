@@ -4,6 +4,7 @@ import ast
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -15,12 +16,45 @@ from catchuparr import runtime, stats
 from scripts.aio_stats_probe import (
     _assert_archive_projection,
     _assert_native_route_match,
+    _NativeBasicProjectionCapture,
     _playback_auth_diagnostics,
     stats_options_draft,
 )
 
 
 class AIOStatsProbeTests(unittest.TestCase):
+    def test_native_projection_capture_ignores_background_same_channel_calls(self):
+        delegated = []
+
+        def real_projection(module, channel_id, native_info):
+            delegated.append((module, channel_id, native_info))
+            return {
+                **native_info,
+                "clients": list(native_info.get("clients", [])),
+            }
+
+        capture = _NativeBasicProjectionCapture(real_projection, "channel-a")
+        request_native = {"clients": [{"client_id": "request-client"}]}
+        background_native = {"clients": [{"client_id": "background-client"}]}
+
+        request_result = capture("native", "channel-a", request_native)
+        background = threading.Thread(
+            target=capture,
+            args=("native", "channel-a", background_native),
+        )
+        background.start()
+        background.join(timeout=5)
+
+        self.assertFalse(background.is_alive())
+        self.assertEqual(len(delegated), 2)
+        self.assertEqual(delegated[0], ("native", "channel-a", request_native))
+        self.assertEqual(delegated[1], ("native", "channel-a", background_native))
+        self.assertEqual(
+            capture.samples,
+            [({"request-client"}, {"request-client"})],
+        )
+        self.assertEqual(request_result["clients"], request_native["clients"])
+
     def test_stats_options_releases_runtime_settings_orm_connection(self):
         class FakeConnection:
             def __init__(self, *, opened=True, in_atomic_block=False, autocommit=True):
