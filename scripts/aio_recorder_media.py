@@ -2283,6 +2283,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     from django.test import Client
     from gevent import sleep as gevent_sleep
 
+    from catchuparr import runtime as catchuparr_runtime
     from catchuparr.adapters.recorder_proxy import _release_worker_reservation
     from catchuparr.configuration import (
         active_settings_path,
@@ -2327,6 +2328,20 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     control_deny_bytes = control_deny.read_bytes() if control_deny_existed else None
     plugin_config = PluginConfig.objects.get(key="catchuparr")
     original_plugin_settings = dict(plugin_config.settings or {})
+
+    def apply_stats_recorder_option(hide_recorders: bool) -> None:
+        from aio_stats_probe import stats_options_draft
+
+        current = PluginConfig.objects.get(key="catchuparr")
+        full_settings = dict(current.settings or {})
+        full_settings.update(settings)
+        draft = stats_options_draft(full_settings, hide_recorders=hide_recorders)
+        current.settings = draft
+        current.save(update_fields=("settings",))
+        applied = catchuparr_runtime.apply_configuration(draft)
+        _require(applied.get("applied") is True,
+                 "Unified Apply rejected recorder Stats visibility option")
+        settings["hide_recorders_in_stats"] = hide_recorders
 
     original_base_url = channel_tasks.get_dvr_stream_base_url
     saved_default_profile = None
@@ -2452,6 +2467,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "archive_root": str(archive_root),
             "retention_hours": 1,
             "max_storage_gib": 1,
+            "show_archive_playback_in_stats": bool(
+                original_plugin_settings.get("show_archive_playback_in_stats", True)
+            ),
+            "hide_recorders_in_stats": True,
         }
         apply_configuration(settings, active_path=active_path)
         active = load_active_configuration(active_path)
@@ -2641,6 +2660,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             ),
             "Native live A source metadata is incomplete",
         )
+        apply_stats_recorder_option(True)
         # With no policy, the real recorder task must attach to this same
         # native A worker and index decoded A rather than opening a second
         # provider connection.
@@ -2684,6 +2704,18 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             _native_source_metadata(redis_client, metadata_key) == source_metadata,
             "No-rules archive changed native live A source metadata",
         )
+        from aio_stats_probe import probe_actual_recorder_stats
+
+        probe_actual_recorder_stats(
+            channel_id=worker_id,
+            redis_client=redis_client,
+            native_server=native_server,
+            profile_a=profile_a,
+            profile_b=profile_b,
+            profile_connections_key=profile_connections_key,
+            assignment_snapshot=assignment_snapshot,
+            metadata_key=metadata_key,
+        )
         run_a.stop()
         run_a.join(cooperative_sleep=gevent_sleep)
         _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
@@ -2697,19 +2729,33 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             == native_a_marker,
             "Stopping the shared no-rules archive changed the live A release marker",
         )
+        apply_stats_recorder_option(False)
 
         # Applying B while A is live must create a dedicated recorder worker.
-        settings_b = dict(
-            settings,
-            filter_config=(
-                "version: 1\n"
-                f"profile: {profile_name}\n"
-                "rules:\n"
-                "  - channels: {profile: all}\n"
-                "    include: [Synthetic archive isolation B]\n"
+        from aio_stats_probe import stats_options_draft
+
+        settings_b = stats_options_draft(
+            dict(
+                settings,
+                filter_config=(
+                    "version: 1\n"
+                    f"profile: {profile_name}\n"
+                    "rules:\n"
+                    "  - channels: {profile: all}\n"
+                    "    include: [Synthetic archive isolation B]\n"
+                ),
             ),
+            hide_recorders=False,
         )
-        apply_configuration(settings_b, active_path=active_path)
+        current_plugin_config = PluginConfig.objects.get(key="catchuparr")
+        full_settings_b = dict(current_plugin_config.settings or {})
+        full_settings_b.update(settings_b)
+        settings_b = full_settings_b
+        current_plugin_config.settings = dict(settings_b)
+        current_plugin_config.save(update_fields=("settings",))
+        applied_b = catchuparr_runtime.apply_configuration(settings_b)
+        _require(applied_b.get("applied") is True,
+                 "Unified Apply rejected B recorder fixture with Stats flags")
         active_b = load_active_configuration(active_path)
         _require(active_b is not None, "Applied B-only recorder configuration was not readable")
         candidates_b = ranked_source_candidates(worker_id, active_b)
@@ -2804,6 +2850,28 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and active_record.get("stream_id") == str(stream_b.id)
             and active_record.get("profile_id") == str(profile_b.id),
             "Archive B did not use a separate managed worker and B profile",
+        )
+        from aio_stats_probe import probe_actual_private_recorder_stats
+
+        probe_actual_private_recorder_stats(
+            channel_id=b_worker_id,
+            redis_client=redis_client,
+            expected_hidden=False,
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + 1,
+            "Native Stats probes changed active live A or private B provider slots",
+        )
+        _require(
+            _key_dump(redis_client, profile_credential_release_key(profile_a.id))
+            == native_a_marker
+            and {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot
+            and _native_source_metadata(redis_client, metadata_key) == source_metadata,
+            "Native Stats probes changed provider assignments or live A source metadata",
         )
         publication_floor_during_b = int(
             native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0

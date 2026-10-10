@@ -574,7 +574,9 @@ def probe():
     require("duration={duration:60}" in xc_text)
     require(time_key + "={utc}" in xc_text)
 
-    def xc_playback(start_epoch, stream_id=channel.id, duration="1"):
+    def xc_playback(start_epoch, stream_id=channel.id, duration="1", *,
+                    consume=True, remote_addr="198.51.100.40",
+                    range_header="bytes=0-187"):
         selected = dict(xc_params, stream=str(stream_id),
                         **{time_key: str(int(start_epoch))})
         if duration is None:
@@ -582,10 +584,13 @@ def probe():
         else:
             selected["duration"] = duration
         result = timeshift.timeshift_proxy_query(request(
-            "/streaming/timeshift.php", selected, HTTP_RANGE="bytes=0-187",
+            "/streaming/timeshift.php", selected, HTTP_RANGE=range_header,
             HTTP_USER_AGENT="Catchuparr synthetic integration",
+            REMOTE_ADDR=remote_addr,
         ))
         require(result.status_code == 206, f"XC range status {result.status_code}")
+        if not consume:
+            return result
         try:
             return b"".join(result.streaming_content)
         finally:
@@ -600,6 +605,19 @@ def probe():
     require(xc_playback(closed_start.timestamp(), closed_channel.id, duration=None)
             == b"\x47" + bytes([2]) * 187,
             "Missing duration must use the actual EPG end from core helpers")
+    sys.path.insert(0, "/tmp")
+    from aio_stats_probe import probe_actual_stats
+
+    probe_actual_stats(
+        root=root,
+        request=request,
+        user=user,
+        channel=channel,
+        token=token,
+        start=start,
+        params=params,
+        xc_playback=xc_playback,
+    )
     bad_credentials = dict(xc_params, password="invalid", **{time_key: str(int(start.timestamp()))})
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", bad_credentials,
