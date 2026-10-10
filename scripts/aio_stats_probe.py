@@ -641,45 +641,84 @@ def probe_actual_recorder_stats(*, channel_id, redis_client, native_server,
         }
         _require(current_recorder_ids == recorder_ids,
                  "Forged user-agent or IP changed recorder identity")
-        raw_native = channel_status.ChannelStatus.get_basic_channel_info
-        native_basic = raw_native
-        while getattr(native_basic, "__wrapped__", None) is not None:
-            native_basic = native_basic.__wrapped__
-        native_payload = native_basic(channel_key)
-        _require(isinstance(native_payload, dict),
-                 "Native basic client stats payload is unavailable")
-        native_top = {
-            str(item.get("client_id")) for item in native_payload.get("clients", [])
-            if isinstance(item, dict)
-        }
-        beyond_native_cap = visible_ids - native_top
-        _require(bool(beyond_native_cap),
-                 "Synthetic fixture did not place a visible client beyond the native cap")
+        from unittest import mock
 
         from django.urls import reverse
 
-        response = client.get(reverse("proxy:combined_stats"))
+        native_projection_samples = []
+        original_visible_basic = stats._visible_basic_channel_info
+
+        def observe_native_projection(module, observed_channel, native_info):
+            result = original_visible_basic(module, observed_channel, native_info)
+            if str(observed_channel) == channel_key and isinstance(native_info, dict):
+                native_ids = {
+                    str(item.get("client_id")) for item in native_info.get("clients", [])
+                    if isinstance(item, dict) and item.get("client_id") is not None
+                }
+                projected_ids = {
+                    str(item.get("client_id")) for item in result.get("clients", [])
+                    if isinstance(item, dict) and item.get("client_id") is not None
+                } if isinstance(result, dict) else set()
+                native_projection_samples.append((native_ids, projected_ids))
+            return result
+
+        with mock.patch.object(
+            stats, "_visible_basic_channel_info", side_effect=observe_native_projection
+        ):
+            response = client.get(reverse("proxy:combined_stats"))
         payload = _response_payload(response)
         channels = payload.get("live", {}).get("channels", [])
         row = next((item for item in channels
                     if str(item.get("channel_id")) == channel_key), None)
         _require(isinstance(row, dict), "Native combined Stats omitted the synthetic channel")
+        _require(bool(native_projection_samples),
+                 "Native combined Stats did not pass through the live recorder filter")
+        native_top, projected_ids = native_projection_samples[-1]
         visible = {
             str(item.get("client_id")) for item in row.get("clients", [])
             if isinstance(item, dict)
         }
         _require(len(visible) == 10,
                  "Visible native clients were not refilled to the ten-row display cap")
-        if current_recorder_ids & native_top:
-            _require(bool(visible & beyond_native_cap),
-                     "Filtering a capped recorder failed to refill visible clients")
+        _require(visible == projected_ids,
+                 "Native combined Stats did not return the observed filtered client set")
         _require(not visible & current_recorder_ids,
                  "A server-verified recorder client remained visible in native Stats")
         expected_count = len(current_ids) - len(current_recorder_ids)
         _require(row.get("client_count") == expected_count,
                  "Native Stats client_count did not subtract only verified recorder clients")
 
-        from unittest import mock
+        # The REST request above uses the real native set order, which is
+        # intentionally unspecified. Force a deterministic native cap input
+        # through the same real filter, using actual Redis client identities,
+        # so the hide-before-cap refill path is always exercised.
+        ordinary_ids = sorted(set(current_ids) - current_recorder_ids)
+        _require(len(ordinary_ids) >= 10,
+                 "Native Stats fixture lacks ten ordinary clients for cap refill")
+        recorder_id = sorted(current_recorder_ids)[0]
+        deterministic_native = {
+            "client_count": len(current_ids),
+            "clients": [{"client_id": recorder_id}]
+            + [{"client_id": client_id} for client_id in ordinary_ids[:9]],
+        }
+        deterministic_projected = stats._visible_basic_channel_info(
+            channel_status, channel_key, deterministic_native
+        )
+        deterministic_visible = {
+            str(item.get("client_id")) for item in deterministic_projected.get("clients", [])
+            if isinstance(item, dict)
+        }
+        deterministic_native_ids = {
+            str(item.get("client_id")) for item in deterministic_native["clients"]
+        }
+        _require(len(deterministic_visible) == 10,
+                 "Verified-recorder filtering did not refill a deterministic native cap")
+        _require(not deterministic_visible & current_recorder_ids,
+                 "Deterministic cap refill retained the verified recorder")
+        _require(bool(deterministic_visible & (set(ordinary_ids) - deterministic_native_ids)),
+                 "Deterministic cap refill omitted every ordinary client beyond the native cap")
+        _require(deterministic_projected.get("client_count") == expected_count,
+                 "Deterministic cap refill changed the verified visible-client count")
 
         from apps.proxy import tasks as proxy_tasks
 

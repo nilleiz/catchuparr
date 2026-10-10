@@ -367,7 +367,10 @@ class StatsProjectionTests(unittest.TestCase):
     def test_verified_recorder_is_removed_before_native_top_ten(self):
         class FakeRedis:
             def smembers(self, key):
-                return {b"recorder"} | {f"viewer-{index}".encode() for index in range(11)}
+                return (
+                    {b"recorder", b"existing-live-viewer"}
+                    | {f"viewer-{index}".encode() for index in range(11)}
+                )
 
             def hmget(self, key, *fields):
                 client_id = key.rsplit(":", 1)[-1]
@@ -398,7 +401,7 @@ class StatsProjectionTests(unittest.TestCase):
             RedisKeys=FakeKeys,
         )
         native = {
-            "client_count": 12,
+            "client_count": 13,
             "clients": [{"client_id": "recorder"}]
             + [{"client_id": f"viewer-{index}"} for index in range(9)],
         }
@@ -408,11 +411,18 @@ class StatsProjectionTests(unittest.TestCase):
             side_effect=lambda channel, client: client == "recorder",
         ):
             result = stats._visible_basic_channel_info(channel_status, "42", native)
-        self.assertEqual(12, native["client_count"])
-        self.assertEqual(11, result["client_count"])
+        self.assertEqual(13, native["client_count"])
+        self.assertEqual(12, result["client_count"])
         self.assertEqual(10, len(result["clients"]))
-        self.assertNotIn("recorder", {client["client_id"] for client in result["clients"]})
-        self.assertIn("viewer-10", {client["client_id"] for client in result["clients"]})
+        visible_ids = {client["client_id"] for client in result["clients"]}
+        native_ids = {client["client_id"] for client in native["clients"]}
+        ordinary_ids = {
+            "existing-live-viewer",
+            *(f"viewer-{index}" for index in range(11)),
+        }
+        self.assertNotIn("recorder", visible_ids)
+        self.assertIn("existing-live-viewer", visible_ids)
+        self.assertTrue(visible_ids & (ordinary_ids - native_ids))
 
     def test_recorder_capability_must_match_current_fenced_lease_and_channel(self):
         token = "synthetic-short-lived-capability"
