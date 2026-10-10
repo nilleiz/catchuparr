@@ -866,6 +866,17 @@ def _active_viewers() -> list[dict[str, Any]]:
     except (OSError, sqlite3.Error, RuntimeError):
         logger.exception("Unable to read Catchuparr Stats viewer projection")
         return []
+    finally:
+        # This projection can run in native websocket/background greenlets,
+        # where request-finished connection cleanup does not run. Release only
+        # the initialized default connection in this context and only when it
+        # is safe to close (outside atomic blocks with autocommit enabled).
+        try:
+            from .recorder_proxy import _close_database_connections
+
+            _close_database_connections()
+        except Exception:
+            logger.error("Unable to release Stats metadata database connection")
 
 
 def _viewer_row(row: sqlite3.Row) -> dict[str, Any] | None:

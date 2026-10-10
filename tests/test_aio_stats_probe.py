@@ -1,11 +1,15 @@
 """Focused assertions for native Stats integration probe helpers."""
 
 import ast
+import sqlite3
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from catchuparr import stats
 from scripts.aio_stats_probe import (
     _assert_archive_projection,
     _assert_native_route_match,
@@ -15,6 +19,36 @@ from scripts.aio_stats_probe import (
 
 
 class AIOStatsProbeTests(unittest.TestCase):
+    def test_stats_viewer_projection_releases_current_context_orm_connection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "archive.sqlite3"
+            with sqlite3.connect(database) as db:
+                stats._ensure_schema(db)
+                db.execute(
+                    "INSERT INTO catchuparr_stats_viewers "
+                    "(viewer_key,display_id,user_id,channel_uuid,logical_started_at,last_success_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        "viewer", "ca_synthetic", "7", "synthetic-channel",
+                        time.time(), time.time(),
+                    ),
+                )
+
+            options = {
+                "show_archive_playback_in_stats": True,
+                "hide_recorders_in_stats": True,
+            }
+            with (
+                patch.object(stats, "_options", return_value=options),
+                patch.object(stats, "_db_path", return_value=database),
+                patch.object(stats, "_viewer_row", return_value={"session_id": "ca_synthetic"}),
+                patch("catchuparr.recorder_proxy._close_database_connections") as close_db,
+            ):
+                rows = stats._active_viewers()
+
+        self.assertEqual(rows, [{"session_id": "ca_synthetic"}])
+        close_db.assert_called_once_with()
+
     def test_auth_diagnostic_is_boolean_only_and_never_contains_token(self):
         token = "synthetic-secret-token"
 
