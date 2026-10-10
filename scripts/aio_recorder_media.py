@@ -24,10 +24,9 @@ def _current_orm_context_snapshot() -> dict[str, object]:
     try:
         from django.db import connections
 
-        wrappers = connections.all()
         initialized = connections.all(initialized_only=True)
         default = next(
-            (wrapper for wrapper in wrappers if wrapper.alias == "default"), None,
+            (wrapper for wrapper in initialized if wrapper.alias == "default"), None,
         )
         default_initialized = bool(default is not None and default.connection is not None)
         default_autocommit = None
@@ -37,7 +36,7 @@ def _current_orm_context_snapshot() -> dict[str, object]:
             except Exception:
                 default_autocommit = None
         return {
-            "wrapper_count": len(wrappers),
+            "wrapper_count": len(initialized),
             "initialized_count": len(initialized),
             "default_initialized": default_initialized,
             "default_in_atomic_block": bool(default and default.in_atomic_block),
