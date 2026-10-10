@@ -93,21 +93,36 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 def _options() -> dict[str, bool]:
     """Read only the applied configuration when that API is available."""
     try:
-        from .runtime import load_runtime_settings
+        try:
+            from .runtime import load_runtime_settings
 
-        settings = load_runtime_settings()
+            settings = load_runtime_settings()
+        except Exception:
+            # Compatibility for installations predating the unified Apply API.
+            # Both options keep their documented defaults until that API exists.
+            settings = {}
+        return {
+            "show_archive_playback_in_stats": _as_bool(
+                settings.get("show_archive_playback_in_stats", True), True
+            ),
+            "hide_recorders_in_stats": _as_bool(
+                settings.get("hide_recorders_in_stats", True), True
+            ),
+        }
+    finally:
+        # The native live builders call _options from request and worker contexts.
+        # load_runtime_settings may query PluginConfig inside transaction.atomic;
+        # return only a safe, initialized connection after that transaction exits.
+        _release_orm_connection()
+
+
+def _release_orm_connection() -> None:
+    try:
+        from .recorder_proxy import _close_database_connections
+
+        _close_database_connections()
     except Exception:
-        # Compatibility for installations predating the unified Apply API.
-        # Both options keep their documented defaults until that API exists.
-        settings = {}
-    return {
-        "show_archive_playback_in_stats": _as_bool(
-            settings.get("show_archive_playback_in_stats", True), True
-        ),
-        "hide_recorders_in_stats": _as_bool(
-            settings.get("hide_recorders_in_stats", True), True
-        ),
-    }
+        logger.error("Unable to release Stats metadata database connection")
 
 
 def _valid_current_playback_lease(
@@ -871,12 +886,7 @@ def _active_viewers() -> list[dict[str, Any]]:
         # where request-finished connection cleanup does not run. Release only
         # the initialized default connection in this context and only when it
         # is safe to close (outside atomic blocks with autocommit enabled).
-        try:
-            from .recorder_proxy import _close_database_connections
-
-            _close_database_connections()
-        except Exception:
-            logger.error("Unable to release Stats metadata database connection")
+        _release_orm_connection()
 
 
 def _viewer_row(row: sqlite3.Row) -> dict[str, Any] | None:

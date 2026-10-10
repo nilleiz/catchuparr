@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from catchuparr import stats
+from catchuparr import runtime, stats
 from scripts.aio_stats_probe import (
     _assert_archive_projection,
     _assert_native_route_match,
@@ -21,6 +21,75 @@ from scripts.aio_stats_probe import (
 
 
 class AIOStatsProbeTests(unittest.TestCase):
+    def test_stats_options_releases_runtime_settings_orm_connection(self):
+        class FakeConnection:
+            def __init__(self, *, opened=True, in_atomic_block=False, autocommit=True):
+                self.alias = "default"
+                self.connection = object() if opened else None
+                self.in_atomic_block = in_atomic_block
+                self.autocommit = autocommit
+                self.close_calls = 0
+
+            def get_autocommit(self):
+                return self.autocommit
+
+            def close(self):
+                self.close_calls += 1
+                self.connection = None
+
+        class FakeConnections:
+            def __init__(self, connection):
+                self.connection = connection
+                self.all_calls = []
+
+            def all(self, *, initialized_only=False):
+                self.all_calls.append(initialized_only)
+                if initialized_only:
+                    return [self.connection] if self.connection.connection is not None else []
+                return [self.connection]
+
+        cases = (
+            ("success", FakeConnection(), False, 1),
+            ("runtime_error", FakeConnection(), True, 1),
+            ("atomic", FakeConnection(in_atomic_block=True), False, 0),
+            ("manual", FakeConnection(autocommit=False), False, 0),
+            ("unopened", FakeConnection(opened=False), False, 0),
+        )
+        for name, default, runtime_error, expected_closes in cases:
+            with self.subTest(name=name):
+                connections = FakeConnections(default)
+                django_module = types.ModuleType("django")
+                django_module.__path__ = []
+                django_db_module = types.ModuleType("django.db")
+                django_db_module.connections = connections
+                django_module.db = django_db_module
+                settings_loader = Mock(
+                    side_effect=RuntimeError("synthetic settings query failure")
+                    if runtime_error else None,
+                    return_value={
+                        "show_archive_playback_in_stats": False,
+                        "hide_recorders_in_stats": False,
+                    },
+                )
+                with (
+                    patch.dict(sys.modules, {
+                        "django": django_module,
+                        "django.db": django_db_module,
+                    }),
+                    patch.object(runtime, "load_runtime_settings", settings_loader),
+                ):
+                    options = stats._options()
+
+                self.assertEqual(default.close_calls, expected_closes)
+                self.assertEqual(connections.all_calls, [True])
+                self.assertEqual(
+                    options,
+                    {
+                        "show_archive_playback_in_stats": runtime_error,
+                        "hide_recorders_in_stats": runtime_error,
+                    },
+                )
+
     def test_stats_projection_uses_real_safe_database_release_guards(self):
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "archive.sqlite3"
