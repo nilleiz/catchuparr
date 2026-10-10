@@ -15,6 +15,45 @@ from catchuparr.runtime import require_supported_version, status
 
 
 class RuntimeStatusTests(unittest.TestCase):
+    def _status_with_celery_probe(self, active, *, paused=False, schedule=None, probe_error=None):
+        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        celery = types.ModuleType("celery")
+
+        class Inspector:
+            def active(self):
+                if probe_error is not None:
+                    raise probe_error
+                return active
+
+        celery.current_app = SimpleNamespace(
+            control=SimpleNamespace(inspect=lambda **_kwargs: Inspector())
+        )
+        core = types.ModuleType("core")
+        core_utils = types.ModuleType("core.utils")
+
+        class Redis:
+            def ping(self):
+                return True
+
+        core_utils.RedisClient = SimpleNamespace(get_client=lambda: Redis())
+        core.utils = core_utils
+        schedule = schedule or {"timezone": "UTC", "channels": {channel: {"mode": "continuous"}}}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {
+            "celery": celery,
+            "core": core,
+            "core.utils": core_utils,
+        }), patch(
+            "catchuparr.configuration.configuration_reset_required", return_value=False
+        ):
+            return status({
+                "version": 1,
+                "channel_uuids": channel,
+                "archive_root": directory,
+                "retention_hours": 24,
+                "max_storage_gib": 5,
+                "recording_schedule": schedule,
+            }, control_state=RecorderControlState(paused, 1))
+
     def test_public_base_url_normalization_rejects_untrusted_url_parts(self):
         from catchuparr.runtime import normalize_public_base_url
 
@@ -146,6 +185,51 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(1, result["channels"][0]["segments"])
         self.assertEqual(len(b"transport stream"), result["indexed_storage_bytes"])
         self.assertIn("recorder_running", result["channels"][0])
+        self.assertEqual(1, result["selected_channel_count"])
+        self.assertIsNone(result["running_recorder_count"])
+        self.assertGreaterEqual(result["archive_storage_bytes"], len(b"transport stream"))
+        self.assertIn("in an unknown state", result["message"])
+
+    def test_status_uses_active_celery_recording_tasks_not_recorder_leases(self):
+        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        running = self._status_with_celery_probe({"worker-a": [{
+            "name": "catchuparr.record_channel", "args": [channel, "synthetic-config", 1],
+        }]})
+        stopped = self._status_with_celery_probe({"worker-a": []})
+
+        self.assertTrue(running["channels"][0]["recorder_running"])
+        self.assertEqual(1, running["running_recorder_count"])
+        self.assertEqual("running", running["channels"][0]["recorder_reason"])
+        self.assertIn("Catchuparr is running", running["message"])
+        self.assertFalse(stopped["channels"][0]["recorder_running"])
+        self.assertEqual(0, stopped["running_recorder_count"])
+        self.assertEqual("eligible", stopped["channels"][0]["recorder_reason"])
+        self.assertIn("Catchuparr is stopped", stopped["message"])
+
+    def test_status_reports_unknown_and_error_when_celery_state_is_unavailable(self):
+        unknown = self._status_with_celery_probe(None)
+        errored = self._status_with_celery_probe({}, probe_error=RuntimeError("synthetic inspector failure"))
+
+        for result in (unknown, errored):
+            with self.subTest(result=result):
+                self.assertIsNone(result["channels"][0]["recorder_running"])
+                self.assertIsNone(result["running_recorder_count"])
+                self.assertEqual("error_recorder_state_unavailable", result["channels"][0]["recorder_reason"])
+                self.assertIn("in an unknown state", result["message"])
+
+    def test_status_reports_schedule_and_pause_eligibility_reasons(self):
+        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        outside_schedule = self._status_with_celery_probe(
+            {"worker-a": []},
+            schedule={"timezone": "UTC", "channels": {channel: {
+                "mode": "weekly", "intervals": [],
+            }}},
+        )
+        paused = self._status_with_celery_probe({"worker-a": []}, paused=True)
+
+        self.assertFalse(outside_schedule["channels"][0]["recording_scheduled"])
+        self.assertEqual("outside_schedule", outside_schedule["channels"][0]["recorder_reason"])
+        self.assertEqual("paused", paused["channels"][0]["recorder_reason"])
 
     def test_runtime_version_matrix(self):
         for version in ("0.31.0", "0.32.0"):
@@ -259,6 +343,7 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(8, result["control_generation"])
         self.assertTrue(result["recording_control_available"])
         self.assertTrue(result["channels"][0]["recording_scheduled"])
+        self.assertEqual("paused", result["channels"][0]["recorder_reason"])
         self.assertIn("segments", result["channels"][0])
 
     def test_runtime_state_denies_recording_when_applied_control_is_unavailable(self):
