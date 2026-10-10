@@ -498,7 +498,14 @@ def _request_session_id(request: Any) -> str:
     return str(data.get("session_id") or "") if isinstance(data, dict) else ""
 
 
-def _registered_drf_endpoint(route: Any, expected_view: Any, method: str) -> bool:
+def _registered_drf_endpoint(
+    route: Any,
+    expected_view: Any,
+    method: str,
+    *,
+    endpoint_name: str,
+    permission_class: type,
+) -> bool:
     """Check that a URL still registers the exact native endpoint we wrap."""
     callback = getattr(route, "callback", None)
     if callback is None or callback is not expected_view:
@@ -507,8 +514,15 @@ def _registered_drf_endpoint(route: Any, expected_view: Any, method: str) -> boo
         parameters = inspect.signature(callback).parameters
     except (TypeError, ValueError):
         return False
-    if tuple(parameters) == ("request",):
-        return True
+    if tuple(parameters) != ("request", "args", "kwargs"):
+        return False
+    parameter_values = tuple(parameters.values())
+    if (
+        parameter_values[0].kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+        or parameter_values[1].kind is not inspect.Parameter.VAR_POSITIONAL
+        or parameter_values[2].kind is not inspect.Parameter.VAR_KEYWORD
+    ):
+        return False
     # DRF @api_view callbacks are variadic. Validate their generated APIView
     # class and the wrapped native function before accepting that signature.
     try:
@@ -518,12 +532,14 @@ def _registered_drf_endpoint(route: Any, expected_view: Any, method: str) -> boo
     view_class = getattr(callback, "cls", None) or getattr(unwrapped, "cls", None)
     if (
         view_class is None
-        or getattr(view_class, "__name__", None) != getattr(expected_view, "__name__", None)
+        or getattr(view_class, "__name__", None) != endpoint_name
         or getattr(view_class, "__module__", None) != getattr(expected_view, "__module__", None)
     ):
         return False
     allowed_methods = set(getattr(view_class, "http_method_names", ()))
     if method not in allowed_methods:
+        return False
+    if permission_class not in tuple(getattr(view_class, "permission_classes", ())):
         return False
     handler = getattr(view_class, method, None)
     if handler is None:
@@ -538,7 +554,7 @@ def _registered_drf_endpoint(route: Any, expected_view: Any, method: str) -> boo
             candidates.append(enclosed)
     for candidate in candidates:
         if (
-            getattr(candidate, "__name__", None) != getattr(expected_view, "__name__", None)
+            getattr(candidate, "__name__", None) != endpoint_name
             or getattr(candidate, "__module__", None) != getattr(expected_view, "__module__", None)
         ):
             continue
@@ -550,6 +566,57 @@ def _registered_drf_endpoint(route: Any, expected_view: Any, method: str) -> boo
     return False
 
 
+def _supported_stream_view_signature(stream_view: Any, signature: tuple[str, ...]) -> bool:
+    if signature == ("request", "channel_id", "user", "force_output_format"):
+        return True
+    if signature != ("request", "args", "kwargs"):
+        return False
+    try:
+        parameters = tuple(inspect.signature(stream_view).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    return (
+        parameters[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        and parameters[1].kind is inspect.Parameter.VAR_POSITIONAL
+        and parameters[2].kind is inspect.Parameter.VAR_KEYWORD
+    )
+
+
+def _install_live_display_hooks(channel_status: Any) -> bool:
+    """Install display-only live builders in web and worker processes."""
+    basic = getattr(channel_status.ChannelStatus, "get_basic_channel_info", None)
+    detail = getattr(channel_status.ChannelStatus, "get_detailed_channel_info", None)
+    if (
+        basic is None
+        or tuple(inspect.signature(basic).parameters) != ("channel_id",)
+        or detail is None
+        or tuple(inspect.signature(detail).parameters) != ("channel_id",)
+    ):
+        return False
+    if not getattr(basic, HOOK_MARKER, False):
+        @functools.wraps(basic)
+        def basic_wrapper(channel_id):
+            return _visible_basic_channel_info(
+                channel_status, channel_id, basic(channel_id)
+            )
+
+        setattr(basic_wrapper, HOOK_MARKER, True)
+        setattr(basic_wrapper, "__catchuparr_original__", basic)
+        channel_status.ChannelStatus.get_basic_channel_info = basic_wrapper
+        _ORIGINALS.append((channel_status.ChannelStatus, "get_basic_channel_info", basic))
+
+    if not getattr(detail, HOOK_MARKER, False):
+        @functools.wraps(detail)
+        def detail_wrapper(channel_id):
+            return _visible_detail_channel_info(channel_id, detail(channel_id))
+
+        setattr(detail_wrapper, HOOK_MARKER, True)
+        setattr(detail_wrapper, "__catchuparr_original__", detail)
+        channel_status.ChannelStatus.get_detailed_channel_info = detail_wrapper
+        _ORIGINALS.append((channel_status.ChannelStatus, "get_detailed_channel_info", detail))
+    return True
+
+
 def _install_stop_hook() -> bool:
     global _STOP_HOOK
     import apps.timeshift.stats_views as stats_views
@@ -558,6 +625,7 @@ def _install_stop_hook() -> bool:
     original = getattr(stats_views, "stop_timeshift_session", None)
     if original is None or getattr(original, HOOK_MARKER, False):
         return original is not None
+    from apps.accounts.permissions import IsAdmin
     changed_routes: list[tuple[Any, Any]] = []
     already_installed = False
     for route in getattr(timeshift_urls, "urlpatterns", ()):
@@ -570,7 +638,13 @@ def _install_stop_hook() -> bool:
         ):
             already_installed = True
             continue
-        if not _registered_drf_endpoint(route, original, "post"):
+        if not _registered_drf_endpoint(
+            route,
+            original,
+            "post",
+            endpoint_name="stop_timeshift_session",
+            permission_class=IsAdmin,
+        ):
             continue
 
         @functools.wraps(callback)
@@ -628,11 +702,7 @@ def _install_identity_hooks(channel_status: Any, live_views: Any) -> bool:
         or original_remove is None
         or tuple(inspect.signature(original_remove).parameters) != ("self", "client_id")
         or stream_ts is None
-        or stream_signature
-        not in {
-            ("request", "channel_id", "user", "force_output_format"),
-            ("args", "kwargs"),
-        }
+        or not _supported_stream_view_signature(stream_ts, stream_signature)
     ):
         return False
     from .adapters.recorder_proxy import _stream_route_channel_id_issue
@@ -667,28 +737,6 @@ def _install_identity_hooks(channel_status: Any, live_views: Any) -> bool:
             route_matches.append((route, callback))
     if not route_matches:
         return False
-
-    if not getattr(basic, HOOK_MARKER, False):
-        @functools.wraps(basic)
-        def basic_wrapper(channel_id):
-            return _visible_basic_channel_info(
-                channel_status, channel_id, basic(channel_id)
-            )
-
-        setattr(basic_wrapper, HOOK_MARKER, True)
-        setattr(basic_wrapper, "__catchuparr_original__", basic)
-        channel_status.ChannelStatus.get_basic_channel_info = basic_wrapper
-        _ORIGINALS.append((channel_status.ChannelStatus, "get_basic_channel_info", basic))
-
-    if not getattr(detail, HOOK_MARKER, False):
-        @functools.wraps(detail)
-        def detail_wrapper(channel_id):
-            return _visible_detail_channel_info(channel_id, detail(channel_id))
-
-        setattr(detail_wrapper, HOOK_MARKER, True)
-        setattr(detail_wrapper, "__catchuparr_original__", detail)
-        channel_status.ChannelStatus.get_detailed_channel_info = detail_wrapper
-        _ORIGINALS.append((channel_status.ChannelStatus, "get_detailed_channel_info", detail))
 
     if not getattr(original_add, HOOK_MARKER, False):
         @functools.wraps(original_add)
@@ -1050,7 +1098,7 @@ def install_stats_hooks(*, route_hooks: bool = True) -> bool:
         (proxy_stats_views, "build_live_channel_stats_data", project_live_stats),
         (proxy_tasks, "build_live_channel_stats_data", project_live_stats),
     )
-    installed = True
+    installed = _install_live_display_hooks(channel_status)
     for module, name, transform in targets:
         # Some verified imports only expose one of the two builders.
         if getattr(module, name, None) is not None:

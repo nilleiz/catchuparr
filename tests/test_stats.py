@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import sqlite3
 import sys
 import tempfile
@@ -97,6 +98,100 @@ class StatsProjectionTests(unittest.TestCase):
         }):
             stats._emit_timeshift_stats_update()
         self.assertEqual([redis], calls)
+
+    def test_worker_installs_live_pre_cap_display_filter_without_web_identity_hooks(self):
+        class ChannelStatus:
+            @staticmethod
+            def get_basic_channel_info(channel_id):
+                return {"channel_id": channel_id, "clients": [], "client_count": 0}
+
+            @staticmethod
+            def get_detailed_channel_info(channel_id):
+                return {"channel_id": channel_id, "clients": []}
+
+        def native_builder(redis_client):
+            return {"channels": [], "count": 0}
+
+        modules = {
+            "version": types.ModuleType("version"),
+            "apps": types.ModuleType("apps"),
+            "apps.proxy": types.ModuleType("apps.proxy"),
+            "apps.proxy.live_proxy": types.ModuleType("apps.proxy.live_proxy"),
+            "apps.proxy.live_proxy.channel_status": types.ModuleType(
+                "apps.proxy.live_proxy.channel_status"
+            ),
+            "apps.proxy.live_proxy.views": types.ModuleType(
+                "apps.proxy.live_proxy.views"
+            ),
+            "apps.proxy.stats_views": types.ModuleType("apps.proxy.stats_views"),
+            "apps.proxy.tasks": types.ModuleType("apps.proxy.tasks"),
+            "apps.timeshift": types.ModuleType("apps.timeshift"),
+            "apps.timeshift.stats": types.ModuleType("apps.timeshift.stats"),
+            "apps.timeshift.stats_views": types.ModuleType("apps.timeshift.stats_views"),
+        }
+        modules["version"].__version__ = "0.31.0"
+        modules["apps"].__path__ = []
+        modules["apps.proxy"].__path__ = []
+        modules["apps.proxy.live_proxy"].__path__ = []
+        modules["apps.timeshift"].__path__ = []
+        modules["apps.proxy.live_proxy.channel_status"].ChannelStatus = ChannelStatus
+        for name in (
+            "apps.proxy.live_proxy.channel_status",
+            "apps.proxy.live_proxy.views",
+            "apps.proxy.stats_views",
+            "apps.proxy.tasks",
+            "apps.timeshift.stats",
+            "apps.timeshift.stats_views",
+        ):
+            modules[name].build_live_channel_stats_data = native_builder
+            modules[name].build_timeshift_stats_data = native_builder
+        original_count = len(stats._ORIGINALS)
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(stats.install_stats_hooks(route_hooks=False))
+            self.assertTrue(
+                getattr(ChannelStatus.get_basic_channel_info, stats.HOOK_MARKER)
+            )
+            self.assertTrue(
+                getattr(ChannelStatus.get_detailed_channel_info, stats.HOOK_MARKER)
+            )
+            self.assertFalse(hasattr(modules["apps.proxy.live_proxy.views"], "stream_ts"))
+        while len(stats._ORIGINALS) > original_count:
+            owner, name, original = stats._ORIGINALS.pop()
+            setattr(owner, name, original)
+
+    def test_native_stream_drf_callback_closure_is_accepted(self):
+        def stream_ts(request, channel_id, user=None, force_output_format=None):
+            return request, channel_id, user, force_output_format
+
+        def get(self, *args, **kwargs):
+            return stream_ts(*args, **kwargs)
+
+        view_class = type(
+            "stream_ts",
+            (),
+            {
+                "__module__": stream_ts.__module__,
+                "http_method_names": ["get", "options"],
+                "get": get,
+            },
+        )
+
+        def callback(request, *args, **kwargs):
+            return stream_ts(request, *args, **kwargs)
+
+        callback.__name__ = "view"
+        callback.__module__ = stream_ts.__module__
+        callback.cls = view_class
+        route = types.SimpleNamespace(
+            name="stream",
+            callback=callback,
+            pattern=types.SimpleNamespace(converters={"channel_id": object()}),
+        )
+        from catchuparr.adapters.recorder_proxy import _stream_route_channel_id_issue
+
+        signature = tuple(inspect.signature(callback).parameters)
+        self.assertTrue(stats._supported_stream_view_signature(callback, signature))
+        self.assertIsNone(_stream_route_channel_id_issue(route, 0, callback))
 
     def test_stats_toggles_are_independent_and_read_applied_settings(self):
         from catchuparr import runtime
@@ -565,33 +660,37 @@ class StatsProjectionTests(unittest.TestCase):
 
         calls = []
 
-        def native_stop(request):
+        def stop_timeshift_session(request):
             calls.append(request.data["session_id"])
             return FakeResponse(403 if not request.is_admin else 404)
+
+        class FakeIsAdmin:
+            pass
 
         def make_drf_callback(endpoint):
             def post(self, *args, **kwargs):
                 return endpoint(*args, **kwargs)
 
             view_class = type(
-                endpoint.__name__,
+                "stop_timeshift_session",
                 (),
                 {
                     "__module__": endpoint.__module__,
                     "http_method_names": ["post", "options"],
+                    "permission_classes": [FakeIsAdmin],
                     "post": post,
                 },
             )
 
-            def callback(*args, **kwargs):
-                return endpoint(*args, **kwargs)
+            def callback(request, *args, **kwargs):
+                return endpoint(request, *args, **kwargs)
 
-            callback.__name__ = endpoint.__name__
+            callback.__name__ = "view"
             callback.__module__ = endpoint.__module__
             callback.cls = view_class
             return callback
 
-        drf_stop = make_drf_callback(native_stop)
+        drf_stop = make_drf_callback(stop_timeshift_session)
 
         stats_views = types.ModuleType("apps.timeshift.stats_views")
         stats_views.stop_timeshift_session = drf_stop
@@ -599,6 +698,10 @@ class StatsProjectionTests(unittest.TestCase):
         route = Route(drf_stop)
         routes.urlpatterns = [route]
         fake_apps = types.ModuleType("apps")
+        fake_accounts = types.ModuleType("apps.accounts")
+        fake_permissions = types.ModuleType("apps.accounts.permissions")
+        fake_permissions.IsAdmin = FakeIsAdmin
+        fake_accounts.permissions = fake_permissions
         fake_timeshift = types.ModuleType("apps.timeshift")
         fake_apps.timeshift = fake_timeshift
         fake_timeshift.stats_views = stats_views
@@ -625,6 +728,8 @@ class StatsProjectionTests(unittest.TestCase):
                 sys.modules,
                 {
                     "apps": fake_apps,
+                    "apps.accounts": fake_accounts,
+                    "apps.accounts.permissions": fake_permissions,
                     "apps.timeshift": fake_timeshift,
                     "apps.timeshift.stats_views": stats_views,
                     "apps.timeshift.urls": routes,
