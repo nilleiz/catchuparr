@@ -987,18 +987,43 @@ def open_managed_source(request, worker_id: str, capability_record: dict[str, An
         client_manager = proxy_server.client_managers.get(worker_id)
         if client_manager is None or not _client_manager_api_supported(client_manager):
             return HttpResponse("Recorder worker resources unavailable", status=503)
+        stats_capability_digest = None
+        try:
+            from ..stats import _verified_recorder_request
+
+            stats_capability_digest = _verified_recorder_request(
+                request,
+                str(capability_record["channel_uuid"]),
+                meta_header="HTTP_X_CATCHUPARR_STATS_RECORDER",
+                request_header="X-Catchuparr-Stats-Recorder",
+            )
+        except Exception:
+            logger.debug("Could not verify recorder Stats identity", exc_info=True)
         client_ip = get_client_ip(request) or "127.0.0.1"
         client_ua = request.META.get("HTTP_USER_AGENT", "Catchuparr recorder")
-        if not client_manager.add_client(
+        client_registered = client_manager.add_client(
             client_id,
             client_ip,
             client_ua,
             user=None,
             output_format="mpegts",
             output_profile_id=None,
-        ):
+        )
+        if not client_registered:
             return HttpResponse("Recorder client registration failed", status=503)
         registered = True
+        if stats_capability_digest is not None:
+            try:
+                from ..stats import recorder_client_registered
+
+                recorder_client_registered(
+                    str(worker_id),
+                    client_id,
+                    stats_capability_digest,
+                    str(capability_record["channel_uuid"]),
+                )
+            except Exception:
+                logger.debug("Could not mark verified recorder Stats identity", exc_info=True)
         buffer = proxy_server.get_buffer(worker_id, profile=None)
         generate = create_stream_generator(
             worker_id,

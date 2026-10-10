@@ -17,17 +17,20 @@ class FakeRedis:
     def __init__(self):
         self.values = {}
 
+    def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    def expire(self, key, seconds):
+        return key in self.values
+
     def delete(self, key):
         return int(self.values.pop(key, None) is not None)
 
     def exists(self, key):
         return int(key in self.values)
-
-    def set(self, key, value, **kwargs):
-        if kwargs.get("nx") and key in self.values:
-            return False
-        self.values[key] = value
-        return True
 
     def eval(self, script, numkeys, *args):
         keys = args[:numkeys]
@@ -205,6 +208,7 @@ class RecorderTaskTests(unittest.TestCase):
                 class FakeLease:
                     def __init__(self, *_args, **_kwargs):
                         self.released = False
+                        self.owner = "synthetic-owner"
                         lease_instances.append(self)
 
                     def acquire(self):
@@ -294,6 +298,7 @@ class RecorderTaskTests(unittest.TestCase):
                 class FakeLease:
                     def __init__(self, *_args, **_kwargs):
                         self.released = False
+                        self.owner = "synthetic-owner"
                         lease_instances.append(self)
 
                     def acquire(self):
@@ -623,6 +628,9 @@ class RecorderTaskTests(unittest.TestCase):
                         tasks.record_channel("channel-1", expected_generation, 4)
 
             self.assertNotIn("catchuparr:recorder:channel-1", redis.values)
+            self.assertFalse(any(
+                key.startswith("catchuparr:recorder:stats-cap:") for key in redis.values
+            ))
             self.assertEqual(ArchiveStore(archive_root).recorder_fence("channel-1"), 26)
 
     def test_override_capacity_or_start_failure_falls_through_ranked_sources(self):

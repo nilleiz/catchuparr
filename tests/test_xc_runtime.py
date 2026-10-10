@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from catchuparr import stats
 from catchuparr.engine.playlist import build_hls_playlist
 from catchuparr.engine.store import ArchiveStore
 from catchuparr.http import ArchiveHTTPService
@@ -22,6 +23,7 @@ from catchuparr.xc_runtime import (
     _active_hls_session_count,
     _local_playback_window,
     _make_callbacks,
+    _PlaybackHeartbeatIterator,
     _to_django_response,
     _xc_session_keys,
     active_ts_session_count,
@@ -49,6 +51,88 @@ class _FakeResponse(dict):
 
 
 class XCRuntimeTests(unittest.TestCase):
+    def test_playback_heartbeat_marks_initial_lease_then_subsequent_heartbeat(self):
+        calls = []
+        stream = _PlaybackHeartbeatIterator(
+            iter((b"first", b"next")), calls.append, interval=0
+        )
+        self.assertEqual(b"first", next(stream))
+        self.assertEqual(b"next", next(stream))
+        self.assertEqual([True, False], calls)
+
+    def test_stats_heartbeat_failure_does_not_interrupt_archive_bytes(self):
+        def failed_heartbeat(_first_chunk):
+            raise OSError("local projection unavailable")
+
+        stream = _PlaybackHeartbeatIterator(iter((b"first", b"next")), failed_heartbeat, 0)
+        with patch("catchuparr.xc_runtime.logger.warning") as warning:
+            self.assertEqual(b"first", next(stream))
+            self.assertEqual(b"next", next(stream))
+        self.assertEqual(2, warning.call_count)
+
+    def test_delayed_old_ts_first_chunk_cannot_revive_stopped_display(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ArchiveStore(root)
+            start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
+            segment_path = root / "wide-segment.ts"
+            segment_path.write_bytes(b"s" * (128 * 1024))
+            store.add_segment(
+                "news", segment_path, start, start + timedelta(seconds=6)
+            )
+            service = ArchiveTSPlaybackService(
+                store,
+                authorize_user_channel=lambda *_: True,
+                catchup_enabled=lambda *_: True,
+            )
+            old_response = service.stream_for_user(
+                "7", "news", start, start + timedelta(seconds=6),
+                session_id="session-L0", device_key="device-key",
+            )
+            self.assertIsInstance(old_response, StreamingTSHTTPResponse)
+            withheld_first_chunk = next(iter(old_response.body))
+
+            with patch.object(stats, "_db_path", return_value=store.db_path), patch(
+                "catchuparr.runtime.load_config",
+                return_value=SimpleNamespace(archive_root=str(root)),
+            ):
+                display_id = stats.successful_playback(
+                    "7", "news", "device-key",
+                    playback_lease_id=old_response.lease_id,
+                )
+                replacement = service.stream_for_user(
+                    "7", "news", start, start + timedelta(seconds=6),
+                    session_id="session-L1", device_key="device-key",
+                )
+                self.assertIsInstance(replacement, StreamingTSHTTPResponse)
+                self.assertNotEqual(old_response.lease_id, replacement.lease_id)
+                replacement_first_chunk = next(iter(replacement.body))
+                self.assertTrue(replacement_first_chunk)
+                stats.successful_playback(
+                    "7", "news", "device-key",
+                    playback_lease_id=replacement.lease_id,
+                )
+                self.assertTrue(stats.revoke_display_session(display_id))
+
+                delayed_response = _PlaybackHeartbeatIterator(
+                    iter((withheld_first_chunk,)),
+                    lambda first_chunk: stats.successful_playback(
+                        "7", "news", "device-key",
+                        heartbeat=not first_chunk,
+                        playback_lease_id=old_response.lease_id,
+                    ),
+                )
+                self.assertEqual(withheld_first_chunk, next(delayed_response))
+                with sqlite3.connect(store.db_path) as db:
+                    row = db.execute(
+                        "SELECT revoked,playback_lease_id FROM catchuparr_stats_viewers "
+                        "WHERE display_id=?",
+                        (display_id,),
+                    ).fetchone()
+                self.assertEqual((1, replacement.lease_id), row)
+                old_response.close()
+                replacement.close()
+
     def test_streaming_local_response_runs_core_db_connection_finalizer(self):
         class FakeStreamingHttpResponse(dict):
             def __init__(self, streaming_content, *, status):

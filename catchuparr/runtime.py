@@ -349,7 +349,8 @@ def bootstrap() -> None:
     # Import the tasks in every worker so Celery sees plugin task names.
     from . import tasks  # noqa: F401
 
-    if "celery" not in " ".join(sys.argv).lower():
+    celery_process = "celery" in " ".join(sys.argv).lower()
+    if not celery_process:
         try:
             from .views import install_routes
 
@@ -364,6 +365,13 @@ def bootstrap() -> None:
                 event("runtime_disabled", logging.WARNING, reason="xc_hooks")
         except Exception:
             error("xc_install_failed")
+    try:
+        from .stats import install_stats_hooks
+
+        if not install_stats_hooks(route_hooks=not celery_process):
+            event("runtime_disabled", logging.WARNING, reason="stats_hooks")
+    except Exception:
+        error("stats_hook_install_failed")
     try:
         _ensure_schedule()
     except Exception:
@@ -396,6 +404,13 @@ def _ensure_schedule() -> None:
 def shutdown() -> None:
     from .logging_utils import error, event
 
+    try:
+        from .stats import uninstall_stats_hooks
+
+        if not uninstall_stats_hooks():
+            event("runtime_disabled", logging.WARNING, reason="stats_uninstall")
+    except Exception:
+        error("stats_hook_uninstall_failed")
     try:
         from .xc_runtime import uninstall_xc_integration
 

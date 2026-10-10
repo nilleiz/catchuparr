@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Local rolling catch-up archive and start-over for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -58,6 +58,20 @@
       "type": "string",
       "default": "INFO",
       "help_text": "DEBUG, INFO, WARNING, or ERROR. Applies to Catchuparr logs only."
+    },
+    {
+      "id": "show_archive_playback_in_stats",
+      "label": "Show archive playback in Stats",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Adds active Catchuparr archive viewers to native Timeshift Stats."
+    },
+    {
+      "id": "hide_recorders_in_stats",
+      "label": "Hide recorders in Stats",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Hides only positively identified Catchuparr recorder clients from live details."
     }
   ],
   "actions": [
