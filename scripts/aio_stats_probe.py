@@ -106,6 +106,35 @@ def _response_payload(response):
     return payload
 
 
+def _playback_auth_diagnostics(*, request, user, token, root, network_checker,
+                               runtime, access_token_store):
+    """Return safe auth-stage booleans without exposing credentials or request data."""
+
+    def checked(callback):
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    return {
+        "supportedVersion": checked(lambda: runtime.require_supported_version() is None),
+        "activeConfig": checked(lambda: runtime.load_config() is not None),
+        "tokenPresent": bool(token),
+        "tokenLookupFound": checked(
+            lambda: access_token_store(root).lookup(token) == str(user.id)
+        ),
+        "userActive": checked(
+            lambda: user.__class__.objects.filter(id=user.id, is_active=True).exists()
+        ),
+        "playlistNetworkAllowed": checked(
+            lambda: network_checker(request, "M3U_EPG", user)
+        ),
+        "streamsNetworkAllowed": checked(
+            lambda: network_checker(request, "STREAMS", user)
+        ),
+    }
+
+
 def _assert_hook_guards(stats) -> None:
     """Check repeat installation and worker-only installation on real modules."""
     from apps.accounts.permissions import IsAdmin
@@ -294,6 +323,7 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     from apps.plugins.models import PluginConfig
     from apps.proxy.utils import get_user_active_connections
     from core.utils import RedisClient
+    from dispatcharr.utils import network_access_allowed
     from django.urls import reverse
     from rest_framework.test import APIClient
 
@@ -342,16 +372,36 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     active_hls = _active_hls_session_count(root, user.id)
     native_connections = len(get_user_active_connections(user.id))
     playback_request = request(
+        "/catchuparr/archive", selected, REMOTE_ADDR="127.0.0.41",
+    )
+    external_probe = request(
         "/catchuparr/archive", selected, REMOTE_ADDR="198.51.100.41",
     )
-    playlist = archive_views.archive_view(playback_request)
     _require(
-        playlist.status_code == 200,
-        "Synthetic HLS playlist returned HTTP "
-        f"{playlist.status_code}; fixture active_ts={active_ts}, "
-        f"active_hls={active_hls}, native_connections={native_connections}, "
-        f"stream_limit={user.stream_limit}",
+        network_access_allowed(playback_request, "M3U_EPG", user)
+        and network_access_allowed(playback_request, "STREAMS", user)
+        and not network_access_allowed(external_probe, "M3U_EPG", user),
+        "Synthetic HLS fixture does not match native playback network policy",
     )
+    playlist = archive_views.archive_view(playback_request)
+    if playlist.status_code != 200:
+        from catchuparr.security import AccessTokenStore
+
+        auth_flags = _playback_auth_diagnostics(
+            request=playback_request,
+            user=user,
+            token=token,
+            root=root,
+            network_checker=network_access_allowed,
+            runtime=runtime,
+            access_token_store=AccessTokenStore,
+        )
+        raise RuntimeError(
+            "Synthetic HLS playlist returned HTTP "
+            f"{playlist.status_code}; fixture active_ts={active_ts}, "
+            f"active_hls={active_hls}, native_connections={native_connections}, "
+            f"stream_limit={user.stream_limit}, auth={json.dumps(auth_flags, sort_keys=True)}",
+        )
     playlist_url = next(
         line for line in playlist.content.decode().splitlines()
         if line and not line.startswith("#")
@@ -361,17 +411,17 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     path_parts = parts.path.rstrip("/").split("/")
     segment = archive_views.segment_view(
         request(parts.path, query, HTTP_RANGE="bytes=0-187",
-                REMOTE_ADDR="198.51.100.41"),
+                REMOTE_ADDR="127.0.0.41"),
         path_parts[-2], path_parts[-1],
     )
     _require(segment.status_code == 206, "Synthetic HLS segment did not return 206")
     reloaded = archive_views.archive_view(request(
-        "/catchuparr/archive", selected, REMOTE_ADDR="198.51.100.41",
+        "/catchuparr/archive", selected, REMOTE_ADDR="127.0.0.41",
     ))
     _require(reloaded.status_code == 200, "Synthetic HLS reload did not return 200")
     seek_params = dict(selected, utc=str(int(start.timestamp()) + 6))
     seek = archive_views.archive_view(request(
-        "/catchuparr/archive", seek_params, REMOTE_ADDR="198.51.100.41",
+        "/catchuparr/archive", seek_params, REMOTE_ADDR="127.0.0.41",
     ))
     _require(seek.status_code == 200, "Synthetic HLS seek did not return 200")
 
@@ -391,7 +441,7 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     ) = hls_rows[0]
     _require(str(display_id).startswith(DISPLAY_ID_PREFIX),
              "HLS playback did not create an opaque plugin display ID")
-    _require(client_ip == "198.51.100.41", "Stats row lost the synthetic request IP")
+    _require(client_ip == "127.0.0.41", "Stats row lost the synthetic request IP")
     _require(abs(float(programme_epoch) - (start.timestamp() + 6)) < 1,
              "Stats row lost the requested synthetic programme timestamp")
     _require(not revoked and old_lease, "HLS request did not retain its actual archive lease")
@@ -445,7 +495,7 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
              "Native Stop route did not revoke the plugin Stats session")
     stale_segment = archive_views.segment_view(
         request(parts.path, query, HTTP_RANGE="bytes=0-187",
-                REMOTE_ADDR="198.51.100.41"),
+                REMOTE_ADDR="127.0.0.41"),
         path_parts[-2], path_parts[-1],
     )
     _require(stale_segment.status_code in (403, 404, 410),
@@ -455,7 +505,7 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     # plugin row, reject its late first-chunk heartbeat, then accept a fresh
     # lease only after the normal native XC request has issued it.
     ts_response = xc_playback(
-        start.timestamp(), consume=False, remote_addr="198.51.100.42",
+        start.timestamp(), consume=False, remote_addr="127.0.0.42",
         range_header="bytes=0-10000000",
     )
     ts_iterator = iter(ts_response.streaming_content)
@@ -505,14 +555,14 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     stats.successful_playback(
         user.id, str(channel.uuid), ts_device_key, heartbeat=False,
         playback_lease_id=ts_lease, programme_start_epoch=start.timestamp(),
-        client_ip="198.51.100.42",
+        client_ip="127.0.0.42",
     )
     stopped_row = next(row for row in _viewer_rows(database, user.id, str(channel.uuid))
                        if row[0] == ts_display_id)
     _require(bool(stopped_row[3]) and stopped_row[4] == ts_lease,
              "A late first chunk revived the stopped TS lease")
     replacement_body = xc_playback(
-        start.timestamp(), remote_addr="198.51.100.42",
+        start.timestamp(), remote_addr="127.0.0.42",
     )
     _require(replacement_body == b"\x47" + bytes(187),
              "Fresh native XC TS request did not return the expected byte range")

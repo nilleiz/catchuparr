@@ -4,15 +4,50 @@ import ast
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from scripts.aio_stats_probe import (
     _assert_archive_projection,
     _assert_native_route_match,
+    _playback_auth_diagnostics,
     stats_options_draft,
 )
 
 
 class AIOStatsProbeTests(unittest.TestCase):
+    def test_auth_diagnostic_is_boolean_only_and_never_contains_token(self):
+        token = "synthetic-secret-token"
+
+        class FakeUser:
+            id = 7
+            objects = SimpleNamespace(
+                filter=Mock(return_value=SimpleNamespace(exists=Mock(return_value=True))),
+            )
+
+        user = FakeUser()
+        runtime = SimpleNamespace(
+            require_supported_version=Mock(return_value=None),
+            load_config=Mock(return_value=object()),
+        )
+        token_store = SimpleNamespace(lookup=Mock(return_value="7"))
+
+        flags = _playback_auth_diagnostics(
+            request=object(),
+            user=user,
+            token=token,
+            root=Path("/synthetic/archive"),
+            network_checker=Mock(return_value=True),
+            runtime=runtime,
+            access_token_store=Mock(return_value=token_store),
+        )
+
+        self.assertEqual(set(flags), {
+            "supportedVersion", "activeConfig", "tokenPresent", "tokenLookupFound",
+            "userActive", "playlistNetworkAllowed", "streamsNetworkAllowed",
+        })
+        self.assertTrue(all(type(value) is bool for value in flags.values()))
+        self.assertNotIn(token, repr(flags))
+
     def test_hls_admission_probe_precedes_one_slot_live_xc_fixtures(self):
         source = Path(__file__).resolve().parents[1] / "scripts/aio_integration_probe.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
