@@ -110,6 +110,42 @@ def _options() -> dict[str, bool]:
     }
 
 
+def _valid_current_playback_lease(
+    db: sqlite3.Connection,
+    lease_id: str,
+    user_id: str | int,
+    channel_uuid: str,
+    device_key: str,
+    now: float,
+) -> bool:
+    """Verify the current TS/HLS lease from the same database transaction."""
+    tables = {
+        str(row[0])
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('ts_playback_sessions','http_playback_sessions')"
+        )
+    }
+    if "ts_playback_sessions" in tables:
+        current_ts = db.execute(
+            "SELECT 1 FROM ts_playback_sessions WHERE lease_id=? AND user_id=? "
+            "AND channel_id=? AND device_key=? AND active=1 AND expires_at>? LIMIT 1",
+            (str(lease_id), str(user_id), str(channel_uuid), str(device_key), now),
+        ).fetchone()
+        if current_ts is not None:
+            return True
+    if "http_playback_sessions" in tables:
+        current_http = db.execute(
+            "SELECT 1 FROM http_playback_sessions WHERE lease_id=? AND user_id=? "
+            "AND channel_id=? AND device_key=? AND grace_until IS NULL "
+            "AND expires_at>? LIMIT 1",
+            (str(lease_id), str(user_id), str(channel_uuid), str(device_key), now),
+        ).fetchone()
+        if current_http is not None:
+            return True
+    return False
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     if type(value) is bool:
         return value
@@ -148,12 +184,23 @@ def successful_playback(
     with closing(sqlite3.connect(database, timeout=5)) as db:
         db.execute("PRAGMA busy_timeout=5000")
         _ensure_schema(db)
+        db.execute("BEGIN IMMEDIATE")
         row = db.execute(
             "SELECT display_id, logical_started_at, last_success_at, revoked, playback_lease_id, "
             "programme_start_epoch, client_ip "
             "FROM catchuparr_stats_viewers WHERE viewer_key=?",
             (viewer_key,),
         ).fetchone()
+        if playback_lease_id is not None and not _valid_current_playback_lease(
+            db,
+            playback_lease_id,
+            user_id,
+            channel_uuid,
+            logical_viewer_key,
+            now,
+        ):
+            db.commit()
+            return str(row[0]) if row is not None else ""
         if row is None:
             changed = True
             display_id = DISPLAY_ID_PREFIX + secrets.token_urlsafe(18)

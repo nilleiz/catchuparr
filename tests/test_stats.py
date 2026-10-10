@@ -44,6 +44,18 @@ class StatsProjectionTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertTrue(first.startswith(stats.DISPLAY_ID_PREFIX))
             self.assertNotIn("hashed-device-key", first)
+            with self._connect() as db:
+                db.execute(
+                    "CREATE TABLE ts_playback_sessions (lease_id TEXT,user_id TEXT,"
+                    "channel_id TEXT,device_key TEXT,active INTEGER,expires_at REAL)"
+                )
+                db.execute(
+                    "INSERT INTO ts_playback_sessions VALUES(?,?,?,?,?,?)",
+                    (
+                        "lease-1", "7", "synthetic-channel-uuid",
+                        "hashed-device-key", 1, 2000,
+                    ),
+                )
             stats.successful_playback(
                 7,
                 "synthetic-channel-uuid",
@@ -75,6 +87,34 @@ class StatsProjectionTests(unittest.TestCase):
                 stats, "_viewer_row", side_effect=lambda row: {"display_id": row["display_id"]}
             ):
                 self.assertEqual([], stats._active_viewers())
+
+    def test_hls_lease_validation_accepts_only_current_unexpired_device_lease(self):
+        with self._connect() as db:
+            db.execute(
+                "CREATE TABLE http_playback_sessions (lease_id TEXT,user_id TEXT,"
+                "channel_id TEXT,device_key TEXT,grace_until REAL,expires_at REAL)"
+            )
+            db.executemany(
+                "INSERT INTO http_playback_sessions VALUES(?,?,?,?,?,?)",
+                [
+                    ("current", "7", "channel-uuid", "device-key", None, 500),
+                    ("grace", "7", "channel-uuid", "device-key", 300, 300),
+                    ("other-device", "7", "channel-uuid", "other-device", None, 500),
+                    ("expired", "7", "channel-uuid", "device-key", None, 99),
+                ],
+            )
+            self.assertTrue(
+                stats._valid_current_playback_lease(
+                    db, "current", "7", "channel-uuid", "device-key", 100
+                )
+            )
+            for lease_id in ("grace", "other-device", "expired"):
+                with self.subTest(lease_id=lease_id):
+                    self.assertFalse(
+                        stats._valid_current_playback_lease(
+                            db, lease_id, "7", "channel-uuid", "device-key", 100
+                        )
+                    )
 
     def test_native_timeshift_websocket_is_asked_to_refresh(self):
         calls = []
@@ -570,12 +610,12 @@ class StatsProjectionTests(unittest.TestCase):
                     """
                     CREATE TABLE ts_playback_sessions (
                         lease_id TEXT PRIMARY KEY,user_id TEXT,channel_id TEXT,
-                        device_key TEXT,active INTEGER
+                        device_key TEXT,active INTEGER,expires_at REAL
                     );
                     CREATE TABLE ts_playback_streams(id TEXT,lease_id TEXT);
                     CREATE TABLE http_playback_sessions (
                         lease_id TEXT PRIMARY KEY,user_id TEXT,channel_id TEXT,
-                        device_key TEXT
+                        device_key TEXT,grace_until REAL,expires_at REAL
                     );
                     """
                 )
@@ -593,27 +633,39 @@ class StatsProjectionTests(unittest.TestCase):
                 )
                 db.execute(
                     "INSERT INTO ts_playback_sessions "
-                    "VALUES('lease-a','7','channel-uuid','device-key',1)"
+                    "VALUES('lease-a','7','channel-uuid','device-key',1,1000)"
                 )
                 db.execute("INSERT INTO ts_playback_streams VALUES('stream-a','lease-a')")
                 db.execute(
                     "INSERT INTO ts_playback_sessions "
-                    "VALUES('lease-b','8','channel-uuid','other-device',1)"
+                    "VALUES('lease-b','8','channel-uuid','other-device',1,1000)"
                 )
                 db.commit()
             with mock.patch("catchuparr.runtime.load_config", return_value=None):
                 self.assertTrue(stats.revoke_display_session("ca_stop_me"))
                 stats.successful_playback(
-                    7, "channel-uuid", "device-key", heartbeat=True,
-                    playback_lease_id="stopped-lease", now=30,
+                    7, "channel-uuid", "device-key",
+                    playback_lease_id="lease-a", now=30,
                 )
+                with self._connect() as db:
+                    self.assertEqual(
+                        1,
+                        db.execute(
+                            "SELECT revoked FROM catchuparr_stats_viewers "
+                            "WHERE display_id='ca_stop_me'"
+                        ).fetchone()[0],
+                    )
+                    db.execute(
+                        "INSERT INTO ts_playback_sessions "
+                        "VALUES('replacement-lease','7','channel-uuid','device-key',1,1000)"
+                    )
                 stats.successful_playback(
                     7, "channel-uuid", "device-key",
                     playback_lease_id="replacement-lease", now=31,
                 )
                 stats.successful_playback(
-                    7, "channel-uuid", "device-key", heartbeat=True,
-                    playback_lease_id="stopped-lease", now=32,
+                    7, "channel-uuid", "device-key",
+                    playback_lease_id="lease-a", now=32,
                 )
             with self._connect() as db:
                 self.assertEqual(
