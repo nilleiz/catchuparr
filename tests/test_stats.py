@@ -43,12 +43,25 @@ class StatsProjectionTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertTrue(first.startswith(stats.DISPLAY_ID_PREFIX))
             self.assertNotIn("hashed-device-key", first)
+            stats.successful_playback(
+                7,
+                "synthetic-channel-uuid",
+                "hashed-device-key",
+                playback_lease_id="lease-1",
+                programme_start_epoch=1_760_000_000,
+                client_ip="192.0.2.20",
+                now=1200,
+            )
             with self._connect() as db:
                 rows = db.execute(
-                    "SELECT display_id,logical_started_at,last_success_at,observed_position "
+                    "SELECT display_id,logical_started_at,last_success_at,observed_position,"
+                    "programme_start_epoch,client_ip "
                     "FROM catchuparr_stats_viewers"
                 ).fetchall()
-            self.assertEqual([(first, 1000.0, 1100.0, None)], rows)
+            self.assertEqual(
+                [(first, 1000.0, 1200.0, None, 1_760_000_000.0, "192.0.2.20")],
+                rows,
+            )
 
     def test_stats_heartbeat_is_display_only_and_expires_at_180_seconds(self):
         with mock.patch.object(stats, "_db_path", return_value=self.database):
@@ -371,8 +384,19 @@ class StatsProjectionTests(unittest.TestCase):
 
             def __init__(self, callback):
                 self.callback = callback
+                self.pattern = types.SimpleNamespace(
+                    converters={"channel_id": object()}
+                )
 
-        route = Route(native_stream)
+        guard_calls = []
+
+        def stream_guard(request, channel_id, *args, **kwargs):
+            guard_calls.append(channel_id)
+            return native_stream(request, channel_id, *args, **kwargs)
+
+        stream_guard._catchuparr_managed_id_guard = True
+        stream_guard._catchuparr_original = native_stream
+        route = Route(stream_guard)
         channel_status = types.ModuleType("apps.proxy.live_proxy.channel_status")
         channel_status.ChannelStatus = ChannelStatus
         channel_status.ProxyServer = types.SimpleNamespace(
@@ -417,7 +441,11 @@ class StatsProjectionTests(unittest.TestCase):
         try:
             with mock.patch.dict(sys.modules, modules):
                 self.assertTrue(stats._install_identity_hooks(channel_status, live_views))
+                installed_callback = route.callback
+                self.assertTrue(stats._install_identity_hooks(channel_status, live_views))
+                self.assertIs(installed_callback, route.callback)
                 self.assertEqual("native-response", route.callback(Request(token), "channel-uuid"))
+                self.assertEqual(["channel-uuid"], guard_calls)
                 marker = "catchuparr:stats:recorder-client:worker-7:client_1"
                 self.assertEqual(f"{digest}|channel-uuid", redis.values[marker])
                 registrations[0].remove_client("client_1")
@@ -425,6 +453,7 @@ class StatsProjectionTests(unittest.TestCase):
                 self.assertEqual(
                     "native-response", route.callback(Request("invalid"), "channel-uuid")
                 )
+                self.assertEqual(["channel-uuid", "channel-uuid"], guard_calls)
                 self.assertEqual(2, len(registrations))
                 self.assertFalse(any(
                     key.startswith("catchuparr:stats:recorder-client:worker-7:")
@@ -458,13 +487,13 @@ class StatsProjectionTests(unittest.TestCase):
                 db.execute(
                     "INSERT INTO catchuparr_stats_viewers "
                     "(viewer_key,display_id,user_id,channel_uuid,playback_device_key,"
-                    "logical_started_at,last_success_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
+                    "logical_started_at,last_success_at,playback_lease_id) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
                     (
                         hashlib.sha256(
                             f"catchuparr-viewer\0{7}\0channel-uuid\0device-key".encode()
                         ).hexdigest(),
-                        "ca_stop_me", "7", "channel-uuid", "device-key", 10, 20,
+                        "ca_stop_me", "7", "channel-uuid", "device-key", 10, 20, "lease-a",
                     ),
                 )
                 db.execute(
@@ -540,10 +569,34 @@ class StatsProjectionTests(unittest.TestCase):
             calls.append(request.data["session_id"])
             return FakeResponse(403 if not request.is_admin else 404)
 
+        def make_drf_callback(endpoint):
+            def post(self, *args, **kwargs):
+                return endpoint(*args, **kwargs)
+
+            view_class = type(
+                endpoint.__name__,
+                (),
+                {
+                    "__module__": endpoint.__module__,
+                    "http_method_names": ["post", "options"],
+                    "post": post,
+                },
+            )
+
+            def callback(*args, **kwargs):
+                return endpoint(*args, **kwargs)
+
+            callback.__name__ = endpoint.__name__
+            callback.__module__ = endpoint.__module__
+            callback.cls = view_class
+            return callback
+
+        drf_stop = make_drf_callback(native_stop)
+
         stats_views = types.ModuleType("apps.timeshift.stats_views")
-        stats_views.stop_timeshift_session = native_stop
+        stats_views.stop_timeshift_session = drf_stop
         routes = types.ModuleType("apps.timeshift.urls")
-        route = Route(native_stop)
+        route = Route(drf_stop)
         routes.urlpatterns = [route]
         fake_apps = types.ModuleType("apps")
         fake_timeshift = types.ModuleType("apps.timeshift")
@@ -581,6 +634,9 @@ class StatsProjectionTests(unittest.TestCase):
             ), mock.patch.object(stats, "revoke_display_session", return_value=True) as revoke:
                 stats._STOP_HOOK = None
                 self.assertTrue(stats._install_stop_hook())
+                installed_callback = route.callback
+                self.assertTrue(stats._install_stop_hook())
+                self.assertIs(installed_callback, route.callback)
                 result = route.callback(Request("ca_display_id", is_admin=True))
                 self.assertEqual(200, result.status_code)
                 revoke.assert_called_once_with("ca_display_id")

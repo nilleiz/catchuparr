@@ -18,6 +18,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,8 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
             last_success_at REAL NOT NULL,
             observed_position REAL,
             playback_lease_id TEXT,
+            programme_start_epoch REAL,
+            client_ip TEXT,
             revoked INTEGER NOT NULL DEFAULT 0
         )"""
     )
@@ -68,6 +71,14 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
             "ALTER TABLE catchuparr_stats_viewers "
             "ADD COLUMN playback_device_key TEXT NOT NULL DEFAULT ''"
         )
+    for column, declaration in (
+        ("programme_start_epoch", "REAL"),
+        ("client_ip", "TEXT"),
+    ):
+        if column not in columns:
+            db.execute(
+                f"ALTER TABLE catchuparr_stats_viewers ADD COLUMN {column} {declaration}"
+            )
     if "revoked" not in columns:
         db.execute(
             "ALTER TABLE catchuparr_stats_viewers "
@@ -113,6 +124,8 @@ def successful_playback(
     observed_position: float | None = None,
     heartbeat: bool = False,
     playback_lease_id: str | None = None,
+    programme_start_epoch: float | None = None,
+    client_ip: str | None = None,
     now: float | None = None,
 ) -> str:
     """Record a successful archive response and return its display-only ID.
@@ -136,7 +149,8 @@ def successful_playback(
         db.execute("PRAGMA busy_timeout=5000")
         _ensure_schema(db)
         row = db.execute(
-            "SELECT display_id, logical_started_at, last_success_at, revoked, playback_lease_id "
+            "SELECT display_id, logical_started_at, last_success_at, revoked, playback_lease_id, "
+            "programme_start_epoch, client_ip "
             "FROM catchuparr_stats_viewers WHERE viewer_key=?",
             (viewer_key,),
         ).fetchone()
@@ -146,33 +160,42 @@ def successful_playback(
             db.execute(
                 "INSERT INTO catchuparr_stats_viewers "
                 "(viewer_key,display_id,user_id,channel_uuid,playback_device_key,"
-                "logical_started_at,last_success_at,observed_position,playback_lease_id) "
-                "VALUES(?,?,?,?,?,?,?,NULL,?)",
+                "logical_started_at,last_success_at,observed_position,playback_lease_id,"
+                "programme_start_epoch,client_ip) "
+                "VALUES(?,?,?,?,?,?,?,NULL,?,?,?)",
                 (
                     viewer_key, display_id, str(user_id), str(channel_uuid),
                     logical_viewer_key, now, now, playback_lease_id,
+                    programme_start_epoch, client_ip,
                 ),
             )
         else:
             display_id = str(row[0])
-            if heartbeat and (
-                bool(row[3])
-                or (
-                    playback_lease_id is not None
-                    and row[4] is not None
-                    and str(row[4]) != str(playback_lease_id)
-                )
-            ):
+            lease_changed = (
+                playback_lease_id is not None
+                and row[4] is not None
+                and str(row[4]) != str(playback_lease_id)
+            )
+            if heartbeat and (bool(row[3]) or lease_changed):
                 db.commit()
                 return display_id
             if bool(row[3]):
+                # A delayed first body chunk from the stopped lease is still
+                # that lease. Only a distinct, validated current TS lease may
+                # start the logical viewer again.
+                if not lease_changed:
+                    db.commit()
+                    return display_id
                 changed = True
                 db.execute(
                     "UPDATE catchuparr_stats_viewers SET playback_device_key=?,"
                     "logical_started_at=?,last_success_at=?,observed_position=NULL,"
-                    "playback_lease_id=?,revoked=0 "
+                    "playback_lease_id=?,programme_start_epoch=?,client_ip=?,revoked=0 "
                     "WHERE viewer_key=?",
-                    (logical_viewer_key, now, now, playback_lease_id, viewer_key),
+                    (
+                        logical_viewer_key, now, now, playback_lease_id,
+                        programme_start_epoch, client_ip, viewer_key,
+                    ),
                 )
             started_at = now if now - float(row[2]) > DISPLAY_TIMEOUT_SECONDS else float(row[1])
             if not bool(row[3]) and now - float(row[2]) >= HEARTBEAT_WRITE_INTERVAL_SECONDS:
@@ -180,16 +203,32 @@ def successful_playback(
                 db.execute(
                     "UPDATE catchuparr_stats_viewers SET playback_device_key=?,"
                     "logical_started_at=?,last_success_at=?,observed_position=NULL,"
-                    "playback_lease_id=? "
+                    "playback_lease_id=?,programme_start_epoch=COALESCE(?,programme_start_epoch),"
+                    "client_ip=COALESCE(?,client_ip) "
                     "WHERE viewer_key=?",
-                    (logical_viewer_key, started_at, now, playback_lease_id, viewer_key),
+                    (
+                        logical_viewer_key, started_at, now, playback_lease_id,
+                        programme_start_epoch, client_ip, viewer_key,
+                    ),
                 )
             elif playback_lease_id is not None and not heartbeat:
                 changed = True
                 db.execute(
-                    "UPDATE catchuparr_stats_viewers SET playback_lease_id=? "
+                    "UPDATE catchuparr_stats_viewers SET playback_lease_id=?,"
+                    "programme_start_epoch=COALESCE(?,programme_start_epoch),"
+                    "client_ip=COALESCE(?,client_ip) "
                     "WHERE viewer_key=?",
-                    (playback_lease_id, viewer_key),
+                    (playback_lease_id, programme_start_epoch, client_ip, viewer_key),
+                )
+            elif not heartbeat and (
+                programme_start_epoch is not None or client_ip is not None
+            ):
+                changed = True
+                db.execute(
+                    "UPDATE catchuparr_stats_viewers SET "
+                    "programme_start_epoch=COALESCE(?,programme_start_epoch),"
+                    "client_ip=COALESCE(?,client_ip) WHERE viewer_key=?",
+                    (programme_start_epoch, client_ip, viewer_key),
                 )
         db.commit()
     if changed:
@@ -459,6 +498,58 @@ def _request_session_id(request: Any) -> str:
     return str(data.get("session_id") or "") if isinstance(data, dict) else ""
 
 
+def _registered_drf_endpoint(route: Any, expected_view: Any, method: str) -> bool:
+    """Check that a URL still registers the exact native endpoint we wrap."""
+    callback = getattr(route, "callback", None)
+    if callback is None or callback is not expected_view:
+        return False
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return False
+    if tuple(parameters) == ("request",):
+        return True
+    # DRF @api_view callbacks are variadic. Validate their generated APIView
+    # class and the wrapped native function before accepting that signature.
+    try:
+        unwrapped = inspect.unwrap(callback)
+    except Exception:
+        unwrapped = callback
+    view_class = getattr(callback, "cls", None) or getattr(unwrapped, "cls", None)
+    if (
+        view_class is None
+        or getattr(view_class, "__name__", None) != getattr(expected_view, "__name__", None)
+        or getattr(view_class, "__module__", None) != getattr(expected_view, "__module__", None)
+    ):
+        return False
+    allowed_methods = set(getattr(view_class, "http_method_names", ()))
+    if method not in allowed_methods:
+        return False
+    handler = getattr(view_class, method, None)
+    if handler is None:
+        return False
+    candidates = [handler]
+    for cell in getattr(handler, "__closure__", ()) or ():
+        try:
+            enclosed = cell.cell_contents
+        except ValueError:
+            continue
+        if callable(enclosed):
+            candidates.append(enclosed)
+    for candidate in candidates:
+        if (
+            getattr(candidate, "__name__", None) != getattr(expected_view, "__name__", None)
+            or getattr(candidate, "__module__", None) != getattr(expected_view, "__module__", None)
+        ):
+            continue
+        try:
+            if tuple(inspect.signature(candidate).parameters) == ("request",):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _install_stop_hook() -> bool:
     global _STOP_HOOK
     import apps.timeshift.stats_views as stats_views
@@ -467,40 +558,47 @@ def _install_stop_hook() -> bool:
     original = getattr(stats_views, "stop_timeshift_session", None)
     if original is None or getattr(original, HOOK_MARKER, False):
         return original is not None
-    try:
-        signature = inspect.signature(original)
-    except (TypeError, ValueError):
-        return False
-    if tuple(signature.parameters) != ("request",):
-        return False
-
-    @functools.wraps(original)
-    def wrapped(request):
-        # The native decorated endpoint performs its own IsAdmin authorization
-        # and retains all native behavior for IDs outside our opaque namespace.
-        response = original(request)
-        display_id = _request_session_id(request)
-        if not display_id.startswith(DISPLAY_ID_PREFIX):
-            return response
-        if getattr(response, "status_code", 200) != 404:
-            return response
-        if not revoke_display_session(display_id):
-            return response
-        from django.http import JsonResponse
-
-        return JsonResponse({"success": True})
-
-    setattr(wrapped, HOOK_MARKER, True)
-    setattr(wrapped, "__catchuparr_original__", original)
-    stats_views.stop_timeshift_session = wrapped
     changed_routes: list[tuple[Any, Any]] = []
+    already_installed = False
     for route in getattr(timeshift_urls, "urlpatterns", ()):
-        if getattr(route, "name", None) == "catchup_stop_client" and route.callback is original:
-            route.callback = wrapped
-            changed_routes.append((route, original))
+        if getattr(route, "name", None) != "catchup_stop_client":
+            continue
+        callback = getattr(route, "callback", None)
+        if (
+            getattr(callback, HOOK_MARKER, False)
+            and getattr(callback, "__catchuparr_original__", None) is original
+        ):
+            already_installed = True
+            continue
+        if not _registered_drf_endpoint(route, original, "post"):
+            continue
+
+        @functools.wraps(callback)
+        def wrapped(*args, __original=callback, **kwargs):
+            # Wrap the registered DRF callback so its native permission classes
+            # and response finalization run before plugin IDs are considered.
+            request = args[0] if args else kwargs.get("request")
+            response = __original(*args, **kwargs)
+            if request is None:
+                return response
+            display_id = _request_session_id(request)
+            if not display_id.startswith(DISPLAY_ID_PREFIX):
+                return response
+            if getattr(response, "status_code", 200) != 404:
+                return response
+            if not revoke_display_session(display_id):
+                return response
+            from django.http import JsonResponse
+
+            return JsonResponse({"success": True})
+
+        setattr(wrapped, HOOK_MARKER, True)
+        setattr(wrapped, "__catchuparr_original__", callback)
+        route.callback = wrapped
+        changed_routes.append((route, callback))
+
     if not changed_routes:
-        stats_views.stop_timeshift_session = original
-        return False
+        return already_installed
     _STOP_HOOK = (stats_views, original, changed_routes)
     return True
 
@@ -519,6 +617,10 @@ def _install_identity_hooks(channel_status: Any, live_views: Any) -> bool:
         "self", "client_id", "client_ip", "user_agent", "user",
         "output_format", "output_profile_id",
     )
+    try:
+        stream_signature = tuple(inspect.signature(stream_ts).parameters)
+    except (TypeError, ValueError):
+        stream_signature = ()
     if (
         basic is None or tuple(inspect.signature(basic).parameters) != ("channel_id",)
         or detail is None or tuple(inspect.signature(detail).parameters) != ("channel_id",)
@@ -526,15 +628,43 @@ def _install_identity_hooks(channel_status: Any, live_views: Any) -> bool:
         or original_remove is None
         or tuple(inspect.signature(original_remove).parameters) != ("self", "client_id")
         or stream_ts is None
-        or tuple(inspect.signature(stream_ts).parameters)
-        != ("request", "channel_id", "user", "force_output_format")
+        or stream_signature
+        not in {
+            ("request", "channel_id", "user", "force_output_format"),
+            ("args", "kwargs"),
+        }
     ):
         return False
-    route_matches = [
-        (route, stream_ts)
-        for route in getattr(live_urls, "urlpatterns", ())
-        if getattr(route, "name", None) == "stream" and route.callback is stream_ts
-    ]
+    from .adapters.recorder_proxy import _stream_route_channel_id_issue
+
+    route_matches = []
+    for index, route in enumerate(getattr(live_urls, "urlpatterns", ())):
+        if getattr(route, "name", None) != "stream":
+            continue
+        callback = getattr(route, "callback", None)
+        guarded_original = getattr(callback, "_catchuparr_original", None)
+        stats_original = getattr(callback, "__catchuparr_original__", None)
+        if callback is not stream_ts and not (
+            getattr(callback, "_catchuparr_managed_id_guard", False)
+            and guarded_original is stream_ts
+        ) and not (
+            getattr(callback, HOOK_MARKER, False)
+            and (
+                stats_original is stream_ts
+                or (
+                    getattr(stats_original, "_catchuparr_managed_id_guard", False)
+                    and getattr(stats_original, "_catchuparr_original", None) is stream_ts
+                )
+            )
+        ):
+            continue
+        validated_route = route
+        if callback is not stream_ts and not getattr(callback, "_catchuparr_managed_id_guard", False):
+            # Validate the original registered endpoint under our own wrapper.
+            validated_route = copy.copy(route)
+            validated_route.callback = stats_original
+        if _stream_route_channel_id_issue(validated_route, index, stream_ts) is None:
+            route_matches.append((route, callback))
     if not route_matches:
         return False
 
@@ -594,12 +724,15 @@ def _install_identity_hooks(channel_status: Any, live_views: Any) -> bool:
         ClientManager.remove_client = remove_client_wrapper
         _ORIGINALS.append((ClientManager, "remove_client", original_remove))
 
-    if not getattr(stream_ts, HOOK_MARKER, False):
-        @functools.wraps(stream_ts)
-        def stream_wrapper(request, channel_id, user=None, force_output_format=None):
+    for route, route_original in route_matches:
+        if getattr(route_original, HOOK_MARKER, False):
+            continue
+
+        @functools.wraps(route_original)
+        def stream_wrapper(request, channel_id, *args, __original=route_original, **kwargs):
             capability_digest = _verified_recorder_request(request, str(channel_id))
             if capability_digest is None:
-                return stream_ts(request, channel_id, user, force_output_format)
+                return __original(request, channel_id, *args, **kwargs)
             meta = getattr(request, "META", None)
             header_name = "HTTP_X_CATCHUPARR_RECORDER"
             if isinstance(meta, dict):
@@ -608,17 +741,14 @@ def _install_identity_hooks(channel_status: Any, live_views: Any) -> bool:
                 (str(channel_id), capability_digest, str(channel_id))
             )
             try:
-                return stream_ts(request, channel_id, user, force_output_format)
+                return __original(request, channel_id, *args, **kwargs)
             finally:
                 _RECORDER_CONTEXT.reset(context_token)
 
         setattr(stream_wrapper, HOOK_MARKER, True)
-        setattr(stream_wrapper, "__catchuparr_original__", stream_ts)
-        live_views.stream_ts = stream_wrapper
-        _ORIGINALS.append((live_views, "stream_ts", stream_ts))
-        for route, _route_original in route_matches:
-            route.callback = stream_wrapper
-        _IDENTITY_ROUTES.extend(route_matches)
+        setattr(stream_wrapper, "__catchuparr_original__", route_original)
+        route.callback = stream_wrapper
+        _IDENTITY_ROUTES.append((route, route_original))
     return True
 
 
@@ -661,7 +791,7 @@ def _viewer_row(row: sqlite3.Row) -> dict[str, Any] | None:
     connection = {
         "client_id": display_id,
         "session_id": display_id,
-        "ip_address": None,
+        "ip_address": row["client_ip"],
         "user_agent": "Catchuparr archive playback",
         "user_id": str(user.id),
         "username": str(getattr(user, "username", "")),
@@ -672,6 +802,11 @@ def _viewer_row(row: sqlite3.Row) -> dict[str, Any] | None:
         "m3u_profile": {},
         "m3u_profile_id": None,
     }
+    programme_epoch = row["programme_start_epoch"]
+    programme_start = (
+        datetime.fromtimestamp(float(programme_epoch), timezone.utc).strftime("%Y-%m-%d:%H-%M")
+        if programme_epoch is not None else None
+    )
     return {
         "session_id": display_id,
         "stats_channel_id": display_id,
@@ -679,7 +814,7 @@ def _viewer_row(row: sqlite3.Row) -> dict[str, Any] | None:
         "channel_uuid": str(channel.uuid),
         "channel_name": str(channel.name),
         "logo_id": getattr(channel, "logo_id", None),
-        "programme_start": None,
+        "programme_start": programme_start,
         "position_anchor_at": None,
         "playback_base_secs": row["observed_position"],
         "paused": None,
@@ -893,7 +1028,7 @@ def _install_builder(module: Any, name: str, transform) -> bool:
     return True
 
 
-def install_stats_hooks() -> bool:
+def install_stats_hooks(*, route_hooks: bool = True) -> bool:
     """Install hooks only for inspected Dispatcharr 0.31/0.32 signatures."""
     from version import __version__ as dispatcharr_version
 
@@ -920,6 +1055,8 @@ def install_stats_hooks() -> bool:
         # Some verified imports only expose one of the two builders.
         if getattr(module, name, None) is not None:
             installed = _install_builder(module, name, transform) and installed
+    if not route_hooks:
+        return installed
     installed = _install_identity_hooks(channel_status, live_views) and installed
     return _install_stop_hook() and installed
 
@@ -930,15 +1067,11 @@ def uninstall_stats_hooks() -> bool:
     if _STOP_HOOK is not None:
         module, original, routes = _STOP_HOOK
         for route, route_original in routes:
-            if getattr(route, "callback", None) is getattr(module, "stop_timeshift_session", None):
+            callback = getattr(route, "callback", None)
+            if getattr(callback, "__catchuparr_original__", None) is route_original:
                 route.callback = route_original
             else:
                 restored = False
-        current = getattr(module, "stop_timeshift_session", None)
-        if getattr(current, "__catchuparr_original__", None) is original:
-            module.stop_timeshift_session = original
-        else:
-            restored = False
         _STOP_HOOK = None
     while _IDENTITY_ROUTES:
         route, original = _IDENTITY_ROUTES.pop()
