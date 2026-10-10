@@ -146,6 +146,10 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(1, result["channels"][0]["segments"])
         self.assertEqual(len(b"transport stream"), result["indexed_storage_bytes"])
         self.assertIn("recorder_running", result["channels"][0])
+        self.assertEqual(1, result["selected_channel_count"])
+        self.assertIsNone(result["running_recorder_count"])
+        self.assertGreaterEqual(result["archive_storage_bytes"], len(b"transport stream"))
+        self.assertIn("in an unknown state", result["message"])
 
     def test_runtime_version_matrix(self):
         for version in ("0.31.0", "0.32.0"):
@@ -259,6 +263,7 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(8, result["control_generation"])
         self.assertTrue(result["recording_control_available"])
         self.assertTrue(result["channels"][0]["recording_scheduled"])
+        self.assertEqual("paused", result["channels"][0]["recorder_reason"])
         self.assertIn("segments", result["channels"][0])
 
     def test_runtime_state_denies_recording_when_applied_control_is_unavailable(self):

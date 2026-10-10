@@ -6,6 +6,7 @@ import contextlib
 import os
 import shutil
 import sqlite3
+import stat
 import tempfile
 import time
 import uuid
@@ -306,6 +307,95 @@ class ArchiveStore:
         """Count all archived channels, including ones no longer selected."""
         with self._database() as db:
             return int(db.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM segments").fetchone()[0])
+
+    def status_metrics(self, channel_ids, *, now: datetime | None = None) -> dict:
+        """Measure archive files and usable channel timelines for status output.
+
+        The disk total walks the archive without following symlinks. Timeline
+        data comes from indexed rows only when their files still exist beneath
+        this archive root.
+        """
+        now_epoch = _utc_epoch(now or datetime.now(timezone.utc))
+        root = self.root.resolve()
+        total_bytes = 0
+        for directory, dirnames, filenames in os.walk(root, followlinks=False):
+            base = Path(directory)
+            dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
+            for filename in filenames:
+                path = base / filename
+                try:
+                    info = path.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    total_bytes += info.st_size
+
+        wanted = {_channel_key(channel) for channel in channel_ids}
+        timelines = {channel: [] for channel in wanted}
+        with self._database() as db:
+            rows = []
+            selected = list(wanted)
+            for offset in range(0, len(selected), 500):
+                chunk = selected[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(db.execute(
+                    "SELECT channel_id, relpath, start_utc, end_utc, discontinuity FROM segments "
+                    f"WHERE channel_id IN ({placeholders}) ORDER BY channel_id,start_utc,end_utc",
+                    chunk,
+                ).fetchall())
+        for row in rows:
+            channel = row["channel_id"]
+            if channel not in wanted:
+                continue
+            path = self.root / row["relpath"]
+            try:
+                resolved = path.resolve(strict=True)
+                if not resolved.is_relative_to(root) or not resolved.is_file():
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            try:
+                file_size = resolved.stat().st_size
+            except OSError:
+                continue
+            timelines[channel].append(
+                (float(row["start_utc"]), float(row["end_utc"]), file_size, int(row["discontinuity"]))
+            )
+
+        result = {}
+        for channel, intervals in timelines.items():
+            intervals.sort()
+            if not intervals:
+                result[channel] = {
+                    "history": "0h0m", "oldest_start_utc": None,
+                    "latest_end_utc": None, "gaps": [], "usable_segments": 0,
+                    "segments": 0, "size_bytes": 0, "discontinuities": 0,
+                }
+                continue
+            spans: list[list[float]] = []
+            for start, end, _size, _discontinuity in intervals:
+                if spans and start <= spans[-1][1] + TIMELINE_GAP_TOLERANCE_SECONDS:
+                    spans[-1][1] = max(spans[-1][1], end)
+                else:
+                    spans.append([start, end])
+            oldest, latest = spans[0][0], spans[-1][1]
+            elapsed = max(0, int((now_epoch - oldest) // 60))
+            gaps = [
+                {"start_utc": _datetime(left[1]).isoformat(), "end_utc": _datetime(right[0]).isoformat()}
+                for left, right in zip(spans, spans[1:])
+                if right[0] > left[1] + TIMELINE_GAP_TOLERANCE_SECONDS
+            ]
+            result[channel] = {
+                "history": f"{elapsed // 60}h{elapsed % 60}m",
+                "oldest_start_utc": _datetime(oldest).isoformat(),
+                "latest_end_utc": _datetime(latest).isoformat(),
+                "gaps": gaps,
+                "usable_segments": len(intervals),
+                "segments": len(intervals),
+                "size_bytes": sum(item[2] for item in intervals),
+                "discontinuities": sum(item[3] for item in intervals),
+            }
+        return {"archive_storage_bytes": total_bytes, "channels": result}
 
     def segment(self, channel_id: str, segment_id: str) -> Segment | None:
         """Look up one immutable segment by the indexed ID and channel."""
