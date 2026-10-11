@@ -574,9 +574,22 @@ def status(settings: dict, *, control_state=None) -> dict:
     running_count = result["running_recorder_count"]
     running_text = "unknown" if running_count is None else str(running_count)
     state_text = "in an unknown state" if running_count is None else "running" if running_count else "stopped"
+    oldest_recording = min(
+        (channel["oldest_start_utc"] for channel in channels if channel["oldest_start_utc"]),
+        default=None,
+    )
+    if oldest_recording is None:
+        history_text = "no archived footage available"
+    else:
+        oldest_start = datetime.fromisoformat(oldest_recording)
+        history_minutes = max(0, int((now - oldest_start).total_seconds() // 60))
+        history_text = (
+            f"oldest indexed footage: {history_minutes // 60}h{history_minutes % 60}m ago"
+        )
     result["message"] = (
         f"Catchuparr is {state_text}: "
         f"{running_text} of {len(channels)} selected channels recording; "
+        f"{history_text}; "
         f"archive uses {archive_metrics['archive_storage_bytes'] / 1024**3:.2f} GiB of "
         f"{config.max_storage_bytes / 1024**3:.2f} GiB."
     )
