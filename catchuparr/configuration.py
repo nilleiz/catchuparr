@@ -1016,6 +1016,12 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
     recording_enabled = settings.get("recording_enabled", True)
     if type(recording_enabled) is not bool:
         raise ValueError("recording_enabled must be boolean")
+    show_archive_playback = settings.get("show_archive_playback_in_stats", True)
+    if type(show_archive_playback) is not bool:
+        raise ValueError("show_archive_playback_in_stats must be boolean")
+    hide_recorders = settings.get("hide_recorders_in_stats", True)
+    if type(hide_recorders) is not bool:
+        raise ValueError("hide_recorders_in_stats must be boolean")
     applicable: dict[str, Any] = {
         "archive_root": str(parsed.archive_root),
         "retention_hours": parsed.retention_hours,
@@ -1023,6 +1029,8 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
         "recording_enabled": recording_enabled,
         "log_level": normalize_log_level(settings.get("log_level", "INFO")),
         "public_base_url": normalize_public_base_url(settings.get("public_base_url", "")),
+        "show_archive_playback_in_stats": show_archive_playback,
+        "hide_recorders_in_stats": hide_recorders,
     }
     raw_user_id = settings.get("playback_user_id")
     if isinstance(raw_user_id, bool):
@@ -1288,7 +1296,10 @@ def _validate_active_document(data: dict[str, Any]) -> None:
     }
     if version >= 4:
         allowed_settings.update(
-            {"recording_enabled", "log_level", "public_base_url"}
+            {
+                "recording_enabled", "log_level", "public_base_url",
+                "show_archive_playback_in_stats", "hide_recorders_in_stats",
+            }
         )
     if set(settings) - allowed_settings:
         raise ValueError("Active Catchuparr settings contain unknown fields")
@@ -1345,6 +1356,9 @@ def _validate_active_document(data: dict[str, Any]) -> None:
     if version >= 4:
         if type(settings.get("recording_enabled")) is not bool:
             raise ValueError("Active Catchuparr recording_enabled is invalid")
+        for field_name in ("show_archive_playback_in_stats", "hide_recorders_in_stats"):
+            if field_name in settings and type(settings[field_name]) is not bool:
+                raise ValueError(f"Active Catchuparr {field_name} is invalid")
         from .logging_utils import normalize_log_level
 
         try:

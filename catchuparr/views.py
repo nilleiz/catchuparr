@@ -516,6 +516,21 @@ def archive_view(request):
         programme_end_utc=programme_end_epoch,
         continuation_end_utc=continuation_end_epoch,
     )
+    if request.method == "GET" and response.status == 200 and getattr(response, "body", None):
+        try:
+            from .stats import successful_playback
+
+            logical_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            successful_playback(
+                user.id,
+                channel,
+                logical_key,
+                playback_lease_id=getattr(response, "playback_lease_id", None),
+                programme_start_epoch=start_epoch,
+                client_ip=(getattr(request, "META", {}) or {}).get("REMOTE_ADDR"),
+            )
+        except Exception:
+            pass
     finish(response, _playlist_trace_reason(response))
     return _to_django_response(response, request.method)
 
@@ -678,6 +693,20 @@ def segment_view(request, channel_id: str, segment_id: str):
         token, channel_id, segment_id, request.GET.get("lease"),
         method=request.method, range_header=request.headers.get("Range"),
     )
+    if request.method == "GET" and response.status in (200, 206) and response.body:
+        try:
+            from .stats import successful_playback
+
+            logical_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            successful_playback(
+                user.id,
+                channel_id,
+                logical_key,
+                playback_lease_id=getattr(response, "playback_lease_id", None),
+                client_ip=(getattr(request, "META", {}) or {}).get("REMOTE_ADDR"),
+            )
+        except Exception:
+            pass
     segment_start = segment_end = None
     if _trace_enabled():
         try:
