@@ -183,6 +183,10 @@ class RuntimeStatusTests(unittest.TestCase):
             }, control_state=RecorderControlState(False, 0))
         self.assertEqual(segment.end_utc.isoformat(), result["channels"][0]["latest_end_utc"])
         self.assertEqual(1, result["channels"][0]["segments"])
+        self.assertIn(
+            f"oldest indexed footage: {result['channels'][0]['history']} ago",
+            result["message"],
+        )
         self.assertEqual(len(b"transport stream"), result["indexed_storage_bytes"])
         self.assertIn("recorder_running", result["channels"][0])
         self.assertEqual(1, result["selected_channel_count"])
