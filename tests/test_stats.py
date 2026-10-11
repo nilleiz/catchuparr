@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import sqlite3
 import sys
 import tempfile
@@ -352,6 +353,175 @@ class StatsProjectionTests(unittest.TestCase):
         )
         self.assertEqual(1, result["channels"][0]["client_count"])
         self.assertEqual(1, result["total_connections"])
+
+    def test_empty_current_private_worker_row_is_removed_with_matching_counts(self):
+        from catchuparr.adapters import recorder_proxy
+        from catchuparr.recorder_proxy import CAPABILITY_PREFIX
+
+        worker_id = "catchuparr-r" + "a" * 40
+        capability_digest = "synthetic-capability-digest"
+        record = {
+            "worker_id": worker_id,
+            "state": "active",
+            "account_id": "synthetic-account",
+            "channel_uuid": "synthetic-channel-uuid",
+            "config_generation": "synthetic-config-generation",
+            "control_generation": "4",
+            "lease_fence": "7",
+            "lease_key": "catchuparr:recorder:synthetic-channel-uuid",
+            "lease_value": "7:synthetic-owner",
+            "stream_id": "synthetic-stream",
+            "capability_digest": capability_digest,
+        }
+
+        class FakeRedis:
+            def get(self, key):
+                if key == record["lease_key"]:
+                    return record["lease_value"]
+                if key == CAPABILITY_PREFIX + capability_digest:
+                    return json.dumps({
+                        key: value for key, value in record.items()
+                        if key != "state"
+                    })
+                return None
+
+        core = types.ModuleType("core")
+        core.__path__ = []
+        utils = types.ModuleType("core.utils")
+        redis = FakeRedis()
+        utils.RedisClient = types.SimpleNamespace(get_client=lambda: redis)
+        native = {
+            "channels": [{
+                "channel_id": worker_id,
+                "client_count": 1,
+                "connection_count": 1,
+                "clients": [{"client_id": "verified-private-recorder"}],
+            }],
+            "count": 1,
+            "total_connections": 1,
+        }
+        with mock.patch.dict(sys.modules, {"core": core, "core.utils": utils}), \
+             mock.patch.object(
+                 recorder_proxy,
+                 "read_worker_record",
+                 side_effect=lambda _redis, value: record if value == worker_id else None,
+             ), \
+             mock.patch.object(
+                 stats, "_is_recorder_client",
+                 side_effect=lambda _channel, client: client == "verified-private-recorder",
+             ):
+            result = stats.project_live_stats(native)
+
+        self.assertEqual(1, len(native["channels"]))
+        self.assertEqual(1, native["count"])
+        self.assertEqual(1, native["total_connections"])
+        self.assertEqual([], result["channels"])
+        self.assertEqual(0, result["count"])
+        self.assertEqual(0, result["total_connections"])
+
+    def test_private_looking_rows_require_current_ownership_and_no_visible_clients(self):
+        from catchuparr.adapters import recorder_proxy
+        from catchuparr.recorder_proxy import CAPABILITY_PREFIX
+
+        worker_id = "catchuparr-r" + "b" * 40
+        fake_prefix_id = "catchuparr-r" + "c" * 39 + "!"
+        capability_digest = "another-synthetic-capability"
+        record = {
+            "worker_id": worker_id,
+            "state": "active",
+            "account_id": "synthetic-account",
+            "channel_uuid": "synthetic-channel-uuid",
+            "config_generation": "synthetic-config-generation",
+            "control_generation": "4",
+            "lease_fence": "9",
+            "lease_key": "catchuparr:recorder:synthetic-channel-uuid",
+            "lease_value": "9:synthetic-owner",
+            "stream_id": "synthetic-stream",
+            "capability_digest": capability_digest,
+        }
+
+        class FakeRedis:
+            lease_value = record["lease_value"]
+
+            def get(self, key):
+                if key == record["lease_key"]:
+                    return self.lease_value
+                if key == CAPABILITY_PREFIX + capability_digest:
+                    return json.dumps({
+                        key: value for key, value in record.items()
+                        if key != "state"
+                    })
+                return None
+
+        core = types.ModuleType("core")
+        core.__path__ = []
+        utils = types.ModuleType("core.utils")
+        redis = FakeRedis()
+        utils.RedisClient = types.SimpleNamespace(get_client=lambda: redis)
+
+        def project(channel_id, clients, *, count=None, ledger=None):
+            native = {
+                "channels": [{
+                    "channel_id": channel_id,
+                    "client_count": len(clients) if count is None else count,
+                    "clients": clients,
+                }],
+                "count": 1,
+                "total_connections": len(clients),
+            }
+            with mock.patch.object(
+                recorder_proxy,
+                "read_worker_record",
+                side_effect=lambda _redis, value: ledger if value == worker_id else None,
+            ), mock.patch.object(
+                stats, "_is_recorder_client",
+                side_effect=lambda _channel, client: client == "verified-recorder",
+            ):
+                return stats.project_live_stats(native)
+
+        with mock.patch.dict(sys.modules, {"core": core, "core.utils": utils}):
+            ordinary_empty = project(
+                "synthetic-live-channel",
+                [],
+                count=0,
+                ledger=None,
+            )
+            unmarked = project(
+                worker_id, [{"client_id": "ordinary-viewer"}], ledger=None,
+            )
+            prefix_fake = project(
+                fake_prefix_id, [{"client_id": "verified-recorder"}], ledger=record,
+            )
+            redis.lease_value = "10:replacement-owner"
+            stale_ledger = project(
+                worker_id, [{"client_id": "verified-recorder"}], ledger=record,
+            )
+            redis.lease_value = record["lease_value"]
+            mixed_visible = project(
+                worker_id,
+                [
+                    {"client_id": "verified-recorder"},
+                    {"client_id": "ordinary-viewer"},
+                ],
+                ledger=record,
+            )
+
+        for result in (ordinary_empty, unmarked, prefix_fake, stale_ledger, mixed_visible):
+            with self.subTest(result=result):
+                self.assertEqual(1, len(result["channels"]))
+                self.assertEqual(1, result["count"])
+        self.assertEqual(
+            [{"client_id": "ordinary-viewer"}],
+            unmarked["channels"][0]["clients"],
+        )
+        self.assertEqual([], prefix_fake["channels"][0]["clients"])
+        self.assertEqual([], stale_ledger["channels"][0]["clients"])
+        self.assertEqual(
+            [{"client_id": "ordinary-viewer"}],
+            mixed_visible["channels"][0]["clients"],
+        )
+        self.assertEqual(1, mixed_visible["channels"][0]["client_count"])
+        self.assertEqual(1, mixed_visible["total_connections"])
 
     def test_unknown_recorder_like_client_is_not_hidden(self):
         payload = {

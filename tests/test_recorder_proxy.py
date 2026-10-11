@@ -273,9 +273,16 @@ class RecorderProxyTests(unittest.TestCase):
                 },
             },
         }
+        hide_false = {**active, "hide_recorders_in_stats": False}
         self.assertNotEqual(
             recorder_proxy.configuration_generation(active),
             recorder_proxy.configuration_generation(scheduled),
+        )
+        self.assertNotEqual(
+            recorder_proxy.configuration_generation(
+                {**active, "hide_recorders_in_stats": True}
+            ),
+            recorder_proxy.configuration_generation(hide_false),
         )
 
     def test_provider_urls_are_redacted_from_messages_and_exceptions(self):
