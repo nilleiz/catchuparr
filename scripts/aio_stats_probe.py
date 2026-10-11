@@ -849,6 +849,43 @@ def _contains_client_id(value, client_id: str) -> bool:
     return False
 
 
+def _private_worker_capability_binding(redis_client, worker_record: dict[str, str]):
+    """Return the current capability binding after matching ledger fields."""
+    import json
+
+    from catchuparr.recorder_proxy import CAPABILITY_PREFIX, capability_binding_current
+
+    binding_fields = (
+        "account_id", "channel_uuid", "config_generation", "control_generation",
+        "lease_fence", "lease_key", "lease_value", "stream_id", "worker_id",
+    )
+    digest = str(worker_record.get("capability_digest", ""))
+    if not digest:
+        return None
+    raw_capability = redis_client.get(CAPABILITY_PREFIX + digest)
+    if not raw_capability:
+        return None
+    try:
+        capability = json.loads(
+            raw_capability.decode("utf-8")
+            if isinstance(raw_capability, bytes) else raw_capability
+        )
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(capability, dict) or str(capability.get("capability_digest", "")) != digest:
+        return None
+    if any(
+        field not in worker_record
+        or field not in capability
+        or str(worker_record[field]) != str(capability[field])
+        for field in binding_fields
+    ):
+        return None
+    binding = {field: str(capability[field]) for field in binding_fields}
+    binding["capability_digest"] = digest
+    return binding if capability_binding_current(redis_client, binding) else None
+
+
 def probe_actual_private_recorder_stats(*, channel_id, ordinary_channel_id,
                                         native_server, redis_client,
                                         expected_hidden: bool) -> None:
@@ -865,7 +902,6 @@ def probe_actual_private_recorder_stats(*, channel_id, ordinary_channel_id,
 
     from catchuparr import stats
     from catchuparr.adapters.recorder_proxy import read_worker_record
-    from catchuparr.recorder_proxy import capability_binding_current
 
     channel_key = str(channel_id)
     ordinary_key = str(ordinary_channel_id)
@@ -875,7 +911,7 @@ def probe_actual_private_recorder_stats(*, channel_id, ordinary_channel_id,
         and record.get("worker_id") == channel_key
         and record.get("state") == "active"
         and record.get("reservation_state") == "reserved"
-        and capability_binding_current(redis_client, record),
+        and _private_worker_capability_binding(redis_client, record) is not None,
         "Private B Stats row is not owned by its current active worker ledger",
     )
     manager = native_server.client_managers.get(channel_key)
