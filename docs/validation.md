@@ -194,8 +194,33 @@ and native integration in the pinned AIO versions. The 0.3.1-specific full
 acceptance run is pending; prior 0.3.0 native results are not counted as a pass
 for the new unified configuration path.
 
+User acceptance for the 0.3.1 candidate scope is recorded. This records
+acceptance only and does not indicate that a 0.3.1 release was published.
+
 Independent review, required CI, isolated Dev verification and real-player
 acceptance remain release gates. This is a candidate status, not a publication
 or player-compatibility claim. See the
 [0.3.1 candidate guide](candidate-0.3.1.md) for current behavior and upgrade
 notes.
+
+## 0.4.0 Stats candidate
+
+The 0.4.0 candidate passed 392 local unit tests, Ruff, compileall, package
+validation, independent review and the full synthetic native integration probe
+on pinned Dispatcharr 0.31.0 and 0.32.0. Both native runs passed their required
+probe assertions and cleanup checks. The probe covers native Stats REST routes
+and admin permissions, native Stop behavior, viewer timeout and connection
+limits, recorder identity filtering, shared and private recorder isolation,
+source-policy behavior, failover and cross-process follower checks.
+
+The WebSocket check captures the actual native event emitter and exercises the
+native consumer's admin authorization helper against its event payload. It does
+not perform a browser or network WebSocket roundtrip. Shared-recorder
+`hide_recorders_in_stats=True` and private-recorder
+`hide_recorders_in_stats=False` were exercised; private-recorder output with
+that option set to true remains unverified.
+
+Required CI, isolated Dev installation and real-player acceptance remain
+pending. These synthetic native results do not establish playback-client
+compatibility or represent a published release. See the
+[0.4.0 candidate guide](candidate-0.4.0.md) for the feature behavior and limits.

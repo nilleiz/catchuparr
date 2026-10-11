@@ -19,6 +19,39 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _current_orm_context_snapshot() -> dict[str, object]:
+    """Return only connection counts and transaction booleans for this context."""
+    try:
+        from django.db import connections
+
+        initialized = connections.all(initialized_only=True)
+        default = next(
+            (wrapper for wrapper in initialized if wrapper.alias == "default"), None,
+        )
+        default_initialized = bool(default is not None and default.connection is not None)
+        default_autocommit = None
+        if default_initialized:
+            try:
+                default_autocommit = bool(default.get_autocommit())
+            except Exception:
+                default_autocommit = None
+        return {
+            "wrapper_count": len(initialized),
+            "initialized_count": len(initialized),
+            "default_initialized": default_initialized,
+            "default_in_atomic_block": bool(default and default.in_atomic_block),
+            "default_autocommit": default_autocommit,
+        }
+    except Exception:
+        return {
+            "wrapper_count": 0,
+            "initialized_count": 0,
+            "default_initialized": False,
+            "default_in_atomic_block": False,
+            "default_autocommit": None,
+        }
+
+
 def _issue_media_probe_attempt(
     redis_client,
     lease,
@@ -2283,6 +2316,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     from django.test import Client
     from gevent import sleep as gevent_sleep
 
+    from catchuparr import runtime as catchuparr_runtime
     from catchuparr.adapters.recorder_proxy import _release_worker_reservation
     from catchuparr.configuration import (
         active_settings_path,
@@ -2328,6 +2362,20 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     plugin_config = PluginConfig.objects.get(key="catchuparr")
     original_plugin_settings = dict(plugin_config.settings or {})
 
+    def apply_stats_recorder_option(hide_recorders: bool) -> None:
+        from aio_stats_probe import stats_options_draft
+
+        current = PluginConfig.objects.get(key="catchuparr")
+        full_settings = dict(current.settings or {})
+        full_settings.update(settings)
+        draft = stats_options_draft(full_settings, hide_recorders=hide_recorders)
+        current.settings = draft
+        current.save(update_fields=("settings",))
+        applied = catchuparr_runtime.apply_configuration(draft)
+        _require(applied.get("applied") is True,
+                 "Unified Apply rejected recorder Stats visibility option")
+        settings["hide_recorders_in_stats"] = hide_recorders
+
     original_base_url = channel_tasks.get_dvr_stream_base_url
     saved_default_profile = None
     default_profile_saved = False
@@ -2349,6 +2397,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     profile_baselines = {}
     marker_baselines = {}
     cleanup_errors = []
+    cleanup_exception_types = []
+    primary_exception = None
 
     try:
         payload_a = _make_paced_transport_stream(
@@ -2452,6 +2502,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "archive_root": str(archive_root),
             "retention_hours": 1,
             "max_storage_gib": 1,
+            "show_archive_playback_in_stats": bool(
+                original_plugin_settings.get("show_archive_playback_in_stats", True)
+            ),
+            "hide_recorders_in_stats": True,
         }
         apply_configuration(settings, active_path=active_path)
         active = load_active_configuration(active_path)
@@ -2641,6 +2695,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             ),
             "Native live A source metadata is incomplete",
         )
+        apply_stats_recorder_option(True)
         # With no policy, the real recorder task must attach to this same
         # native A worker and index decoded A rather than opening a second
         # provider connection.
@@ -2684,6 +2739,18 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             _native_source_metadata(redis_client, metadata_key) == source_metadata,
             "No-rules archive changed native live A source metadata",
         )
+        from aio_stats_probe import probe_actual_recorder_stats
+
+        probe_actual_recorder_stats(
+            channel_id=worker_id,
+            redis_client=redis_client,
+            native_server=native_server,
+            profile_a=profile_a,
+            profile_b=profile_b,
+            profile_connections_key=profile_connections_key,
+            assignment_snapshot=assignment_snapshot,
+            metadata_key=metadata_key,
+        )
         run_a.stop()
         run_a.join(cooperative_sleep=gevent_sleep)
         _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
@@ -2697,19 +2764,33 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             == native_a_marker,
             "Stopping the shared no-rules archive changed the live A release marker",
         )
+        apply_stats_recorder_option(False)
 
         # Applying B while A is live must create a dedicated recorder worker.
-        settings_b = dict(
-            settings,
-            filter_config=(
-                "version: 1\n"
-                f"profile: {profile_name}\n"
-                "rules:\n"
-                "  - channels: {profile: all}\n"
-                "    include: [Synthetic archive isolation B]\n"
+        from aio_stats_probe import stats_options_draft
+
+        settings_b = stats_options_draft(
+            dict(
+                settings,
+                filter_config=(
+                    "version: 1\n"
+                    f"profile: {profile_name}\n"
+                    "rules:\n"
+                    "  - channels: {profile: all}\n"
+                    "    include: [Synthetic archive isolation B]\n"
+                ),
             ),
+            hide_recorders=False,
         )
-        apply_configuration(settings_b, active_path=active_path)
+        current_plugin_config = PluginConfig.objects.get(key="catchuparr")
+        full_settings_b = dict(current_plugin_config.settings or {})
+        full_settings_b.update(settings_b)
+        settings_b = full_settings_b
+        current_plugin_config.settings = dict(settings_b)
+        current_plugin_config.save(update_fields=("settings",))
+        applied_b = catchuparr_runtime.apply_configuration(settings_b)
+        _require(applied_b.get("applied") is True,
+                 "Unified Apply rejected B recorder fixture with Stats flags")
         active_b = load_active_configuration(active_path)
         _require(active_b is not None, "Applied B-only recorder configuration was not readable")
         candidates_b = ranked_source_candidates(worker_id, active_b)
@@ -2783,9 +2864,26 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             _native_source_metadata(redis_client, metadata_key) == source_metadata,
             "Archive B changed native live A source metadata",
         )
+        try:
+            current_assignment_rows = list(
+                ChannelStream.objects.filter(channel=channel).order_by("order", "id")
+                .values_list("stream_id", "order")
+            )
+        except BaseException as error:
+            print(
+                "CATCHUPARR_DB_CONTEXT_DIAGNOSTIC "
+                + json.dumps(
+                    {
+                        "operation": "native_assignment_read",
+                        "exception_type": type(error).__name__,
+                        "db_context": _current_orm_context_snapshot(),
+                    },
+                    sort_keys=True,
+                )
+            )
+            raise
         _require(
-            list(ChannelStream.objects.filter(channel=channel).order_by("order", "id")
-                 .values_list("stream_id", "order")) == assignment_rows,
+            current_assignment_rows == assignment_rows,
             "Archive B reordered native ChannelStream rows",
         )
         active_records = [
@@ -2804,6 +2902,28 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and active_record.get("stream_id") == str(stream_b.id)
             and active_record.get("profile_id") == str(profile_b.id),
             "Archive B did not use a separate managed worker and B profile",
+        )
+        from aio_stats_probe import probe_actual_private_recorder_stats
+
+        probe_actual_private_recorder_stats(
+            channel_id=b_worker_id,
+            redis_client=redis_client,
+            expected_hidden=False,
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + 1,
+            "Native Stats probes changed active live A or private B provider slots",
+        )
+        _require(
+            _key_dump(redis_client, profile_credential_release_key(profile_a.id))
+            == native_a_marker
+            and {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot
+            and _native_source_metadata(redis_client, metadata_key) == source_metadata,
+            "Native Stats probes changed provider assignments or live A source metadata",
         )
         publication_floor_during_b = int(
             native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
@@ -3019,6 +3139,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Live/archive probe changed native ChannelStream rows",
         )
         print("AIO native live A remained isolated while the real recorder indexed B")
+    except BaseException as error:
+        primary_exception = error
+        raise
     finally:
         # On a startup failure, freeze the observed state before cleanup
         # changes Redis keys or native worker state. The successful path has
@@ -3189,13 +3312,28 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     channel.delete()
                 for channel_profile in created_channel_profiles:
                     channel_profile.delete()
-            except Exception:
+            except Exception as error:
                 cleanup_errors.append("synthetic-database-rows")
+                cleanup_exception_types.append(type(error).__name__)
         if not cleanup_errors:
             shutil.rmtree(archive_root, ignore_errors=True)
         shutil.rmtree(fixture_root, ignore_errors=True)
         if cleanup_errors:
             details = ", ".join(sorted(set(cleanup_errors)))
-            raise RuntimeError(
-                f"Synthetic live/archive isolation cleanup was incomplete ({details})"
-            )
+            cleanup_diagnostic = {
+                "cleanup_stages": sorted(set(cleanup_errors)),
+                "cleanup_exception_types": sorted(set(cleanup_exception_types)),
+                "db_context": _current_orm_context_snapshot(),
+            }
+            if primary_exception is not None:
+                cleanup_diagnostic["primary_exception_type"] = type(primary_exception).__name__
+                print(
+                    "CATCHUPARR_CLEANUP_AFTER_PRIMARY_FAILURE "
+                    + json.dumps(cleanup_diagnostic, sort_keys=True)
+                )
+            else:
+                raise RuntimeError(
+                    "Synthetic live/archive isolation cleanup was incomplete "
+                    f"({details}); "
+                    + json.dumps(cleanup_diagnostic, sort_keys=True)
+                )

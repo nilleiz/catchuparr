@@ -34,6 +34,9 @@ class HTTPResponse:
     status: int
     headers: dict[str, str]
     body: bytes = b""
+    # Internal-only identity for the local Stats projection. This value is
+    # never copied into HTTP headers or response bodies.
+    playback_lease_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -926,6 +929,7 @@ class ArchiveHTTPService:
                 "X-Content-Type-Options": "nosniff",
             },
             body,
+            lease_id,
         )
 
     def _session_state(self, lease_id: str):
@@ -1089,7 +1093,7 @@ class ArchiveHTTPService:
             headers["Content-Range"] = f"bytes {selected.start}-{selected.end}/{size}"
         headers["Content-Length"] = str(length)
         if method == "HEAD":
-            return HTTPResponse(status, headers)
+            return HTTPResponse(status, headers, playback_lease_id=lease_id)
         try:
             with path.open("rb") as source:
                 source.seek(offset)
@@ -1100,7 +1104,7 @@ class ArchiveHTTPService:
             # Files are immutable after publication; a short read indicates a
             # concurrent storage fault and should not be presented as complete.
             return _error(503, "segment changed during read")
-        return HTTPResponse(status, headers, body)
+        return HTTPResponse(status, headers, body, lease_id)
 
     def end_session(self, token: str | None, channel_id: str, lease_id: str) -> bool:
         """End a caller-owned playback session early; expired leases self-clean."""
