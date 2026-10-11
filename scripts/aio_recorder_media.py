@@ -19,6 +19,14 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _assert_private_worker_stop_request_count(before: dict, after: dict) -> None:
+    """A cooperative stop must not open another provider request."""
+    _require(
+        after.get("source-b.ts") == before.get("source-b.ts"),
+        "Stopping a private recorder unexpectedly reopened provider B",
+    )
+
+
 def _current_orm_context_snapshot() -> dict[str, object]:
     """Return only connection counts and transaction booleans for this context."""
     try:
@@ -2955,9 +2963,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and int(redis_client.scard(RedisKeys.clients(first_b_worker_id)) or 0) == 0
             and first_b_stopped_active["source-b.ts"] == 0
             and first_b_stopped_counts["source-b.ts"]
-            == counts_during_b["source-b.ts"] + 1,
+            == counts_during_b["source-b.ts"],
             "Stopping the hide=true B worker did not release its native source",
         )
+        _assert_private_worker_stop_request_count(counts_during_b, first_b_stopped_counts)
         _assert_worker_cleanup(redis_client, worker_id)
         _require(
             _profile_count(redis_client, profile_b.id, profile_connections_key)
@@ -2995,8 +3004,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         visible_generation = configuration_generation(active_b_visible)
         _require(
-            visible_generation == configuration_generation(active_b),
-            "Stats visibility Apply unexpectedly changed the recorder generation",
+            visible_generation != configuration_generation(active_b),
+            "Hide=false Apply did not publish its applied recorder generation",
         )
         baseline_ids_b_visible = {segment.id for segment in store.segments(worker_id)}
         run_b = _RecorderTaskRun(worker_id, startup_timeout=45, media_idle_timeout=25)

@@ -1,6 +1,7 @@
 """Focused assertions for native Stats integration probe helpers."""
 
 import ast
+import json
 import sqlite3
 import sys
 import tempfile
@@ -18,11 +19,69 @@ from scripts.aio_stats_probe import (
     _assert_native_route_match,
     _NativeBasicProjectionCapture,
     _playback_auth_diagnostics,
+    _private_worker_capability_binding,
     stats_options_draft,
 )
 
 
 class AIOStatsProbeTests(unittest.TestCase):
+    def test_private_worker_binding_ignores_ledger_only_fields(self):
+        from catchuparr import recorder_proxy
+
+        channel_id = "00000000-0000-0000-0000-000000000041"
+        lease_key = f"catchuparr:recorder:{channel_id}"
+        active = {
+            "channel_uuids": channel_id,
+            "source_policies": {},
+            "hide_recorders_in_stats": True,
+        }
+        digest = "synthetic-capability-digest"
+        binding = {
+            "account_id": "12",
+            "channel_uuid": channel_id,
+            "config_generation": recorder_proxy.configuration_generation(active),
+            "control_generation": "8",
+            "lease_fence": "7",
+            "lease_key": lease_key,
+            "lease_value": "7:synthetic-owner",
+            "stream_id": "44",
+            "worker_id": "managed-synthetic-worker",
+            "capability_digest": digest,
+        }
+        capability = json.dumps(binding)
+
+        class CapabilityRedis:
+            values = {
+                recorder_proxy.CAPABILITY_PREFIX + digest: capability,
+                lease_key: "7:synthetic-owner",
+            }
+
+            def get(self, key):
+                return self.values.get(key)
+
+        worker_record = {
+            **binding,
+            "state": "active",
+            "reservation_state": "reserved",
+            "reservation_id": "synthetic-reservation",
+            "profile_id": "13",
+            "created_at": "123.0",
+        }
+        redis = CapabilityRedis()
+        with patch(
+            "catchuparr.configuration.load_applied_state",
+            return_value=(active, SimpleNamespace(paused=False, generation=8)),
+        ), patch.object(recorder_proxy, "candidate_is_current", return_value=True):
+            extracted = _private_worker_capability_binding(redis, worker_record)
+            self.assertTrue(recorder_proxy.capability_binding_current(redis, extracted))
+
+        self.assertEqual(extracted, binding)
+        self.assertIsNone(
+            _private_worker_capability_binding(
+                redis, {**worker_record, "stream_id": "45"},
+            )
+        )
+
     def test_native_projection_capture_ignores_background_same_channel_calls(self):
         delegated = []
 

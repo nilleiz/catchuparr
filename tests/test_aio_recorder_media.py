@@ -35,6 +35,16 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_private_worker_stop_does_not_count_a_provider_reconnect(self):
+        before = {"source-b.ts": 4}
+        probe._assert_private_worker_stop_request_count(
+            before, {"source-b.ts": 4},
+        )
+        with self.assertRaises(RuntimeError):
+            probe._assert_private_worker_stop_request_count(
+                before, {"source-b.ts": 5},
+            )
+
     def test_media_probe_attempt_uses_current_applied_control_generation(self):
         from catchuparr import recorder_proxy
 
