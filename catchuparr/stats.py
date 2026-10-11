@@ -91,29 +91,23 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 
 
 def _options() -> dict[str, bool]:
-    """Read only the applied configuration when that API is available."""
+    """Read committed display options without waiting on database or Apply locks."""
     try:
-        try:
-            from .runtime import load_runtime_settings
+        from .configuration import load_stats_configuration
 
-            settings = load_runtime_settings()
-        except Exception:
-            # Compatibility for installations predating the unified Apply API.
-            # Both options keep their documented defaults until that API exists.
-            settings = {}
-        return {
-            "show_archive_playback_in_stats": _as_bool(
-                settings.get("show_archive_playback_in_stats", True), True
-            ),
-            "hide_recorders_in_stats": _as_bool(
-                settings.get("hide_recorders_in_stats", True), True
-            ),
-        }
-    finally:
-        # The native live builders call _options from request and worker contexts.
-        # load_runtime_settings may query PluginConfig inside transaction.atomic;
-        # return only a safe, initialized connection after that transaction exits.
-        _release_orm_connection()
+        settings = load_stats_configuration() or {}
+    except Exception:
+        # Missing, contended, or invalid committed state falls back to the
+        # documented display defaults. The next payload retries the read.
+        settings = {}
+    return {
+        "show_archive_playback_in_stats": _as_bool(
+            settings.get("show_archive_playback_in_stats", True), True
+        ),
+        "hide_recorders_in_stats": _as_bool(
+            settings.get("hide_recorders_in_stats", True), True
+        ),
+    }
 
 
 def _release_orm_connection() -> None:

@@ -1,7 +1,9 @@
+import fcntl
 import json
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -18,6 +20,7 @@ from catchuparr.configuration import (
     load_active_configuration,
     load_applied_state,
     load_draft_settings,
+    load_stats_configuration,
     reset_legacy_configuration,
     source_catalog,
     validate_configuration,
@@ -131,6 +134,95 @@ class ConfigurationTests(unittest.TestCase):
             configuration.active_configuration_generation(applied),
             control.configuration_generation,
         )
+
+    def test_stats_reader_is_nonblocking_readonly_and_ignores_drafts(self):
+        applied = dict(
+            self.settings,
+            show_archive_playback_in_stats=False,
+            hide_recorders_in_stats=False,
+        )
+        apply_configuration(applied, self.catalog, self.active_path)
+        lock_path = self.active_path.with_suffix(self.active_path.suffix + ".lock")
+        before_names = set(self.active_path.parent.iterdir())
+
+        with patch.object(
+            configuration,
+            "load_draft_settings",
+            return_value={
+                "show_archive_playback_in_stats": True,
+                "hide_recorders_in_stats": True,
+            },
+        ) as load_draft, lock_path.open("rb") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            started = time.monotonic()
+            try:
+                self.assertIsNone(load_stats_configuration(self.active_path))
+            finally:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            self.assertLess(time.monotonic() - started, 0.25)
+            load_draft.assert_not_called()
+
+        self.assertEqual(before_names, set(self.active_path.parent.iterdir()))
+        self.assertEqual(
+            {
+                "show_archive_playback_in_stats": False,
+                "hide_recorders_in_stats": False,
+            },
+            {
+                key: load_stats_configuration(self.active_path)[key]
+                for key in (
+                    "show_archive_playback_in_stats", "hide_recorders_in_stats",
+                )
+            },
+        )
+
+    def test_stats_reader_missing_lock_does_not_create_paths(self):
+        missing_path = self.root / "missing" / ".catchuparr-active-settings.json"
+        self.assertIsNone(load_stats_configuration(missing_path))
+        self.assertFalse(missing_path.parent.exists())
+
+    def test_stats_reader_uses_validated_previous_bundle_and_fails_closed_on_mismatch(self):
+        old_settings = dict(
+            self.settings,
+            show_archive_playback_in_stats=False,
+            hide_recorders_in_stats=False,
+        )
+        new_settings = dict(
+            self.settings,
+            show_archive_playback_in_stats=True,
+            hide_recorders_in_stats=True,
+        )
+        apply_configuration(old_settings, self.catalog, self.active_path)
+        with patch.object(configuration, "_cleanup_committed_activation_locked"):
+            applied = apply_configuration(new_settings, self.catalog, self.active_path)
+        self.assertTrue(applied["applied"])
+
+        state_path = self.active_path.parent / configuration.ACTIVATION_STATE_NAME
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        configuration._write_activation_state_locked(
+            self.active_path, "pending", state["activation_id"],
+        )
+        previous = load_stats_configuration(self.active_path)
+        self.assertFalse(previous["show_archive_playback_in_stats"])
+        self.assertFalse(previous["hide_recorders_in_stats"])
+
+        backup_path = self.active_path.parent / configuration.ACTIVATION_BACKUP_NAME
+        backup = json.loads(backup_path.read_text(encoding="utf-8"))
+        backup["activation_id"] = "mismatched-synthetic-activation"
+        backup_path.write_text(json.dumps(backup), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "backup is invalid|does not match"):
+            load_stats_configuration(self.active_path)
+
+        from catchuparr import stats
+
+        with patch.object(configuration, "active_settings_path", return_value=self.active_path):
+            self.assertEqual(
+                {
+                    "show_archive_playback_in_stats": True,
+                    "hide_recorders_in_stats": True,
+                },
+                stats._options(),
+            )
 
     def test_v4_control_snapshot_mismatch_fails_closed(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
