@@ -2325,7 +2325,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     )
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.recorder_control import control_deny_path, control_state_path
-    from catchuparr.recorder_proxy import ranked_source_candidates
+    from catchuparr.recorder_proxy import configuration_generation, ranked_source_candidates
 
     _require(
         os.environ.get("CATCHUPARR_INTEGRATION_TEST") == "1",
@@ -2764,8 +2764,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             == native_a_marker,
             "Stopping the shared no-rules archive changed the live A release marker",
         )
-        apply_stats_recorder_option(False)
-
         # Applying B while A is live must create a dedicated recorder worker.
         from aio_stats_probe import stats_options_draft
 
@@ -2780,7 +2778,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     "    include: [Synthetic archive isolation B]\n"
                 ),
             ),
-            hide_recorders=False,
+            hide_recorders=True,
         )
         current_plugin_config = PluginConfig.objects.get(key="catchuparr")
         full_settings_b = dict(current_plugin_config.settings or {})
@@ -2907,8 +2905,14 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
 
         probe_actual_private_recorder_stats(
             channel_id=b_worker_id,
+            ordinary_channel_id=worker_id,
+            native_server=native_server,
             redis_client=redis_client,
-            expected_hidden=False,
+            expected_hidden=True,
+        )
+        _require(
+            source_server.snapshot() == (counts_during_b, active_during_b),
+            "Hide=true private Stats probe changed provider source activity",
         )
         _require(
             _profile_count(redis_client, profile_a.id, profile_connections_key)
@@ -2924,6 +2928,125 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             == assignment_snapshot
             and _native_source_metadata(redis_client, metadata_key) == source_metadata,
             "Native Stats probes changed provider assignments or live A source metadata",
+        )
+
+        # A hide=false result must come from a fresh committed generation. Stop
+        # B and prove every private resource is released before applying it.
+        first_b_worker_id = b_worker_id
+        run_b.stop()
+        run_b.join(cooperative_sleep=gevent_sleep)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            b_manager = native_server.stream_managers.get(first_b_worker_id)
+            b_clients = int(redis_client.scard(RedisKeys.clients(first_b_worker_id)) or 0)
+            _counts, b_active = source_server.snapshot()
+            if (
+                b_manager is None
+                and redis_client.get(RedisKeys.channel_owner(first_b_worker_id)) is None
+                and b_clients == 0
+                and b_active["source-b.ts"] == 0
+            ):
+                break
+            gevent_sleep(0.1)
+        first_b_stopped_counts, first_b_stopped_active = source_server.snapshot()
+        _require(
+            native_server.stream_managers.get(first_b_worker_id) is None
+            and redis_client.get(RedisKeys.channel_owner(first_b_worker_id)) is None
+            and int(redis_client.scard(RedisKeys.clients(first_b_worker_id)) or 0) == 0
+            and first_b_stopped_active["source-b.ts"] == 0
+            and first_b_stopped_counts["source-b.ts"]
+            == counts_during_b["source-b.ts"] + 1,
+            "Stopping the hide=true B worker did not release its native source",
+        )
+        _assert_worker_cleanup(redis_client, worker_id)
+        _require(
+            _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id]
+            and _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1,
+            "Stopping hide=true B did not release its profile slot exactly once",
+        )
+        _require(
+            native_server.stream_managers.get(worker_id) is native_manager
+            and native_manager.running
+            and _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id)))
+            == native_owner
+            and _native_source_metadata(redis_client, metadata_key) == source_metadata
+            and {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot,
+            "Stopping hide=true B changed live A ownership or assignments",
+        )
+
+        settings_b = stats_options_draft(settings_b, hide_recorders=False)
+        current_plugin_config = PluginConfig.objects.get(key="catchuparr")
+        current_plugin_config.settings = dict(settings_b)
+        current_plugin_config.save(update_fields=("settings",))
+        applied_b_visible = catchuparr_runtime.apply_configuration(settings_b)
+        _require(applied_b_visible.get("applied") is True,
+                 "Unified Apply rejected B recorder fixture with Hide=false")
+        active_b_visible = load_active_configuration(active_path)
+        _require(active_b_visible is not None,
+                 "Applied Hide=false B configuration was not readable")
+        _require(
+            ranked_source_candidates(worker_id, active_b_visible) is not None
+            and [str(candidate.get("id")) for candidate in
+                 ranked_source_candidates(worker_id, active_b_visible)] == [str(stream_b.id)],
+            "Hide=false Apply changed the selected B source or was not committed",
+        )
+        visible_generation = configuration_generation(active_b_visible)
+        _require(
+            visible_generation == configuration_generation(active_b),
+            "Stats visibility Apply unexpectedly changed the recorder generation",
+        )
+        baseline_ids_b_visible = {segment.id for segment in store.segments(worker_id)}
+        run_b = _RecorderTaskRun(worker_id, startup_timeout=45, media_idle_timeout=25)
+        run_b.start()
+        harnesses.append(run_b)
+        segments_b_visible = _wait_for_indexed_tone(
+            run_b, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=880, existing_ids=baseline_ids_b_visible, minimum=1,
+            timeout=90, cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(segments_b_visible),
+                 "Hide=false B recorder did not index synthetic source media")
+        visible_counts, visible_active = source_server.snapshot()
+        _require(
+            visible_counts["source-b.ts"] == first_b_stopped_counts["source-b.ts"] + 1
+            and visible_active["source-b.ts"] == 1
+            and visible_active["source-a.ts"] == 1,
+            "Hide=false B recorder did not open exactly one B source beside live A",
+        )
+        active_visible_records = [
+            record for record in _worker_records(redis_client, worker_id)
+            if record.get("state") == "active"
+            and record.get("reservation_state") == "reserved"
+        ]
+        _require(len(active_visible_records) == 1,
+                 "Hide=false B recorder did not own exactly one active worker")
+        visible_worker_id = active_visible_records[0].get("worker_id")
+        _require(
+            visible_worker_id and visible_worker_id != first_b_worker_id
+            and active_visible_records[0].get("config_generation") == visible_generation,
+            "Hide=false B recorder reused a stale worker or recorder generation",
+        )
+        b_worker_id = visible_worker_id
+        probe_actual_private_recorder_stats(
+            channel_id=b_worker_id,
+            ordinary_channel_id=worker_id,
+            native_server=native_server,
+            redis_client=redis_client,
+            expected_hidden=False,
+        )
+        _require(
+            source_server.snapshot() == (visible_counts, visible_active)
+            and _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + 1
+            and {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot
+            and _native_source_metadata(redis_client, metadata_key) == source_metadata,
+            "Hide=false private Stats probe changed sources, slots, or live A metadata",
         )
         publication_floor_during_b = int(
             native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
@@ -2962,7 +3085,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             profile_b=profile_b,
             profile_baselines=profile_baselines,
             native_a_marker=native_a_marker,
-            initial_b_request_baseline=counts_after_shared["source-b.ts"],
+            initial_b_request_baseline=first_b_stopped_counts["source-b.ts"],
             ffmpeg=ffmpeg,
             ffprobe=ffprobe,
             harnesses=harnesses,
