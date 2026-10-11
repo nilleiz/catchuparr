@@ -235,7 +235,7 @@ class StatsProjectionTests(unittest.TestCase):
         self.assertIsNone(_stream_route_channel_id_issue(route, 0, callback))
 
     def test_stats_toggles_are_independent_and_read_applied_settings(self):
-        from catchuparr import runtime
+        from catchuparr import configuration
 
         self.options.stop()
         try:
@@ -243,7 +243,7 @@ class StatsProjectionTests(unittest.TestCase):
                 for hide_recorders in (False, True):
                     with self.subTest(show_archive=show_archive, hide_recorders=hide_recorders):
                         with mock.patch.object(
-                            runtime, "load_runtime_settings",
+                            configuration, "load_stats_configuration",
                             return_value={
                                 "show_archive_playback_in_stats": show_archive,
                                 "hide_recorders_in_stats": hide_recorders,
