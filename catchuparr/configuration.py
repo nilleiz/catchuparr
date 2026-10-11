@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import fcntl
 import hashlib
 import json
@@ -1053,6 +1054,34 @@ def load_active_configuration(active_path: Path | None = None) -> dict[str, Any]
             return _load_active_configuration_locked(path)
     except FileNotFoundError:
         return None
+
+
+def load_stats_configuration(active_path: Path | None = None) -> dict[str, Any] | None:
+    """Read committed Stats options without waiting behind Apply or creating paths."""
+    path = Path(active_path) if active_path is not None else active_settings_path()
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    try:
+        handle = lock_path.open("rb")
+    except FileNotFoundError:
+        return None
+
+    acquired = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                return None
+            raise
+        acquired = True
+        try:
+            return _load_active_configuration_locked(path)
+        except FileNotFoundError:
+            return None
+    finally:
+        if acquired:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def recover_interrupted_activation(active_path: Path | None = None) -> None:

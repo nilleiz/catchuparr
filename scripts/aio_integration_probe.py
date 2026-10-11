@@ -600,8 +600,10 @@ def probe():
     # outstanding native TS session.  The later XC checks intentionally open
     # a live session, which correctly occupies that same stream-limit slot.
     sys.path.insert(0, "/tmp")
+    from aio_stats_gevent_probe import run_actual_gevent_probe
     from aio_stats_probe import probe_actual_stats
 
+    run_actual_gevent_probe()
     probe_actual_stats(
         root=root,
         request=request,
