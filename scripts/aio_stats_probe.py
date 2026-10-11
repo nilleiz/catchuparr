@@ -849,10 +849,51 @@ def _contains_client_id(value, client_id: str) -> bool:
     return False
 
 
-def probe_actual_private_recorder_stats(*, channel_id, redis_client,
+def _private_worker_capability_binding(redis_client, worker_record: dict[str, str]):
+    """Return the current capability binding after matching ledger fields."""
+    import json
+
+    from catchuparr.recorder_proxy import CAPABILITY_PREFIX, capability_binding_current
+
+    binding_fields = (
+        "account_id", "channel_uuid", "config_generation", "control_generation",
+        "lease_fence", "lease_key", "lease_value", "stream_id", "worker_id",
+    )
+    digest = str(worker_record.get("capability_digest", ""))
+    if not digest:
+        return None
+    raw_capability = redis_client.get(CAPABILITY_PREFIX + digest)
+    if not raw_capability:
+        return None
+    try:
+        capability = json.loads(
+            raw_capability.decode("utf-8")
+            if isinstance(raw_capability, bytes) else raw_capability
+        )
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(capability, dict) or str(capability.get("capability_digest", "")) != digest:
+        return None
+    if any(
+        field not in worker_record
+        or field not in capability
+        or str(worker_record[field]) != str(capability[field])
+        for field in binding_fields
+    ):
+        return None
+    binding = {field: str(capability[field]) for field in binding_fields}
+    binding["capability_digest"] = digest
+    return binding if capability_binding_current(redis_client, binding) else None
+
+
+def probe_actual_private_recorder_stats(*, channel_id, ordinary_channel_id,
+                                        native_server, redis_client,
                                         expected_hidden: bool) -> None:
-    """Check the real private B worker registration through Redis and Stats."""
+    """Check a private worker's committed visibility in REST and native Stats."""
+    from unittest import mock
+
     from apps.accounts.models import User
+    from apps.proxy import tasks as proxy_tasks
     from apps.proxy.live_proxy import channel_status
     from apps.proxy.live_proxy.redis_keys import RedisKeys
     from django.urls import reverse
@@ -860,8 +901,22 @@ def probe_actual_private_recorder_stats(*, channel_id, redis_client,
     from rest_framework_simplejwt.tokens import AccessToken
 
     from catchuparr import stats
+    from catchuparr.adapters.recorder_proxy import read_worker_record
 
     channel_key = str(channel_id)
+    ordinary_key = str(ordinary_channel_id)
+    record = read_worker_record(redis_client, channel_key)
+    _require(
+        record is not None
+        and record.get("worker_id") == channel_key
+        and record.get("state") == "active"
+        and record.get("reservation_state") == "reserved"
+        and _private_worker_capability_binding(redis_client, record) is not None,
+        "Private B Stats row is not owned by its current active worker ledger",
+    )
+    manager = native_server.client_managers.get(channel_key)
+    _require(manager is not None,
+             "Private B native worker has no active ClientManager")
     client_ids = {
         value.decode("utf-8") if isinstance(value, bytes) else str(value)
         for value in redis_client.smembers(RedisKeys.clients(channel_key))
@@ -872,10 +927,16 @@ def probe_actual_private_recorder_stats(*, channel_id, redis_client,
     }
     _require(len(recorder_ids) == 1,
              "Private B native Redis client set has no unique signed recorder identity")
+    _require(client_ids == recorder_ids,
+             "Private B visibility probe must begin with only its recorder client")
     recorder_id = next(iter(recorder_ids))
     metadata_key = RedisKeys.client_metadata(channel_key, recorder_id)
     _require(bool(redis_client.hgetall(metadata_key)),
              "Private B recorder client lacks native ClientManager metadata")
+    _require(
+        stats._is_current_private_worker(redis_client, channel_key),
+        "Private B worker ledger, lease fence, or capability is not current",
+    )
 
     admin = User.objects.create_user(
         username="synthetic-private-recorder-admin",
@@ -884,19 +945,133 @@ def probe_actual_private_recorder_stats(*, channel_id, redis_client,
     )
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {AccessToken.for_user(admin)}")
-    _require(stats._options()["hide_recorders_in_stats"] is expected_hidden,
-             "Private recorder probe did not run under the expected applied option")
-    basic = channel_status.ChannelStatus.get_basic_channel_info(channel_key)
-    detailed = channel_status.ChannelStatus.get_detailed_channel_info(channel_key)
-    combined_response = client.get(reverse("proxy:combined_stats"))
-    combined = _response_payload(combined_response)
-    actual = (
-        _contains_client_id(basic, recorder_id),
-        _contains_client_id(detailed, recorder_id),
-        _contains_client_id(combined, recorder_id),
-    )
-    expected_visible = not expected_hidden
-    _require(actual == (expected_visible, expected_visible, expected_visible),
-             "Private B recorder identity did not follow the applied native Stats option")
-    client.logout()
-    admin.delete()
+    ordinary_client_id = "synthetic-private-worker-viewer"
+    ordinary_added = False
+
+    def request_rest():
+        basic = channel_status.ChannelStatus.get_basic_channel_info(channel_key)
+        detailed = channel_status.ChannelStatus.get_detailed_channel_info(channel_key)
+        combined = _response_payload(client.get(reverse("proxy:combined_stats")))
+        channels = combined.get("live", {}).get("channels", [])
+        row = next((item for item in channels
+                    if str(item.get("channel_id")) == channel_key), None)
+        ordinary_row = next((item for item in channels
+                             if str(item.get("channel_id")) == ordinary_key), None)
+        _require(isinstance(ordinary_row, dict) and
+                 int(ordinary_row.get("client_count", 0)) >= 1,
+                 "Native REST Stats omitted the ordinary live A viewer row")
+        _require(stats._options()["hide_recorders_in_stats"] is expected_hidden,
+                 "Private recorder probe did not run under the committed applied option")
+        return basic, detailed, combined, row
+
+    def request_worker():
+        emitted = []
+        _require(stats.uninstall_stats_hooks(),
+                 "Could not switch to native worker-mode Stats hooks")
+        try:
+            _require(stats.install_stats_hooks(route_hooks=False),
+                     "Could not install native worker-mode Stats hooks")
+            with mock.patch.object(
+                proxy_tasks, "send_websocket_update",
+                side_effect=lambda *args, **kwargs: emitted.append((args, kwargs)),
+            ):
+                proxy_tasks.fetch_channel_stats()
+        finally:
+            stats.uninstall_stats_hooks()
+            _require(stats.install_stats_hooks(),
+                     "Could not restore full Stats hooks after private worker request")
+        _require(len(emitted) == 1,
+                 "Native private worker Stats task did not emit its update")
+        event = emitted[0][0][2]
+        _require(event.get("type") == "channel_stats",
+                 "Native private worker Stats task event type changed")
+        payload = json.loads(event["stats"])
+        channels = payload.get("channels", [])
+        row = next((item for item in channels
+                    if str(item.get("channel_id")) == channel_key), None)
+        ordinary_row = next((item for item in channels
+                             if str(item.get("channel_id")) == ordinary_key), None)
+        _require(
+            payload.get("count") == len(channels),
+            "Native worker Stats count does not match emitted channel rows",
+        )
+        _require(isinstance(ordinary_row, dict) and
+                 int(ordinary_row.get("client_count", 0)) >= 1,
+                 "Native worker Stats omitted the ordinary live A viewer row")
+        return payload, row
+
+    def assert_row(row, *, should_exist: bool, expected_clients: set[str], label: str):
+        _require((row is not None) is should_exist,
+                 f"{label} private worker row visibility was incorrect")
+        if row is not None:
+            visible = {
+                str(item.get("client_id")) for item in row.get("clients", [])
+                if isinstance(item, dict)
+            }
+            _require(visible == expected_clients,
+                     f"{label} private worker row exposed unexpected clients")
+            _require(int(row.get("client_count", -1)) == len(expected_clients),
+                     f"{label} private worker client_count did not match visible clients")
+
+    try:
+        basic, detailed, combined, rest_row = request_rest()
+        payload, worker_row = request_worker()
+        if expected_hidden:
+            _require(not _contains_client_id(basic, recorder_id)
+                     and not _contains_client_id(detailed, recorder_id)
+                     and not _contains_client_id(combined, recorder_id),
+                     "Private B recorder client remained visible in hidden mode")
+            assert_row(rest_row, should_exist=False, expected_clients=set(), label="REST empty")
+            assert_row(worker_row, should_exist=False, expected_clients=set(), label="Worker empty")
+            _require(payload.get("count") == len(payload.get("channels", [])),
+                     "Native worker channel count retained the removed private row")
+
+            _require(
+                manager.add_client(
+                    ordinary_client_id, "198.51.100.240",
+                    "Synthetic ordinary viewer", None,
+                ),
+                "Could not add an ordinary client to the private worker ClientManager",
+            )
+            ordinary_added = True
+            try:
+                _, _, mixed_combined, mixed_rest_row = request_rest()
+                mixed_payload, mixed_worker_row = request_worker()
+                _require(not _contains_client_id(mixed_combined, recorder_id),
+                         "Mixed private worker REST row exposed its recorder client")
+                assert_row(mixed_rest_row, should_exist=True,
+                           expected_clients={ordinary_client_id}, label="REST mixed")
+                assert_row(mixed_worker_row, should_exist=True,
+                           expected_clients={ordinary_client_id}, label="Worker mixed")
+                _require(mixed_payload.get("count") == len(mixed_payload.get("channels", [])),
+                         "Native worker channel count was incorrect for a mixed private row")
+            finally:
+                manager.remove_client(ordinary_client_id)
+                ordinary_added = False
+
+            _, _, hidden_again, hidden_again_row = request_rest()
+            hidden_again_payload, hidden_again_worker_row = request_worker()
+            _require(not _contains_client_id(hidden_again, recorder_id),
+                     "Private B recorder reappeared after ordinary client removal")
+            assert_row(hidden_again_row, should_exist=False,
+                       expected_clients=set(), label="REST empty after removal")
+            assert_row(hidden_again_worker_row, should_exist=False,
+                       expected_clients=set(), label="Worker empty after removal")
+            _require(hidden_again_payload.get("count") ==
+                     len(hidden_again_payload.get("channels", [])),
+                     "Native worker count was incorrect after private row removal")
+        else:
+            expected_clients = {recorder_id}
+            _require(_contains_client_id(basic, recorder_id)
+                     and _contains_client_id(detailed, recorder_id)
+                     and _contains_client_id(combined, recorder_id),
+                     "Private B recorder client was hidden under committed Hide=false")
+            assert_row(rest_row, should_exist=True, expected_clients=expected_clients,
+                       label="REST visible")
+            assert_row(worker_row, should_exist=True, expected_clients=expected_clients,
+                       label="Worker visible")
+    finally:
+        if ordinary_added:
+            manager.remove_client(ordinary_client_id)
+        client.logout()
+        admin.delete()

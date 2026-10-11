@@ -383,6 +383,54 @@ def _is_recorder_client(channel_id: str, client_id: str) -> bool:
         return False
 
 
+def _is_current_private_worker(redis: Any, worker_id: str) -> bool:
+    """Confirm a private worker row is backed by its current server ledger."""
+    try:
+        from .adapters.recorder_proxy import is_managed_worker_id, read_worker_record
+        from .recorder_proxy import CAPABILITY_PREFIX
+
+        if not is_managed_worker_id(worker_id):
+            return False
+        record = read_worker_record(redis, worker_id)
+        if not record or record.get("worker_id") != worker_id or record.get("state") != "active":
+            return False
+        channel_uuid = record.get("channel_uuid", "")
+        lease_key = record.get("lease_key", "")
+        lease_value = record.get("lease_value", "")
+        lease_fence = record.get("lease_fence", "")
+        capability_digest = record.get("capability_digest", "")
+        if (
+            not channel_uuid
+            or lease_key != f"catchuparr:recorder:{channel_uuid}"
+            or not lease_value
+            or not lease_fence
+            or not capability_digest
+            or _decode_redis_value(redis.get(lease_key)) != lease_value
+        ):
+            return False
+        try:
+            if int(lease_value.partition(":")[0]) != int(lease_fence):
+                return False
+        except (TypeError, ValueError):
+            return False
+        raw_capability = redis.get(CAPABILITY_PREFIX + capability_digest)
+        if not raw_capability:
+            return False
+        capability = json.loads(_decode_redis_value(raw_capability))
+        if not isinstance(capability, dict):
+            return False
+        binding_fields = (
+            "account_id", "channel_uuid", "config_generation", "control_generation",
+            "lease_fence", "lease_key", "lease_value", "stream_id", "worker_id",
+        )
+        return (
+            capability.get("capability_digest") == capability_digest
+            and all(str(capability.get(field, "")) == record.get(field) for field in binding_fields)
+        )
+    except Exception:
+        return False
+
+
 def _decode_redis_value(value: Any) -> str:
     return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
 
@@ -969,12 +1017,16 @@ def project_live_stats(native_result: Any) -> Any:
     if not isinstance(channels, list):
         return result
     hidden_total = 0
+    visible_channels = []
+    hidden_private_rows = 0
     for channel in channels:
         if not isinstance(channel, dict):
+            visible_channels.append(channel)
             continue
         channel_key = str(channel.get("channel_id", ""))
         clients = channel.get("clients")
         if not isinstance(clients, list):
+            visible_channels.append(channel)
             continue
         retained = []
         hidden = 0
@@ -991,6 +1043,35 @@ def project_live_stats(native_result: Any) -> Any:
             if "connection_count" in channel:
                 channel["connection_count"] = max(0, int(channel["connection_count"]) - hidden)
             hidden_total += hidden
+        count_fields = [
+            field for field in ("client_count", "connection_count") if field in channel
+        ]
+        try:
+            no_visible_clients = (
+                not retained
+                and bool(count_fields)
+                and all(int(channel[field] or 0) == 0 for field in count_fields)
+            )
+        except (TypeError, ValueError):
+            no_visible_clients = False
+        if no_visible_clients:
+            try:
+                from core.utils import RedisClient
+
+                redis = RedisClient.get_client()
+            except Exception:
+                redis = None
+            if redis is not None and _is_current_private_worker(redis, channel_key):
+                hidden_private_rows += 1
+                continue
+        visible_channels.append(channel)
+    if hidden_private_rows:
+        result["channels"] = visible_channels
+        if "count" in result:
+            try:
+                result["count"] = max(0, int(result["count"]) - hidden_private_rows)
+            except (TypeError, ValueError):
+                pass
     if hidden_total and "total_connections" in result:
         result["total_connections"] = max(0, int(result["total_connections"]) - hidden_total)
     return result
