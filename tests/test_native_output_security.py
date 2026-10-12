@@ -52,7 +52,7 @@ class NativeOutputSecurityTests(unittest.TestCase):
     def test_tampering_wrong_purpose_and_oversized_tokens_fail_closed(self):
         token = self.capability()
         encoded, signature = token.split(".")
-        altered = encoded[:-1] + ("A" if encoded[-1] != "A" else "B")
+        altered = ("A" if encoded[0] != "A" else "B") + encoded[1:]
         self.assertIsNone(
             verify_native_capability(
                 self.active_path, f"{altered}.{signature}", current_key_id=self.key_id
@@ -63,6 +63,18 @@ class NativeOutputSecurityTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "claims are invalid"):
             self.capability(mode="legacy-access-token")
+
+    def test_significant_signature_tampering_fails_verification(self):
+        token = self.capability()
+        payload, signature = token.rsplit(".", 1)
+        altered_signature = ("A" if signature[0] != "A" else "B") + signature[1:]
+        altered = f"{payload}.{altered_signature}"
+
+        self.assertIsNone(
+            verify_native_capability(
+                self.active_path, altered, current_key_id=self.key_id
+            )
+        )
 
     def test_device_identity_is_opaque_and_stable_per_export_and_client(self):
         token = self.capability()
