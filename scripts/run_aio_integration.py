@@ -56,6 +56,8 @@ def run():
         docker("cp", str(ROOT / "catchuparr"), f"{name}:/data/plugins/catchuparr")
         docker("cp", str(ROOT / "scripts/aio_recorder_media.py"), f"{name}:/tmp/aio_recorder_media.py")
         docker("cp", str(ROOT / "scripts/aio_stats_probe.py"), f"{name}:/tmp/aio_stats_probe.py")
+        docker("cp", str(ROOT / "scripts/aio_native_output_probe.py"),
+               f"{name}:/tmp/aio_native_output_probe.py")
         docker("cp", str(ROOT / "scripts/aio_stats_gevent_probe.py"),
                f"{name}:/tmp/aio_stats_gevent_probe.py")
         docker("cp", str(ROOT / "scripts/aio_native_redis_diagnostic.py"),

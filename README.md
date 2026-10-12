@@ -15,12 +15,17 @@ archive is local to the Dispatcharr installation and is not a cloud service.
 
 ## Compatibility and status
 
+- Version 0.4.0 is released. Version 0.5.0 is the only release currently in
+  development; its native AIO checks and player acceptance are pending.
 - Dispatcharr 0.31.0 and 0.32.0 are the supported versions covered by the
   repository's pinned native integration checks.
 - The primary path is M3U/XMLTV with HLS playback using MPEG-TS segments.
 - Native XC playback is implemented behind guarded Dispatcharr hooks. Native
   server integration is covered by synthetic checks; player-specific XC
   acceptance is still separate and should be verified with the client in use.
+- The 0.5.0 candidate adds an optional native M3U/XMLTV archive toggle. Its
+  local suite passes, but pinned native AIO verification and player acceptance
+  are pending; see the [0.5.0 candidate guide](docs/candidate-0.5.0.md).
 - Playback follows the selected user's Dispatcharr permissions, channel access,
   catch-up permission and stream/session limits. It does not provide transcoding
   or frame-accurate seeking.
@@ -67,6 +72,7 @@ a draft alone does not alter the active recorder configuration.
 | **Catchuparr log level** | Catchuparr-only log verbosity: `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | **Show archive playback in Stats** | Add active Catchuparr archive viewers to native Timeshift Stats. Enabled by default. |
 | **Hide recorders in Stats** | Hide positively identified Catchuparr recorder clients from live Stats details. Enabled by default. |
+| **Add Catchuparr catch-up to native output** | Optional 0.5.0 candidate setting. Adds local archive metadata to eligible native Dispatcharr M3U/XMLTV output. Disabled by default; use the same unified Apply as other settings. |
 
 ### Select channels and sources
 
@@ -335,6 +341,16 @@ python3 -m compileall -q catchuparr scripts tests
 ruff check .
 python3 scripts/build_plugin.py
 ```
+
+## Optional native output archive (0.5.0 candidate)
+
+The candidate adds local archive metadata to Dispatcharr's native M3U/XMLTV
+exports when **Add Catchuparr catch-up to native output** is enabled and applied.
+It preserves the native channel/profile output and provider catch-up fields.
+Native archive playback serves stored MPEG-TS segments; a live output profile
+does not transcode archive media. The setting defaults off. The local suite
+passes, but native AIO and player acceptance are pending. Read the
+[candidate guide](docs/candidate-0.5.0.md) before enabling it.
 
 CI also runs synthetic integration against pinned Dispatcharr AIO images for
 0.31.0 and 0.32.0. See [development and deployment](docs/development.md) for an
