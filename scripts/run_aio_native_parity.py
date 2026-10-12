@@ -10,12 +10,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _manage_shell_source(probe_path: str) -> str:
-    """Build a shell payload that needs only built-ins in Django's exec scope."""
+def _manage_script_exec(script_path: str) -> str:
+    """Use the same shell entrypoint and globals as the complete AIO probe."""
     return (
-        "exec(compile(open(" + repr(probe_path) + ", 'rb').read(), "
-        + repr(probe_path)
-        + ", 'exec'))"
+        f"filename={script_path!r}; "
+        "namespace={'__name__':'__main__','__file__':filename,'__cached__':None,"
+        "'__doc__':None,'__loader__':None,'__package__':None,'__spec__':None}; "
+        "exec(compile(Path(filename).read_bytes(),filename,'exec'),namespace)"
     )
 
 
@@ -64,22 +65,17 @@ def run():
             time.sleep(3)
 
         docker("cp", str(ROOT / "catchuparr"), f"{name}:/data/plugins/catchuparr")
-        docker(
-            "cp",
-            str(ROOT / "scripts/aio_native_playback_parity_probe.py"),
-            f"{name}:/tmp/aio_native_playback_parity_probe.py",
-        )
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
-        probe_path = "/tmp/aio_native_playback_parity_probe.py"
-        shell_source = _manage_shell_source(probe_path)
-        docker(
-            "exec", name, "/dispatcharrpy/bin/python", "-c",
-            "import os,sys; from pathlib import Path; "
-            "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
-            f"sys.argv=['manage.py','shell','-c',{shell_source!r}]; "
-            "exec(compile(Path('/app/manage.py').read_bytes(), '/app/manage.py', 'exec'))",
-            timeout=180,
-        )
+        with (ROOT / "scripts/aio_native_playback_parity_probe.py").open("rb") as script:
+            docker(
+                "exec", "-i", name, "/dispatcharrpy/bin/python", "-c",
+                "import os,sys; from pathlib import Path; "
+                "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
+                "sys.argv=['gunicorn','shell']; "
+                + _manage_script_exec("/app/manage.py"),
+                stdin=script,
+                timeout=180,
+            )
     finally:
         subprocess.run(
             ["docker", "rm", "-f", "-v", name],

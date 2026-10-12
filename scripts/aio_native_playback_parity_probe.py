@@ -9,10 +9,6 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from django.test import RequestFactory
-from django.utils import timezone
-
-
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
@@ -42,7 +38,19 @@ def _normalized_playlist(response):
     return tuple(normalized)
 
 
+def _add_plugin_root(plugin_root="/data/plugins"):
+    """Use the package path installed by the Dispatcharr plugin manager."""
+    import sys
+
+    sys.path.insert(0, plugin_root)
+
+
 def probe():
+    _add_plugin_root()
+
+    from django.test import RequestFactory
+    from django.utils import timezone
+
     from apps.accounts.models import User
     from apps.channels.models import Channel, ChannelProfile, ChannelProfileMembership
     from apps.epg.models import EPGData, ProgramData
@@ -231,4 +239,5 @@ def probe():
     }, sort_keys=True))
 
 
-probe()
+if __name__ == "__main__":
+    probe()
