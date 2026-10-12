@@ -291,6 +291,48 @@ class AIOStatsProbeTests(unittest.TestCase):
         self.assertTrue(xc_calls)
         self.assertLess(stats_call, min(xc_calls))
 
+    def test_stats_probe_releases_replacement_ts_lease_before_native_admission(self):
+        source = Path(__file__).resolve().parents[1] / "scripts/aio_stats_probe.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        probe = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "probe_actual_stats"
+        )
+        replacement_line = next(
+            node.lineno for node in ast.walk(probe)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "replacement_body"
+                    for target in node.targets)
+        )
+        stop_line = next(
+            node.lineno for node in ast.walk(probe)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "replacement_stop"
+                    for target in node.targets)
+        )
+        admission_count_lines = [
+            node.lineno for node in ast.walk(probe)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "active_ts_session_count"
+        ]
+        stop_call = next(
+            node for node in ast.walk(probe)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "replacement_stop"
+                    for target in node.targets)
+        ).value
+
+        self.assertLess(replacement_line, stop_line)
+        self.assertTrue(any(line > stop_line for line in admission_count_lines))
+        self.assertIsInstance(stop_call, ast.Call)
+        self.assertIsInstance(stop_call.func, ast.Attribute)
+        self.assertEqual(stop_call.func.attr, "post")
+        self.assertEqual(ast.unparse(stop_call.args[0]), "native_paths['stop']")
+        probe_source = ast.get_source_segment(source.read_text(encoding="utf-8"), probe)
+        self.assertIn("SELECT active FROM ts_playback_sessions WHERE lease_id=?", probe_source)
+        self.assertIn("Native Stop did not revoke the replacement Stats row", probe_source)
+
     def test_native_route_identity_rejects_frontend_fallback(self):
         native = SimpleNamespace(namespace="proxy:catchup", url_name="catchup_stats")
         frontend = SimpleNamespace(namespace="", url_name="index")

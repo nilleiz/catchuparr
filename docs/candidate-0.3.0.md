@@ -1,15 +1,15 @@
 # 0.3.0 recording-schedule candidate (superseded)
 
 This guide records the earlier 0.3.0 candidate and its configuration behavior.
-For the current 0.3.1 candidate, use [candidate-0.3.1.md](candidate-0.3.1.md).
-In particular, 0.3.1 changes timezone resolution and combines settings in one
-Apply operation; do not use the historical instructions below for a current
-installation.
+Version 0.3.0 was superseded by 0.3.1; neither development version was
+published separately. Their schedule, timezone and unified-Apply features are
+included in released 0.4.0. Use [candidate-0.4.0.md](candidate-0.4.0.md) for
+current release and validation information.
 
-This is an unreleased candidate. The manifest and generated ZIP use version
-`0.3.0`. Synthetic native integration passed on Dispatcharr 0.31.0 and 0.32.0.
-Required CI and real-player acceptance remain open; do not treat the candidate
-as a published release.
+This historical, unpublished candidate used manifest version `0.3.0`.
+Synthetic native integration passed on Dispatcharr 0.31.0 and 0.32.0 at that
+checkpoint. Its features were carried into later versions; see the released
+[0.4.0 guide](candidate-0.4.0.md) for current release and acceptance status.
 
 ## YAML schedules
 
@@ -110,6 +110,6 @@ that restore point cannot recover archive content that was lost or overwritten.
 The candidate's synthetic native probes passed in both pinned Dispatcharr
 versions for schedule closure, global pause/resume while running, stale-job
 fencing, failover media, concurrent live/archive isolation and cleanup. The
-full local suite, lint, compile and package checks also passed. Green CI and
-real-player acceptance remain release gates; no 0.3.0 release or player
-compatibility claim is made here.
+full local suite, lint, compile and package checks also passed at that
+checkpoint. The standalone 0.3.0 version was not released; its schedule and
+recorder-control behavior was later incorporated into released 0.4.0.

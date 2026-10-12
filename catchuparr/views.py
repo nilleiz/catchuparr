@@ -20,6 +20,7 @@ _ROUTE_NAMES = frozenset(
     {
         "catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive",
         "catchuparr-segment", "catchuparr-recorder",
+        "catchuparr-native-archive", "catchuparr-native-segment",
     }
 )
 
@@ -64,13 +65,25 @@ def install_routes() -> None:
             recorder_proxy.stream_recorder_view,
             name="catchuparr-recorder",
         ),
+        path(
+            "catchuparr/native/archive",
+            _native_archive_route,
+            name="catchuparr-native-archive",
+        ),
+        path(
+            "catchuparr/native/segment/<str:channel_id>/<str:segment_id>",
+            _native_segment_route,
+            name="catchuparr-native-segment",
+        ),
     ]
     existing_names = {getattr(route, "name", None) for route in root_urls.urlpatterns}
     new_routes = [route for route in new_routes if route.name not in existing_names]
-    if not new_routes:
-        return
-    root_urls.urlpatterns[0:0] = new_routes
-    clear_url_caches()
+    if new_routes:
+        root_urls.urlpatterns[0:0] = new_routes
+        clear_url_caches()
+    from .native_output import install_output_hooks
+
+    install_output_hooks()
 
 
 def uninstall_routes() -> None:
@@ -81,6 +94,9 @@ def uninstall_routes() -> None:
         stop_managed_workers,
         uninstall_proxyserver_cleanup_hook,
     )
+    from .native_output import uninstall_output_hooks
+
+    uninstall_output_hooks()
 
     root_urls.urlpatterns[:] = [
         route for route in root_urls.urlpatterns if getattr(route, "name", None) not in _ROUTE_NAMES
@@ -289,7 +305,7 @@ def m3u_view(request):
     from core.utils import build_absolute_uri_with_port
     from django.http import HttpResponse
 
-    from .adapters.m3u import annotate_m3u
+    from .adapters.m3u import annotate_m3u, set_xmltv_playlist_urls
     from .engine.store import ArchiveStore
 
     if request.method not in {"GET", "HEAD"}:
@@ -306,10 +322,7 @@ def m3u_view(request):
     playlist = response.content.decode("utf-8")
     xmltv_url = build_absolute_uri_with_port(request, "/catchuparr/xmltv")
     xmltv_url += "?access_token=" + _url_token(token)
-    lines = playlist.splitlines(keepends=True)
-    if lines and lines[0].startswith("#EXTM3U"):
-        lines[0] = f'#EXTM3U x-tvg-url="{xmltv_url}" url-tvg="{xmltv_url}"\n'
-    playlist = "".join(lines)
+    playlist = set_xmltv_playlist_urls(playlist, xmltv_url)
 
     if is_catchup_enabled(user=user):
         store = ArchiveStore(config.archive_root)
@@ -390,27 +403,13 @@ def xmltv_view(request):
 def _xmltv_channel_map(request, user, config):
     from apps.output.views import generate_m3u
 
+    from .adapters.m3u import xmltv_channel_map_from_m3u
+
     response = generate_m3u(_core_request(request), user=user)
     if response.status_code != 200:
         return {}
     playlist = response.content.decode("utf-8")
-    mapping = {}
-    ambiguous = set()
-    pending_id = None
-    for line in playlist.splitlines():
-        if line.startswith("#EXTINF:"):
-            found = re.search(r'\btvg-id="([^"]+)"', line)
-            pending_id = found.group(1) if found else None
-        elif pending_id and "/proxy/ts/stream/" in line:
-            channel = line.split("/proxy/ts/stream/", 1)[1].split("?", 1)[0].strip("/")
-            if channel in config.channel_uuids and pending_id not in ambiguous:
-                if pending_id in mapping and mapping[pending_id] != channel:
-                    mapping.pop(pending_id)
-                    ambiguous.add(pending_id)
-                else:
-                    mapping[pending_id] = channel
-            pending_id = None
-    return mapping
+    return xmltv_channel_map_from_m3u(playlist, config.channel_uuids)
 
 
 def _epg_request(request, retention_hours: int):
@@ -735,6 +734,290 @@ def _catchup_epoch(value: str) -> float:
     if not math.isfinite(epoch):
         raise ValueError("catch-up timestamp must be finite")
     return epoch
+
+
+def _native_archive_route(request):
+    from .native_output import native_archive_view
+
+    return native_archive_view(request)
+
+
+def _native_segment_route(request, channel_id: str, segment_id: str):
+    from .native_output import native_segment_view
+
+    return native_segment_view(request, channel_id, segment_id)
+
+
+def _native_archive_response(request, route_channel: str | None, segment_id: str | None):
+    """Authorize and serve native-only signed archive capabilities."""
+    from django.http import HttpResponse
+
+    if request.method not in {"GET", "HEAD"}:
+        return HttpResponse(status=405)
+    token = request.GET.get("token", "")
+    if not token or len(token) > 4096:
+        return _no_cache(HttpResponse(status=403))
+    channel = route_channel or request.GET.get("channel_id", "")
+    context = _native_playback_context(request, token, channel)
+    if context is None:
+        return _no_cache(HttpResponse(status=403))
+    active, config, user, claims, key = context
+    if route_channel is None and request.GET.get("channel_id") != claims["channel"]:
+        return _no_cache(HttpResponse(status=403))
+
+    service = _native_archive_service(request, active, config, user, claims, key, token)
+    if segment_id is not None:
+        response = service.segment(
+            token,
+            channel,
+            segment_id,
+            request.GET.get("lease"),
+            method=request.method,
+            range_header=request.headers.get("Range"),
+        )
+        if request.method == "GET" and response.status in (200, 206) and response.body:
+            _record_native_playback(
+                service, token, user, channel, response,
+                client_ip=_native_client_ip(request),
+            )
+        return _to_django_response(response, request.method)
+
+    try:
+        start_epoch = _catchup_epoch(request.GET.get("utc", ""))
+        raw_duration = request.GET.get("duration", "")
+        if not re.fullmatch(r"[0-9]{1,5}", raw_duration):
+            raise ValueError("invalid duration")
+        duration_seconds = int(raw_duration)
+    except (TypeError, ValueError, OverflowError):
+        return _no_cache(HttpResponse("Invalid catch-up time", status=400))
+    if not 0 < duration_seconds <= 24 * 60 * 60:
+        return _no_cache(HttpResponse("Invalid catch-up duration", status=400))
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    requested_end_epoch = start_epoch + duration_seconds
+    if (
+        start_epoch > now_epoch
+        or requested_end_epoch < now_epoch - config.retention_hours * 3600
+    ):
+        return _no_cache(HttpResponse("No archived programme", status=404))
+    store = service.store
+    programme_end_epoch, next_programme_end_epoch = _archive_epg_bounds(
+        channel, start_epoch, store
+    )
+    if programme_end_epoch is None:
+        return _no_cache(HttpResponse("No matching EPG programme", status=404))
+    end_epoch, continuation_end_epoch = _archive_playback_window(
+        start_epoch,
+        duration_seconds,
+        programme_end_epoch,
+        next_programme_end_epoch,
+    )
+    covered_until = min(end_epoch, now_epoch)
+    if covered_until > start_epoch and not store.coverage(
+        channel, start_epoch, covered_until
+    ).complete:
+        return _no_cache(HttpResponse("Archive coverage is incomplete", status=404))
+    if request.method == "HEAD":
+        response = HttpResponse(status=200, content_type="application/vnd.apple.mpegurl")
+        return _no_cache(response)
+    response = service.playlist(
+        token,
+        channel,
+        start_epoch,
+        end_epoch,
+        live=_archive_window_live(service, str(user.id), channel, end_epoch, now_epoch),
+        request_identity_end=requested_end_epoch,
+        programme_end_utc=programme_end_epoch,
+        continuation_end_utc=continuation_end_epoch,
+    )
+    if request.method == "GET" and response.status == 200 and response.body:
+        _record_native_playback(
+            service, token, user, channel, response,
+            programme_start_epoch=start_epoch,
+            client_ip=_native_client_ip(request),
+        )
+    return _to_django_response(response, request.method)
+
+
+def _native_playback_context(request, token: str, channel_id: str):
+    from apps.accounts.models import User
+    from apps.channels.utils import is_catchup_enabled
+    from dispatcharr.utils import network_access_allowed
+
+    from .configuration import active_settings_path, load_active_configuration
+    from .native_output_security import load_native_key, verify_native_capability
+    from .runtime import load_config, require_supported_version
+
+    try:
+        require_supported_version()
+        active = load_active_configuration()
+        if active is None or not active.get("native_output_catchup"):
+            return None
+        config = load_config(active_snapshot=active)
+        if config is None:
+            return None
+        key_id = active.get("native_output_key_id")
+        claims = verify_native_capability(
+            active_settings_path(), token, current_key_id=key_id
+        )
+        if claims is None or claims.get("channel") != channel_id:
+            return None
+        selected = set(config.channel_uuids)
+        if channel_id not in selected:
+            return None
+        mode = claims["mode"]
+        if mode == "anonymous_admission":
+            configured_id = active.get("playback_user_id")
+            if configured_id is None or str(configured_id) != claims["subject"]:
+                return None
+            user = User.objects.filter(id=configured_id, is_active=True).first()
+        elif mode == "trusted_native_user":
+            request_user = getattr(request, "user", None)
+            user = request_user if (
+                getattr(request_user, "is_authenticated", False)
+                and getattr(request_user, "is_active", True)
+                and str(getattr(request_user, "id", "")) == claims["subject"]
+            ) else None
+        else:
+            return None
+        if user is None or not is_catchup_enabled(user=user):
+            return None
+        if not (
+            network_access_allowed(request, "M3U_EPG", user)
+            and network_access_allowed(request, "STREAMS", user)
+        ):
+            return None
+        profile_id = claims.get("profile")
+        if not _native_channel_allowed(user, channel_id, profile_id):
+            return None
+        key = load_native_key(active_settings_path(), key_id)
+        if key is None:
+            return None
+        return active, config, user, claims, key
+    except Exception:
+        logger.exception("Native archive authorization failed closed")
+        return None
+
+
+def _native_channel_allowed(user, channel_id: str, profile_id: str | None) -> bool:
+    from apps.channels.managers import with_effective_values
+    from apps.channels.models import Channel, ChannelProfile
+
+    if profile_id is not None and not ChannelProfile.objects.filter(id=profile_id).exists():
+        return False
+    query = Channel.objects.filter(
+        uuid=channel_id,
+        user_level__lte=int(getattr(user, "user_level", 0)),
+    )
+    if profile_id is not None:
+        query = query.filter(
+            channelprofilemembership__enabled=True,
+            channelprofilemembership__channel_profile_id=profile_id,
+        )
+    if int(getattr(user, "user_level", 0)) < 10:
+        profiles = getattr(user, "channel_profiles", None)
+        if profiles is not None and profiles.count() > 0:
+            query = query.filter(
+                channelprofilemembership__enabled=True,
+                channelprofilemembership__channel_profile__in=profiles.all(),
+            )
+    if (getattr(user, "custom_properties", None) or {}).get("hide_adult_content", False):
+        query = query.filter(is_adult=False)
+    return (
+        with_effective_values(query.distinct(), select_related_fks=True)
+        .exclude(hidden_from_output=True)
+        .exists()
+    )
+
+
+def _native_archive_service(request, active, config, user, claims, key, token):
+    from apps.channels.utils import is_catchup_enabled
+    from apps.proxy.utils import get_user_active_connections
+    from core.utils import RedisClient
+
+    from .engine.store import ArchiveStore
+    from .http import ArchiveHTTPService
+    from .native_output_security import native_device_identity
+    from .xc_runtime import active_ts_session_count
+
+    user_id = str(user.id)
+    channel_id = claims["channel"]
+    profile_id = claims.get("profile")
+
+    class _CapabilityStore:
+        @staticmethod
+        def lookup(candidate):
+            return user_id if candidate == token else None
+
+    def authorized(subject, channel):
+        return (
+            subject == user_id
+            and channel == channel_id
+            and channel in config.channel_uuids
+            and _native_channel_allowed(user, channel, profile_id)
+        )
+
+    def allow_new_session(subject, channel, plugin_sessions):
+        if subject != user_id or channel != channel_id or not authorized(subject, channel):
+            return False
+        limit = int(getattr(user, "stream_limit", 0) or 0)
+        if limit <= 0:
+            return True
+        try:
+            redis = RedisClient.get_client()
+            plugin_sessions += active_ts_session_count(config.archive_root, subject)
+        except Exception:
+            logger.exception("Native playback admission could not be verified")
+            return False
+        return _session_limit_allows(
+            limit, plugin_sessions, redis,
+            lambda: get_user_active_connections(user.id),
+        )
+
+    device_key = native_device_identity(
+        key, claims, _native_client_ip(request),
+        (getattr(request, "META", {}) or {}).get("HTTP_USER_AGENT", "unknown"),
+    )
+    return ArchiveHTTPService(
+        ArchiveStore(config.archive_root),
+        _CapabilityStore(),
+        authorize_user_channel=authorized,
+        catchup_enabled=lambda subject, channel: (
+            subject == user_id
+            and channel == channel_id
+            and is_catchup_enabled(user=user)
+        ),
+        allow_new_session=allow_new_session,
+        base_path="/catchuparr/native",
+        device_identity=lambda candidate, subject, channel: (
+            device_key if candidate == token and subject == user_id and channel == channel_id
+            else ""
+        ),
+    )
+
+
+def _native_client_ip(request) -> str:
+    from dispatcharr.utils import get_client_ip
+
+    return str(get_client_ip(request) or "unknown")
+
+
+def _record_native_playback(
+    service, token, user, channel, response, *, programme_start_epoch=None, client_ip=None
+):
+    try:
+        from .stats import successful_playback
+
+        logical_key = service.playback_device_identity(token, str(user.id), channel)
+        successful_playback(
+            user.id,
+            channel,
+            logical_key,
+            playback_lease_id=getattr(response, "playback_lease_id", None),
+            programme_start_epoch=programme_start_epoch,
+            client_ip=client_ip,
+        )
+    except Exception:
+        pass
 
 
 def _archive_service(request, user, config):

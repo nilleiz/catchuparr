@@ -1,3 +1,4 @@
+import hashlib
 import multiprocessing
 import sqlite3
 import tempfile
@@ -155,6 +156,49 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.assertIn("/catchuparr/segment/news/seg-A?token=", text)
         self.assertIn("&lease=", text)
         self.assertEqual(len(self.archive.leases), 1)
+
+    def test_custom_device_identity_is_shared_by_playlist_segment_and_stop(self):
+        identities = []
+
+        def identity(token, user, channel):
+            value = "native:" + hashlib.sha256(
+                f"{token}:{user}:{channel}".encode()
+            ).hexdigest()
+            identities.append(value)
+            return value
+
+        service = ArchiveHTTPService(
+            self.archive,
+            self.tokens,
+            authorize_user_channel=lambda user, channel: user == "user-a" and channel == "news",
+            catchup_enabled=lambda *_: True,
+            playlist_builder=_builder,
+            device_identity=identity,
+        )
+        playlist = service.playlist(
+            self.token, "news", self.start, self.start + timedelta(seconds=10)
+        )
+        self.assertEqual(200, playlist.status)
+        lease_id = playlist.body.decode().split("&lease=")[1].splitlines()[0]
+        self.assertTrue(service.playback_device_identity(
+            self.token, "user-a", "news"
+        ).startswith("native:"))
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            row = db.execute(
+                "SELECT device_key FROM http_playback_sessions WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+        self.assertEqual(identities[0], row[0])
+        self.assertEqual(200, service.segment(self.token, "news", "seg-A", lease_id).status)
+        self.assertTrue(service.end_session(self.token, "news", lease_id))
+        self.assertGreaterEqual(len(identities), 4)
+        self.assertEqual(1, len(set(identities)))
+
+    def test_default_device_identity_remains_sha256_of_token(self):
+        self.assertEqual(
+            hashlib.sha256(self.token.encode()).hexdigest(),
+            self.service.playback_device_identity(self.token, "user-a", "news"),
+        )
 
     def test_segment_get_head_and_byte_range(self):
         playlist = self._playlist().body.decode()

@@ -1,10 +1,9 @@
 # Superseded 0.2.1 YAML filter candidate
 
-The 0.2.1 package was never released. Its YAML filter engine is included in
-the unreleased 0.3.1 candidate, which adds day-group schedules, timezone
-resolution, unified settings Apply and recorder controls. Use the
-[current 0.3.1 candidate guide](candidate-0.3.1.md) for installation and
-acceptance status. The schema notes below are retained as historical reference.
+The 0.2.1 package was never released separately. Its YAML filter engine is
+included in released 0.4.0, along with the schedule, timezone and unified-Apply
+work from 0.3.1. Use the [0.4.0 guide](candidate-0.4.0.md) for current release
+and validation status. The schema notes below are historical reference.
 
 ## Configuration
 
