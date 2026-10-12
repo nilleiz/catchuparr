@@ -1,6 +1,6 @@
 # Catchuparr roadmap
 
-Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. Related features are grouped into releases; native output integration comes last.
+Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. The only release currently in development is 0.5.0; later work is planned, not implemented.
 
 ## Workflow and release gates
 
@@ -18,8 +18,9 @@ Baseline: released 0.1.4, M3U/XMLTV + HLS real-player acceptance completed with 
 | 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented; superseded by the 0.3.1 candidate and not published separately |
 | 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Implemented; user acceptance recorded; release, Dev and player gates remain pending |
-| 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Implemented candidate; review and pinned native checks passed; CI and Dev/player acceptance remain pending |
-| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Planned last |
+| 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
+| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Current development; optional and disabled by default |
+| 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.0 is complete |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.
@@ -302,10 +303,38 @@ Test recorder-only workers, shared workers, genuine local clients, more than ten
 
 ## 0.5.0 — native output integration
 
+This is the only release currently in development. It remains optional and is
+disabled by default; the existing separate Catchuparr links remain available.
+
 - One settings toggle, disabled by default, enables local catch-up attributes and archived EPG in native Dispatcharr M3U/XMLTV links.
 - Keep the full existing channel list, profiles, permissions, live URLs and provider catch-up. Separate plugin links remain available independently.
 - Disable the toggle to restore original output without local additions. Toggle changes require no container restart.
 - Use version-checked, idempotent and removable wrappers; test authorization, gaps, duplicate EPG entries and both toggle states.
+
+## 0.6.0 — smart connection sharing (planned)
+
+Implementation is deferred. This release is a future plan and none of the
+behavior below is available in the current release or 0.5.0 development.
+
+- Keep the feature disabled by default. When enabled, share one upstream live
+  connection for compatible viewers of the same channel, while respecting
+  Dispatcharr's native authentication, provider limits and output profiles.
+- A source rule that requires an exception to the shared connection may use a
+  separate upstream connection while viewers are active. Release design must
+  preserve the selected source policy and return viewers to the shared route
+  when the last viewer leaves.
+- Provide three integer cooldown settings, each accepting 0 through 3600
+  seconds: live stability (default 5 seconds), last-viewer return (default 30
+  seconds), and minimum switch interval (default 60 seconds). Zero disables
+  that cooldown. Store each setting persistently per sender so it survives
+  worker restarts.
+- Coalesce repeated viewer and source events. Failure recovery and an explicit
+  control stop bypass cooldowns so failed or stopped connections are handled
+  promptly. The minimum switch interval governs native upstream switching; it
+  is not a Catchuparr plugin cooldown.
+- Validate sharing against native authorization, provider capacity, output
+  profile behavior, source-rule exceptions, last-viewer return, worker restart,
+  event bursts, failure recovery and control stop before release.
 
 ## Deferred validation
 
