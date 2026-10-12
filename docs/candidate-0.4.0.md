@@ -1,6 +1,6 @@
 # 0.4.0 validation and behavior
 
-This candidate adds Catchuparr archive playback to native Timeshift Stats and
+The 0.4.0 release adds Catchuparr archive playback to native Timeshift Stats and
 adds an independent control for hiding positively identified Catchuparr
 recorders from live Stats.
 
@@ -24,7 +24,7 @@ opaque display ID only after native admin authorization and revokes its local
 playback leases.
 
 The projection hooks are signature checked for Dispatcharr 0.31.0 and 0.32.0.
-The 0.4.0 implementation passed the local suite (392 tests), lint, compile,
+The 0.4.0 release passed the local suite (400 tests), lint, compile,
 package validation, independent review and full synthetic native integration
 on both pinned versions. Native checks cover Stats routes and permissions,
 Stop, timeouts and limits, recorder identity filtering, shared/private
@@ -37,7 +37,7 @@ The WebSocket evidence uses the native event emitter and native consumer
 authorization helper; it does not include a browser or network roundtrip, so
 end-to-end WebSocket delivery is not established. A container crash observed
 during diagnostics was not attributed to Catchuparr; no causal claim is made.
-These server-side checks do not establish playback-client compatibility.
-Isolated Dev installation and player-specific XC acceptance remain separate
-validation steps. See the [validation record](validation.md) for the current
-evidence and its limits.
+These server-side checks do not establish playback-client compatibility. The
+release passed isolated Dev and user acceptance; the WebSocket check remains
+limited to the native event emitter and authorization helper. See the
+[validation record](validation.md) for the evidence and its limits.

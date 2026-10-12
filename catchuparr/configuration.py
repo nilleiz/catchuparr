@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .native_output_security import ensure_native_key, native_key_id_valid
 from .runtime import PLUGIN_KEY, parse_settings
 
 ACTIVE_CONFIG_NAME = ".catchuparr-active-settings.json"
@@ -313,7 +314,6 @@ def _apply_configuration_locked(
         "source_policies": active["source_policies"],
         "recording_schedule": active["recording_schedule"],
     }
-    _validate_active_document(document)
     _prevalidate_archive_root(document["settings"]["archive_root"])
     try:
         previous_active = _load_active_configuration_locked(path)
@@ -326,6 +326,8 @@ def _apply_configuration_locked(
         and Path(previous_active["archive_root"]).expanduser().resolve()
         != Path(document["settings"]["archive_root"]).expanduser().resolve()
     )
+    _stage_native_output_key(document, previous_active, path)
+    _validate_active_document(document)
     prepared = _prepare_document_with_control_locked(path, document)
     return {
         "applied": True,
@@ -368,6 +370,29 @@ def _prevalidate_archive_root(raw_path: str) -> None:
             os.close(directory)
     except OSError:
         raise ValueError("archive_root is not accessible for recording and playback") from None
+
+
+def _stage_native_output_key(
+    document: dict[str, Any], previous_active: dict[str, Any] | None, active_path: Path
+) -> None:
+    """Persist key material before activating a snapshot that references it."""
+    settings = document["settings"]
+    if not settings.get("native_output_catchup", False):
+        settings.pop("native_output_key_id", None)
+        return
+    if not settings.get("playback_user_id"):
+        raise ValueError("native output requires a configured playback user")
+
+    previous_settings = previous_active or {}
+    old_id = previous_settings.get("native_output_key_id")
+    rotate = (
+        not previous_settings.get("native_output_catchup", False)
+        or not native_key_id_valid(old_id)
+        or previous_settings.get("archive_root") != settings.get("archive_root")
+        or previous_settings.get("playback_user_id") != settings.get("playback_user_id")
+    )
+    key_id = ensure_native_key(active_path, preferred_id=None if rotate else old_id)
+    settings["native_output_key_id"] = key_id
 
 
 class _PreparedActivation:
@@ -1023,6 +1048,9 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
     hide_recorders = settings.get("hide_recorders_in_stats", True)
     if type(hide_recorders) is not bool:
         raise ValueError("hide_recorders_in_stats must be boolean")
+    native_output_catchup = settings.get("native_output_catchup", False)
+    if type(native_output_catchup) is not bool:
+        raise ValueError("native_output_catchup must be boolean")
     applicable: dict[str, Any] = {
         "archive_root": str(parsed.archive_root),
         "retention_hours": parsed.retention_hours,
@@ -1032,6 +1060,7 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
         "public_base_url": normalize_public_base_url(settings.get("public_base_url", "")),
         "show_archive_playback_in_stats": show_archive_playback,
         "hide_recorders_in_stats": hide_recorders,
+        "native_output_catchup": native_output_catchup,
     }
     raw_user_id = settings.get("playback_user_id")
     if isinstance(raw_user_id, bool):
@@ -1328,6 +1357,7 @@ def _validate_active_document(data: dict[str, Any]) -> None:
             {
                 "recording_enabled", "log_level", "public_base_url",
                 "show_archive_playback_in_stats", "hide_recorders_in_stats",
+                "native_output_catchup", "native_output_key_id",
             }
         )
     if set(settings) - allowed_settings:
@@ -1388,6 +1418,18 @@ def _validate_active_document(data: dict[str, Any]) -> None:
         for field_name in ("show_archive_playback_in_stats", "hide_recorders_in_stats"):
             if field_name in settings and type(settings[field_name]) is not bool:
                 raise ValueError(f"Active Catchuparr {field_name} is invalid")
+        if (
+            "native_output_catchup" in settings
+            and type(settings["native_output_catchup"]) is not bool
+        ):
+            raise ValueError("Active Catchuparr native_output_catchup is invalid")
+        key_id = settings.get("native_output_key_id")
+        if key_id is not None and not native_key_id_valid(key_id):
+            raise ValueError("Active Catchuparr native output key ID is invalid")
+        if settings.get("native_output_catchup", False) and key_id is None:
+            raise ValueError("Active Catchuparr native output key ID is missing")
+        if settings.get("native_output_catchup", False) and not settings.get("playback_user_id"):
+            raise ValueError("Active Catchuparr native output playback user is missing")
         from .logging_utils import normalize_log_level
 
         try:

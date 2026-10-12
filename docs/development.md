@@ -8,14 +8,18 @@ Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q catchu
 
 Import `dist/catchuparr-<version>.zip` from Dispatcharr's Plugins page and enable it after inspecting its settings. The plugin code is installed under Dispatcharr's `/data/plugins/catchuparr`. The AIO container runs web and Celery with the same `/data/catchuparr` archive mount. During an update, stop the recorders, install the new ZIP, reload plugins, run the compatibility check, and resume the selected channels. Keep the prior ZIP and a verified application/configuration restore point until playback smoke tests pass; use the backup policy below.
 
-For the unreleased 0.3.1 candidate, use the
-[candidate guide](candidate-0.3.1.md) for YAML schedules, timezone resolution,
-unified settings Apply, recorder controls, legacy-setting reset behavior and
-current acceptance status. The 0.3.0 guide is historical. The build command
-uses the manifest version when naming the ZIP.
+For historical 0.3.1 schedule, timezone and unified-Apply details, see its
+[guide](candidate-0.3.1.md). Those features are included in released 0.4.0;
+the 0.3.0 guide is also historical. The build command uses the manifest version
+when naming the ZIP.
 
-For the 0.4.0 candidate, see [its guide](candidate-0.4.0.md) for native Stats
-projection behavior, settings and remaining acceptance gates.
+For released 0.4.0, see [its guide](candidate-0.4.0.md) for native Stats
+projection behavior, settings and validation limits.
+
+For the 0.5.0 native output candidate, see [its guide](candidate-0.5.0.md).
+It is disabled by default. The local suite and package checks pass, while the
+exact native probe still needs to pass in both pinned AIO images before native
+server acceptance is recorded.
 
 Dispatcharr v0.31.0 and v0.32.0 accept a manual update at authenticated admin
 `POST /api/plugins/plugins/import/` with multipart field `file` and explicit
@@ -63,7 +67,9 @@ usable hint, the actual EPG programme end determines the remaining window;
 without reliable EPG metadata, playback delegates to the provider. Dispatcharr's
 extra provider duration padding is never required for local archive coverage.
 Use the plugin XMLTV endpoint with the plugin M3U export. Native XC M3U tags
-do not extend the core XMLTV endpoint's historical guide.
+do not extend the core XMLTV endpoint's historical guide. The optional 0.5.0
+integration targets Dispatcharr's native `/output/m3u` and `/output/epg`
+endpoints; it remains a candidate pending pinned AIO verification.
 
 ## Backup and rollback scope
 
@@ -73,6 +79,16 @@ verified task-owned Dev backups, and prune an older one only after the new
 restore point has been verified. Include archive data only with explicit
 authorization. An application/configuration-only restore point cannot recover
 archive files or database content that was lost or overwritten.
+
+For the native output candidate, include the private Catchuparr state files
+`.catchuparr-active-settings.json` and `.catchuparr-native-output-keys.json`
+with the matching Dispatcharr configuration backup. They sit beside the
+replaceable plugin directory, outside both the plugin ZIP and archive directory.
+Restore those files together; a missing matching keyring makes old signed
+playback capabilities fail closed until a valid Apply stages a new key and
+clients refresh native output. Keep the existing limit of two verified
+task-owned application/configuration backups. Do not add the archive, recordings
+or archive database to these restore points.
 
 Rollback uses the previous plugin/image and its matching application/configuration
 restore point while preserving the current archive directory, recordings and
@@ -110,9 +126,14 @@ production is not updated. Preserve Dev bind addresses, volumes and egress rules
 
 For a rebuild instead of an in-place upgrade, use the backup ZIP/API restoration
 procedure below. Run `python3 scripts/run_aio_integration.py --image <pinned-image>`
-for a disposable, networkless AIO probe; it refuses databases containing users or
-channels. CI runs the same synthetic probe against both supported releases and
-collects no container data, recordings or credentials as artifacts.
+once for each pinned Dispatcharr version. Each invocation creates a uniquely
+named, networkless container with its own anonymous `/data` volume and no fixed
+host ports, so the two version checks can run in parallel. Capture each run's
+output in a separate private log outside the repository. The runner refuses
+databases containing users or channels and removes only its own container and
+volume; verify both exit codes and cleanup before recording acceptance. CI runs
+the same synthetic probe against both supported releases and collects no
+container data, recordings or credentials as artifacts.
 
 ## Isolated development stack
 

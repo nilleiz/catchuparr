@@ -301,6 +301,7 @@ class ArchiveHTTPService:
         replacement_grace_seconds: float = SESSION_REPLACEMENT_GRACE_SECONDS,
         clock: Callable[[], float] = time.time,
         playlist_builder: Callable[..., str] | None = None,
+        device_identity: Callable[[str, str, str], str] | None = None,
     ):
         if not base_path.startswith("/") or "\r" in base_path or "\n" in base_path:
             raise ValueError("base_path must be an absolute URL path")
@@ -318,7 +319,19 @@ class ArchiveHTTPService:
         self.replacement_grace_seconds = replacement_grace_seconds
         self.clock = clock
         self.playlist_builder = playlist_builder
+        self.device_identity = device_identity
         self._init_sessions()
+
+    def playback_device_identity(
+        self, token: str, user_id: str, channel_id: str
+    ) -> str:
+        """Return the stable opaque device key used by leases and Stats."""
+        if self.device_identity is None:
+            return hashlib.sha256(token.encode("utf-8")).hexdigest()
+        value = self.device_identity(token, user_id, channel_id)
+        if not isinstance(value, str) or not value or len(value) > 128:
+            raise ValueError("playback device identity is invalid")
+        return value
 
     def _connect(self) -> sqlite3.Connection:
         db_path = Path(self.store.root) / "archive.sqlite3"
@@ -820,7 +833,10 @@ class ArchiveHTTPService:
             return _error(403, "forbidden")
         if user_id is None:
             return _error(401, "unauthorized")
-        device_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        try:
+            device_key = self.playback_device_identity(token, user_id, channel_id)
+        except (TypeError, ValueError):
+            return _error(403, "forbidden")
         request_key = hashlib.sha256(
             f"{device_key}\0{channel_id}\0{start:.6f}\0{identity_end:.6f}".encode()
         ).hexdigest()
@@ -1056,7 +1072,10 @@ class ArchiveHTTPService:
             return _error(400, "invalid channel")
         if segment is None:
             return _error(404, "segment not found")
-        device_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        try:
+            device_key = self.playback_device_identity(token, user_id, channel_id)
+        except (TypeError, ValueError):
+            return _error(403, "forbidden")
         if not self._renew_lease(user_id, channel_id, lease_id, device_key, segment):
             return _error(403, "invalid or expired playback lease")
         try:
@@ -1114,7 +1133,10 @@ class ArchiveHTTPService:
             return False
         if user_id is None:
             return False
-        device_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        try:
+            device_key = self.playback_device_identity(token, user_id, channel_id)
+        except (TypeError, ValueError):
+            return False
         return self._delete_session(lease_id, user_id, device_key)
 
     def _delete_session(self, lease_id: str, user_id: str, device_key: str) -> bool:

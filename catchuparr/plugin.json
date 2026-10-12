@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Local rolling catch-up archive and start-over for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -72,6 +72,13 @@
       "type": "boolean",
       "default": true,
       "help_text": "Hides only positively identified Catchuparr recorder clients from live details."
+    },
+    {
+      "id": "native_output_catchup",
+      "label": "Add Catchuparr catch-up to native output",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Adds local archive catch-up metadata to eligible channels in Dispatcharr M3U and XMLTV output. Disabled by default. Apply this setting with the rest of the configuration."
     }
   ],
   "actions": [
