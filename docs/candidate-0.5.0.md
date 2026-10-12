@@ -91,11 +91,11 @@ validation. The 30-entry package has SHA-256
 The full synthetic AIO probe passed on Dispatcharr 0.31.0
 (`f81924fa3dbfeb463b3908be7e086bf58aacbd2ba56062bfb555ee3a471acf8f`) and
 0.32.0 (`b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a`).
-Each version passed the complete 32-test AIO gate, including native M3U/XMLTV
-output, signed archive access, byte ranges, current permission and session
-checks, Stats Stop, and cleanup. The two version runs passed separately; they
-were not a concurrent-run test. No container data, recordings or credentials
-were retained as artifacts.
+Each version passed 32 engine tests and the complete integration gates,
+including native M3U/XMLTV output, signed archive access, byte ranges, current
+permission and session checks, Stats Stop, and cleanup. The two version runs
+passed separately; they were not a concurrent-run test. No container data,
+recordings or credentials were retained as artifacts.
 
 Independent review and the exact package contents were verified. Required CI,
 isolated Dev verification and player-specific behavior remain pending. This
