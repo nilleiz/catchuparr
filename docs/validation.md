@@ -1,5 +1,9 @@
 # Validation status
 
+Sections for 0.2.0 through 0.3.1 are historical candidate checkpoints; their
+pending release gates describe the status at that time. Current 0.4.0 evidence
+and remaining limitations are recorded at the end of this document.
+
 ## Released baseline: 0.1.4
 
 M3U/XMLTV with HLS passed qualitative real-player acceptance on Dispatcharr
@@ -203,24 +207,25 @@ or player-compatibility claim. See the
 [0.3.1 candidate guide](candidate-0.3.1.md) for current behavior and upgrade
 notes.
 
-## 0.4.0 Stats candidate
+## 0.4.0 Stats integration (current)
 
-The 0.4.0 candidate passed 392 local unit tests, Ruff, compileall, package
+The 0.4.0 implementation passed 392 local unit tests, Ruff, compileall, package
 validation, independent review and the full synthetic native integration probe
 on pinned Dispatcharr 0.31.0 and 0.32.0. Both native runs passed their required
 probe assertions and cleanup checks. The probe covers native Stats REST routes
 and admin permissions, native Stop behavior, viewer timeout and connection
 limits, recorder identity filtering, shared and private recorder isolation,
-source-policy behavior, failover and cross-process follower checks.
+source-policy behavior, failover and cross-process follower checks. Stats
+projection passed under Dispatcharr's gevent runtime. Shared and private
+recorder cases with `hide_recorders_in_stats` enabled and disabled were
+exercised, including private-recorder hiding enabled.
 
 The WebSocket check captures the actual native event emitter and exercises the
 native consumer's admin authorization helper against its event payload. It does
-not perform a browser or network WebSocket roundtrip. Shared-recorder
-`hide_recorders_in_stats=True` and private-recorder
-`hide_recorders_in_stats=False` were exercised; private-recorder output with
-that option set to true remains unverified.
-
-Required CI, isolated Dev installation and real-player acceptance remain
-pending. These synthetic native results do not establish playback-client
-compatibility or represent a published release. See the
-[0.4.0 candidate guide](candidate-0.4.0.md) for the feature behavior and limits.
+not perform a browser or network WebSocket roundtrip, so end-to-end WebSocket
+delivery is not established. A container crash observed during diagnostics was
+not attributed to Catchuparr; no causal claim is made. The synthetic native
+results do not establish playback-client compatibility. Isolated Dev
+installation and player-specific XC acceptance remain separate validation
+steps. See the [0.4.0 behavior and validation guide](candidate-0.4.0.md) for
+details.

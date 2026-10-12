@@ -1,0 +1,199 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Plugin version from CHANGELOG.md (without the v prefix)
+        required: true
+        type: string
+      prerelease:
+        description: Mark a stable-numbered version as a pre-release
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Required CI and native integration
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish plugin archive
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a reviewed main-branch commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && "${REF_NAME}" != "main" ]]; then
+            echo "Manual releases must be dispatched from main" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "${RELEASE_SHA}" origin/main || {
+            echo "Release commit is not contained in main" >&2
+            exit 1
+          }
+
+      - name: Download CI-built plugin archive
+        uses: actions/download-artifact@v4
+        with:
+          name: catchuparr-plugin
+          path: dist
+
+      - name: Verify version, archive name, and changelog
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          if os.environ["EVENT_NAME"] == "workflow_dispatch":
+              version = os.environ["INPUT_VERSION"].strip()
+          else:
+              ref = os.environ["REF_NAME"]
+              if not ref.startswith("v"):
+                  raise SystemExit("Tag-triggered releases must use a v-prefixed tag")
+              version = ref[1:]
+
+          if not re.fullmatch(
+              r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+              r"(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?",
+              version,
+          ):
+              raise SystemExit(f"Invalid release version: {version!r}")
+
+          manifest = json.loads(Path("catchuparr/plugin.json").read_text())
+          if manifest.get("version") != version:
+              raise SystemExit(
+                  f"Release version {version} does not match plugin version {manifest.get('version')}"
+              )
+
+          archive = Path("dist") / f"catchuparr-{version}.zip"
+          if not archive.is_file():
+              raise SystemExit(f"CI archive not found: {archive}")
+          archives = list(Path("dist").glob("*.zip"))
+          if archives != [archive]:
+              raise SystemExit(f"Expected only {archive.name}, found {[p.name for p in archives]}")
+
+          from zipfile import ZipFile
+
+          with ZipFile(archive) as package:
+              names = package.namelist()
+              if not names or any(
+                  name.startswith("/")
+                  or "\\" in name
+                  or ".." in Path(name).parts
+                  or not name.startswith("catchuparr/")
+                  or Path(name).suffix not in {".py", ".json"}
+                  for name in names
+              ):
+                  raise SystemExit("Plugin ZIP contains an unexpected path or file type")
+              if len(names) != len(set(names)):
+                  raise SystemExit("Plugin ZIP contains duplicate paths")
+              packaged_manifest = json.loads(package.read("catchuparr/plugin.json"))
+              if packaged_manifest.get("version") != version:
+                  raise SystemExit("Packaged manifest version does not match release version")
+              plugin_source = package.read("catchuparr/plugin.py").decode("utf-8")
+              plugin_version = re.search(
+                  r"^\s+version\s*=\s*['\"]([^'\"]+)['\"]",
+                  plugin_source,
+                  re.MULTILINE,
+              )
+              if plugin_version is None or plugin_version.group(1) != version:
+                  raise SystemExit("Packaged plugin.py version does not match release version")
+
+          changelog = Path("CHANGELOG.md").read_text()
+          heading = f"## [{version}]"
+          if heading not in changelog:
+              raise SystemExit(f"No {heading} section in CHANGELOG.md")
+          prerelease = "-" in version or (
+              os.environ["EVENT_NAME"] == "workflow_dispatch"
+              and os.environ["INPUT_PRERELEASE"] == "true"
+          )
+          Path("dist/RELEASE_NOTES.md").write_text(changelog)
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"version={version}\n")
+              output.write(f"prerelease={'true' if prerelease else 'false'}\n")
+          PY
+
+      - name: Create archive checksum
+        working-directory: dist
+        run: |
+          sha256sum "catchuparr-${{ steps.release.outputs.version }}.zip" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Verify or create the exact tested version tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          tag="v${VERSION}"
+          if [[ "${EVENT_NAME}" != "workflow_dispatch" && "${REF_NAME}" != "${tag}" ]]; then
+            echo "Tag ref does not match plugin version ${VERSION}" >&2
+            exit 1
+          fi
+
+          remote_tag="$(git ls-remote --tags origin \
+            "refs/tags/${tag}" "refs/tags/${tag}^{}")"
+          if [[ -n "${remote_tag}" ]]; then
+            git fetch --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
+            tag_sha="$(git rev-parse "${tag}^{commit}")"
+            if [[ "${tag_sha}" != "${RELEASE_SHA}" ]]; then
+              echo "Existing tag ${tag} points to a different commit; refusing to retag" >&2
+              exit 1
+            fi
+          else
+            if [[ "${EVENT_NAME}" != "workflow_dispatch" ]]; then
+              echo "The pushed release tag is not available on origin" >&2
+              exit 1
+            fi
+            git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "${tag}" "${RELEASE_SHA}" -m "Catchuparr ${VERSION}"
+            git push origin "refs/tags/${tag}"
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
+        run: |
+          args=("${TAG}" "dist/catchuparr-${VERSION}.zip" dist/SHA256SUMS \
+            --title "Catchuparr ${VERSION}" --notes-file dist/RELEASE_NOTES.md \
+            --target "${RELEASE_SHA}" --verify-tag)
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "${args[@]}"
