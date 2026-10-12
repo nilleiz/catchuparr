@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       prerelease:
-        description: Mark this GitHub release as a pre-release
+        description: Mark a stable-numbered version as a pre-release
         required: true
         default: false
         type: boolean
@@ -63,6 +63,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           python - <<'PY'
@@ -79,7 +80,11 @@ jobs:
                   raise SystemExit("Tag-triggered releases must use a v-prefixed tag")
               version = ref[1:]
 
-          if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?", version):
+          if not re.fullmatch(
+              r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+              r"(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?",
+              version,
+          ):
               raise SystemExit(f"Invalid release version: {version!r}")
 
           manifest = json.loads(Path("catchuparr/plugin.json").read_text())
@@ -101,6 +106,7 @@ jobs:
               names = package.namelist()
               if not names or any(
                   name.startswith("/")
+                  or "\\" in name
                   or ".." in Path(name).parts
                   or not name.startswith("catchuparr/")
                   or Path(name).suffix not in {".py", ".json"}
@@ -125,13 +131,14 @@ jobs:
           heading = f"## [{version}]"
           if heading not in changelog:
               raise SystemExit(f"No {heading} section in CHANGELOG.md")
-          body = changelog.split(heading, 1)[1].split("\n## [", 1)[0].strip()
-          if not body:
-              raise SystemExit(f"The {version} changelog section is empty")
-
-          Path("dist/RELEASE_NOTES.md").write_text(f"## {version}\n\n{body}\n")
+          prerelease = "-" in version or (
+              os.environ["EVENT_NAME"] == "workflow_dispatch"
+              and os.environ["INPUT_PRERELEASE"] == "true"
+          )
+          Path("dist/RELEASE_NOTES.md").write_text(changelog)
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
               output.write(f"version={version}\n")
+              output.write(f"prerelease={'true' if prerelease else 'false'}\n")
           PY
 
       - name: Create archive checksum
@@ -140,16 +147,53 @@ jobs:
           sha256sum "catchuparr-${{ steps.release.outputs.version }}.zip" > SHA256SUMS
           sha256sum --check SHA256SUMS
 
+      - name: Verify or create the exact tested version tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          tag="v${VERSION}"
+          if [[ "${EVENT_NAME}" != "workflow_dispatch" && "${REF_NAME}" != "${tag}" ]]; then
+            echo "Tag ref does not match plugin version ${VERSION}" >&2
+            exit 1
+          fi
+
+          remote_tag="$(git ls-remote --tags origin \
+            "refs/tags/${tag}" "refs/tags/${tag}^{}")"
+          if [[ -n "${remote_tag}" ]]; then
+            git fetch --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
+            tag_sha="$(git rev-parse "${tag}^{commit}")"
+            if [[ "${tag_sha}" != "${RELEASE_SHA}" ]]; then
+              echo "Existing tag ${tag} points to a different commit; refusing to retag" >&2
+              exit 1
+            fi
+          else
+            if [[ "${EVENT_NAME}" != "workflow_dispatch" ]]; then
+              echo "The pushed release tag is not available on origin" >&2
+              exit 1
+            fi
+            git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "${tag}" "${RELEASE_SHA}" -m "Catchuparr ${VERSION}"
+            git push origin "refs/tags/${tag}"
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
           VERSION: ${{ steps.release.outputs.version }}
-          PRERELEASE: ${{ inputs.prerelease }}
+          RELEASE_SHA: ${{ github.sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
         run: |
-          args=("v${VERSION}" "dist/catchuparr-${VERSION}.zip" dist/SHA256SUMS \
-            --title "Catchuparr ${VERSION}" --notes-file dist/RELEASE_NOTES.md)
-          if [[ "${EVENT_NAME}" == "workflow_dispatch" && "${PRERELEASE}" == "true" ]]; then
-            args+=(--prerelease)
+          args=("${TAG}" "dist/catchuparr-${VERSION}.zip" dist/SHA256SUMS \
+            --title "Catchuparr ${VERSION}" --notes-file dist/RELEASE_NOTES.md \
+            --target "${RELEASE_SHA}" --verify-tag)
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease --latest=false)
           fi
           gh release create "${args[@]}"
