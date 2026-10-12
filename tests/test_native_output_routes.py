@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -81,6 +82,101 @@ class NativeArchiveServiceTests(unittest.TestCase):
             "native:synthetic",
         )
         self.assertIs(core_utils.RedisClient.get_client.return_value, redis_client)
+
+
+class NativeArchiveParityTests(unittest.TestCase):
+    class Response:
+        def __init__(self, content=b"", status=200, content_type=None):
+            self.content = content
+            self.status_code = status
+            self.headers = {}
+            if content_type:
+                self.headers["Content-Type"] = content_type
+
+        def __setitem__(self, key, value):
+            self.headers[key] = value
+
+    def setUp(self):
+        self.now = datetime.now(timezone.utc).timestamp()
+        self.start = self.now - 120
+        self.duration = 60
+        self.requested_end = self.start + self.duration
+        self.user = SimpleNamespace(id=7)
+        self.claims = {"channel": "channel-synthetic"}
+        self.candidates = [object()]
+        self.service = SimpleNamespace(
+            store=SimpleNamespace(segments=Mock(return_value=self.candidates)),
+            _manifest_segments=Mock(return_value=[object()]),
+            playlist=Mock(return_value=SimpleNamespace(status=200, headers={}, body=b"#EXTM3U")),
+        )
+        self.context = ({}, SimpleNamespace(retention_hours=48), self.user, self.claims, b"k" * 32)
+        self.request = SimpleNamespace(
+            method="GET",
+            GET={
+                "token": "synthetic",
+                "channel_id": "channel-synthetic",
+                "utc": str(self.start),
+                "duration": str(self.duration),
+            },
+            headers={},
+            META={},
+        )
+        django_http = types.ModuleType("django.http")
+        django_http.HttpResponse = self.Response
+        self.django_modules = {"django": types.ModuleType("django"), "django.http": django_http}
+
+    def call_archive(self, method="GET"):
+        self.request.method = method
+        with (
+            patch.dict(sys.modules, self.django_modules),
+            patch.object(views, "_native_playback_context", return_value=self.context),
+            patch.object(views, "_native_archive_service", return_value=self.service),
+            patch.object(
+                views,
+                "_archive_epg_bounds",
+                return_value=(self.requested_end + 60, None),
+            ),
+            patch.object(
+                views,
+                "_archive_playback_window",
+                return_value=(self.requested_end, None),
+            ),
+            patch.object(views, "_archive_window_live", return_value=False),
+            patch.object(views, "_record_native_playback"),
+            patch.object(views, "_native_client_ip", return_value="192.0.2.10"),
+        ):
+            return views._native_archive_response(self.request, None, None)
+
+    def test_get_delegates_sparse_window_to_shared_playlist_service(self):
+        response = self.call_archive()
+
+        self.assertEqual(response.status_code, 200)
+        self.service.playlist.assert_called_once()
+        self.service.store.segments.assert_not_called()
+
+    def test_head_checks_shared_manifest_without_creating_a_playlist(self):
+        response = self.call_archive("HEAD")
+
+        self.assertEqual(response.status_code, 200)
+        self.service.store.segments.assert_called_once_with(
+            "channel-synthetic", self.start, self.requested_end
+        )
+        self.service._manifest_segments.assert_called_once_with(
+            "channel-synthetic",
+            "[]",
+            self.candidates,
+            programme_end=self.requested_end + 60,
+        )
+        self.service.playlist.assert_not_called()
+
+    def test_head_preserves_empty_manifest_not_found(self):
+        self.service._manifest_segments.return_value = []
+
+        response = self.call_archive("HEAD")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.content, b"")
+        self.service.playlist.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -811,12 +811,24 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
         programme_end_epoch,
         next_programme_end_epoch,
     )
-    covered_until = min(end_epoch, now_epoch)
-    if covered_until > start_epoch and not store.coverage(
-        channel, start_epoch, covered_until
-    ).complete:
-        return _no_cache(HttpResponse("Archive coverage is incomplete", status=404))
     if request.method == "HEAD":
+        # Match GET's playlist eligibility without acquiring a lease or
+        # persisting a manifest. The shared builder decides which indexed
+        # segments belong to this effective programme window.
+        try:
+            candidates = store.segments(channel, start_epoch, end_epoch)
+            manifest = service._manifest_segments(
+                channel,
+                "[]",
+                candidates,
+                programme_end=programme_end_epoch,
+            )
+        except (OSError, RuntimeError, sqlite3.Error):
+            return _no_cache(HttpResponse(status=503))
+        except (TypeError, ValueError):
+            return _no_cache(HttpResponse("Invalid channel", status=400))
+        if not manifest:
+            return _no_cache(HttpResponse(status=404))
         response = HttpResponse(status=200, content_type="application/vnd.apple.mpegurl")
         return _no_cache(response)
     response = service.playlist(
