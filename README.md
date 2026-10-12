@@ -66,18 +66,47 @@ a draft alone does not alter the active recorder configuration.
 
 ### Select channels and sources
 
-Use YAML version 1. Select a channel using exactly one of `numbers`, `names`,
-`groups` or `profile`. A decimal channel number or range can be written as a
-number or a quoted string. Channel groups and channel profiles must match
-Dispatcharr entries. A named channel profile selects its enabled members;
-`profile: all` means all eligible channels.
+Use YAML version 1. A rule selects channels using exactly one of `numbers`,
+`names`, `groups` or `profile`. Use numbers for individual channel numbers and
+quoted strings for ranges, such as `numbers: [100, "102-105"]`. Names and group
+names must match Dispatcharr entries. A named profile selects its enabled
+members; `channels: {profile: all}` selects every eligible channel.
 
-The outer `profile` (default `all`) limits the channels that rules can select.
-Each rule's channel selector must resolve to at least one eligible channel.
-Concrete rule selectors may not overlap. A rule that includes source policy or
-priority replaces the default policy for its selected channels. Other channels
-use the outer default: `profile: all` with no specific rule means every source
-already assigned to the channel may be used.
+The outer `profile` (default `all`) limits which channels are eligible for rule
+selection; it does not select or record those channels by itself. A nonblank
+configuration with no rules selects no channels. Each rule's selector must
+resolve to at least one eligible channel, and concrete rule selectors may not
+overlap. `channels.profile: all` also sets the baseline source policy for all
+eligible channels: use every source already assigned to each channel. A
+specific rule replaces that baseline policy for its selected channels.
+
+The following selector forms are examples. For the combined example, choose
+values that resolve to disjoint channels in your catalog:
+
+```yaml
+version: 1
+profile: "Synthetic Scope"  # Optional outer scope: enabled members only.
+rules:
+  - channels:
+      numbers: [100, "102-105"]
+  - channels:
+      names: ["Synthetic Channel A"]
+  - channels:
+      groups: ["Synthetic Group"]
+  - channels:
+      profile: "Synthetic Enabled Profile"
+```
+
+To select all channels eligible under the outer profile and keep all of their
+assigned sources eligible, add an explicit `channels.profile: all` rule:
+
+```yaml
+version: 1
+profile: all
+rules:
+  - channels:
+      profile: all
+```
 
 `include` and `exclude` refer to exact M3U source names already assigned to a
 channel. They are mutually exclusive. `exclude: []` allows every assigned
@@ -107,6 +136,12 @@ rules:
       "Synthetic M3U A": 100
       "Synthetic M3U B": 50
     schedule:
+      weekdays:
+        - start: "18:00"
+          end: "23:00"
+      weekend:
+        - start: "10:00"
+          end: "13:00"
       friday:
         - start: "19:00"
           end: "23:30"
@@ -117,10 +152,11 @@ rules:
 ```
 
 Replace the synthetic channel, group and source values with exact entries from
-your Dispatcharr catalog. The example schedules channels 100–102 on weekdays
-and weekend days using the global windows, except Friday when that rule uses
-its rule-level window. Channels in `Synthetic Group` record continuously,
-excluding the named source.
+your Dispatcharr catalog. The outer schedule applies to the selected channels
+unless a rule supplies its own schedule. The first rule's schedule replaces the
+global one: channels 100–102 use its weekday and weekend windows, with the
+explicit Friday window replacing that rule's weekday window. Channels in
+`Synthetic Group` record continuously, excluding the named source.
 
 ### Schedule behavior
 
@@ -217,10 +253,13 @@ are available for supported routes. Native XC playback uses MPEG-TS. Catchuparr
 does not transcode streams or claim client-specific output-profile support.
 
 Start-over and seek positions use programme boundaries and available indexed
-segments. Segment boundaries and EPG timing mean seeks are not frame-accurate.
-An archive programme must be historical, indexed and within retention. Incomplete
-archive coverage, missing EPG data, expired content or missing segments can
-prevent playback. Live playback remains handled by Dispatcharr.
+segments. Start-over can begin at the start of a programme that is still in
+progress; playback stops at that programme's observed EPG end, and only the
+already captured part is available. Completed programmes use the same indexed
+archive and retention checks. Segment boundaries and EPG timing mean seeks are
+not frame-accurate. Incomplete archive coverage, missing EPG data, expired
+content or missing segments can prevent playback. Live playback remains handled
+by Dispatcharr.
 
 Pause and Resume in a client control that playback session. The plugin's global
 Pause/Resume actions control recording only.
@@ -296,3 +335,23 @@ python3 scripts/build_plugin.py
 CI also runs synthetic integration against pinned Dispatcharr AIO images for
 0.31.0 and 0.32.0. See [development and deployment](docs/development.md) for an
 isolated development environment, upgrade and rollback guidance.
+
+## Release workflow
+
+Maintainers can start a release by pushing a `v<version>` tag or by choosing
+**Build and publish release** under GitHub Actions. The workflow reuses the
+complete CI workflow, including unit/lint/package checks and both pinned native
+integration jobs. Publishing only proceeds for a commit contained in `main`
+and when the tag, plugin manifest and built ZIP all have the same version.
+
+For a manual run, select `main`, enter the version without its `v` prefix, and
+choose whether the release should be a pre-release. A missing version tag is
+created at the exact tested commit; an existing tag is accepted only when it
+points to that same commit. Tags for suffixed versions such as `0.5.0-rc.1` are
+automatically marked as pre-releases. The workflow refuses to move or replace
+an existing tag.
+
+The GitHub release includes `catchuparr-<version>.zip`, `SHA256SUMS`, and the
+complete changelog from 0.2.0 through the release version. A pre-release is
+excluded from GitHub's latest-stable designation. The workflow validates the
+ZIP layout and checksum before publication.

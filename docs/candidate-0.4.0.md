@@ -1,4 +1,4 @@
-# 0.4.0 candidate
+# 0.4.0 validation and behavior
 
 This candidate adds Catchuparr archive playback to native Timeshift Stats and
 adds an independent control for hiding positively identified Catchuparr
@@ -24,16 +24,20 @@ opaque display ID only after native admin authorization and revokes its local
 playback leases.
 
 The projection hooks are signature checked for Dispatcharr 0.31.0 and 0.32.0.
-The 0.4.0 candidate passed the local suite (392 tests), lint, compile, package
-validation, independent review and full synthetic native integration on both
-pinned versions. Native checks cover Stats routes and permissions, Stop,
-timeouts and limits, recorder identity filtering, shared/private isolation,
-source policies, failover and cross-process follower behavior.
+The 0.4.0 implementation passed the local suite (392 tests), lint, compile,
+package validation, independent review and full synthetic native integration
+on both pinned versions. Native checks cover Stats routes and permissions,
+Stop, timeouts and limits, recorder identity filtering, shared/private
+isolation, source policies, failover and cross-process follower behavior.
+Stats projection also passed under Dispatcharr's gevent runtime. Shared and
+private recorder cases with `hide_recorders_in_stats` both enabled and disabled
+were exercised, including private-recorder hiding enabled.
 
 The WebSocket evidence uses the native event emitter and native consumer
-authorization helper; it does not include a browser or network roundtrip.
-Shared-recorder `hide_recorders_in_stats=True` and private-recorder
-`hide_recorders_in_stats=False` were exercised. Private-recorder output with
-`hide_recorders_in_stats=True` remains unverified. Required CI, isolated Dev
-installation and real-player acceptance remain pending. These checks do not
-establish playback-client compatibility or indicate a published release.
+authorization helper; it does not include a browser or network roundtrip, so
+end-to-end WebSocket delivery is not established. A container crash observed
+during diagnostics was not attributed to Catchuparr; no causal claim is made.
+These server-side checks do not establish playback-client compatibility.
+Isolated Dev installation and player-specific XC acceptance remain separate
+validation steps. See the [validation record](validation.md) for the current
+evidence and its limits.
