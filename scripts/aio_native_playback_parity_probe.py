@@ -214,7 +214,9 @@ def probe():
         legacy_match,
         {"channel_id": channel_id, "utc": str(now.timestamp()), "duration": "1"},
     )
-    tampered = capability[:-1] + ("A" if capability[-1] != "A" else "B")
+    payload, signature = capability.rsplit(".", 1)
+    altered_signature = ("A" if signature[0] != "A" else "B") + signature[1:]
+    tampered = f"{payload}.{altered_signature}"
     denied_native = call(
         native_match,
         {"channel_id": channel_id, "utc": str(now.timestamp()),
