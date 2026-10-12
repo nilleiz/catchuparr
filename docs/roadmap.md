@@ -1,6 +1,6 @@
 # Catchuparr roadmap
 
-Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. The only release currently in development is 0.5.0; later work is planned, not implemented.
+Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. Release 0.5.0 is in development; 0.5.1 is the planned intermediate configuration-inheritance step before 0.6.0. Later work is planned, not implemented.
 
 ## Workflow and release gates
 
@@ -20,7 +20,8 @@ Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed w
 | 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Superseded development version; included in released 0.4.0 |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Both pinned AIO probes, 433 local tests, package checks and independent review pass; required CI, isolated Dev verification and player acceptance remain pending |
-| 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.0 is complete |
+| 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Planned; configuration behavior only, before 0.6.0 |
+| 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.1 is complete |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.
@@ -315,6 +316,80 @@ The 433-test local suite and full synthetic AIO probes passed on pinned
 Dispatcharr 0.31.0 and 0.32.0. Those two runs completed separately and are not
 a concurrency test. Required CI, isolated Dev verification and real-player
 acceptance remain release gates; see the [validation record](validation.md).
+
+## 0.5.1 — named profile configuration inheritance (planned)
+
+This is a planned configuration step between 0.5.0 and 0.6.0. The behavior
+below is not supported by the current 0.5.0 candidate. It does not change
+enabled profile membership or add connection sharing; 0.6.0 sharing and its
+cooldown design remain as described below.
+
+- A named profile supplies the base configuration for its enabled members.
+  Direct channel rules selected by name or number act as exceptions regardless
+  of their order relative to that profile rule. Enabled membership is unchanged.
+- For sources, an omitted `include`/`exclude` inherits the profile's effective
+  filter. An explicit `include` or `exclude` replaces that filter; they remain
+  mutually exclusive. An explicit `priority` replaces the whole inherited map,
+  then the resulting effective values are validated.
+- A rule's own schedule replaces the whole week by default: omitted days are
+  off. `schedule_mode: replace` makes that behavior explicit. With
+  `schedule_mode: override_days`, only specified expanded days replace the
+  inherited day and all other days inherit. An explicitly empty day is off.
+  `schedule_mode` is valid only when the rule has its own schedule.
+- Expand schedule groups before inheritance. Resolve each day from its direct
+  day entry, then its group entry, then `daily`. Replacing a day also removes
+  inherited overnight windows owned by that start day.
+- Reject multiple matching direct rules and competing named profile rules.
+  Validate the final effective source filters and schedules at the same Apply
+  that activates them, and retain the origin of each inherited or replaced
+  value for validation feedback.
+
+The following generic YAML sketches describe the planned syntax only. They are
+not accepted by the current 0.5.0 candidate.
+
+An explicit filter replaces the inherited filter for the selected direct
+channel. Here the direct rule's include list replaces the profile's exclude
+list; its priority map is the complete effective map for that channel.
+
+```yaml
+version: 1
+profile: all
+rules:
+  - channels:
+      profile: "Synthetic Recording Profile"
+    exclude: ["Synthetic M3U B"]
+    priority:
+      "Synthetic M3U A": 20
+  - channels:
+      names: ["Synthetic Channel A"]
+    include: ["Synthetic M3U C"]
+    priority:
+      "Synthetic M3U C": 50
+```
+
+For schedules, `replace` leaves unspecified days off. `override_days` replaces
+only the expanded `weekdays` group; Saturday and Sunday still inherit. An
+explicitly empty day turns that day off.
+
+```yaml
+version: 1
+profile: all
+rules:
+  - channels:
+      profile: "Synthetic Recording Profile"
+    schedule:
+      daily:
+        - start: "08:00"
+          end: "18:00"
+  - channels:
+      names: ["Synthetic Channel A"]
+    schedule_mode: override_days
+    schedule:
+      weekdays:
+        - start: "18:00"
+          end: "22:00"
+      sunday: []
+```
 
 ## 0.6.0 — smart connection sharing (planned)
 
