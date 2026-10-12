@@ -1,9 +1,7 @@
 import sys
-import tempfile
 import types
 import unittest
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -86,75 +84,98 @@ class NativeArchiveServiceTests(unittest.TestCase):
         self.assertIs(core_utils.RedisClient.get_client.return_value, redis_client)
 
 
-class NativeArchiveCoverageTests(unittest.TestCase):
+class NativeArchiveParityTests(unittest.TestCase):
+    class Response:
+        def __init__(self, content=b"", status=200, content_type=None):
+            self.content = content
+            self.status_code = status
+            self.headers = {}
+            if content_type:
+                self.headers["Content-Type"] = content_type
+
+        def __setitem__(self, key, value):
+            self.headers[key] = value
+
     def setUp(self):
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tempdir.cleanup)
-        self.root = Path(self.tempdir.name)
-        self.store = archive_store_module.ArchiveStore(self.root)
-        self.now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc).timestamp()
-        self.start = self.now - 20
-        self.end = self.now + 10
-        self.programme_end = self.now + 60
-
-    def add_segment(self, start, end):
-        path = self.root / f"segment-{len(list(self.root.glob('*.ts')))}.ts"
-        path.write_bytes(b"synthetic transport stream")
-        self.store.add_segment(
-            "channel-synthetic",
-            path,
-            datetime.fromtimestamp(start, timezone.utc),
-            datetime.fromtimestamp(end, timezone.utc),
+        self.now = datetime.now(timezone.utc).timestamp()
+        self.start = self.now - 120
+        self.duration = 60
+        self.requested_end = self.start + self.duration
+        self.user = SimpleNamespace(id=7)
+        self.claims = {"channel": "channel-synthetic"}
+        self.candidates = [object()]
+        self.service = SimpleNamespace(
+            store=SimpleNamespace(segments=Mock(return_value=self.candidates)),
+            _manifest_segments=Mock(return_value=[object()]),
+            playlist=Mock(return_value=SimpleNamespace(status=200, headers={}, body=b"#EXTM3U")),
         )
-
-    def available(self, end=None, programme_end=None):
-        return views._native_archive_coverage_complete(
-            self.store,
-            "channel-synthetic",
-            self.start,
-            self.end if end is None else end,
-            self.now,
-            self.programme_end if programme_end is None else programme_end,
+        self.context = ({}, SimpleNamespace(retention_hours=48), self.user, self.claims, b"k" * 32)
+        self.request = SimpleNamespace(
+            method="GET",
+            GET={
+                "token": "synthetic",
+                "channel_id": "channel-synthetic",
+                "utc": str(self.start),
+                "duration": str(self.duration),
+            },
+            headers={},
+            META={},
         )
+        django_http = types.ModuleType("django.http")
+        django_http.HttpResponse = self.Response
+        self.django_modules = {"django": types.ModuleType("django"), "django.http": django_http}
 
-    def test_current_window_allows_only_the_unfinalized_trailing_tail(self):
-        self.add_segment(self.start, self.now - 5)
-        self.assertTrue(self.available())
+    def call_archive(self, method="GET"):
+        self.request.method = method
+        with (
+            patch.dict(sys.modules, self.django_modules),
+            patch.object(views, "_native_playback_context", return_value=self.context),
+            patch.object(views, "_native_archive_service", return_value=self.service),
+            patch.object(
+                views,
+                "_archive_epg_bounds",
+                return_value=(self.requested_end + 60, None),
+            ),
+            patch.object(
+                views,
+                "_archive_playback_window",
+                return_value=(self.requested_end, None),
+            ),
+            patch.object(views, "_archive_window_live", return_value=False),
+            patch.object(views, "_record_native_playback"),
+            patch.object(views, "_native_client_ip", return_value="192.0.2.10"),
+        ):
+            return views._native_archive_response(self.request, None, None)
 
-        self.add_segment(self.now - 5, self.now)
-        self.assertTrue(self.available())
+    def test_get_delegates_sparse_window_to_shared_playlist_service(self):
+        response = self.call_archive()
 
-    def test_current_window_rejects_leading_and_internal_gaps(self):
-        self.add_segment(self.start + 2, self.now)
-        self.assertFalse(self.available())
+        self.assertEqual(response.status_code, 200)
+        self.service.playlist.assert_called_once()
+        self.service.store.segments.assert_not_called()
 
-        self.store = archive_store_module.ArchiveStore(self.root / "internal")
-        self.add_segment(self.start, self.start + 5)
-        self.add_segment(self.start + 6, self.now)
-        self.assertFalse(self.available())
+    def test_head_checks_shared_manifest_without_creating_a_playlist(self):
+        response = self.call_archive("HEAD")
 
-    def test_current_window_without_segments_is_unavailable(self):
-        self.assertFalse(self.available())
+        self.assertEqual(response.status_code, 200)
+        self.service.store.segments.assert_called_once_with(
+            "channel-synthetic", self.start, self.requested_end
+        )
+        self.service._manifest_segments.assert_called_once_with(
+            "channel-synthetic",
+            "[]",
+            self.candidates,
+            programme_end=self.requested_end + 60,
+        )
+        self.service.playlist.assert_not_called()
 
-    def test_completed_windows_require_full_coverage(self):
-        completed_end = self.now - 2
-        self.add_segment(self.start, completed_end)
-        self.assertTrue(self.available(end=completed_end))
+    def test_head_preserves_empty_manifest_not_found(self):
+        self.service._manifest_segments.return_value = []
 
-        self.store = archive_store_module.ArchiveStore(self.root / "partial")
-        self.add_segment(self.start, completed_end - 5)
-        self.assertFalse(self.available(end=completed_end))
+        response = self.call_archive("HEAD")
 
-    def test_manifest_programme_boundary_and_requested_window_bound_segments(self):
-        bounded_end = self.now - 2
-        # A segment crossing the programme boundary is excluded by the shared
-        # HLS manifest builder even when it overlaps the requested window.
-        self.add_segment(self.start, bounded_end + 1)
-        self.assertFalse(self.available(end=bounded_end, programme_end=bounded_end))
-
-        self.store = archive_store_module.ArchiveStore(self.root / "bounded")
-        self.add_segment(self.start, bounded_end)
-        self.assertTrue(self.available(end=bounded_end, programme_end=bounded_end))
+        self.assertEqual(response.status_code, 404)
+        self.service.playlist.assert_not_called()
 
 
 if __name__ == "__main__":

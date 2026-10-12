@@ -748,48 +748,6 @@ def _native_segment_route(request, channel_id: str, segment_id: str):
     return native_segment_view(request, channel_id, segment_id)
 
 
-def _native_archive_coverage_complete(
-    store, channel, start_epoch, end_epoch, now_epoch, programme_end_epoch
-):
-    """Require full completed coverage, but allow an unfinished live tail.
-
-    Growing HLS manifests contain indexed segments only. For a genuinely
-    in-progress programme, native admission follows that same committed
-    segment edge and ignores only the interval after it. Any leading or
-    internal gap still makes the request unavailable.
-    """
-    from .engine.store import TIMELINE_GAP_TOLERANCE_SECONDS
-
-    completed = end_epoch <= now_epoch
-    coverage_end = end_epoch if completed else min(end_epoch, now_epoch)
-    if coverage_end <= start_epoch:
-        return False
-    segments = store.segments(channel, start_epoch, coverage_end)
-    # ArchiveHTTPService._manifest_segments excludes a segment that crosses
-    # the selected programme boundary. Apply the same eligibility rule here.
-    segments = [
-        segment for segment in segments
-        if segment.end_utc.timestamp() <= programme_end_epoch
-    ]
-    if not segments:
-        return False
-
-    cursor = start_epoch
-    for segment in segments:
-        segment_start = max(start_epoch, segment.start_utc.timestamp())
-        segment_end = min(coverage_end, segment.end_utc.timestamp())
-        if segment_end <= segment_start:
-            continue
-        if segment_start > cursor + TIMELINE_GAP_TOLERANCE_SECONDS:
-            # A leading or internal gap is not an unfinalized trailing tail.
-            return False
-        cursor = max(cursor, segment_end)
-
-    if completed:
-        return cursor >= coverage_end - TIMELINE_GAP_TOLERANCE_SECONDS
-    return cursor > start_epoch
-
-
 def _native_archive_response(request, route_channel: str | None, segment_id: str | None):
     """Authorize and serve native-only signed archive capabilities."""
     from django.http import HttpResponse
@@ -853,11 +811,26 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
         programme_end_epoch,
         next_programme_end_epoch,
     )
-    if not _native_archive_coverage_complete(
-        store, channel, start_epoch, end_epoch, now_epoch, programme_end_epoch
-    ):
-        return _no_cache(HttpResponse("Archive coverage is incomplete", status=404))
     if request.method == "HEAD":
+        # Match GET's playlist eligibility without acquiring a lease or
+        # persisting a manifest. The shared builder decides which indexed
+        # segments belong to this effective programme window.
+        try:
+            candidates = store.segments(channel, start_epoch, end_epoch)
+            manifest = service._manifest_segments(
+                channel,
+                "[]",
+                candidates,
+                programme_end=programme_end_epoch,
+            )
+        except (OSError, RuntimeError, sqlite3.Error):
+            return _no_cache(HttpResponse(status=503))
+        except (TypeError, ValueError):
+            return _no_cache(HttpResponse("Invalid channel", status=400))
+        if not manifest:
+            return _no_cache(
+                HttpResponse("no archived segments in requested range", status=404)
+            )
         response = HttpResponse(status=200, content_type="application/vnd.apple.mpegurl")
         return _no_cache(response)
     response = service.playlist(
