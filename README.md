@@ -1,5 +1,9 @@
 # Catchuparr
 
+<p align="center">
+  <img src="docs/assets/catchuparr-icon-256.png" width="128" height="128" alt="Catchuparr logo">
+</p>
+
 Catchuparr adds a local rolling catch-up archive and start-over playback to
 [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr). It records selected
 live channels into a shared local archive and exposes the indexed programmes
