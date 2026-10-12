@@ -4,6 +4,21 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.5.1] - Prerelease candidate, not published
+
+### Added
+
+- Inherit source filters, priority maps and schedules from enabled named
+  channel profiles, with direct channel exceptions and explicit day overrides.
+- Preserve resolved configuration origins in validation previews and applied
+  snapshots.
+
+### Notes
+
+- This candidate is not published. Required CI, pinned AIO verification, Dev
+  verification and publication gates remain pending. See the [0.5.1 candidate
+  guide](docs/candidate-0.5.1.md).
+
 ## [0.5.0] - Development candidate, not published
 
 ### Added

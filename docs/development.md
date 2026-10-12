@@ -21,6 +21,10 @@ It is disabled by default. The local suite and package checks pass, while the
 exact native probe still needs to pass in both pinned AIO images before native
 server acceptance is recorded.
 
+For the 0.5.1 named-profile inheritance prerelease, see [its candidate guide](candidate-0.5.1.md).
+Its CI, pinned AIO verification, isolated Dev verification and publication
+gates remain pending.
+
 Dispatcharr v0.31.0 and v0.32.0 accept a manual update at authenticated admin
 `POST /api/plugins/plugins/import/` with multipart field `file` and explicit
 `overwrite=true`; the response must contain `success: true` and the expected

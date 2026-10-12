@@ -249,6 +249,60 @@ def normalize_schedule(
     return RecordingSchedule("weekly", _merge_intervals(intervals))
 
 
+def expand_schedule_days(
+    value: Any,
+    *,
+    line: int = 1,
+    field: str = "schedule",
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    """Return validated windows by start day after group expansion."""
+    if value == "continuous":
+        return {day: ((0, MINUTES_PER_DAY),) for day in _DAYS}
+    if not isinstance(value, Mapping):
+        raise ScheduleError(f"line {line}, field {field}: expected continuous or a weekday mapping")
+    allowed_keys = set(_DAYS) | set(_DAY_GROUPS) | {"daily"}
+    for day in value:
+        if not isinstance(day, str) or day not in allowed_keys:
+            raise ScheduleError(f"line {line}, field {field}: unknown weekday or day group")
+    validated = {
+        key: _normalize_windows(windows, line=line, field=f"{field}.{key}")
+        for key, windows in value.items()
+    }
+    expanded: dict[str, str] = {}
+    if "daily" in value:
+        expanded.update({day: "daily" for day in _DAYS})
+    for group, days in _DAY_GROUPS.items():
+        if group in value:
+            expanded.update({day: group for day in days})
+    for day in _DAYS:
+        if day in value:
+            expanded[day] = day
+    return {day: validated[key] for day, key in expanded.items()}
+
+
+def normalize_expanded_schedule_days(
+    expanded: Mapping[str, tuple[tuple[int, int], ...]],
+) -> RecordingSchedule:
+    """Normalize already validated windows keyed by their start weekday."""
+    intervals: list[tuple[int, int]] = []
+    for day, windows in expanded.items():
+        if day not in _DAYS:
+            raise ScheduleError("expanded schedule contains an invalid weekday")
+        day_offset = _DAYS[day] * MINUTES_PER_DAY
+        for start, end in windows:
+            start_abs = day_offset + start
+            end_abs = day_offset + end
+            if end_abs <= MINUTES_PER_WEEK:
+                intervals.append((start_abs, end_abs))
+            else:
+                intervals.append((start_abs, MINUTES_PER_WEEK))
+                intervals.append((0, end_abs - MINUTES_PER_WEEK))
+    merged = _merge_intervals(intervals)
+    if merged == ((0, MINUTES_PER_WEEK),):
+        return CONTINUOUS_SCHEDULE
+    return RecordingSchedule("weekly", merged)
+
+
 def schedule_from_snapshot(value: Any) -> RecordingSchedule:
     """Load and strictly validate one canonical active-snapshot schedule."""
     if not isinstance(value, Mapping):
