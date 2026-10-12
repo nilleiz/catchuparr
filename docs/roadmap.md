@@ -15,9 +15,9 @@ Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed w
 
 | Release | Feature | Relative effort | Status |
 | --- | --- | --- | --- |
-| 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Installed in isolated Dev; release acceptance remains pending |
+| 0.2.1 | YAML filter engine: channel selection, M3U include/exclude and optional priorities | High | Superseded development version; included in released 0.4.0 |
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented; superseded by the 0.3.1 candidate and not published separately |
-| 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Implemented; user acceptance recorded; release, Dev and player gates remain pending |
+| 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Superseded development version; included in released 0.4.0 |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Current development; optional and disabled by default |
 | 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.0 is complete |
@@ -87,12 +87,12 @@ was required for this content step.
 
 REST and WebSocket agree. Test HLS/XC, reloads, seeks, pause, replacement/grace sessions, disconnect, restart, stale heartbeat cleanup and isolated Stop actions. Verify no duplicate limit counting and existing native controls cannot target a live worker through an archive entry.
 
-Full synthetic native integration passed on pinned Dispatcharr 0.31.0 and
-0.32.0. Required CI, isolated Dev installation and real-player acceptance
-remain pending. The native WebSocket evidence covers event emission and the
-consumer authorization helper, not a network roundtrip. Shared-recorder hiding
-with the option enabled and private-recorder visibility with it disabled were
-tested; private-recorder hiding with the option enabled remains unverified.
+The 0.4.0 release passed its required CI, isolated Dev installation and user
+acceptance checks. All 400 tests passed. Synthetic native integration passed
+on pinned Dispatcharr 0.31.0 and 0.32.0, including private-recorder hiding with
+the option enabled. The native WebSocket evidence covers event emission and
+the consumer authorization helper, not a network roundtrip. The original crash
+attribution remains unproven.
 
 ## 0.3.0 — recording schedules, recorder control and logging
 
