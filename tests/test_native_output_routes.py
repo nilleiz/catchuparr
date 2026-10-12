@@ -1,6 +1,9 @@
 import sys
+import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -81,6 +84,77 @@ class NativeArchiveServiceTests(unittest.TestCase):
             "native:synthetic",
         )
         self.assertIs(core_utils.RedisClient.get_client.return_value, redis_client)
+
+
+class NativeArchiveCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.store = archive_store_module.ArchiveStore(self.root)
+        self.now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc).timestamp()
+        self.start = self.now - 20
+        self.end = self.now + 10
+        self.programme_end = self.now + 60
+
+    def add_segment(self, start, end):
+        path = self.root / f"segment-{len(list(self.root.glob('*.ts')))}.ts"
+        path.write_bytes(b"synthetic transport stream")
+        self.store.add_segment(
+            "channel-synthetic",
+            path,
+            datetime.fromtimestamp(start, timezone.utc),
+            datetime.fromtimestamp(end, timezone.utc),
+        )
+
+    def available(self, end=None, programme_end=None):
+        return views._native_archive_coverage_complete(
+            self.store,
+            "channel-synthetic",
+            self.start,
+            self.end if end is None else end,
+            self.now,
+            self.programme_end if programme_end is None else programme_end,
+        )
+
+    def test_current_window_allows_only_the_unfinalized_trailing_tail(self):
+        self.add_segment(self.start, self.now - 5)
+        self.assertTrue(self.available())
+
+        self.add_segment(self.now - 5, self.now)
+        self.assertTrue(self.available())
+
+    def test_current_window_rejects_leading_and_internal_gaps(self):
+        self.add_segment(self.start + 2, self.now)
+        self.assertFalse(self.available())
+
+        self.store = archive_store_module.ArchiveStore(self.root / "internal")
+        self.add_segment(self.start, self.start + 5)
+        self.add_segment(self.start + 6, self.now)
+        self.assertFalse(self.available())
+
+    def test_current_window_without_segments_is_unavailable(self):
+        self.assertFalse(self.available())
+
+    def test_completed_windows_require_full_coverage(self):
+        completed_end = self.now - 2
+        self.add_segment(self.start, completed_end)
+        self.assertTrue(self.available(end=completed_end))
+
+        self.store = archive_store_module.ArchiveStore(self.root / "partial")
+        self.add_segment(self.start, completed_end - 5)
+        self.assertFalse(self.available(end=completed_end))
+
+    def test_manifest_programme_boundary_and_requested_window_bound_segments(self):
+        bounded_end = self.now - 2
+        # A segment crossing the programme boundary is excluded by the shared
+        # HLS manifest builder even when it overlaps the requested window.
+        self.add_segment(self.start, bounded_end + 1)
+        self.assertFalse(self.available(end=bounded_end, programme_end=bounded_end))
+
+        self.store = archive_store_module.ArchiveStore(self.root / "bounded")
+        self.add_segment(self.start, bounded_end)
+        self.assertTrue(self.available(end=bounded_end, programme_end=bounded_end))
 
 
 if __name__ == "__main__":
