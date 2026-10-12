@@ -1,8 +1,9 @@
 # Validation status
 
 Sections for 0.2.0 through 0.3.1 are historical candidate checkpoints; their
-pending release gates describe the status at that time. Current 0.4.0 evidence
-and remaining limitations are recorded at the end of this document.
+pending release gates describe the status at that time. Version 0.4.0 is
+released; version 0.5.0 is the current development candidate. Their evidence
+and remaining limitations are recorded below.
 
 ## Released baseline: 0.1.4
 
@@ -98,7 +99,7 @@ Enable sanitized diagnostics only for a test and disable them afterward.
 Review collected output before sharing; never publish raw URLs, session tokens,
 personal EPG data or real-world request timestamps.
 
-## 0.2.1 YAML filter engine (included in the 0.3.1 candidate)
+## Historical 0.2.1 YAML filter engine (included in released 0.4.0)
 
 The unified YAML engine replaced the unreleased 0.2.0 configuration interface.
 Its implementation passed 232 local unit tests, Ruff, compileall and package
@@ -114,8 +115,9 @@ capacity and runtime failover, indexed media gaps and connection cleanup.
 Native profile creation automatically supplies memberships; fixtures disable
 these before enabling their intended synthetic members.
 
-The engine is included in the 0.3.1 candidate. The earlier 0.2.1 package was
-never released and has no separate player-acceptance claim.
+The 0.2.1 package was never released separately. The engine was later
+incorporated into 0.3.1 and released in 0.4.0; the 0.4.0 acceptance record
+below covers the released baseline.
 
 ## Historical 0.2.0 candidate evidence (unreleased)
 
@@ -178,41 +180,41 @@ workers remains deferred. See the
 The 0.3.0 candidate added weekly recording windows, durable global recording
 pause/resume, configuration-generation fencing and scoped `[Catchuparr]` logs.
 The full synthetic native integration probe passed on pinned Dispatcharr
-0.31.0 and 0.32.0. This version is superseded by 0.3.1; see its current
-validation status below.
+0.31.0 and 0.32.0. This version was superseded by 0.3.1 and was not published
+separately; its features were later included in released 0.4.0.
 
 The local suite passed 299 tests after the playback-grace test was changed to a
 shared fake clock. Ruff, compileall and package-build checks passed. See the
 [historical 0.3.0 guide](candidate-0.3.0.md) only for its former behavior.
 
-## 0.3.1 unified configuration candidate
+## Historical 0.3.1 unified configuration candidate
 
 The 0.3.1 candidate adds `daily`, `weekdays` and `weekend` schedule groups,
 explicit-day precedence, environment/system timezone resolution, and one Apply
 operation for all settings. Pause and Resume remain immediate controls. It also
 returns labeled M3U and XMLTV links when an access token is created, using the
-applied public base URL setting. Candidate
-verification includes schedule/DST tests, configuration rollback and
-generation-fencing tests, privacy checks for token handling, package validation
-and native integration in the pinned AIO versions. The 0.3.1-specific full
-acceptance run is pending; prior 0.3.0 native results are not counted as a pass
-for the new unified configuration path.
+applied public base URL setting. Verification included schedule/DST tests,
+configuration rollback and generation-fencing tests, privacy checks for token
+handling, package validation and native integration in the pinned AIO versions.
+The 0.3.1 candidate was not published separately; its features and acceptance
+gates were incorporated into released 0.4.0, whose evidence is recorded below.
 
 User acceptance for the 0.3.1 candidate scope is recorded. This records
 acceptance only and does not indicate that a 0.3.1 release was published.
 
-Independent review, required CI, isolated Dev verification and real-player
-acceptance remain release gates. This is a candidate status, not a publication
-or player-compatibility claim. See the
-[0.3.1 candidate guide](candidate-0.3.1.md) for current behavior and upgrade
-notes.
+Independent review, required CI, isolated Dev verification and user acceptance
+were completed for the 0.4.0 release. The standalone 0.3.1 candidate was not
+published. See the [0.3.1 historical guide](candidate-0.3.1.md) for its former
+behavior and the [0.4.0 release guide](candidate-0.4.0.md) for the released
+baseline.
 
-## 0.4.0 Stats integration (current)
+## Released 0.4.0 Stats integration
 
-The 0.4.0 implementation passed 392 local unit tests, Ruff, compileall, package
+The 0.4.0 release passed 400 local unit tests, Ruff, compileall, package
 validation, independent review and the full synthetic native integration probe
 on pinned Dispatcharr 0.31.0 and 0.32.0. Both native runs passed their required
-probe assertions and cleanup checks. The probe covers native Stats REST routes
+probe assertions and cleanup checks. Required CI, isolated Dev installation and
+user acceptance also passed. The probe covers native Stats REST routes
 and admin permissions, native Stop behavior, viewer timeout and connection
 limits, recorder identity filtering, shared and private recorder isolation,
 source-policy behavior, failover and cross-process follower checks. Stats
@@ -225,7 +227,28 @@ native consumer's admin authorization helper against its event payload. It does
 not perform a browser or network WebSocket roundtrip, so end-to-end WebSocket
 delivery is not established. A container crash observed during diagnostics was
 not attributed to Catchuparr; no causal claim is made. The synthetic native
-results do not establish playback-client compatibility. Isolated Dev
-installation and player-specific XC acceptance remain separate validation
-steps. See the [0.4.0 behavior and validation guide](candidate-0.4.0.md) for
-details.
+results do not establish playback-client compatibility. See the
+[0.4.0 behavior and validation guide](candidate-0.4.0.md) for details.
+
+## 0.5.0 native output candidate
+
+The candidate adds a disabled-by-default toggle for Catchuparr archive metadata
+in Dispatcharr's native M3U/XMLTV endpoints. The local suite passes 431 tests;
+Ruff, Python compilation and package validation pass. The package contains 30
+entries and has SHA-256
+`e710fb265a70ed4c12b585ff750e02c4912a31bab417593d2f258c386996434a`.
+The earlier probe correction passed independent review; independent review of
+the current DIRECT-output fix is pending.
+
+The probe is wired into the existing synthetic AIO harness and exercises native
+route resolution, current access checks, signed archive playback, byte ranges,
+Stats Stop and cleanup against real Dispatcharr ORM and Redis paths. Full runs
+on pinned 0.31.0 and 0.32.0 both reached the DIRECT-output equality gate and
+failed because eligible proxy fallback rows were augmented. The implementation
+now leaves `direct=true` M3U responses unchanged; both full runs must be
+repeated before native server checks can pass. Player-specific acceptance also
+remains open. No claim is made that the candidate is release-ready or that
+native playback has passed.
+
+See the [0.5.0 candidate guide](candidate-0.5.0.md) for the feature boundary,
+authorization model, output-profile limitation and rollback state.

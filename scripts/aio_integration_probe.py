@@ -614,6 +614,17 @@ def probe():
         params=params,
         xc_playback=xc_playback,
     )
+    from aio_native_output_probe import probe_native_output
+
+    probe_native_output(
+        root=root,
+        user=user,
+        channel=channel,
+        channel_profile=channel_profile,
+        start=start,
+        runtime=runtime,
+        request=request,
+    )
 
     require(xc_playback(start.timestamp()) == b"\x47" + bytes(187))
     require(xc_playback((start + timedelta(seconds=6)).timestamp())

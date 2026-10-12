@@ -25,6 +25,13 @@ from catchuparr.configuration import (
     source_catalog,
     validate_configuration,
 )
+from catchuparr.native_output_security import (
+    KEYRING_NAME,
+    MAX_KEYRING_ENTRIES,
+    _write_keyring,
+    ensure_native_key,
+    load_native_key,
+)
 from catchuparr.runtime import load_runtime_settings
 
 CHANNEL_A = "00000000-0000-0000-0000-000000000001"
@@ -301,6 +308,7 @@ class ConfigurationTests(unittest.TestCase):
             ("public_base_url", "https://user:pass@media.example.test"),
             ("show_archive_playback_in_stats", "false"),
             ("hide_recorders_in_stats", 1),
+            ("native_output_catchup", "false"),
         ):
             with self.subTest(key=key, value=value):
                 document = json.loads(json.dumps(valid_document))
@@ -349,6 +357,154 @@ class ConfigurationTests(unittest.TestCase):
         legacy["settings"].pop("hide_recorders_in_stats")
         self.active_path.write_text(json.dumps(legacy), encoding="utf-8")
         self.assertIsNotNone(load_active_configuration(self.active_path))
+
+    def test_native_output_catchup_is_default_off_and_applies_independently(self):
+        result = apply_configuration(self.settings, self.catalog, self.active_path)
+        self.assertTrue(result["applied"])
+        active = load_active_configuration(self.active_path)
+        self.assertFalse(active["native_output_catchup"])
+        self.assertTrue(active["show_archive_playback_in_stats"])
+        self.assertTrue(active["hide_recorders_in_stats"])
+
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                result = apply_configuration(
+                    dict(
+                        self.settings,
+                        native_output_catchup=enabled,
+                        playback_user_id=123 if enabled else None,
+                        show_archive_playback_in_stats=True,
+                        hide_recorders_in_stats=True,
+                    ),
+                    self.catalog,
+                    self.active_path,
+                )
+                self.assertTrue(result["applied"])
+                active = load_active_configuration(self.active_path)
+                self.assertEqual(enabled, active["native_output_catchup"])
+                self.assertTrue(active["show_archive_playback_in_stats"])
+                self.assertTrue(active["hide_recorders_in_stats"])
+
+        with self.assertRaisesRegex(ValueError, "native_output_catchup must be boolean"):
+            validate_configuration(
+                dict(self.settings, native_output_catchup="false"), self.catalog
+            )
+
+        with self.assertRaisesRegex(ValueError, "requires a configured playback user"):
+            apply_configuration(
+                dict(self.settings, native_output_catchup=True), self.catalog, self.active_path
+            )
+
+    def test_native_output_key_is_private_and_rotates_only_on_security_changes(self):
+        apply_configuration(
+            dict(self.settings, native_output_catchup=True, playback_user_id=123),
+            self.catalog,
+            self.active_path,
+        )
+        first = load_active_configuration(self.active_path)["native_output_key_id"]
+        first_key = load_native_key(self.active_path, first)
+        keyring = self.active_path.with_name(KEYRING_NAME)
+        snapshot_text = self.active_path.read_text(encoding="utf-8")
+        self.assertEqual(32, len(first_key))
+        self.assertEqual(0o600, keyring.stat().st_mode & 0o777)
+        self.assertNotIn(first_key.hex(), snapshot_text)
+
+        apply_configuration(
+            dict(
+                self.settings,
+                native_output_catchup=True,
+                playback_user_id=123,
+                retention_hours=12,
+            ),
+            self.catalog,
+            self.active_path,
+        )
+        self.assertEqual(first, load_active_configuration(self.active_path)["native_output_key_id"])
+
+        apply_configuration(
+            dict(
+                self.settings,
+                native_output_catchup=True,
+                playback_user_id=123,
+                archive_root=str(self.root / "new-archive"),
+            ),
+            self.catalog,
+            self.active_path,
+        )
+        second = load_active_configuration(self.active_path)["native_output_key_id"]
+        self.assertNotEqual(first, second)
+        self.assertIsNotNone(load_native_key(self.active_path, first))
+        self.assertIsNotNone(load_native_key(self.active_path, second))
+
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        self.assertNotIn("native_output_key_id", load_active_configuration(self.active_path))
+        apply_configuration(
+            dict(self.settings, native_output_catchup=True, playback_user_id=123),
+            self.catalog,
+            self.active_path,
+        )
+        third = load_active_configuration(self.active_path)["native_output_key_id"]
+        self.assertNotEqual(second, third)
+        apply_configuration(
+            dict(self.settings, native_output_catchup=True, playback_user_id=456),
+            self.catalog,
+            self.active_path,
+        )
+        fourth = load_active_configuration(self.active_path)["native_output_key_id"]
+        self.assertNotEqual(third, fourth)
+
+    def test_native_key_staging_keeps_previous_key_available_after_apply_rollback(self):
+        apply_configuration(
+            dict(self.settings, native_output_catchup=True, playback_user_id=123),
+            self.catalog,
+            self.active_path,
+        )
+        old_id = load_active_configuration(self.active_path)["native_output_key_id"]
+        old_key = load_native_key(self.active_path, old_id)
+        with patch.object(
+            configuration,
+            "_write_activation_commit_locked",
+            side_effect=OSError("synthetic commit failure"),
+        ):
+            with self.assertRaises(Exception):
+                apply_configuration(
+                    dict(
+                        self.settings,
+                        native_output_catchup=True,
+                        playback_user_id=123,
+                        archive_root=str(self.root / "new-archive"),
+                    ),
+                    self.catalog,
+                    self.active_path,
+                )
+        self.assertEqual(old_id, load_active_configuration(self.active_path)["native_output_key_id"])
+        self.assertEqual(old_key, load_native_key(self.active_path, old_id))
+
+    def test_native_enabled_snapshot_requires_a_key_id(self):
+        apply_configuration(
+            dict(self.settings, native_output_catchup=True, playback_user_id=123),
+            self.catalog,
+            self.active_path,
+        )
+        document = json.loads(self.active_path.read_text(encoding="utf-8"))
+        document["settings"].pop("native_output_key_id")
+        self.active_path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "key ID is missing"):
+            load_active_configuration(self.active_path)
+
+    def test_native_keyring_refuses_rotation_at_limit_without_corrupting_active_key(self):
+        keyring = self.active_path.with_name(KEYRING_NAME)
+        keyring.parent.mkdir(parents=True, exist_ok=True)
+        keys = {
+            f"{number:032x}": "A" * 43 + "="
+            for number in range(MAX_KEYRING_ENTRIES)
+        }
+        _write_keyring(keyring, keys)
+        before = keyring.read_bytes()
+        with self.assertRaisesRegex(ValueError, "safe rotation limit"):
+            ensure_native_key(self.active_path, preferred_id=None)
+        self.assertEqual(before, keyring.read_bytes())
+        self.assertTrue(keyring.stat().st_size < 65536)
 
     def test_archive_root_apply_preserves_old_archive_without_copying_or_deleting(self):
         old_root = Path(self.settings["archive_root"])
@@ -1048,6 +1204,7 @@ class ConfigurationTests(unittest.TestCase):
         snapshot["settings"].pop("public_base_url")
         snapshot["settings"].pop("show_archive_playback_in_stats")
         snapshot["settings"].pop("hide_recorders_in_stats")
+        snapshot["settings"].pop("native_output_catchup")
         self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
 
         active = load_active_configuration(self.active_path)
@@ -1064,6 +1221,7 @@ class ConfigurationTests(unittest.TestCase):
         snapshot["settings"].pop("recording_enabled")
         snapshot["settings"].pop("show_archive_playback_in_stats")
         snapshot["settings"].pop("hide_recorders_in_stats")
+        snapshot["settings"].pop("native_output_catchup")
         snapshot["settings"].pop("log_level")
         snapshot["settings"].pop("public_base_url")
         self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")

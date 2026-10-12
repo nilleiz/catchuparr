@@ -545,6 +545,8 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     # Existing XC route exercise returns native TS leases.  Stop their active
     # plugin row, reject its late first-chunk heartbeat, then accept a fresh
     # lease only after the normal native XC request has issued it.
+    _require(active_ts_session_count(root, user.id) == 0,
+             "Stats probe entered the XC checks with an active TS session")
     ts_response = xc_playback(
         start.timestamp(), consume=False, remote_addr="127.0.0.42",
         range_header="bytes=0-10000000",
@@ -611,6 +613,42 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
                            if row[0] == ts_display_id)
     _require(not replacement_row[3] and replacement_row[4] != ts_lease,
              "Only a distinct current TS lease may revive the stopped display row")
+    replacement_lease = replacement_row[4]
+    with ts_service._connect() as db:
+        active_replacement = db.execute(
+            "SELECT active FROM ts_playback_sessions WHERE lease_id=?",
+            (replacement_lease,),
+        ).fetchone()
+    _require(active_replacement is not None and active_replacement[0] == 1,
+             "Fresh XC request did not retain its replacement TS lease")
+    _require(active_ts_session_count(root, user.id) == 1,
+             "Fresh XC request did not account for exactly one active TS session")
+
+    # Validate replacement revival first, then release this test-owned lease
+    # through the real protected Stop route before the one-slot native archive
+    # admission probe starts.
+    replacement_stop = admin_client.post(
+        native_paths["stop"], {"session_id": ts_display_id}, format="json",
+    )
+    _require(replacement_stop.status_code == 200
+             and replacement_stop.json().get("success") is True,
+             "Native Stop route did not stop the replacement XC display ID")
+    with ts_service._connect() as db:
+        released_replacement = db.execute(
+            "SELECT active FROM ts_playback_sessions WHERE lease_id=?",
+            (replacement_lease,),
+        ).fetchone()
+    _require(released_replacement is None,
+             "Native Stop did not remove the replacement XC playback lease")
+    stopped_replacement_row = next(
+        row for row in _viewer_rows(database, user.id, str(channel.uuid))
+        if row[0] == ts_display_id
+    )
+    _require(bool(stopped_replacement_row[3])
+             and stopped_replacement_row[4] == replacement_lease,
+             "Native Stop did not revoke the replacement Stats row")
+    _require(active_ts_session_count(root, user.id) == 0,
+             "Replacement XC session still consumes a native playback slot")
     _assert_native_websocket_event()
 
     ordinary_client.logout()

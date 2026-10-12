@@ -4,6 +4,22 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.5.0] - Development candidate, not published
+
+### Added
+
+- Add a disabled-by-default unified-Apply setting to annotate eligible native
+  Dispatcharr M3U output with Catchuparr archive catch-up metadata and merge
+  covered local programme history into native XMLTV output.
+- Add signed channel/profile-scoped capabilities and native archive/segment
+  routes that recheck current user access, network scope and session limits.
+
+### Notes
+
+- Native AIO verification for pinned Dispatcharr 0.31.0 and 0.32.0 and
+  player-specific acceptance remain pending. See the
+  [0.5.0 candidate guide](docs/candidate-0.5.0.md) for boundaries and status.
+
 ## [0.4.0] - 2026-10-12
 
 ### Added

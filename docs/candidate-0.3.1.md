@@ -1,10 +1,9 @@
-# 0.3.1 candidate
+# 0.3.1 historical development candidate
 
-This is an unreleased candidate for version `0.3.1`. It combines the existing
-YAML source filters and recording schedules with day-group shorthand, applied
-timezone resolution, one Apply operation for all settings, immediate Pause and
-Resume controls, and labeled M3U/XMLTV token links. Independent review, required
-CI, isolated Dev validation and real-player acceptance are release gates.
+Version `0.3.1` was not published separately. Its schedule, timezone, unified
+Apply, recorder-control and M3U/XMLTV token-link features are included in the
+released 0.4.0 package. This guide is retained as historical reference; use the
+[0.4.0 guide](candidate-0.4.0.md) for the current release and validation status.
 
 ## Schedule and timezone
 
@@ -130,6 +129,6 @@ than two verified task-owned Dev restore points. Include archive data only
 with explicit authorization. A data-only restore point cannot recover archive
 content that was lost or overwritten.
 
-This guide describes candidate behavior; it is not a release notice. Required
-CI, independent review, isolated Dev validation and real-player regression must
-pass before publication.
+This guide records the behavior as designed for the unpublished 0.3.1 version.
+Its release gates were completed as part of 0.4.0; see the
+[validation record](validation.md) for the accepted and released status.

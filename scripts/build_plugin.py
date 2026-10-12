@@ -25,6 +25,8 @@ REQUIRED_MODULES = (
     "tasks.py",
     "views.py",
     "security.py",
+    "native_output_security.py",
+    "native_output.py",
     "http.py",
     "ts_http.py",
     "xc_runtime.py",
