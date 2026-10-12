@@ -175,6 +175,7 @@ class NativeArchiveParityTests(unittest.TestCase):
         response = self.call_archive("HEAD")
 
         self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.content, b"")
         self.service.playlist.assert_not_called()
 
 

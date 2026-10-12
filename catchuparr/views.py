@@ -828,9 +828,7 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
         except (TypeError, ValueError):
             return _no_cache(HttpResponse("Invalid channel", status=400))
         if not manifest:
-            return _no_cache(
-                HttpResponse("no archived segments in requested range", status=404)
-            )
+            return _no_cache(HttpResponse(status=404))
         response = HttpResponse(status=200, content_type="application/vnd.apple.mpegurl")
         return _no_cache(response)
     response = service.playlist(
