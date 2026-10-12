@@ -16,7 +16,8 @@ archive is local to the Dispatcharr installation and is not a cloud service.
 ## Compatibility and status
 
 - Version 0.4.0 is released. Version 0.5.0 is the only release currently in
-  development; its native AIO checks and player acceptance are pending.
+  development; both pinned native AIO checks pass, while required CI, isolated
+  Dev verification and player acceptance remain pending.
 - Dispatcharr 0.31.0 and 0.32.0 are the supported versions covered by the
   repository's pinned native integration checks.
 - The primary path is M3U/XMLTV with HLS playback using MPEG-TS segments.
@@ -24,8 +25,9 @@ archive is local to the Dispatcharr installation and is not a cloud service.
   server integration is covered by synthetic checks; player-specific XC
   acceptance is still separate and should be verified with the client in use.
 - The 0.5.0 candidate adds an optional native M3U/XMLTV archive toggle. Its
-  local suite passes, but pinned native AIO verification and player acceptance
-  are pending; see the [0.5.0 candidate guide](docs/candidate-0.5.0.md).
+  433-test local suite and full pinned AIO probes pass on Dispatcharr 0.31.0 and
+  0.32.0. CI, isolated Dev verification and player acceptance remain pending;
+  see the [0.5.0 candidate guide](docs/candidate-0.5.0.md).
 - Playback follows the selected user's Dispatcharr permissions, channel access,
   catch-up permission and stream/session limits. It does not provide transcoding
   or frame-accurate seeking.
@@ -348,8 +350,9 @@ The candidate adds local archive metadata to Dispatcharr's native M3U/XMLTV
 exports when **Add Catchuparr catch-up to native output** is enabled and applied.
 It preserves the native channel/profile output and provider catch-up fields.
 Native archive playback serves stored MPEG-TS segments; a live output profile
-does not transcode archive media. The setting defaults off. The local suite
-passes, but native AIO and player acceptance are pending. Read the
+does not transcode archive media. The setting defaults off. The 433-test local
+suite and full pinned native AIO probes pass; required CI, isolated Dev
+verification and player acceptance remain pending. Read the
 [candidate guide](docs/candidate-0.5.0.md) before enabling it.
 
 CI also runs synthetic integration against pinned Dispatcharr AIO images for

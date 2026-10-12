@@ -233,22 +233,27 @@ results do not establish playback-client compatibility. See the
 ## 0.5.0 native output candidate
 
 The candidate adds a disabled-by-default toggle for Catchuparr archive metadata
-in Dispatcharr's native M3U/XMLTV endpoints. The local suite passes 431 tests;
-Ruff, Python compilation and package validation pass. The package contains 30
-entries and has SHA-256
+in Dispatcharr's native M3U/XMLTV endpoints. The 433-test local suite, Ruff,
+Python compilation, package validation and independent review pass. The
+30-entry package has SHA-256
 `e710fb265a70ed4c12b585ff750e02c4912a31bab417593d2f258c386996434a`.
-The earlier probe correction passed independent review; independent review of
-the current DIRECT-output fix is pending.
 
-The probe is wired into the existing synthetic AIO harness and exercises native
-route resolution, current access checks, signed archive playback, byte ranges,
-Stats Stop and cleanup against real Dispatcharr ORM and Redis paths. Full runs
-on pinned 0.31.0 and 0.32.0 both reached the DIRECT-output equality gate and
-failed because eligible proxy fallback rows were augmented. The implementation
-now leaves `direct=true` M3U responses unchanged; both full runs must be
-repeated before native server checks can pass. Player-specific acceptance also
-remains open. No claim is made that the candidate is release-ready or that
-native playback has passed.
+The scripts-only probe in `scripts/aio_native_output_probe.py`, called by the
+existing AIO harness, passed in both pinned Dispatcharr versions:
+
+- 0.31.0: `f81924fa3dbfeb463b3908be7e086bf58aacbd2ba56062bfb555ee3a471acf8f`
+- 0.32.0: `b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a`
+
+Each full run passed its 32 AIO tests and the integration gates for native
+output, signed archive playback, byte ranges, current permissions and session
+limits, Stats Stop, and cleanup. The two version runs completed separately; this
+does not establish concurrent-run behavior. The existing M3U/XMLTV callback,
+ORM and Redis paths were exercised without bypassing their native checks.
+
+Required CI, isolated Dev verification and real-player acceptance remain
+pending. These server-side checks do not establish player compatibility,
+archive output-profile transcoding or frame-accurate seeking; the candidate is
+not release-ready.
 
 See the [0.5.0 candidate guide](candidate-0.5.0.md) for the feature boundary,
 authorization model, output-profile limitation and rollback state.

@@ -19,7 +19,7 @@ Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed w
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented; superseded by the 0.3.1 candidate and not published separately |
 | 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Superseded development version; included in released 0.4.0 |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
-| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Current development; optional and disabled by default |
+| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Both pinned AIO probes, 433 local tests, package checks and independent review pass; required CI, isolated Dev verification and player acceptance remain pending |
 | 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.0 is complete |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
@@ -310,6 +310,11 @@ disabled by default; the existing separate Catchuparr links remain available.
 - Keep the full existing channel list, profiles, permissions, live URLs and provider catch-up. Separate plugin links remain available independently.
 - Disable the toggle to restore original output without local additions. Toggle changes require no container restart.
 - Use version-checked, idempotent and removable wrappers; test authorization, gaps, duplicate EPG entries and both toggle states.
+
+The 433-test local suite and full synthetic AIO probes passed on pinned
+Dispatcharr 0.31.0 and 0.32.0. Those two runs completed separately and are not
+a concurrency test. Required CI, isolated Dev verification and real-player
+acceptance remain release gates; see the [validation record](validation.md).
 
 ## 0.6.0 — smart connection sharing (planned)
 

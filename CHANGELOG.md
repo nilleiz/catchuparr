@@ -16,9 +16,11 @@ included here to explain the feature history leading to 0.4.0.
 
 ### Notes
 
-- Native AIO verification for pinned Dispatcharr 0.31.0 and 0.32.0 and
-  player-specific acceptance remain pending. See the
-  [0.5.0 candidate guide](docs/candidate-0.5.0.md) for boundaries and status.
+- The 433-test local suite and full native AIO probes on pinned Dispatcharr
+  0.31.0 and 0.32.0 pass. Required CI, isolated Dev verification and
+  player-specific acceptance remain pending; this candidate is not published.
+  See the [0.5.0 candidate guide](docs/candidate-0.5.0.md) for boundaries and
+  status.
 
 ## [0.4.0] - 2026-10-12
 
