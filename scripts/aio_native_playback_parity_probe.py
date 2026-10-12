@@ -38,15 +38,12 @@ def _normalized_playlist(response):
     return tuple(normalized)
 
 
-def _add_plugin_root(plugin_root="/data/plugins"):
-    """Use the package path installed by the Dispatcharr plugin manager."""
+def probe():
+    # Match the verified full AIO probe's plugin-manager checkout path before
+    # importing the installed Catchuparr package.
     import sys
 
-    sys.path.insert(0, plugin_root)
-
-
-def probe():
-    _add_plugin_root()
+    sys.path.insert(0, "/data/plugins")
 
     from django.test import RequestFactory
     from django.utils import timezone
@@ -239,5 +236,4 @@ def probe():
     }, sort_keys=True))
 
 
-if __name__ == "__main__":
-    probe()
+probe()
