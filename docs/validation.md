@@ -2,8 +2,10 @@
 
 Sections for 0.2.0 through 0.3.1 are historical candidate checkpoints; their
 pending release gates describe the status at that time. Version 0.4.0 is
-released; version 0.5.0 is the current development candidate. Their evidence
-and remaining limitations are recorded below.
+released. Version 0.5.0 remains under native-output acceptance; the 0.5.1
+profile-inheritance prerelease is implemented, with CI, AIO, Dev and publication
+gates pending. The 0.5.0 evidence and limitations are recorded below; see the
+[0.5.1 candidate guide](candidate-0.5.1.md) for its acceptance state.
 
 ## Released baseline: 0.1.4
 

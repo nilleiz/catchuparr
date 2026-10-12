@@ -13,9 +13,11 @@ from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
 
 from .schedule import (
+    CONTINUOUS_SCHEDULE,
     RecordingSchedule,
     ScheduleError,
-    normalize_schedule,
+    expand_schedule_days,
+    normalize_expanded_schedule_days,
     resolve_timezone,
 )
 
@@ -41,6 +43,13 @@ class SourcePolicy:
 
 
 @dataclass(frozen=True)
+class _FilterPatch:
+    filter_kind: str | None
+    filter_ids: frozenset[str]
+    priorities: tuple[tuple[str, int], ...] | None
+
+
+@dataclass(frozen=True)
 class FilterCompilation:
     channel_uuids: tuple[str, ...]
     profile_ids: tuple[str, ...]
@@ -48,6 +57,7 @@ class FilterCompilation:
     channels: tuple[dict[str, Any], ...]
     timezone: str
     channel_schedules: dict[str, RecordingSchedule] = field(default_factory=dict)
+    channel_origins: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class _RestrictedSafeLoader(yaml.SafeLoader):
@@ -354,36 +364,31 @@ def _resolve_filter(
     account_names: dict[str, str],
     account_ids: set[str],
     ambiguous_account_names: set[str],
-) -> SourcePolicy | None:
+) -> _FilterPatch:
     include_present = "include" in rule
     exclude_present = "exclude" in rule
     if include_present and exclude_present:
         raise SourceRuleError(f"line {line}, fields include/exclude: choose only one")
-    if "priority" in rule and not (include_present or exclude_present):
-        raise SourceRuleError(f"line {line}, field priority: requires include or exclude")
-    if not include_present and not exclude_present:
-        return None
-
-    include_ids: frozenset[str] | None = None
-    exclude_ids: frozenset[str] = frozenset()
+    filter_kind = "include" if include_present else "exclude" if exclude_present else None
+    filter_ids: frozenset[str] = frozenset()
     if include_present:
         names = _string_list(rule["include"], line=line, field="include")
-        include_ids = frozenset(
+        filter_ids = frozenset(
             _account_id(name, "include", line, account_names, account_ids, ambiguous_account_names)
             for name in names
         )
-    else:
+    elif exclude_present:
         names = _string_list(rule["exclude"], line=line, field="exclude", allow_empty=True)
-        exclude_ids = frozenset(
+        filter_ids = frozenset(
             _account_id(name, "exclude", line, account_names, account_ids, ambiguous_account_names)
             for name in names
         )
 
-    priorities: tuple[tuple[str, int], ...] = ()
+    priorities: tuple[tuple[str, int], ...] | None = None
     if "priority" in rule:
         raw_priorities = rule["priority"]
-        if not isinstance(raw_priorities, dict) or not raw_priorities:
-            raise SourceRuleError(f"line {line}, field priority: expected a non-empty mapping")
+        if not isinstance(raw_priorities, dict):
+            raise SourceRuleError(f"line {line}, field priority: expected a mapping")
         pairs = []
         for name, value in raw_priorities.items():
             if not isinstance(name, str) or not name:
@@ -393,23 +398,50 @@ def _resolve_filter(
             account_id = _account_id(
                 name, f"priority.{name}", line, account_names, account_ids, ambiguous_account_names
             )
-            if include_ids is not None and account_id not in include_ids:
-                raise SourceRuleError(
-                    f"line {line}, field priority.{name}: account is excluded by include filter"
-                )
-            if account_id in exclude_ids:
-                raise SourceRuleError(
-                    f"line {line}, field priority.{name}: account is excluded by source filter"
-                )
             pairs.append((account_id, value))
         priorities = tuple(pairs)
+    return _FilterPatch(filter_kind, filter_ids, priorities)
 
-    return SourcePolicy(
-        include_account_ids=include_ids,
-        exclude_account_ids=exclude_ids,
-        priorities=priorities,
-        known_account_ids=frozenset(account_ids),
-    )
+
+def _effective_filter(
+    patch: _FilterPatch | None,
+    inherited: SourcePolicy | None,
+    *,
+    line: int,
+    known_account_ids: set[str],
+) -> SourcePolicy | None:
+    if patch is None:
+        return inherited
+    if patch.filter_kind == "include":
+        include_ids = patch.filter_ids
+        exclude_ids = frozenset()
+    elif patch.filter_kind == "exclude":
+        include_ids = None
+        exclude_ids = patch.filter_ids
+    elif inherited is not None:
+        include_ids = inherited.include_account_ids
+        exclude_ids = inherited.exclude_account_ids
+    else:
+        include_ids = None
+        exclude_ids = frozenset()
+    priorities = patch.priorities
+    if priorities is None:
+        priorities = inherited.priorities if inherited is not None else ()
+    for account_id, _score in priorities:
+        if include_ids is not None and account_id not in include_ids:
+            raise SourceRuleError(
+                f"line {line}, field priority: account is excluded by include filter"
+            )
+        if account_id in exclude_ids:
+            raise SourceRuleError(
+                f"line {line}, field priority: account is excluded by source filter"
+            )
+    if patch.priorities is not None and patch.filter_kind is None and inherited is None:
+        raise SourceRuleError(f"line {line}, field priority: requires include or exclude")
+    if patch.filter_kind is None and patch.priorities is None:
+        return inherited
+    known_ids = frozenset(known_account_ids)
+    return SourcePolicy(include_ids, exclude_ids, priorities, known_ids)
 
 
 def _account_id(
@@ -497,7 +529,7 @@ def compile_filter_config(
             resolve_timezone(document["timezone"])
             if "timezone" in document else resolve_timezone()
         )
-        global_schedule = normalize_schedule(
+        global_schedule_days = expand_schedule_days(
             document.get("schedule", "continuous"), field="schedule"
         )
     except ScheduleError as exc:
@@ -531,26 +563,35 @@ def compile_filter_config(
         )
 
     account_names, account_ids, ambiguous_account_names = _account_index(accounts)
-    resolved_rules = []
     all_rule = None
-    occupied: set[str] = set()
+    profile_rules: list[dict[str, Any]] = []
+    direct_rules: list[dict[str, Any]] = []
+    occupied_direct: set[str] = set()
+    occupied_profiles: set[str] = set()
     for index, raw_rule in enumerate(raw_rules, start=1):
         line = rule_lines[index - 1] if index <= len(rule_lines) else index + 2
         rule = _rule_call(index, _mapping,
             raw_rule,
             line=line,
             field=f"rules[{index - 1}]",
-            allowed={"channels", "include", "exclude", "priority", "schedule"},
+            allowed={"channels", "include", "exclude", "priority", "schedule", "schedule_mode"},
             required={"channels"},
         )
+        schedule_mode = rule.get("schedule_mode", "replace")
+        if not isinstance(schedule_mode, str) or schedule_mode not in {"replace", "override_days"}:
+            raise SourceRuleError(
+                f"line {line}, field schedule_mode: expected replace or override_days"
+            )
+        if "schedule_mode" in rule and "schedule" not in rule:
+            raise SourceRuleError(f"line {line}, field schedule_mode: requires schedule")
         try:
-            rule_schedule = (
-                normalize_schedule(
+            rule_schedule_days = (
+                expand_schedule_days(
                     rule["schedule"],
                     line=line,
                     field=f"rules[{index - 1}].schedule",
                 )
-                if "schedule" in rule else global_schedule
+                if "schedule" in rule else None
             )
         except ScheduleError as exc:
             raise SourceRuleError(f"rule {index}: {exc}") from None
@@ -568,46 +609,136 @@ def compile_filter_config(
             profiles_by_name=profiles_by_name,
         )
         referenced_profile_ids.update(selector_profile_ids)
-        if is_all:
-            if all_rule is not None:
-                raise SourceRuleError(f"line {line}, rule {index}, field channels.profile: duplicate all rule")
-            policy = _rule_call(index, _resolve_filter,
-                rule,
-                line=line,
-                account_names=account_names,
-                account_ids=account_ids,
-                ambiguous_account_names=ambiguous_account_names,
-            )
-            all_rule = (index, selected, policy, rule_schedule)
-            continue
-        overlap = occupied & selected
-        if overlap:
-            raise SourceRuleError(f"line {line}, rule {index}, field channels: concrete rules overlap")
-        occupied.update(selected)
-        policy = _rule_call(index, _resolve_filter,
+        selector_kind = next(iter(selector))
+        patch = _rule_call(index, _resolve_filter,
             rule,
             line=line,
             account_names=account_names,
             account_ids=account_ids,
             ambiguous_account_names=ambiguous_account_names,
         )
-        resolved_rules.append((index, selected, policy, rule_schedule))
+        entry = {
+            "index": index,
+            "line": line,
+            "selected": selected,
+            "selector_kind": selector_kind,
+            "patch": patch,
+            "schedule_days": rule_schedule_days,
+            "schedule_mode": schedule_mode,
+        }
+        if is_all:
+            if all_rule is not None:
+                raise SourceRuleError(f"line {line}, rule {index}, field channels.profile: duplicate all rule")
+            all_rule = entry
+            continue
+        if selector_kind == "profile":
+            if occupied_profiles & selected:
+                raise SourceRuleError(
+                    f"line {line}, rule {index}, field channels.profile: competing named profile rules"
+                )
+            occupied_profiles.update(selected)
+            profile_rules.append(entry)
+        else:
+            if occupied_direct & selected:
+                raise SourceRuleError(
+                    f"line {line}, rule {index}, field channels: direct channel rules overlap"
+                )
+            occupied_direct.update(selected)
+            direct_rules.append(entry)
 
-    selected_ids = set(all_rule[1]) if all_rule is not None else set()
-    effective: dict[str, tuple[int, SourcePolicy | None, RecordingSchedule]] = {}
-    if all_rule is not None:
-        for channel_uuid in all_rule[1]:
-            effective[channel_uuid] = (all_rule[0], all_rule[2], all_rule[3])
-    for index, channel_ids, policy, rule_schedule in resolved_rules:
-        selected_ids.update(channel_ids)
-        for channel_uuid in channel_ids:
-            effective[channel_uuid] = (index, policy, rule_schedule)
+    profile_by_channel: dict[str, dict[str, Any]] = {}
+    direct_by_channel: dict[str, dict[str, Any]] = {}
+    for entry in profile_rules:
+        for channel_uuid in entry["selected"]:
+            profile_by_channel[channel_uuid] = entry
+    for entry in direct_rules:
+        if entry["selector_kind"] not in {"names", "numbers"} and (
+            entry["selected"] & profile_by_channel.keys()
+        ):
+            raise SourceRuleError(
+                f"line {entry['line']}, field channels: named-profile exceptions require names or numbers"
+            )
+        for channel_uuid in entry["selected"]:
+            direct_by_channel[channel_uuid] = entry
+    all_selected = all_rule["selected"] if all_rule is not None else set()
+    selected_ids = set(all_selected) | set(profile_by_channel) | set(direct_by_channel)
+    effective: dict[str, tuple[SourcePolicy | None, RecordingSchedule, dict[str, Any]]] = {}
+    days = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    global_schedule_origin = "document schedule" if "schedule" in document else "default continuous"
+    for channel_uuid in sorted(selected_ids):
+        inherited_policy = None
+        origin = {"source_filter": None, "priority": None}
+        inherited_days = dict(global_schedule_days)
+        schedule_origins = {day: global_schedule_origin for day in days}
+        base_entries = []
+        # Resolve the all rule before a named profile, regardless of YAML order.
+        if channel_uuid in all_selected:
+            base_entries.append(all_rule)
+        if channel_uuid in profile_by_channel:
+            base_entries.append(profile_by_channel[channel_uuid])
+        for base_entry in base_entries:
+            inherited_policy = _effective_filter(
+                base_entry["patch"], inherited_policy, line=base_entry["line"],
+                known_account_ids=account_ids,
+            )
+            if base_entry["patch"].filter_kind is not None:
+                origin["source_filter"] = f"rule {base_entry['index']}"
+            if base_entry["patch"].priorities is not None:
+                origin["priority"] = f"rule {base_entry['index']}"
+            if base_entry["schedule_days"] is not None:
+                if base_entry["schedule_mode"] == "override_days":
+                    for day, windows in base_entry["schedule_days"].items():
+                        inherited_days[day] = windows
+                        schedule_origins[day] = f"rule {base_entry['index']}"
+                else:
+                    inherited_days = {
+                        day: base_entry["schedule_days"].get(day, ()) for day in days
+                    }
+                    schedule_origins = {day: f"rule {base_entry['index']}" for day in days}
+        direct_entry = direct_by_channel.get(channel_uuid)
+        if direct_entry is not None:
+            direct_patch = direct_entry["patch"]
+            effective_policy = _effective_filter(
+                direct_patch, inherited_policy, line=direct_entry["line"],
+                known_account_ids=account_ids,
+            )
+            if direct_patch.filter_kind is not None:
+                origin["source_filter"] = f"rule {direct_entry['index']}"
+            if direct_patch.priorities is not None:
+                origin["priority"] = f"rule {direct_entry['index']}"
+            if direct_entry["schedule_days"] is not None:
+                if direct_entry["schedule_mode"] == "override_days":
+                    for day, windows in direct_entry["schedule_days"].items():
+                        inherited_days[day] = windows
+                        schedule_origins[day] = f"rule {direct_entry['index']}"
+                else:
+                    inherited_days = {
+                        day: direct_entry["schedule_days"].get(day, ()) for day in days
+                    }
+                    schedule_origins = {day: f"rule {direct_entry['index']}" for day in days}
+        else:
+            effective_policy = inherited_policy
+        channel_schedule = (
+            CONTINUOUS_SCHEDULE
+            if len(inherited_days) == 7 and all(
+                inherited_days.get(day) == ((0, 1440),) for day in days
+            )
+            else normalize_expanded_schedule_days(inherited_days)
+        )
+        effective[channel_uuid] = (
+            effective_policy, channel_schedule,
+            {"source_filter": origin["source_filter"] or "inherited default",
+             "priority": origin["priority"] or "inherited default",
+             "schedule_days": schedule_origins},
+        )
 
     source_policies: dict[str, SourcePolicy] = {}
     channel_schedules: dict[str, RecordingSchedule] = {}
     preview_by_uuid: dict[str, dict[str, Any]] = {}
+    channel_origins: dict[str, dict[str, Any]] = {}
     for channel_uuid in sorted(selected_ids):
-        _rule_index, policy, channel_schedule = effective[channel_uuid]
+        policy, channel_schedule, origins = effective[channel_uuid]
+        channel_origins[channel_uuid] = origins
         channel_schedules[channel_uuid] = channel_schedule
         streams = streams_by_channel.get(channel_uuid, ())
         baseline = _ordered_assigned(streams, account_ids)
@@ -634,6 +765,7 @@ def compile_filter_config(
             "candidates": candidate_views,
             "source_override": channel_uuid in source_policies,
             "recording_schedule": channel_schedule.to_snapshot(),
+            "configuration_origin": origins,
             "warning": (
                 "This override uses a dedicated worker and may need another provider or tuner slot."
                 if channel_uuid in source_policies else None
@@ -646,6 +778,7 @@ def compile_filter_config(
         channels=tuple(preview_by_uuid[channel] for channel in sorted(preview_by_uuid)),
         timezone=timezone_name,
         channel_schedules=channel_schedules,
+        channel_origins=channel_origins,
     )
 
 

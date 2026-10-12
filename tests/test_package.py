@@ -23,9 +23,9 @@ class PackageTest(unittest.TestCase):
             self.assertFalse(any("__pycache__" in name for name in names))
             manifest = json.loads(archive.read("catchuparr/plugin.json"))
             self.assertEqual(manifest["name"], "Catchuparr")
-            self.assertEqual(manifest["version"], "0.5.0")
+            self.assertEqual(manifest["version"], "0.5.1")
             self.assertEqual(Plugin.version, manifest["version"])
-            self.assertEqual(Path(archive_path).name, "catchuparr-0.5.0.zip")
+            self.assertEqual(Path(archive_path).name, "catchuparr-0.5.1.zip")
             field_ids = [field["id"] for field in manifest["fields"]]
             self.assertIn("filter_config", field_ids)
             self.assertIn("recording_enabled", field_ids)
