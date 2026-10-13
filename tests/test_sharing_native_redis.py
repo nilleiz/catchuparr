@@ -1,0 +1,428 @@
+"""Faithful Redis/Lua tests for the unwired sharing native adapter.
+
+Set REDIS_CLI_DOCKER_CONTAINER to the name of the task-owned, isolated Redis
+container. Commands run via ``sudo -n docker exec``; no host Redis port or
+credentials are used. Tests use synthetic-only keys and flush logical DB 0.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import unittest
+from types import SimpleNamespace
+
+from catchuparr.adapters.sharing_native import (
+    check_and_touch_borrowed_client,
+    project_opening_episode,
+    publish_current_authority,
+    read_native_episode_grant,
+    register_borrowed_client,
+)
+from catchuparr.sharing_episode import BorrowEpisodeSnapshot
+
+CHANNEL = "channel-synthetic-lua-060"
+WORKER = "worker-synthetic-lua-060"
+STREAM = "stream-synthetic-lua-060"
+ACCOUNT = "account-synthetic-lua-060"
+M3U_PROFILE = "m3u-profile-synthetic-lua-060"
+INPUT_PROFILE = "input-profile-synthetic-lua-060"
+LEASE = "synthetic-only-lease-lua-060"
+VIEWER = "viewer-synthetic-lua-060"
+CLIENT = "catchuparr-client-synthetic-lua-060"
+TASK_WORKER = "task-worker-synthetic-lua-060"
+CATALOG = "catalog-synthetic-lua-060"
+CONFIG = "config-synthetic-lua-060"
+EPISODE_ID = "episode-synthetic-lua-060"
+
+
+class Connection:
+    __module__ = "redis.connection"
+
+
+class RedisCli:
+    """Small redis-py-shaped facade backed by redis-cli in the test container."""
+
+    def __init__(self, container: str):
+        self.container = container
+        self.connection_pool = SimpleNamespace(
+            connection_class=Connection,
+            connection_kwargs={
+                "host": "redis-isolated.synthetic.invalid", "port": 6379,
+                "db": 0, "decode_responses": False,
+            },
+        )
+
+    def command(self, *args: object) -> list[str]:
+        result = subprocess.run(
+            ["sudo", "-n", "docker", "exec", self.container,
+             "redis-cli", "--raw", *(str(arg) for arg in args)],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode:
+            raise RuntimeError("isolated redis-cli command failed")
+        return result.stdout.rstrip("\n").splitlines() if result.stdout else []
+
+    def eval(self, script: str, numkeys: int, *args: object):
+        self.last_invocation = (numkeys, len(args), script[-100:])
+        result = subprocess.run(
+            ["sudo", "-n", "docker", "exec", self.container,
+             "redis-cli", "--json", "EVAL", script, str(numkeys),
+             *(str(arg) for arg in args)],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode:
+            raise RuntimeError("isolated redis-cli EVAL failed")
+        try:
+            output = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise AssertionError("Redis returned a malformed JSON Lua result") from exc
+        self.last_eval = output
+        if isinstance(output, str) and output.startswith("ERR "):
+            raise AssertionError(f"Redis rejected Lua script: {output}")
+        return output
+
+    def get(self, key: str):
+        values = self.command("GET", key)
+        return values[0] if values else None
+
+    def hget(self, key: str, field: str):
+        values = self.command("HGET", key, field)
+        return values[0] if values else None
+
+    def hgetall(self, key: str):
+        values = self.command("HGETALL", key)
+        return dict(zip(values[::2], values[1::2]))
+
+    def smembers(self, key: str):
+        return set(self.command("SMEMBERS", key))
+
+    def exists(self, key: str):
+        return bool(int(self.command("EXISTS", key)[0]))
+
+    def ttl(self, key: str):
+        return int(self.command("TTL", key)[0])
+
+
+def _episode(*, epoch: int = 9) -> BorrowEpisodeSnapshot:
+    identity = (
+        CHANNEL, WORKER, WORKER, WORKER, STREAM, ACCOUNT, M3U_PROFILE,
+        INPUT_PROFILE,
+    )
+    return BorrowEpisodeSnapshot(
+        episode_id=EPISODE_ID, channel_uuid=CHANNEL, phase="opening",
+        configuration_generation=CONFIG, control_generation=7,
+        recorder_fence=11, intent_epoch=epoch, identity=identity,
+        lease_digest=hashlib.sha256(LEASE.encode()).hexdigest(), client_id=None,
+        connected_at=None, version=1, last_viewer_left_at=None,
+        return_deadline=None,
+    )
+
+
+def _keys():
+    return {
+        "current": f"catchuparr:sharing:current:{CHANNEL}",
+        "episode": f"catchuparr:sharing:episode:{CHANNEL}",
+        "lease": f"catchuparr:recorder:{CHANNEL}",
+        "owner": f"live:channel:{CHANNEL}:owner",
+        "heartbeat": f"live:worker:{WORKER}:heartbeat",
+        "metadata": f"live:channel:{CHANNEL}:metadata",
+        "clients": f"live:channel:{CHANNEL}:clients",
+        "viewer": f"live:channel:{CHANNEL}:clients:{VIEWER}",
+        "buffer_index": f"live:channel:{CHANNEL}:input:buffer:index",
+        "timestamps": f"live:channel:{CHANNEL}:input:buffer:chunk_timestamps",
+        "chunk": f"live:channel:{CHANNEL}:input:buffer:chunk:1",
+        "private": f"catchuparr:sharing:private:{CHANNEL}",
+        "client": f"live:channel:{CHANNEL}:clients:{CLIENT}",
+    }
+
+
+@unittest.skipUnless(os.environ.get("REDIS_CLI_DOCKER_CONTAINER"),
+                     "requires the isolated task-owned Redis test container")
+class NativeLuaRedisTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.redis = RedisCli(os.environ["REDIS_CLI_DOCKER_CONTAINER"])
+
+    def setUp(self):
+        self.redis.command("FLUSHDB")
+
+    def _base_authority(self, *, revision: int = 1):
+        keys = _keys()
+        self.redis.command(
+            "HSET", keys["current"], "configuration_generation", CONFIG,
+            "control_generation", "7", "catalog_generation", CATALOG,
+            "authority_revision", revision,
+        )
+        self.redis.command("SET", keys["lease"], LEASE, "EX", 600)
+
+    def _native_source_and_viewer(self):
+        keys = _keys()
+        self.redis.command("SET", keys["owner"], WORKER, "EX", 600)
+        self.redis.command("SET", keys["heartbeat"], "alive", "EX", 600)
+        self.redis.command(
+            "HSET", keys["metadata"], "owner", WORKER,
+            "channel_uuid", CHANNEL, "state", "active", "stream_id", STREAM,
+            "m3u_profile", M3U_PROFILE, "stream_profile", INPUT_PROFILE,
+        )
+        self.redis.command("SET", keys["buffer_index"], "1")
+        self.redis.command("ZADD", keys["timestamps"], "100", "1")
+        self.redis.command("SET", keys["chunk"], "synthetic-ts")
+        self.redis.command("SADD", keys["clients"], VIEWER)
+        self.redis.command(
+            "HSET", keys["viewer"], "connected_at", "100",
+            "worker_id", "viewer-worker-synthetic-lua-060", "user_id", "7",
+            "output_format", "mpegts", "output_profile_id", "",
+        )
+
+    def _opening_projection(self, *, episode=None):
+        episode = episode or _episode()
+        self._base_authority()
+        self.assertTrue(project_opening_episode(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            return_seconds=30, minimum_switch_seconds=60, last_switch_at=95,
+        ))
+        return episode
+
+    def _register(self, *, client_id: str = CLIENT):
+        episode = self._opening_projection()
+        self._native_source_and_viewer()
+        ack = register_borrowed_client(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            client_id=client_id, local_worker_id=TASK_WORKER,
+            user_agent="Synthetic Player", client_ip="192.0.2.60",
+            client_record_ttl=60,
+        )
+        return episode, ack
+
+    def test_current_authority_revision_cas_prevents_stale_overwrite(self):
+        self._base_authority(revision=4)
+        self.assertTrue(publish_current_authority(
+            self.redis, CHANNEL, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            expected_revision=4, authority_revision=5,
+        ))
+        self.assertFalse(publish_current_authority(
+            self.redis, CHANNEL, configuration_generation=CONFIG,
+            control_generation=7, catalog_generation=CATALOG,
+            expected_revision=4, authority_revision=6,
+        ))
+        self.assertEqual(self.redis.hget(_keys()["current"], "authority_revision"), "5")
+        self.assertEqual(self.redis.hget(_keys()["current"], "configuration_generation"), "config-next")
+
+    def test_project_rejects_wrong_projection_type_without_replacing_key(self):
+        self._base_authority()
+        keys = _keys()
+        self.redis.command("SET", keys["episode"], "original-string-synthetic")
+        self.assertFalse(project_opening_episode(
+            self.redis, _episode(), lease_value=LEASE, catalog_generation=CATALOG,
+            return_seconds=30, minimum_switch_seconds=60, last_switch_at=95,
+        ))
+        self.assertEqual(self.redis.get(keys["episode"]), "original-string-synthetic")
+
+    def test_projection_and_registration_execute_lua_against_real_key_types(self):
+        episode, ack = self._register()
+        self.assertIsNotNone(
+            ack,
+            f"Lua registration returned {self.redis.last_eval!r}; phase="
+            f"{self.redis.hget(_keys()['episode'], 'phase')!r}; call={self.redis.last_invocation!r}",
+        )
+        keys = _keys()
+        self.assertEqual(self.redis.hget(keys["episode"], "phase"), "active")
+        self.assertEqual(self.redis.smembers(keys["clients"]), {VIEWER, CLIENT})
+        self.assertEqual(self.redis.hget(keys["private"], CLIENT), EPISODE_ID)
+        self.assertEqual(self.redis.hget(keys["client"], "worker_id"), TASK_WORKER)
+        self.assertGreater(self.redis.ttl(keys["client"]), 0)
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.assertIsNotNone(grant)
+        self.assertEqual(grant.version, episode.version + 1)
+
+    def test_registration_rejects_stale_authority_and_has_no_partial_writes(self):
+        episode = self._opening_projection()
+        self._native_source_and_viewer()
+        self.redis.command("HSET", _keys()["current"], "control_generation", "8")
+        result = register_borrowed_client(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            client_id=CLIENT, local_worker_id=TASK_WORKER,
+            user_agent="Synthetic Player", client_ip="192.0.2.60",
+        )
+        self.assertIsNone(result)
+        keys = _keys()
+        self.assertEqual(self.redis.hget(keys["episode"], "phase"), "opening")
+        self.assertFalse(self.redis.exists(keys["client"]))
+        self.assertFalse(self.redis.smembers(keys["clients"]) - {VIEWER})
+        self.assertIsNone(self.redis.hget(keys["private"], CLIENT))
+
+    def test_registration_rejects_hash_only_client_collision_without_replacing_it(self):
+        episode = self._opening_projection()
+        self._native_source_and_viewer()
+        keys = _keys()
+        self.redis.command("HSET", keys["client"], "connected_at", "original", "user_id", "42")
+        result = register_borrowed_client(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            client_id=CLIENT, local_worker_id=TASK_WORKER,
+            user_agent="Synthetic Player", client_ip="192.0.2.60",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(self.redis.hget(keys["client"], "connected_at"), "original")
+        self.assertNotIn(CLIENT, self.redis.smembers(keys["clients"]))
+        self.assertIsNone(self.redis.hget(keys["private"], CLIENT))
+
+    def test_registration_type_preflight_prevents_partial_mutation(self):
+        for wrong_key in ("client", "clients", "private"):
+            with self.subTest(wrong_key=wrong_key):
+                self.redis.command("FLUSHDB")
+                episode = self._opening_projection()
+                self._native_source_and_viewer()
+                keys = _keys()
+                if wrong_key == "clients":
+                    self.redis.command("DEL", keys["clients"])
+                    self.redis.command("HSET", keys["clients"], "wrong-type", "sentinel")
+                else:
+                    self.redis.command("SET", keys[wrong_key], "wrong-type-sentinel")
+                before = self.redis.hgetall(keys["episode"])
+                result = register_borrowed_client(
+                    self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+                    client_id=CLIENT, local_worker_id=TASK_WORKER,
+                    user_agent="Synthetic Player", client_ip="192.0.2.60",
+                )
+                self.assertIsNone(result)
+                self.assertEqual(self.redis.hgetall(keys["episode"]), before)
+                self.assertEqual(self.redis.command("TYPE", keys[wrong_key]),
+                                 ["string" if wrong_key != "clients" else "hash"])
+                self.assertEqual(self.redis.get(keys["client"]),
+                                 "wrong-type-sentinel" if wrong_key == "client" else None)
+                self.assertEqual(self.redis.command("TYPE", keys["private"]),
+                                 ["string"] if wrong_key == "private" else ["none"])
+
+    def test_check_type_preflight_prevents_partial_heartbeat_or_projection_writes(self):
+        self._register()
+        keys = _keys()
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.redis.command("DEL", keys["client"])
+        self.redis.command("SET", keys["client"], "original-string-synthetic")
+        before_projection = self.redis.hgetall(keys["episode"])
+        before_members = self.redis.smembers(keys["clients"])
+        ok, _, _ = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertFalse(ok)
+        self.assertEqual(self.redis.get(keys["client"]), "original-string-synthetic")
+        self.assertEqual(self.redis.hgetall(keys["episode"]), before_projection)
+        self.assertEqual(self.redis.smembers(keys["clients"]), before_members)
+
+    def test_check_and_touch_executes_active_and_viewer_return_grace_transitions(self):
+        self._register()
+        keys = _keys()
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        ok, deadline, version = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertTrue(ok)
+        self.assertIsNone(deadline)
+        self.assertEqual(version, grant.version)
+
+        self.redis.command("SREM", keys["clients"], VIEWER)
+        self.redis.command("DEL", keys["viewer"])
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        ok, deadline, version = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertTrue(ok)
+        self.assertIsNotNone(deadline)
+        self.assertEqual(version, grant.version + 1)
+        self.assertEqual(self.redis.hget(keys["episode"], "phase"), "wait_return")
+
+        self.redis.command("SADD", keys["clients"], VIEWER)
+        self.redis.command(
+            "HSET", keys["viewer"], "connected_at", "200",
+            "worker_id", "viewer-worker-synthetic-lua-060", "user_id", "7",
+            "output_format", "mpegts", "output_profile_id", "",
+        )
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        ok, deadline, version = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertTrue(ok)
+        self.assertIsNone(deadline)
+        self.assertEqual(version, grant.version + 1)
+        self.assertEqual(self.redis.hget(keys["episode"], "phase"), "active")
+
+    def test_check_rejects_revoked_flags_expired_grace_and_stale_projection(self):
+        self._register()
+        keys = _keys()
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.redis.command("SET", f"live:channel:{CHANNEL}:stopping", "1")
+        before = self.redis.hget(keys["client"], "last_active")
+        ok, _, _ = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertFalse(ok)
+        self.assertEqual(self.redis.hget(keys["client"], "last_active"), before)
+
+        self.redis.command("DEL", f"live:channel:{CHANNEL}:stopping")
+        self.redis.command("HSET", keys["episode"], "phase", "wait_return",
+                           "viewer_left_at", "1", "return_deadline", "1")
+        expired = read_native_episode_grant(self.redis, CHANNEL)
+        self.assertIsNotNone(expired)
+        before = self.redis.hget(keys["client"], "last_active")
+        ok, _, _ = check_and_touch_borrowed_client(self.redis, expired)
+        self.assertFalse(ok)
+        self.assertEqual(self.redis.hget(keys["client"], "last_active"), before)
+
+    def test_stale_recorder_marker_is_not_promoted_to_ordinary_viewer(self):
+        # A present server marker with missing/expired/malformed capability is
+        # unknown, never positive evidence of an ordinary viewer.
+        for condition in ("missing_cap", "expired_cap", "wrong_lease", "wrong_marker_type"):
+            with self.subTest(condition=condition):
+                self.redis.command("FLUSHDB")
+                episode = self._opening_projection()
+                self._native_source_and_viewer()
+                keys = _keys()
+                self.redis.command("DEL", keys["clients"])
+                self.redis.command("SADD", keys["clients"], VIEWER)
+                marker = f"catchuparr:stats:recorder-client:{CHANNEL}:{VIEWER}"
+                cap = "catchuparr:recorder:stats-cap:digest-stale-synthetic"
+                self.redis.command("SET", marker, f"digest-stale-synthetic|{CHANNEL}")
+                if condition == "expired_cap":
+                    self.redis.command("SET", cap, f"{CHANNEL}|{LEASE}", "EX", 1)
+                    self.redis.command("EXPIRE", cap, 0)
+                elif condition == "wrong_lease":
+                    self.redis.command("SET", cap, f"{CHANNEL}|wrong-lease-synthetic")
+                elif condition == "wrong_marker_type":
+                    self.redis.command("DEL", marker)
+                    self.redis.command("HSET", marker, "marker", "wrong-type")
+                elif condition != "missing_cap":
+                    self.fail(f"unknown marker condition {condition}")
+                result = register_borrowed_client(
+                    self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+                    client_id=CLIENT, local_worker_id=TASK_WORKER,
+                    user_agent="Synthetic Player", client_ip="192.0.2.60",
+                )
+                self.assertIsNone(result)
+                self.assertEqual(self.redis.hget(keys["episode"], "phase"), "opening")
+                self.assertFalse(self.redis.exists(keys["client"]))
+
+    def test_check_and_touch_rejects_unknown_stale_marker(self):
+        self._register()
+        keys = _keys()
+        self.redis.command("SREM", keys["clients"], VIEWER)
+        self.redis.command("DEL", keys["viewer"])
+        # Retain an ordinary-looking native hash but attach an expired server
+        # capability marker; Lua must not count it as a viewer or publish.
+        self.redis.command("SADD", keys["clients"], VIEWER)
+        self.redis.command(
+            "HSET", keys["viewer"], "connected_at", "100",
+            "worker_id", "viewer-worker-synthetic-lua-060",
+        )
+        self.redis.command(
+            "SET", f"catchuparr:stats:recorder-client:{CHANNEL}:{VIEWER}",
+            f"digest-stale-synthetic|{CHANNEL}",
+        )
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        before = self.redis.hget(keys["client"], "last_active")
+        ok, _, _ = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertFalse(ok)
+        self.assertEqual(self.redis.hget(keys["client"], "last_active"), before)
+
+    def test_grant_repr_does_not_expose_lease_bearer(self):
+        self._register()
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.assertIsNotNone(grant)
+        self.assertNotIn(LEASE, repr(grant))
+
+
+if __name__ == "__main__":
+    unittest.main()
