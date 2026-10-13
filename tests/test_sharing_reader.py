@@ -80,6 +80,10 @@ class Connection:
     __module__ = "redis.connection"
 
 
+class SSLConnection:
+    __module__ = "redis.connection"
+
+
 class FakeRedisState:
     def __init__(self, head=5):
         self.head = head
@@ -95,6 +99,7 @@ class FakeRedis:
         self.sets = self.state.sets
         self.hashes = self.state.hashes
         self.reads = []
+        self.expirations = {}
         connection_kwargs = {
             "host": "redis.synthetic.invalid",
             "port": 6379,
@@ -138,6 +143,13 @@ class FakeRedis:
         self.hashes.pop(key, None)
         self.values.pop(key, None)
         self.sets.pop(key, None)
+        self.expirations.pop(key, None)
+
+    def expire(self, key, seconds):
+        if key not in self.hashes and key not in self.sets and key not in self.values:
+            return False
+        self.expirations[key] = seconds
+        return True
 
     @staticmethod
     def _string(value):
@@ -178,6 +190,14 @@ class FakeRedis:
             client_set, client_key, disconnect_key = keys
             client_id = self._string(argv[0])
             client = self.hashes.get(client_key)
+            is_member = client_id in self.sets.get(client_set, set())
+            if not client:
+                if not is_member:
+                    return 0
+                self.sets[client_set].discard(client_id)
+                if not self.sets[client_set]:
+                    self.values[disconnect_key] = self._string(argv[8])
+                return 1
             fields = ("connected_at", "worker_id", "user_agent", "ip_address", "user_id", "output_format", "output_profile_id")
             if not client or any(self._string(client.get(field, "")) != self._string(argv[index])
                                  for field, index in zip(fields, (1, 2, 3, 4, 5, 6, 7), strict=True)):
@@ -262,6 +282,8 @@ class FakeClientManager:
         )
         self.worker_id = "viewer-worker-7"
         self.fail_remove = False
+        self.add_failure_stage = None
+        self.add_failure_snapshot = None
         self.lock = threading.RLock()
         self._registered_clients = set()
         self.last_heartbeat_time = {}
@@ -269,9 +291,10 @@ class FakeClientManager:
         self.client_ttl = 60
 
     def _write_registration(self, client_id, client_ip, user_agent, output_format, output_profile_id):
-        self.redis_client.hset(
-            f"live:channel:{self.channel_id}:clients:{client_id}",
-            mapping={
+        client_key = f"live:channel:{self.channel_id}:clients:{client_id}"
+        if self.add_failure_stage == "hset":
+            raise RuntimeError("synthetic HSET failure")
+        self.redis_client.hset(client_key, mapping={
                 "user_agent": user_agent or "unknown",
                 "ip_address": client_ip,
                 "connected_at": "100.0",
@@ -280,23 +303,42 @@ class FakeClientManager:
                 "user_id": "0",
                 "output_format": output_format,
                 "output_profile_id": output_profile_id or "",
-            },
-        )
+            })
+        if self.add_failure_stage == "expire_hash":
+            raise RuntimeError("synthetic hash EXPIRE failure")
+        self.redis_client.expire(client_key, self.client_ttl)
+        if self.add_failure_stage == "sadd":
+            raise RuntimeError("synthetic SADD failure")
         self.redis_client.sadd(self.client_set_key, client_id)
+        if self.add_failure_stage == "expire_set":
+            raise RuntimeError("synthetic set EXPIRE failure")
+        self.redis_client.expire(self.client_set_key, self.client_ttl)
 
     def add_client(
         self, client_id, client_ip, user_agent=None, user=None,
         output_format="mpegts", output_profile_id=None,
     ):
         self.add_calls.append((client_id, client_ip, user_agent, user, output_format, output_profile_id))
-        if self.add_result is False:
-            self._write_registration(client_id, client_ip, user_agent, output_format, output_profile_id)
-            return False
-        self._write_registration(client_id, client_ip, user_agent, output_format, output_profile_id)
         self.clients.add(client_id)
         self._registered_clients.add(client_id)
+        try:
+            self._write_registration(client_id, client_ip, user_agent, output_format, output_profile_id)
+        except Exception:
+            client_key = f"live:channel:{self.channel_id}:clients:{client_id}"
+            self.add_failure_snapshot = {
+                "hash_exists": self.redis_client.exists(client_key),
+                "member_exists": self.redis_client.sismember(self.client_set_key, client_id),
+                "hash_ttl": self.redis_client.expirations.get(client_key),
+                "set_ttl": self.redis_client.expirations.get(self.client_set_key),
+            }
+            self.clients.discard(client_id)
+            self._registered_clients.discard(client_id)
+            return False
+        if self.add_result is False:
+            return False
         if self.add_result == "raise":
             self.clients.discard(client_id)
+            self._registered_clients.discard(client_id)
             raise RuntimeError("synthetic post-write add failure")
         return self.add_result if self.add_result is not None else len(self.clients)
 
@@ -502,6 +544,32 @@ class SharingReaderTests(unittest.TestCase):
         reader = ReadOnlyTsBufferReader(buffer, binding(), lambda: proof())
         with self.assertRaises(BorrowReaderUnavailable):
             next(reader.iter_chunks())
+
+    def test_redis_tls_security_options_are_bound_but_tuning_may_differ(self):
+        def ssl_pool(**overrides):
+            result = FakeRedis(decode_responses=True, backend={
+                "ssl": True, "ssl_cert_reqs": "required", "ssl_validate_ocsp": False,
+                "ssl_validate_ocsp_stapled": False, "ssl_ciphers": "DEFAULT",
+                "ssl_ca_path": "/synthetic/ca",
+            })
+            result.connection_pool.connection_class = SSLConnection
+            result.connection_pool.connection_kwargs.update(overrides)
+            return result
+
+        baseline = ssl_pool()
+        for option, value in (("ssl_validate_ocsp", True), ("ssl_validate_ocsp_stapled", True),
+                              ("ssl_ciphers", "HIGH"), ("ssl_ca_path", "/synthetic/other-ca")):
+            with self.subTest(option=option):
+                self.assertNotEqual(redis_backend_signature(baseline),
+                                    redis_backend_signature(ssl_pool(**{option: value})))
+        tuned = ssl_pool(socket_timeout=0.25, health_check_interval=10,
+                         socket_keepalive=True, decode_responses=False)
+        self.assertEqual(redis_backend_signature(baseline), redis_backend_signature(tuned))
+        with self.assertRaises(BorrowReaderUnavailable) as captured:
+            redis_backend_signature(ssl_pool(credential_provider=object()))
+        self.assertNotIn("synthetic-secret", str(captured.exception))
+        with self.assertRaises(BorrowReaderUnavailable):
+            redis_backend_signature(ssl_pool(ssl_unknown_security_option=True))
 
     def test_client_registration_cleans_only_its_exact_client_and_private_marker(self):
         manager = FakeClientManager()
@@ -734,6 +802,56 @@ class SharingReaderTests(unittest.TestCase):
         registration.close()
         self.assertFalse(manager.redis_client.exists(f"live:channel:{manager.channel_id}:clients:{CLIENT_ID}"))
         self.assertFalse(manager.redis_client.sismember(manager.client_set_key, CLIENT_ID))
+        self.assertEqual(1, manager.stop_calls)
+
+    def test_each_native_registration_write_failure_is_exactly_cleaned(self):
+        for stage in ("hset", "expire_hash", "sadd", "expire_set"):
+            with self.subTest(stage=stage):
+                manager = FakeClientManager()
+                manager.add_failure_stage = stage
+                registration = BorrowedClientRegistration(
+                    manager, binding(), lambda: proof(), client_id=CLIENT_ID,
+                    client_ip="192.0.2.10", user_agent="Synthetic recorder",
+                    owns_client_manager=True, activity_writer=self.activity_writer,
+                )
+                with self.assertRaises(BorrowReaderUnavailable):
+                    registration.open(task_local_buffer(redis_client=manager.redis_client))
+                snapshot = manager.add_failure_snapshot
+                self.assertIsNotNone(snapshot)
+                if stage == "expire_hash":
+                    self.assertTrue(snapshot["hash_exists"])
+                    self.assertFalse(snapshot["member_exists"])
+                    self.assertIsNone(snapshot["hash_ttl"])
+                elif stage == "sadd":
+                    self.assertTrue(snapshot["hash_exists"])
+                    self.assertFalse(snapshot["member_exists"])
+                    self.assertEqual(60, snapshot["hash_ttl"])
+                elif stage == "expire_set":
+                    self.assertTrue(snapshot["hash_exists"])
+                    self.assertTrue(snapshot["member_exists"])
+                    self.assertEqual(60, snapshot["hash_ttl"])
+                    self.assertIsNone(snapshot["set_ttl"])
+                key = f"live:channel:{manager.channel_id}:clients:{CLIENT_ID}"
+                self.assertFalse(manager.redis_client.exists(key))
+                self.assertFalse(manager.redis_client.sismember(manager.client_set_key, CLIENT_ID))
+                self.assertNotIn(CLIENT_ID, manager.clients)
+                self.assertEqual(1, manager.stop_calls)
+
+    def test_membership_only_expired_metadata_ghost_is_removed_safely(self):
+        manager = FakeClientManager()
+        registration = BorrowedClientRegistration(
+            manager, binding(), lambda: self.registration_proof(manager),
+            client_id=CLIENT_ID, client_ip="192.0.2.10", user_agent="Synthetic recorder",
+            owns_client_manager=True, activity_writer=self.activity_writer,
+        )
+        registration.proof_reader = lambda: self.registration_proof(manager)
+        registration.open(task_local_buffer(redis_client=manager.redis_client))
+        client_key = f"live:channel:{manager.channel_id}:clients:{CLIENT_ID}"
+        manager.redis_client.hashes.pop(client_key)
+        self.assertTrue(manager.redis_client.sismember(manager.client_set_key, CLIENT_ID))
+        registration.close()
+        self.assertFalse(manager.redis_client.sismember(manager.client_set_key, CLIENT_ID))
+        self.assertFalse(manager.redis_client.exists(client_key))
         self.assertEqual(1, manager.stop_calls)
 
     def test_stop_event_between_batch_yields_suppresses_remaining_chunks(self):
