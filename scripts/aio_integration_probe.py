@@ -157,8 +157,8 @@ def probe_source_configuration(channel, root):
     active_path = root / "synthetic-active-settings.json"
     apply_configuration(settings, active_path=active_path)
     active = load_active_configuration(active_path)
-    require(active is not None and active.get("version") == 4,
-            "Apply must persist a v4 active snapshot")
+    require(active is not None and active.get("version") == 5,
+            "Apply must persist a v5 active snapshot")
     require(active["recording_schedule"] == {
         "timezone": "UTC",
         "channels": {
@@ -378,8 +378,8 @@ def probe():
     from catchuparr.configuration import load_active_configuration
 
     active = load_active_configuration()
-    require(active is not None and active.get("version") == 4,
-            "One Apply must persist a v4 active snapshot")
+    require(active is not None and active.get("version") == 5,
+            "One Apply must persist a v5 active snapshot")
     require(
         active.get("recording_enabled") is True and active.get("log_level") == "INFO",
         "One Apply must activate the global recorder and logging settings",
