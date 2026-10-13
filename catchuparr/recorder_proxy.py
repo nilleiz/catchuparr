@@ -47,10 +47,9 @@ class RecorderProxyAttempt:
 
 
 def configuration_generation(active_configuration: Mapping[str, Any]) -> str:
-    serialized = json.dumps(
-        active_configuration, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    from .configuration import active_configuration_generation
+
+    return active_configuration_generation(dict(active_configuration))
 
 
 def _decode(value):

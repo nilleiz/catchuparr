@@ -273,6 +273,93 @@ class ConfigurationTests(unittest.TestCase):
             active["connection_sharing"],
         )
 
+    def test_legacy_v4_v5_control_sidecars_keep_their_original_generation(self):
+        from catchuparr.recorder_control import control_state_path
+        from catchuparr.recorder_proxy import configuration_generation
+
+        for version in (4, 5):
+            with self.subTest(version=version):
+                apply_configuration(self.settings, self.catalog, self.active_path)
+                snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+                snapshot["version"] = version
+                snapshot.pop("connection_sharing")
+                if version < 5:
+                    snapshot.pop("configuration_origins")
+                self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
+                active = load_active_configuration(self.active_path)
+                generation = configuration.active_configuration_generation(active)
+                sidecar_path = control_state_path(self.active_path)
+                sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                sidecar["configuration_generation"] = generation
+                sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+                self.assertTrue(
+                    configuration._configuration_bundle_valid(
+                        self.active_path.read_bytes(), sidecar_path.read_bytes()
+                    )
+                )
+                loaded, control = load_applied_state(self.active_path)
+                self.assertEqual(version, loaded["version"])
+                self.assertEqual(generation, control.configuration_generation)
+                self.assertEqual(generation, configuration_generation(loaded))
+
+    def test_interrupted_apply_restores_valid_legacy_v5_bundle(self):
+        from catchuparr.recorder_control import control_state_path
+
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+        snapshot["version"] = 5
+        snapshot.pop("connection_sharing")
+        self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        legacy_active = load_active_configuration(self.active_path)
+        sidecar_path = control_state_path(self.active_path)
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["configuration_generation"] = configuration.active_configuration_generation(
+            legacy_active
+        )
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+        load_applied_state(self.active_path)
+
+        with patch.object(configuration._PreparedActivation, "commit"):
+            apply_configuration(
+                dict(self.settings, retention_hours=48), self.catalog, self.active_path
+            )
+        self.assertTrue(configuration._activation_state_path(self.active_path).exists())
+
+        configuration.recover_interrupted_activation(self.active_path)
+        restored, control = load_applied_state(self.active_path)
+        self.assertEqual(5, restored["version"])
+        self.assertEqual(24, restored["retention_hours"])
+        self.assertEqual(
+            configuration.active_configuration_generation(restored),
+            control.configuration_generation,
+        )
+
+    def test_v6_sharing_values_rotate_applied_generation(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        original, original_control = load_applied_state(self.active_path)
+        result = apply_configuration(
+            dict(
+                self.settings,
+                connection_sharing_config=(
+                    "version: 1\ndefault:\n  enabled: true\n"
+                ),
+            ),
+            self.catalog,
+            self.active_path,
+        )
+        updated, updated_control = load_applied_state(self.active_path)
+        self.assertTrue(result["applied"])
+        self.assertNotEqual(
+            configuration.active_configuration_generation(original),
+            configuration.active_configuration_generation(updated),
+        )
+        self.assertEqual(
+            configuration.active_configuration_generation(updated),
+            updated_control.configuration_generation,
+        )
+        self.assertNotEqual(original_control.generation, updated_control.generation)
+
     def test_v4_snapshot_without_origins_remains_readable(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))

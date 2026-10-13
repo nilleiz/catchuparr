@@ -1254,7 +1254,16 @@ def _active_configuration_view(data: dict[str, Any]) -> dict[str, Any]:
 
 def active_configuration_generation(active: dict[str, Any]) -> str:
     """Return the stable generation used to bind control and queued tasks."""
-    serialized = json.dumps(active, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    generation_view = active
+    if type(active.get("version")) is int and active["version"] < 6:
+        # Older persisted snapshots did not carry this normalized, disabled
+        # view. Preserve the exact hash their control sidecars were bound to.
+        generation_view = {
+            key: value for key, value in active.items() if key != "connection_sharing"
+        }
+    serialized = json.dumps(
+        generation_view, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
