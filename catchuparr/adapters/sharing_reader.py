@@ -52,16 +52,37 @@ def redis_backend_signature(redis_client: Any) -> str:
     database = kwargs.get("db")
     if type(database) is not int or database < 0:
         raise BorrowReaderUnavailable("Redis database identity is incomplete")
-    fields = (
+    backend_fields = {
         "host", "port", "db", "username", "password", "path", "unix_socket_path",
-        "ssl",
-        "ssl_cert_reqs", "ssl_ca_certs", "ssl_ca_data", "ssl_keyfile", "ssl_certfile",
-        "ssl_password", "ssl_check_hostname", "ssl_min_version", "ssl_max_version",
-    )
+        "ssl", "ssl_cert_reqs", "ssl_ca_certs", "ssl_ca_data", "ssl_ca_path",
+        "ssl_keyfile", "ssl_certfile", "ssl_password", "ssl_check_hostname",
+        "ssl_min_version", "ssl_max_version", "ssl_validate_ocsp",
+        "ssl_validate_ocsp_stapled", "ssl_ciphers",
+    }
+    # These options may differ between the text and binary pools without
+    # changing backend identity or authentication policy.
+    harmless_tuning_fields = {
+        "decode_responses", "encoding", "encoding_errors", "socket_timeout",
+        "socket_connect_timeout", "socket_keepalive", "socket_keepalive_options",
+        "retry_on_timeout", "retry_on_error", "health_check_interval", "client_name",
+        "protocol",
+    }
+    allowed_fields = backend_fields | harmless_tuning_fields | {"credential_provider"}
+    if set(kwargs) - allowed_fields:
+        raise BorrowReaderUnavailable("Redis transport options are unsupported")
+    if kwargs.get("credential_provider") is not None:
+        # Dynamic credentials cannot be compared safely without invoking the
+        # provider (which would be an external authentication side effect).
+        raise BorrowReaderUnavailable("dynamic Redis credentials are unsupported")
+    tls_options = backend_fields.intersection(kwargs) - {
+        "host", "port", "db", "username", "password", "path", "unix_socket_path", "ssl",
+    }
+    if class_name != "SSLConnection" and any(kwargs.get(key) is not None for key in tls_options):
+        raise BorrowReaderUnavailable("TLS options require a supported SSL transport")
     if class_name == "SSLConnection" and kwargs.get("ssl") is False:
         raise BorrowReaderUnavailable("Redis TLS configuration is inconsistent")
     material: dict[str, Any] = {"connection_class": class_name}
-    for key in fields:
+    for key in sorted(backend_fields):
         value = kwargs.get(key)
         if isinstance(value, bytes):
             value = {"bytes_sha256": hashlib.sha256(value).hexdigest()}
@@ -308,8 +329,18 @@ return 1
 """
 
 _REMOVE_EXACT_NATIVE_CLIENT_LUA = """
-if redis.call('EXISTS', KEYS[2]) == 0 then return 0 end
-if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then return 0 end
+local has_record = redis.call('EXISTS', KEYS[2])
+local has_membership = redis.call('SISMEMBER', KEYS[1], ARGV[1])
+if has_record == 0 then
+  if has_membership == 0 then return 0 end
+  -- The exact private client ID has no live record to replace. Removing only
+  -- its orphaned membership cannot delete a valid replacement hash.
+  redis.call('SREM', KEYS[1], ARGV[1])
+  if redis.call('SCARD', KEYS[1]) == 0 then
+    redis.call('SET', KEYS[3], ARGV[9], 'EX', ARGV[10])
+  end
+  return 1
+end
 if redis.call('HGET', KEYS[2], 'connected_at') ~= ARGV[2] then return 0 end
 if redis.call('HGET', KEYS[2], 'worker_id') ~= ARGV[3] then return 0 end
 if redis.call('HGET', KEYS[2], 'user_agent') ~= ARGV[4] then return 0 end
