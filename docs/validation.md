@@ -2,8 +2,9 @@
 
 Sections for 0.2.0 through 0.3.1 are historical candidate checkpoints; their
 pending release gates describe the status at that time. Version 0.4.0 is
-released; version 0.5.0 is the current development candidate. Their evidence
-and remaining limitations are recorded below.
+released; version 0.5.0 implementation and user acceptance are complete, with
+publication pending its required release workflow. Its evidence and remaining
+limitations are recorded below.
 
 ## Released baseline: 0.1.4
 
@@ -230,19 +231,19 @@ not attributed to Catchuparr; no causal claim is made. The synthetic native
 results do not establish playback-client compatibility. See the
 [0.4.0 behavior and validation guide](candidate-0.4.0.md) for details.
 
-## 0.5.0 native output candidate
+## 0.5.0 native output integration
 
-The candidate adds a disabled-by-default toggle for Catchuparr archive metadata
-in Dispatcharr's native M3U/XMLTV endpoints. The 433-test local suite, Ruff,
-Python compilation, package validation and independent review pass. The
-30-entry package has SHA-256
+Version 0.5.0 adds a disabled-by-default toggle for Catchuparr archive metadata
+in Dispatcharr's native M3U/XMLTV endpoints. The earlier implementation passed
+the 433-test suite, Ruff, Python compilation and package validation. The
+30-entry package had SHA-256
 `e710fb265a70ed4c12b585ff750e02c4912a31bab417593d2f258c386996434a`.
 
 The scripts-only probe in `scripts/aio_native_output_probe.py`, called by the
 existing AIO harness, passed in both pinned Dispatcharr versions:
 
 - 0.31.0: `f81924fa3dbfeb463b3908be7e086bf58aacbd2ba56062bfb555ee3a471acf8f`
-- 0.32.0: `b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a`
+- 0.32.0: `b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`
 
 Each full run passed its 32 AIO tests and the integration gates for native
 output, signed archive playback, byte ranges, current permissions and session
@@ -250,10 +251,15 @@ limits, Stats Stop, and cleanup. The two version runs completed separately; this
 does not establish concurrent-run behavior. The existing M3U/XMLTV callback,
 ORM and Redis paths were exercised without bypassing their native checks.
 
-Required CI, isolated Dev verification and real-player acceptance remain
-pending. These server-side checks do not establish player compatibility,
-archive output-profile transcoding or frame-accurate seeking; the candidate is
-not release-ready.
+The final 30-entry package has SHA-256
+`ac24d28af19312f4f107f04a3b7e4263e43d619311105334b0cbfec8b7954fe8`. The final
+parity correction received independent review and passed four focused
+native 0.32.0 cases, including authorization and HEAD cleanup. The complete
+historical suite and 0.31.0 probes
+were not rerun after the correction. User acceptance is complete. Required
+release CI remains the publication gate. These server-side checks do not
+establish every player's compatibility, archive output-profile transcoding or
+frame-accurate seeking.
 
-See the [0.5.0 candidate guide](candidate-0.5.0.md) for the feature boundary,
+See the [0.5.0 guide](candidate-0.5.0.md) for the feature boundary,
 authorization model, output-profile limitation and rollback state.

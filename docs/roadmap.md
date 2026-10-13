@@ -1,6 +1,6 @@
 # Catchuparr roadmap
 
-Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. The only release currently in development is 0.5.0; later work is planned, not implemented.
+Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Version 0.5.0 implementation and user acceptance are complete; publication awaits the required release workflow. Production deployment is outside this roadmap. Later work is planned, not implemented.
 
 ## Workflow and release gates
 
@@ -19,7 +19,7 @@ Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed w
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented; superseded by the 0.3.1 candidate and not published separately |
 | 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Superseded development version; included in released 0.4.0 |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
-| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Both pinned AIO probes, 433 local tests, package checks and independent review pass; required CI, isolated Dev verification and player acceptance remain pending |
+| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | User acceptance complete; final parity correction passed four focused native 0.32.0 cases; required release workflow remains pending; not yet published |
 | 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.0 is complete |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
@@ -303,23 +303,25 @@ Test recorder-only workers, shared workers, genuine local clients, more than ten
 
 ## 0.5.0 — native output integration
 
-This is the only release currently in development. It remains optional and is
-disabled by default; the existing separate Catchuparr links remain available.
+Release preparation is complete. Publication awaits the required workflow. The
+feature remains optional and disabled by default; separate Catchuparr links
+remain available.
 
 - One settings toggle, disabled by default, enables local catch-up attributes and archived EPG in native Dispatcharr M3U/XMLTV links.
 - Keep the full existing channel list, profiles, permissions, live URLs and provider catch-up. Separate plugin links remain available independently.
 - Disable the toggle to restore original output without local additions. Toggle changes require no container restart.
 - Use version-checked, idempotent and removable wrappers; test authorization, gaps, duplicate EPG entries and both toggle states.
 
-The 433-test local suite and full synthetic AIO probes passed on pinned
-Dispatcharr 0.31.0 and 0.32.0. Those two runs completed separately and are not
-a concurrency test. Required CI, isolated Dev verification and real-player
-acceptance remain release gates; see the [validation record](validation.md).
+The earlier implementation passed the 433-test suite and full native AIO probes
+on pinned Dispatcharr 0.31.0 and 0.32.0. The final parity correction passed
+four focused native 0.32.0 cases; the complete historical suite and 0.31.0
+probes were not rerun afterward. User acceptance is complete. Required release
+CI remains the publication gate; see the [validation record](validation.md).
 
 ## 0.6.0 — smart connection sharing (planned)
 
 Implementation is deferred. This release is a future plan and none of the
-behavior below is available in the current release or 0.5.0 development.
+behavior below is available in the current release or 0.5.0.
 
 - Keep the feature disabled by default. When enabled, share one upstream live
   connection for compatible viewers of the same channel, while respecting
