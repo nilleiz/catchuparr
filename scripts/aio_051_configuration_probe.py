@@ -1,6 +1,7 @@
 """Exercise the 0.5.1 configuration compiler against real Django catalog rows."""
 
 import json
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -12,6 +13,7 @@ def require(condition, message):
 
 
 def probe():
+    sys.path.insert(0, "/data/plugins")
     from apps.channels.models import (
         Channel,
         ChannelProfile,
@@ -206,6 +208,7 @@ def probe():
             validated = validate_configuration(settings)
             applied = apply_configuration(settings, active_path=active_path)
             active = load_active_configuration(active_path)
+            persisted = json.loads(active_path.read_text(encoding="utf-8"))
             require(applied.get("applied") is True, "real Django configuration Apply failed")
             require(validated["channels"] == applied["channels"],
                     "Validate and Apply previews diverged")
@@ -218,6 +221,9 @@ def probe():
             require(active["source_policies"][str(channel_a.uuid)]["priorities"]
                     == [[str(account_b.id), 20]], "v5 snapshot did not retain replacement priorities")
             previews = {row["channel_uuid"]: row for row in validated["channels"]}
+            require(persisted["configuration_origins"] == {
+                key: value["configuration_origin"] for key, value in previews.items()
+            }, "raw v5 persisted origins differ from the validated effective preview")
             require(previews[str(channel_a.uuid)]["effective_source_policy"] == {
                 "include": None, "exclude": [account_a.name],
                 "priority": {account_b.name: 20},
