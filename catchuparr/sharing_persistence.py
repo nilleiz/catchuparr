@@ -333,8 +333,8 @@ class SharingIntentLedger:
                 raise ValueError("borrow intent requires exact admitted target identity")
             if state.candidate_connection_identity != target_identity:
                 raise ValueError("borrow target does not match the planner candidate")
-        elif target_admitted:
-            raise ValueError("target_admitted applies only to attach-borrow intents")
+        elif target_identity is not None or target_admitted:
+            raise ValueError("target identity and admission apply only to attach-borrow intents")
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 1):
             raise ValueError("expected_revision must be positive or None for first insert")
         updated = self._finite_time(self.clock() if updated_at is None else updated_at, "updated_at")

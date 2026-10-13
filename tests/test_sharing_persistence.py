@@ -608,6 +608,32 @@ class SharingPersistenceTests(unittest.TestCase):
         self.assertTrue(ran)
         self.assertEqual("stop", result)
 
+    def test_nonborrow_target_is_rejected_before_persisting_any_intent(self):
+        for action, phase, pending in (
+            (SharingAction.RETURN_TO_ALLOWED, SharingPhase.FAILED, SharingAction.RETURN_TO_ALLOWED),
+            (SharingAction.PAUSE_NO_ALLOWED_SOURCE, SharingPhase.FAILED,
+             SharingAction.PAUSE_NO_ALLOWED_SOURCE),
+            (SharingAction.STOP, SharingPhase.STOPPED, None),
+        ):
+            with self.subTest(action=action):
+                ledger = SharingIntentLedger(
+                    Path(self.directory.name) / f"invalid-{action.value}.sqlite3",
+                    clock=lambda: self.now[0],
+                )
+                current = ledger.save(
+                    pending_attach(), action=SharingAction.ATTACH_BORROW,
+                    expected_revision=None, target_identity=IDENTITY,
+                    target_admitted=True, not_before=105.0,
+                )
+                before = ledger.read(CHANNEL)
+                invalid_state = replace(current.state, phase=phase, pending_action=pending)
+                with self.assertRaises(ValueError):
+                    ledger.save(
+                        invalid_state, action=action, expected_revision=current.revision,
+                        target_identity=IDENTITY, target_admitted=False, not_before=105.0,
+                    )
+                self.assertEqual(before, ledger.read(CHANNEL))
+
 
 if __name__ == "__main__":
     unittest.main()
