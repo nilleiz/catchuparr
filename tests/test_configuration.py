@@ -90,7 +90,20 @@ class ConfigurationTests(unittest.TestCase):
 
         self.assertEqual(2, result["selected_channel_count"])
         self.assertEqual("2 channel(s) selected.", result["message"])
+        self.assertEqual(
+            {"source_filter", "priority", "schedule_days"},
+            set(result["channels"][0]["configuration_origin"]),
+        )
+        self.assertEqual(
+            {"default continuous"},
+            set(result["channels"][0]["configuration_origin"]["schedule_days"].values()),
+        )
         self.assertTrue(applied["applied"])
+        self.assertEqual(result["channels"], applied["channels"])
+        self.assertEqual(
+            {"include": None, "exclude": [], "priority": {}},
+            result["channels"][0]["effective_source_policy"],
+        )
         self.assertEqual(ACTIVE_CONFIG_VERSION, saved["version"])
         self.assertEqual([CHANNEL_A, CHANNEL_B], saved["channel_uuids"])
         self.assertEqual(["7"], saved["channel_profile_ids"])
@@ -101,7 +114,32 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("filter_config", serialized)
         self.assertNotIn("https://provider.invalid", serialized)
 
-    def test_v4_snapshot_contains_settings_and_stable_per_channel_schedule(self):
+    def test_validate_and_apply_return_same_effective_policy_and_origins(self):
+        settings = dict(
+            self.settings,
+            filter_config=(
+                "version: 1\nprofile: all\nrules:\n"
+                "  - channels: {profile: Synthetic Profile All}\n"
+                "    include: [Synthetic Provider]\n"
+                "    priority: {Synthetic Provider: 20}\n"
+            ),
+        )
+        validated = validate_configuration(settings, self.catalog)
+        applied = apply_configuration(settings, self.catalog, self.active_path)
+
+        self.assertEqual(validated["channels"], applied["channels"])
+        self.assertEqual(
+            {
+                "include": ["Synthetic Provider"],
+                "exclude": [],
+                "priority": {"Synthetic Provider": 20},
+            },
+            validated["channels"][0]["effective_source_policy"],
+        )
+        self.assertEqual("rule 1", validated["channels"][0]["configuration_origin"]["source_filter"])
+        self.assertEqual("rule 1", validated["channels"][0]["configuration_origin"]["priority"])
+
+    def test_v5_snapshot_contains_settings_schedules_and_configuration_origins(self):
         settings = dict(
             self.settings,
             filter_config=(
@@ -113,7 +151,7 @@ class ConfigurationTests(unittest.TestCase):
         apply_configuration(settings, self.catalog, self.active_path)
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
         active = load_active_configuration(self.active_path)
-        self.assertEqual(4, snapshot["version"])
+        self.assertEqual(5, snapshot["version"])
         self.assertEqual(True, snapshot["settings"]["recording_enabled"])
         self.assertEqual("INFO", snapshot["settings"]["log_level"])
         self.assertEqual(
@@ -127,6 +165,11 @@ class ConfigurationTests(unittest.TestCase):
             snapshot["recording_schedule"],
         )
         self.assertEqual(snapshot["recording_schedule"], active["recording_schedule"])
+        self.assertEqual({CHANNEL_A, CHANNEL_B}, set(snapshot["configuration_origins"]))
+        self.assertEqual(
+            {"source_filter", "priority", "schedule_days"},
+            set(snapshot["configuration_origins"][CHANNEL_A]),
+        )
         sidecar = json.loads(
             (self.active_path.parent / ".catchuparr-recorder-control.json").read_text(
                 encoding="utf-8"
@@ -141,6 +184,16 @@ class ConfigurationTests(unittest.TestCase):
             configuration.active_configuration_generation(applied),
             control.configuration_generation,
         )
+
+    def test_v4_snapshot_without_origins_remains_readable(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+        snapshot["version"] = 4
+        snapshot.pop("configuration_origins")
+        self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        active = load_active_configuration(self.active_path)
+        self.assertEqual(4, active["version"])
+        self.assertEqual([CHANNEL_A, CHANNEL_B], active["channel_uuids"].splitlines())
 
     def test_stats_reader_is_nonblocking_readonly_and_ignores_drafts(self):
         applied = dict(
@@ -1199,6 +1252,7 @@ class ConfigurationTests(unittest.TestCase):
         apply_configuration(self.settings, self.catalog, self.active_path)
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
         snapshot["version"] = 3
+        snapshot.pop("configuration_origins")
         snapshot["settings"].pop("recording_enabled")
         snapshot["settings"].pop("log_level")
         snapshot["settings"].pop("public_base_url")
@@ -1218,6 +1272,7 @@ class ConfigurationTests(unittest.TestCase):
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
         snapshot["version"] = 2
         snapshot.pop("recording_schedule")
+        snapshot.pop("configuration_origins")
         snapshot["settings"].pop("recording_enabled")
         snapshot["settings"].pop("show_archive_playback_in_stats")
         snapshot["settings"].pop("hide_recorders_in_stats")

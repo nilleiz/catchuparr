@@ -1,6 +1,6 @@
 # Catchuparr roadmap
 
-Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Version 0.5.0 implementation and user acceptance are complete; publication awaits the required release workflow. Production deployment is outside this roadmap. Later work is planned, not implemented.
+Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Version 0.5.0 implementation and user acceptance are complete; publication awaits the required release workflow. The 0.5.1 configuration-inheritance prerelease is implemented, with its full pinned AIO probes passed; CI, isolated Dev verification and publication remain pending. Production deployment is outside this roadmap. Later work is planned, not implemented.
 
 ## Workflow and release gates
 
@@ -20,7 +20,8 @@ Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed w
 | 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Superseded development version; included in released 0.4.0 |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | User acceptance complete; final parity correction passed four focused native 0.32.0 cases; required release workflow remains pending; not yet published |
-| 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.0 is complete |
+| 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Implemented in the prerelease candidate; the 453-test suite and full pinned AIO probes passed; CI and isolated Dev verification remain pending |
+| 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.1 acceptance is complete |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.
@@ -303,25 +304,103 @@ Test recorder-only workers, shared workers, genuine local clients, more than ten
 
 ## 0.5.0 — native output integration
 
-Release preparation is complete. Publication awaits the required workflow. The
-feature remains optional and disabled by default; separate Catchuparr links
-remain available.
+This is the only release currently in development. It remains optional and is
+disabled by default; the existing separate Catchuparr links remain available.
 
 - One settings toggle, disabled by default, enables local catch-up attributes and archived EPG in native Dispatcharr M3U/XMLTV links.
 - Keep the full existing channel list, profiles, permissions, live URLs and provider catch-up. Separate plugin links remain available independently.
 - Disable the toggle to restore original output without local additions. Toggle changes require no container restart.
 - Use version-checked, idempotent and removable wrappers; test authorization, gaps, duplicate EPG entries and both toggle states.
 
-The earlier implementation passed the 433-test suite and full native AIO probes
-on pinned Dispatcharr 0.31.0 and 0.32.0. The final parity correction passed
-four focused native 0.32.0 cases; the complete historical suite and 0.31.0
-probes were not rerun afterward. User acceptance is complete. Required release
-CI remains the publication gate; see the [validation record](validation.md).
+The 433-test local suite and full synthetic AIO probes passed on pinned
+Dispatcharr 0.31.0 and 0.32.0. Those two runs completed separately and are not
+a concurrency test. Required CI, isolated Dev verification and real-player
+acceptance remain release gates; see the [validation record](validation.md).
+
+## 0.5.1 — named profile configuration inheritance (prerelease)
+
+This is a configuration step between 0.5.0 and 0.6.0. The behavior below is
+implemented in the 0.5.1 prerelease candidate and is not supported by released
+0.5.0. The 453-test suite and full pinned AIO probes passed. CI, isolated Dev
+verification and publication remain pending. It does not change
+enabled profile membership or add connection sharing; 0.6.0 sharing and its
+cooldown design remain as described below.
+
+- A named profile supplies the base configuration for its enabled members.
+  Direct channel rules selected by name or number act as exceptions regardless
+  of their order relative to that profile rule. Group selectors cannot act as
+  profile exceptions. Enabled membership is unchanged.
+- For sources, an omitted `include`/`exclude` inherits the profile's effective
+  filter. An explicit `include` or `exclude` replaces that filter; they remain
+  mutually exclusive. An explicit `priority` replaces the whole inherited map,
+  and `priority: {}` clears inherited scores. Validate the resulting effective
+  values after inheritance.
+- A rule's own schedule replaces the whole week by default: omitted days are
+  off. `schedule_mode: replace` makes that behavior explicit. With
+  `schedule_mode: override_days`, only specified expanded days replace the
+  inherited day and all other days inherit. An explicitly empty day is off.
+  `schedule_mode` is valid only when the rule has its own schedule.
+- Expand schedule groups before inheritance. Resolve each day from its direct
+  day entry, then its group entry, then `daily`. Replacing a day also removes
+  inherited overnight windows owned by that start day.
+- Reject multiple matching direct rules and competing named profile rules.
+  Validate the final effective source filters and schedules at the same Apply
+  that activates them, and retain the origin of each inherited or replaced
+  value for validation feedback.
+
+The following generic YAML sketches describe the planned syntax only. They are
+not accepted by the current 0.5.0 candidate.
+
+An explicit filter replaces the inherited filter for the selected direct
+channel. Here the direct rule's include list replaces the profile's exclude
+list; its priority map is the complete effective map for that channel. Assume
+Synthetic Channel A is an enabled member of Synthetic Recording Profile, and
+the listed sources are assigned to it.
+
+```yaml
+version: 1
+profile: all
+rules:
+  - channels:
+      profile: "Synthetic Recording Profile"
+    exclude: ["Synthetic M3U B"]
+    priority:
+      "Synthetic M3U A": 20
+  - channels:
+      names: ["Synthetic Channel A"]
+    include: ["Synthetic M3U C"]
+    priority:
+      "Synthetic M3U C": 50
+```
+
+For schedules, `replace` leaves unspecified days off. `override_days` replaces
+only the expanded `weekdays` group; Saturday and Sunday still inherit. An
+explicitly empty day turns that day off.
+
+```yaml
+version: 1
+profile: all
+rules:
+  - channels:
+      profile: "Synthetic Recording Profile"
+    schedule:
+      daily:
+        - start: "08:00"
+          end: "18:00"
+  - channels:
+      names: ["Synthetic Channel A"]
+    schedule_mode: override_days
+    schedule:
+      weekdays:
+        - start: "18:00"
+          end: "22:00"
+      sunday: []
+```
 
 ## 0.6.0 — smart connection sharing (planned)
 
 Implementation is deferred. This release is a future plan and none of the
-behavior below is available in the current release or 0.5.0.
+behavior below is available in the current release or 0.5.0 development.
 
 - Keep the feature disabled by default. When enabled, share one upstream live
   connection for compatible viewers of the same channel, while respecting

@@ -185,6 +185,162 @@ class SourceRulesTests(unittest.TestCase):
         self.assertEqual(frozenset({"13"}), result.source_policies[CHANNEL_A].exclude_account_ids)
         self.assertEqual(["b1"], [row["stream_id"] for row in result.channels[1]["candidates"]])
 
+    def test_named_profile_filters_inherit_and_direct_exceptions_ignore_order(self):
+        profile_first = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    exclude: [Synthetic Source C]\n"
+            "    priority: {Synthetic Source A: 10}\n"
+            "    schedule: {monday: [{start: '08:00', end: '10:00'}]}\n"
+            "  - channels: {names: [Synthetic Channel B]}\n"
+            "    include: [Synthetic Source B]\n"
+            "    priority: {Synthetic Source B: 80}\n"
+        )
+        direct_first = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {numbers: ['3.5']}\n"
+            "    include: [Synthetic Source B]\n"
+            "    priority: {Synthetic Source B: 80}\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    exclude: [Synthetic Source C]\n"
+            "    priority: {Synthetic Source A: 10}\n"
+            "    schedule: {monday: [{start: '08:00', end: '10:00'}]}\n"
+        )
+        self.assertEqual(profile_first.channel_uuids, direct_first.channel_uuids)
+        self.assertEqual(profile_first.source_policies, direct_first.source_policies)
+        self.assertEqual(frozenset({"13"}), profile_first.source_policies[CHANNEL_A].exclude_account_ids)
+        self.assertEqual(frozenset({"12"}), profile_first.source_policies[CHANNEL_B].include_account_ids)
+        self.assertEqual((("11", 10),), profile_first.source_policies[CHANNEL_A].priorities)
+        self.assertEqual((("12", 80),), profile_first.source_policies[CHANNEL_B].priorities)
+        self.assertEqual({"mode": "weekly", "intervals": [[480, 600]]},
+                         profile_first.channel_schedules[CHANNEL_B].to_snapshot())
+        self.assertEqual("rule 2", profile_first.channel_origins[CHANNEL_B]["source_filter"])
+        self.assertEqual("rule 1", direct_first.channel_origins[CHANNEL_B]["source_filter"])
+
+    def test_profile_schedule_inheritance_replacement_and_day_origins(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    schedule: {daily: [{start: '08:00', end: '18:00'}]}\n"
+            "  - channels: {names: [Synthetic Channel A]}\n"
+            "    schedule_mode: override_days\n"
+            "    schedule: {weekdays: [{start: '18:00', end: '22:00'}], sunday: []}\n"
+        )
+        self.assertEqual(
+            {"mode": "weekly", "intervals": [[1080, 1320], [2520, 2760],
+             [3960, 4200], [5400, 5640], [6840, 7080], [7680, 8280]]},
+            result.channel_schedules[CHANNEL_A].to_snapshot(),
+        )
+        self.assertEqual("rule 2", result.channel_origins[CHANNEL_A]["schedule_days"]["monday"])
+        self.assertEqual("rule 1", result.channel_origins[CHANNEL_A]["schedule_days"]["saturday"])
+
+    def test_readme_051_complete_example_compiles_to_expected_effective_values(self):
+        result = self.compile(
+            "version: 1\nprofile: all\ntimezone: Etc/UTC\nrules:\n"
+            "  - channels:\n      profile: Synthetic Profile All\n"
+            "    exclude: [Synthetic Source B]\n"
+            "    priority: {Synthetic Source A: 20}\n"
+            "    schedule: {daily: [{start: '08:00', end: '18:00'}]}\n"
+            "  - channels:\n      names: [Synthetic Channel A]\n"
+            "    include: [Synthetic Source B]\n"
+            "    priority: {Synthetic Source B: 50}\n"
+            "    schedule_mode: override_days\n"
+            "    schedule: {weekdays: [{start: '18:00', end: '22:00'}], sunday: []}\n"
+        )
+        self.assertEqual(frozenset({"12"}), result.source_policies[CHANNEL_A].include_account_ids)
+        self.assertEqual((("12", 50),), result.source_policies[CHANNEL_A].priorities)
+        self.assertEqual("rule 2", result.channel_origins[CHANNEL_A]["source_filter"])
+        self.assertEqual("rule 2", result.channel_origins[CHANNEL_A]["priority"])
+        self.assertEqual("rule 1", result.channel_origins[CHANNEL_A]["schedule_days"]["saturday"])
+
+    def test_empty_override_day_removes_inherited_overnight_start_window(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    schedule: {sunday: [{start: '23:00', end: '02:00'}]}\n"
+            "  - channels: {names: [Synthetic Channel A]}\n"
+            "    schedule_mode: override_days\n"
+            "    schedule: {sunday: []}\n"
+        )
+        self.assertEqual({"mode": "weekly", "intervals": []},
+                         result.channel_schedules[CHANNEL_A].to_snapshot())
+
+    def test_own_schedule_defaults_to_full_week_replacement(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    schedule: {daily: [{start: '08:00', end: '18:00'}]}\n"
+            "  - channels: {numbers: [1]}\n"
+            "    schedule: {monday: [{start: '09:00', end: '10:00'}]}\n"
+        )
+        self.assertEqual({"mode": "weekly", "intervals": [[540, 600]]},
+                         result.channel_schedules[CHANNEL_A].to_snapshot())
+
+    def test_schedule_mode_requires_own_schedule_and_rule_conflicts_are_rejected(self):
+        invalid = (
+            ("version: 1\nrules: [{channels: {numbers: [1]}, schedule_mode: replace}]\n",
+             "requires schedule"),
+            ("version: 1\nrules: [{channels: {profile: Synthetic Profile All}}, "
+             "{channels: {profile: Synthetic Profile Limited}}]\n", "competing named profile"),
+            ("version: 1\nrules: [{channels: {numbers: [1]}}, "
+             "{channels: {names: [Synthetic Channel A]}}]\n", "direct channel rules overlap"),
+            ("version: 1\nrules: [{channels: {profile: Synthetic Profile Limited}}, "
+             "{channels: {groups: [News]}}]\n", "exceptions require names or numbers"),
+        )
+        for document, message in invalid:
+            with self.subTest(message=message), self.assertRaisesRegex(SourceRuleError, message):
+                self.compile(document)
+
+    def test_effective_inherited_priority_is_validated_after_filter_replacement(self):
+        document = (
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    exclude: []\n"
+            "    priority: {Synthetic Source B: 20}\n"
+            "  - channels: {names: [Synthetic Channel A]}\n"
+            "    include: [Synthetic Source A]\n"
+        )
+        with self.assertRaisesRegex(SourceRuleError, "excluded by include filter"):
+            self.compile(document)
+
+    def test_final_policy_can_replace_filter_and_priority_in_later_exception(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    include: [Synthetic Source A]\n"
+            "    priority: {Synthetic Source A: 10}\n"
+            "  - channels: {names: [Synthetic Channel A]}\n"
+            "    include: [Synthetic Source B]\n"
+            "    priority: {Synthetic Source B: 20}\n"
+        )
+        policy = result.source_policies[CHANNEL_A]
+        self.assertEqual(frozenset({"12"}), policy.include_account_ids)
+        self.assertEqual((("12", 20),), policy.priorities)
+
+    def test_final_policy_still_rejects_unreplaced_incompatible_priority(self):
+        document = (
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    include: [Synthetic Source A]\n"
+            "    priority: {Synthetic Source A: 10}\n"
+            "  - channels: {names: [Synthetic Channel A]}\n"
+            "    include: [Synthetic Source B]\n"
+        )
+        with self.assertRaisesRegex(SourceRuleError, "excluded by include filter"):
+            self.compile(document)
+
+    def test_empty_priority_mapping_clears_inherited_map(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    include: [Synthetic Source A]\n"
+            "    priority: {Synthetic Source A: 20}\n"
+            "  - channels: {numbers: [1]}\n"
+            "    priority: {}\n"
+        )
+        self.assertEqual(frozenset({"11"}), result.source_policies[CHANNEL_A].include_account_ids)
+        self.assertEqual((), result.source_policies[CHANNEL_A].priorities)
+
     def test_selector_numbers_names_groups_and_profiles(self):
         number = self.compile(
             "version: 1\nprofile: all\nrules:\n  - channels:\n      numbers: [1, '3.5']\n"

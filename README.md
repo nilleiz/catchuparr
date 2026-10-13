@@ -17,18 +17,23 @@ archive is local to the Dispatcharr installation and is not a cloud service.
 
 - Version 0.4.0 is released. Version 0.5.0 implementation and user acceptance
   are complete; publication awaits the required release workflow and it is not
-  yet published.
+  yet published. Version 0.5.1 is a prerelease candidate; its 453-test suite
+  and full pinned AIO probes pass. CI, isolated Dev verification and publication
+  remain pending.
 - Dispatcharr 0.31.0 and 0.32.0 are the supported versions covered by the
   repository's pinned native integration checks.
 - The primary path is M3U/XMLTV with HLS playback using MPEG-TS segments.
 - Native XC playback is implemented behind guarded Dispatcharr hooks. Native
   server integration is covered by synthetic checks; player-specific XC
   acceptance is still separate and should be verified with the client in use.
-- The 0.5.0 native output integration adds an optional M3U/XMLTV archive
-  toggle. The earlier implementation passed 433 tests and full pinned AIO probes
-  on Dispatcharr 0.31.0 and 0.32.0; its final parity correction passed four
-  focused native 0.32.0 cases. User acceptance is complete; required release CI
-  remains pending. See the [0.5.0 guide](docs/candidate-0.5.0.md).
+- Version 0.5.0 adds an optional native M3U/XMLTV archive toggle. The earlier
+  implementation passed 433 tests and full pinned AIO probes on Dispatcharr
+  0.31.0 and 0.32.0. Its final parity correction passed four focused native
+  0.32.0 cases; required release CI remains pending. See the
+  [0.5.0 guide](docs/candidate-0.5.0.md).
+- The 0.5.1 prerelease candidate adds named-profile configuration inheritance.
+  CI, isolated Dev verification and publication remain pending; see the
+  [0.5.1 candidate guide](docs/candidate-0.5.1.md).
 - Playback follows the selected user's Dispatcharr permissions, channel access,
   catch-up permission and stream/session limits. It does not provide transcoding
   or frame-accurate seeking.
@@ -75,7 +80,7 @@ a draft alone does not alter the active recorder configuration.
 | **Catchuparr log level** | Catchuparr-only log verbosity: `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | **Show archive playback in Stats** | Add active Catchuparr archive viewers to native Timeshift Stats. Enabled by default. |
 | **Hide recorders in Stats** | Hide positively identified Catchuparr recorder clients from live Stats details. Enabled by default. |
-| **Add Catchuparr catch-up to native output** | Optional 0.5.0 setting. Adds local archive metadata to eligible native Dispatcharr M3U/XMLTV output. Disabled by default; use the same unified Apply as other settings. |
+| **Add Catchuparr catch-up to native output** | Optional 0.5.0 candidate setting. Adds local archive metadata to eligible native Dispatcharr M3U/XMLTV output. Disabled by default; use the same unified Apply as other settings. |
 
 ### Select channels and sources
 
@@ -88,10 +93,12 @@ members; `channels: {profile: all}` selects every eligible channel.
 The outer `profile` (default `all`) limits which channels are eligible for rule
 selection; it does not select or record those channels by itself. A nonblank
 configuration with no rules selects no channels. Each rule's selector must
-resolve to at least one eligible channel, and concrete rule selectors may not
-overlap. `channels.profile: all` also sets the baseline source policy for all
-eligible channels: use every source already assigned to each channel. A
-specific rule replaces that baseline policy for its selected channels.
+resolve to at least one eligible channel. Direct channel rules may not overlap
+each other, and named profile rules may not compete for the same channel.
+Direct rules selected by channel name or number may overlap a named profile
+rule; they act as exceptions regardless of YAML order. A group selector cannot
+act as a named-profile exception. `channels.profile: all` selects all eligible
+channels and can provide a baseline configuration.
 
 The following selector forms are examples. For the combined example, choose
 values that resolve to disjoint channels in your catalog:
@@ -123,12 +130,17 @@ rules:
 
 `include` and `exclude` refer to exact M3U source names already assigned to a
 channel. They are mutually exclusive. `exclude: []` allows every assigned
-source. `priority` is an integer score for sources permitted by that rule;
-higher scores are tried first, missing scores are zero, and equal scores keep
-Dispatcharr's channel stream order. A source filter never assigns a source to a
-channel and never selects a source outside the allowed set. A filtered or
-prioritized rule may use a dedicated recorder and require another provider
-slot.
+source. When a rule omits both fields, its effective filter inherits from the
+matching named profile rule, then from `channels.profile: all` when present.
+An explicit `include` or `exclude` replaces the inherited filter. An explicit
+`priority` replaces the entire inherited priority map; an omitted priority map
+inherits, and `priority: {}` clears inherited scores. Priorities are integer
+scores for allowed sources; higher scores are tried first, missing scores are
+zero, and equal scores keep Dispatcharr's channel stream order. The final
+combined filter and priority map are validated when you validate or Apply. A
+source filter never assigns a source to a channel and never selects a source
+outside the allowed set. A filtered or prioritized rule may use a dedicated
+recorder and require another provider slot.
 
 ```yaml
 version: 1
@@ -171,15 +183,118 @@ global one: channels 100–102 use its weekday and weekend windows, with the
 explicit Friday window replacing that rule's weekday window. Channels in
 `Synthetic Group` record continuously, excluding the named source.
 
+### Named profile inheritance in the 0.5.1 prerelease
+
+A named profile rule supplies source and schedule settings for its enabled
+members. Direct rules selected by channel name or number can override those
+settings before or after the profile rule in the YAML. Profile membership is
+still Dispatcharr's enabled membership; this feature does not change it.
+
+In this complete example, the profile excludes one source and sets its source
+priority map and weekday schedule. The direct channel rule replaces the source
+filter and whole priority map. Its `override_days` schedule changes Monday
+through Friday and turns Sunday off; Saturday inherits the profile's hours.
+Group expansion happens before inheritance, so `weekdays` means Monday through
+Friday. An empty day means recording is off for that day.
+
+```yaml
+version: 1
+profile: all
+timezone: Etc/UTC
+rules:
+  - channels:
+      profile: "Synthetic Profile All"
+    exclude: ["Synthetic Source B"]
+    priority:
+      "Synthetic Source A": 20
+    schedule:
+      daily:
+        - start: "08:00"
+          end: "18:00"
+  - channels:
+      names: ["Synthetic Channel A"]
+    include: ["Synthetic Source B"]
+    priority:
+      "Synthetic Source B": 50
+    schedule_mode: override_days
+    schedule:
+      weekdays:
+        - start: "18:00"
+          end: "22:00"
+      sunday: []
+```
+
+A rule with its own schedule uses `schedule_mode: replace` by default. It
+replaces the entire inherited week, and unspecified days are off. Spell
+`schedule_mode: replace` to make that choice explicit. Use
+`schedule_mode: override_days` to replace only days present after group
+expansion; all other days inherit. `schedule_mode` requires a `schedule` on the
+same rule. Overnight windows belong to their start day: replacing or emptying
+that day removes its inherited overnight window, while an overnight window
+starting on the preceding day can still extend into it.
+
+Validation previews show the effective source filter, priority map and schedule
+along with the rule or document schedule each value came from. Validate and
+Apply compile the same complete settings draft, and Apply stores the resolved
+values and their origins together. Multiple direct rules selecting the same
+channel are invalid. Named profile rules whose enabled memberships overlap are
+also invalid.
+
+Order does not affect the inheritance. This complete example places the direct
+numeric-channel exception before its named-profile rule; it resolves the same
+effective values as the reversed order.
+
+```yaml
+version: 1
+profile: all
+rules:
+  - channels:
+      numbers: ["3.5"]
+    include: ["Synthetic Source B"]
+    priority:
+      "Synthetic Source B": 80
+  - channels:
+      profile: "Synthetic Profile All"
+    exclude: ["Synthetic Source C"]
+    priority:
+      "Synthetic Source A": 10
+    schedule:
+      monday:
+        - start: "08:00"
+          end: "10:00"
+```
+
+These two sketches are invalid examples because each creates a conflict:
+
+```yaml
+version: 1
+profile: all
+rules:
+  # Synthetic Channel A is channel number 1 in this catalog.
+  - channels: {numbers: [1]}
+  - channels: {names: ["Synthetic Channel A"]}
+```
+
+```yaml
+version: 1
+profile: all
+rules:
+  - channels: {profile: "Synthetic Profile All"}
+  - channels: {profile: "Synthetic Profile Limited"}
+```
+
 ### Schedule behavior
 
 Top-level and per-rule schedules accept `daily`, `weekdays`, `weekend` and
 explicit weekday keys (`monday` through `sunday`). For each day, an explicit
 weekday entry overrides its group, which overrides `daily`. A day without a
-matching entry is off. A rule schedule replaces the global schedule for that
-rule; it does not merge with it. An omitted schedule means continuous recording
-when no global schedule is present. `schedule: {}` means off; `schedule:
-continuous` means always on.
+matching entry is off in a replacing schedule. An omitted rule schedule
+inherits the applicable named profile schedule, then the top-level schedule,
+then continuous recording when neither is present. A rule with its own schedule
+replaces the inherited week by default; use `schedule_mode: override_days` to
+merge only specified expanded days. In `replace` mode, `schedule: {}` means off;
+in `override_days` mode, `schedule: {}` changes no days. `schedule: continuous`
+means always on in replace mode.
 
 Times are local wall-clock values in the selected IANA timezone. The timezone
 is resolved when applying configuration in this order: valid YAML `timezone`,
@@ -345,17 +460,16 @@ ruff check .
 python3 scripts/build_plugin.py
 ```
 
-## Optional native output archive (0.5.0)
+## Optional native output archive (0.5.0 candidate)
 
-Version 0.5.0 adds local archive metadata to Dispatcharr's native M3U/XMLTV
+The candidate adds local archive metadata to Dispatcharr's native M3U/XMLTV
 exports when **Add Catchuparr catch-up to native output** is enabled and applied.
 It preserves the native channel/profile output and provider catch-up fields.
 Native archive playback serves stored MPEG-TS segments; a live output profile
-does not transcode archive media. The setting defaults off. The earlier
-implementation passed 433 tests and full pinned native AIO probes; the final
-parity correction passed four focused native 0.32.0 cases. User acceptance is
-complete; required release CI remains pending. Read the
-[guide](docs/candidate-0.5.0.md) before enabling it.
+does not transcode archive media. The setting defaults off. The 433-test local
+suite and full pinned native AIO probes pass; required CI, isolated Dev
+verification and player acceptance remain pending. Read the
+[candidate guide](docs/candidate-0.5.0.md) before enabling it.
 
 CI also runs synthetic integration against pinned Dispatcharr AIO images for
 0.31.0 and 0.32.0. See [development and deployment](docs/development.md) for an
