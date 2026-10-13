@@ -246,12 +246,15 @@ class FFmpegCopyRecorder:
                     list_path, offset, require_useful_media=True,
                     attempt_switch=attempt_switch,
                 )
+                if committed:
+                    # These rows are already committed under the switch
+                    # publication barrier. Count them even if the requester
+                    # sets the signal immediately after that commit.
+                    useful += committed
+                    last_useful_at = time.monotonic()
                 if attempt_switch is not None and attempt_switch.is_set():
                     status = "switch_requested"
                     break
-                if committed:
-                    useful += committed
-                    last_useful_at = time.monotonic()
                 now = time.monotonic()
                 if useful == 0 and now - start_clock >= startup_timeout:
                     status = "no_media"

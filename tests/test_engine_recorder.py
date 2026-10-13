@@ -264,6 +264,56 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(1, len(segments))
         self.assertTrue(segments[0].discontinuity)
 
+    def test_attempt_switch_counts_segment_committed_immediately_before_request(self):
+        switch = RecorderAttemptSwitch()
+        stop_event = threading.Event()
+
+        class CommittedThenSwitchedProcess:
+            def __init__(self, command, **_kwargs):
+                self.command = command
+                self.return_code = None
+                output = Path(command[-1]).parent / "committed.ts"
+                output.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                listing = Path(command[command.index("-segment_list") + 1])
+                listing.write_text("committed.ts,0,6\n", encoding="utf-8")
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self):
+                self.return_code = -15
+
+            def wait(self, timeout=None):
+                return self.return_code
+
+            def kill(self):
+                raise AssertionError("terminated process should already be reaped")
+
+        recorder = FFmpegCopyRecorder(
+            self.store, "ch1", "http://dispatcharr/catchuparr/recorder/ch1",
+            self.root / "switch-committed-work", fencing_token=11, require_media_progress=True,
+        )
+        publish = FFmpegCopyRecorder._publish_csv_rows
+
+        def publish_then_request(instance, *args, **kwargs):
+            result = publish(instance, *args, **kwargs)
+            if result[1]:
+                switch.request()
+            return result
+
+        with (
+            patch("catchuparr.engine.recorder.subprocess.Popen", CommittedThenSwitchedProcess),
+            patch.object(FFmpegCopyRecorder, "_publish_csv_rows", publish_then_request),
+        ):
+            result = recorder.run_candidate(stop_event, attempt_switch=switch)
+
+        self.assertEqual("switch_requested", result.status)
+        self.assertEqual(1, result.useful_segments)
+        self.assertEqual(1, len(self.store.segments("ch1")))
+
     def test_media_stall_without_attempt_switch_keeps_existing_final_flush_behavior(self):
         class StallingProcess:
             def __init__(self, command, **_kwargs):
