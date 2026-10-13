@@ -13,6 +13,13 @@
       "help_text": "Use version: 1 with channel rules selected by numbers, names, groups, or enabled profiles. Named-profile rules provide inherited source filters and schedules; direct channel rules can override them regardless of order. Omitted source filters inherit, explicit include/exclude replaces the filter, and explicit priority replaces the whole map. A rule schedule replaces the whole week by default; schedule_mode: override_days changes only specified expanded days. Day precedence is explicit weekday, group, then daily. Timezone is YAML timezone, valid container TZ, then detected system zone. Validate and Apply the complete settings together; blank YAML selects no channels. Filtered sources may need another provider slot."
     },
     {
+      "id": "connection_sharing_config",
+      "label": "Recorder connection sharing (YAML)",
+      "type": "text",
+      "default": "",
+      "help_text": "Optional version: 1 YAML. The default is disabled, with cooldowns of 5 seconds for a stable live target, 30 seconds after the last viewer leaves, and 60 seconds between switches. Set default.enabled and add per-channel rules using the same number/name/group/profile selectors as channel filters. Cooldowns are strict integers from 0 to 3600; zero disables only that cooldown. Sharing only applies to channels selected in Channel and source filter. Validate and Apply this together with all settings."
+    },
+    {
       "id": "archive_root",
       "label": "Archive path",
       "type": "string",

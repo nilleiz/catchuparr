@@ -25,8 +25,8 @@ from .native_output_security import ensure_native_key, native_key_id_valid
 from .runtime import PLUGIN_KEY, parse_settings
 
 ACTIVE_CONFIG_NAME = ".catchuparr-active-settings.json"
-ACTIVE_CONFIG_VERSION = 5
-SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, 4, ACTIVE_CONFIG_VERSION})
+ACTIVE_CONFIG_VERSION = 6
+SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, 4, 5, ACTIVE_CONFIG_VERSION})
 RESET_REQUIRED_NAME = ".catchuparr-configuration-reset-required"
 ACTIVATION_STATE_NAME = ".catchuparr-configuration-activation.json"
 ACTIVATION_BACKUP_NAME = ".catchuparr-configuration-activation-previous.json"
@@ -182,6 +182,19 @@ def compile_draft(
         catalog.profiles,
         catalog.streams_by_channel,
     )
+    from .source_rules import compile_connection_sharing_config
+
+    raw_sharing_config = settings.get("connection_sharing_config", "")
+    if raw_sharing_config is None:
+        raw_sharing_config = ""
+    if not isinstance(raw_sharing_config, str):
+        raise ValueError("connection_sharing_config must be text")
+    connection_sharing = compile_connection_sharing_config(
+        raw_sharing_config,
+        catalog.channels,
+        catalog.profiles,
+        compiled.channel_uuids,
+    )
     encoded = {
         channel_uuid: {
             "include_account_ids": (
@@ -197,6 +210,7 @@ def compile_draft(
     previews = [
         {
             **preview,
+            "connection_sharing": connection_sharing[preview["channel_uuid"]],
             "warning": (
                 "This filter opens a dedicated provider connection and may use "
                 "additional provider or tuner capacity."
@@ -220,6 +234,7 @@ def compile_draft(
             },
         },
         "configuration_origins": compiled.channel_origins,
+        "connection_sharing": connection_sharing,
         "recording_enabled": recording_enabled,
         "log_level": log_level,
     }, catalog, previews
@@ -315,6 +330,7 @@ def _apply_configuration_locked(
         "source_policies": active["source_policies"],
         "recording_schedule": active["recording_schedule"],
         "configuration_origins": active["configuration_origins"],
+        "connection_sharing": active["connection_sharing"],
     }
     _prevalidate_archive_root(document["settings"]["archive_root"])
     try:
@@ -1216,12 +1232,22 @@ def _active_configuration_view(data: dict[str, Any]) -> dict[str, Any]:
         }
     else:
         recording_schedule = data["recording_schedule"]
+    if data["version"] >= 6:
+        connection_sharing = data["connection_sharing"]
+    else:
+        from .source_rules import CONNECTION_SHARING_DEFAULTS
+
+        connection_sharing = {
+            channel: dict(CONNECTION_SHARING_DEFAULTS)
+            for channel in data["channel_uuids"]
+        }
     return {
         **data["settings"],
         "channel_uuids": "\n".join(channel_ids),
         "channel_profile_ids": list(data["channel_profile_ids"]),
         "source_policies": data["source_policies"],
         "recording_schedule": recording_schedule,
+        "connection_sharing": connection_sharing,
         "version": data["version"],
     }
 
@@ -1345,6 +1371,8 @@ def _validate_active_document(data: dict[str, Any]) -> None:
         expected_fields.add("recording_schedule")
     if version >= 5:
         expected_fields.add("configuration_origins")
+    if version >= 6:
+        expected_fields.add("connection_sharing")
     if set(data) != expected_fields:
         raise ValueError("Active Catchuparr configuration fields are invalid")
     settings = data["settings"]
@@ -1398,6 +1426,27 @@ def _validate_active_document(data: dict[str, Any]) -> None:
                 or any(not isinstance(value, str) for value in origin["schedule_days"].values())
             ):
                 raise ValueError("Active Catchuparr configuration origins are invalid")
+    if version >= 6:
+        from .source_rules import CONNECTION_SHARING_DEFAULTS
+
+        sharing = data.get("connection_sharing")
+        if not isinstance(sharing, dict) or set(sharing) != set(normalized_channels):
+            raise ValueError("Active Catchuparr connection sharing map is invalid")
+        expected_sharing_fields = set(CONNECTION_SHARING_DEFAULTS)
+        for channel, sharing_settings in sharing.items():
+            if (
+                not isinstance(sharing_settings, dict)
+                or set(sharing_settings) != expected_sharing_fields
+            ):
+                raise ValueError("Active Catchuparr connection sharing settings are invalid")
+            if type(sharing_settings.get("enabled")) is not bool:
+                raise ValueError("Active Catchuparr connection sharing enabled flag is invalid")
+            for field_name in expected_sharing_fields - {"enabled"}:
+                value = sharing_settings[field_name]
+                if type(value) is not int or not 0 <= value <= 3600:
+                    raise ValueError(
+                        f"Active Catchuparr connection sharing {field_name} is invalid"
+                    )
     profile_ids = data.get("channel_profile_ids")
     if (
         not isinstance(profile_ids, list)

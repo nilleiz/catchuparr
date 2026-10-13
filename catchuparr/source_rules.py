@@ -817,3 +817,119 @@ def _requires_override(policy: SourcePolicy) -> bool:
         or bool(policy.exclude_account_ids)
         or bool(policy.priorities)
     )
+
+
+CONNECTION_SHARING_DEFAULTS = {
+    "enabled": False,
+    "live_stability_seconds": 5,
+    "last_viewer_return_seconds": 30,
+    "min_switch_interval_seconds": 60,
+}
+_CONNECTION_SHARING_COOLDOWNS = (
+    "live_stability_seconds",
+    "last_viewer_return_seconds",
+    "min_switch_interval_seconds",
+)
+
+
+def compile_connection_sharing_config(
+    text: str,
+    channels: Iterable[Mapping[str, Any]],
+    profiles: Iterable[Mapping[str, Any]],
+    selected_channel_uuids: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    """Resolve strict per-channel sharing defaults and overrides to stable UUIDs."""
+    from copy import deepcopy
+
+    selected_ids = {str(value) for value in selected_channel_uuids}
+    selected_rows, selected_by_uuid = _channel_rows(
+        row for row in channels if str(row.get("uuid") or "") in selected_ids
+    )
+    if set(selected_by_uuid) != selected_ids:
+        raise SourceRuleError("connection_sharing_config references an unknown selected channel")
+    result = {channel: deepcopy(CONNECTION_SHARING_DEFAULTS) for channel in sorted(selected_ids)}
+    if not text.strip():
+        return result
+    document, rule_lines = _yaml_document(text)
+    if document is None:
+        return result
+    document = _mapping(
+        document,
+        line=1,
+        field="connection_sharing_config",
+        allowed={"version", "default", "rules"},
+        required={"version"},
+    )
+    if type(document.get("version")) is not int or document["version"] != 1:
+        raise SourceRuleError(
+            "line 1, field connection_sharing_config.version: expected integer version 1"
+        )
+
+    def values(raw: Any, *, line: int, field: str, base: dict[str, Any]) -> dict[str, Any]:
+        patch = _mapping(
+            raw, line=line, field=field,
+            allowed={"enabled", *_CONNECTION_SHARING_COOLDOWNS},
+        )
+        merged = dict(base)
+        if "enabled" in patch:
+            if type(patch["enabled"]) is not bool:
+                raise SourceRuleError(f"line {line}, field {field}.enabled: expected a boolean")
+            merged["enabled"] = patch["enabled"]
+        for key in _CONNECTION_SHARING_COOLDOWNS:
+            if key not in patch:
+                continue
+            value = patch[key]
+            if type(value) is not int or not 0 <= value <= 3600:
+                raise SourceRuleError(
+                    f"line {line}, field {field}.{key}: expected an integer from 0 to 3600"
+                )
+            merged[key] = value
+        return merged
+
+    defaults = values(
+        document.get("default", {}), line=1,
+        field="connection_sharing_config.default",
+        base=CONNECTION_SHARING_DEFAULTS,
+    )
+    result = {channel: dict(defaults) for channel in sorted(selected_ids)}
+    raw_rules = document.get("rules", [])
+    if not isinstance(raw_rules, list):
+        raise SourceRuleError("line 1, field connection_sharing_config.rules: expected a list")
+    if len(raw_rules) > MAX_RULES:
+        raise SourceRuleError("line 1, field connection_sharing_config.rules: too many rules")
+
+    profiles_by_name, _ = _profile_catalog(profiles)
+    occupied: set[str] = set()
+    for index, raw_rule in enumerate(raw_rules, start=1):
+        line = rule_lines[index - 1] if index <= len(rule_lines) else index + 2
+        rule = _mapping(
+            raw_rule, line=line, field=f"connection_sharing_config.rules[{index - 1}]",
+            allowed={"channels", "enabled", *_CONNECTION_SHARING_COOLDOWNS},
+            required={"channels"},
+        )
+        selector = _mapping(
+            rule["channels"], line=line,
+            field=f"connection_sharing_config.rules[{index - 1}].channels",
+            allowed={"numbers", "names", "groups", "profile"},
+        )
+        selected, _, _ = _resolve_channel_selector(
+            selector,
+            line=line,
+            channel_rows=selected_rows,
+            eligible_channel_ids=selected_ids,
+            profiles_by_name=profiles_by_name,
+        )
+        if occupied & selected:
+            raise SourceRuleError(
+                f"line {line}, field connection_sharing_config.rules: channel selectors overlap"
+            )
+        occupied.update(selected)
+        override = values(
+            {key: value for key, value in rule.items() if key != "channels"},
+            line=line,
+            field=f"connection_sharing_config.rules[{index - 1}]",
+            base=defaults,
+        )
+        for channel_uuid in selected:
+            result[channel_uuid] = override
+    return result
