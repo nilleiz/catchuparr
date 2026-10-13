@@ -14,6 +14,7 @@ import math
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -103,7 +104,7 @@ class PersistedSharingState:
 
 
 class SharingIntentLedger:
-    """SQLite state ledger with cooperative per-channel action serialization."""
+    """SQLite ledger with local cooperative locks and durable cross-process CAS."""
 
     _lock_map_guard = _CooperativeRLock()
     _thread_locks: dict[tuple[str, str], object] = {}
@@ -148,6 +149,17 @@ class SharingIntentLedger:
                     target_admitted INTEGER NOT NULL,
                     not_before REAL,
                     updated_at REAL NOT NULL
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS sharing_intent_claims (
+                    channel_uuid TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    intent_epoch INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    claim_nonce TEXT NOT NULL,
+                    claimed_at REAL NOT NULL,
+                    PRIMARY KEY (channel_uuid, revision)
                 )"""
             )
 
@@ -293,8 +305,15 @@ class SharingIntentLedger:
         return self._decode(row) if row is not None else None
 
     @staticmethod
+    def _strict_json_loads(value: str):
+        def reject_constant(_constant: str):
+            raise ValueError("non-finite persisted JSON number")
+
+        return json.loads(value, parse_constant=reject_constant)
+
+    @staticmethod
     def _decode(row: sqlite3.Row) -> PersistedSharingState:
-        snapshot = json.loads(row["state_json"])
+        snapshot = SharingIntentLedger._strict_json_loads(row["state_json"])
         expected_snapshot_fields = {
             "version", "channel_uuid", "configuration_generation", "control_generation",
             "phase", "candidate_identity", "candidate_connection_identity", "candidate_since",
@@ -313,6 +332,18 @@ class SharingIntentLedger:
             or snapshot["intent_epoch"] < 0
             or type(row["revision"]) is not int
             or row["revision"] < 1
+            or type(row["recorder_fence"]) is not int
+            or row["recorder_fence"] < 0
+            or not isinstance(snapshot.get("configuration_generation"), str)
+            or not snapshot["configuration_generation"]
+            or not isinstance(row["configuration_generation"], str)
+            or not row["configuration_generation"]
+            or type(row["control_generation"]) is not int
+            or row["control_generation"] < 0
+            or type(row["target_admitted"]) is not int
+            or row["target_admitted"] not in (0, 1)
+            or not isinstance(row["updated_at"], (int, float))
+            or not math.isfinite(float(row["updated_at"]))
         ):
             raise ValueError("persisted sharing state snapshot is inconsistent")
         try:
@@ -320,8 +351,36 @@ class SharingIntentLedger:
         except (TypeError, ValueError) as exc:
             raise ValueError("persisted sharing phase is invalid") from exc
         action_value = row["action"]
-        if int(row["target_admitted"]) not in (0, 1):
-            raise ValueError("persisted target admission is invalid")
+        if action_value is not None and not isinstance(action_value, str):
+            raise ValueError("persisted sharing action is invalid")
+        candidate = snapshot.get("candidate_identity")
+        candidate_connection = snapshot.get("candidate_connection_identity")
+        if candidate is not None and (
+            not isinstance(candidate, list)
+            or len(candidate) != 8
+            or any(not isinstance(part, str) or not part for part in candidate)
+            or candidate[0] != row["channel_uuid"]
+        ):
+            raise ValueError("persisted candidate identity is invalid")
+        if candidate_connection is not None and (
+            not isinstance(candidate_connection, list)
+            or len(candidate_connection) != 8
+            or any(not isinstance(part, str) or not part for part in candidate_connection)
+            or candidate_connection[0] != row["channel_uuid"]
+        ):
+            raise ValueError("persisted candidate connection identity is invalid")
+        if (candidate is None) != (candidate_connection is None):
+            raise ValueError("persisted candidate identities are inconsistent")
+        for name in ("candidate_since", "last_viewer_left_at", "last_switch_at"):
+            value = snapshot.get(name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(f"persisted {name} must be finite or null")
+        if (candidate is None) != (snapshot.get("candidate_since") is None):
+            raise ValueError("persisted candidate clock is inconsistent")
         if action_value is None:
             if (
                 row["intent_epoch"] is not None
@@ -332,8 +391,14 @@ class SharingIntentLedger:
                 raise ValueError("state-only sharing row contains stale intent fields")
         elif (
             action_value not in {action.value for action in _INTENT_ACTIONS}
+            or type(row["intent_epoch"]) is not int
             or int(row["intent_epoch"]) != snapshot["intent_epoch"]
             or (phase == SharingPhase.STOPPED and action_value != SharingAction.STOP.value)
+            or (action_value == SharingAction.STOP.value and phase != SharingPhase.STOPPED)
+            or row["not_before"] is None
+            or isinstance(row["not_before"], bool)
+            or not isinstance(row["not_before"], (int, float))
+            or not math.isfinite(float(row["not_before"]))
         ):
             raise ValueError("persisted sharing intent is inconsistent")
         # The snapshot never includes borrowed_identity; loading cannot restore it.
@@ -343,10 +408,9 @@ class SharingIntentLedger:
             control_generation=snapshot["control_generation"],
             recorder_fence=int(row["recorder_fence"]),
             phase=phase,
-            candidate_identity=tuple(snapshot["candidate_identity"]) if snapshot.get("candidate_identity") else None,
+            candidate_identity=tuple(candidate) if candidate is not None else None,
             candidate_connection_identity=(
-                tuple(snapshot["candidate_connection_identity"])
-                if snapshot.get("candidate_connection_identity") else None
+                tuple(candidate_connection) if candidate_connection is not None else None
             ),
             candidate_since=snapshot.get("candidate_since"),
             borrowed_identity=None,
@@ -357,7 +421,23 @@ class SharingIntentLedger:
         )
         intent = None
         if action_value is not None:
-            target = json.loads(row["target_identity_json"]) if row["target_identity_json"] else None
+            target = SharingIntentLedger._strict_json_loads(row["target_identity_json"]) if row["target_identity_json"] else None
+            if target is not None and (
+                not isinstance(target, list)
+                or len(target) != 8
+                or any(not isinstance(part, str) or not part for part in target)
+                or target[0] != row["channel_uuid"]
+            ):
+                raise ValueError("persisted target identity is invalid")
+            if action_value == SharingAction.ATTACH_BORROW.value:
+                if (
+                    target is None
+                    or row["target_admitted"] != 1
+                    or tuple(target) != state.candidate_connection_identity
+                ):
+                    raise ValueError("persisted borrow intent target is inconsistent")
+            elif target is not None or row["target_admitted"] != 0:
+                raise ValueError("non-borrow intent contains target admission")
             intent = SharingIntentToken(
                 channel_uuid=row["channel_uuid"],
                 revision=int(row["revision"]),
@@ -380,15 +460,42 @@ class SharingIntentLedger:
         control_generation: int,
         recorder_fence: int,
         now: float,
+        expected_revision: int | None,
+        recovery_is_current: Callable[[str, int | None, str, int, int], bool],
     ) -> PersistedSharingState:
-        """Restore only planner clocks and invalidate any pre-restart intent."""
+        """Restore clocks only after exact revision and current-owner validation.
+
+        The callback must verify current recorder ownership/admission and the
+        requested config/control/fence tuple. SQLite then CASes the revision
+        and rejects fence/control rollback before replacing the row.
+        """
         channel = self._channel(channel_uuid)
         now = self._finite_time(now, "now")
+        if (
+            not isinstance(configuration_generation, str)
+            or not configuration_generation
+            or type(control_generation) is not int
+            or control_generation < 0
+            or type(recorder_fence) is not int
+            or recorder_fence < 0
+            or (expected_revision is not None and (type(expected_revision) is not int or expected_revision < 1))
+            or not callable(recovery_is_current)
+        ):
+            raise ValueError("recovery identity and revision must be valid")
+        if recovery_is_current(
+            channel, expected_revision, configuration_generation, control_generation, recorder_fence
+        ) is not True:
+            raise StaleSharingIntent("current recorder ownership did not authorize recovery")
         with self.action_lock(channel), self._database() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT * FROM sharing_runtime WHERE channel_uuid=?", (channel,)
             ).fetchone()
+            if (row is None) != (expected_revision is None) or (
+                row is not None and int(row["revision"]) != expected_revision
+            ):
+                db.rollback()
+                raise StaleSharingIntent("sharing state revision changed during recovery")
             if row is None:
                 from .sharing_planner import SharingObservation, SharingSettings, initial_state
 
@@ -403,8 +510,14 @@ class SharingIntentLedger:
                 ))
                 revision = 1
             else:
+                if recorder_fence < int(row["recorder_fence"]):
+                    db.rollback()
+                    raise StaleSharingIntent("recovery recorder fence cannot move backwards")
+                if control_generation < int(row["control_generation"]):
+                    db.rollback()
+                    raise StaleSharingIntent("recovery control generation cannot move backwards")
                 restored = restore_state(
-                    json.loads(row["state_json"]),
+                    self._strict_json_loads(row["state_json"]),
                     channel_uuid=channel,
                     configuration_generation=configuration_generation,
                     control_generation=control_generation,
@@ -460,11 +573,13 @@ class SharingIntentLedger:
         fresh_validate: Callable[[SharingIntentToken], bool],
         side_effect: Callable[[SharingIntentToken], object],
     ) -> tuple[bool, object | None]:
-        """Run one effect under the channel lock after exact fresh validation.
+        """Claim one intent durably before its one permitted side-effect call.
 
-        SQLite transactions end before callbacks. The per-channel advisory lock
-        serializes local and cross-process ledger changes during validation and
-        dispatch; the caller still must use a native CAS for native mutations.
+        A short BEGIN IMMEDIATE transaction consumes this exact revision once
+        across processes. A crash after the claim fails closed: the same token
+        is never automatically retried. The effect callback must still perform
+        its native/current lease/config/control/target CAS at the mutation
+        boundary; no SQLite transaction or Python lock spans the callback.
         """
         if not isinstance(token, SharingIntentToken):
             raise ValueError("token must be SharingIntentToken")
@@ -478,9 +593,44 @@ class SharingIntentLedger:
                 return False, None
             if fresh_validate(token) is not True:
                 return False, None
-            # Re-read after external proof to catch a newer persisted intent
-            # before dispatch; no DB transaction is held across either callback.
+            # Claim and recheck the deadline after proof, under SQLite's
+            # cross-process write lock. This transaction contains no callback.
+            now = self._finite_time(self.clock(), "clock")
+            if now < float(token.not_before):
+                return False, None
+            nonce = uuid.uuid4().hex
+            with self._database() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT * FROM sharing_runtime WHERE channel_uuid=?", (token.channel_uuid,)
+                ).fetchone()
+                if row is None or self._decode(row).intent != token:
+                    db.rollback()
+                    return False, None
+                dispatch_time = self._finite_time(self.clock(), "clock")
+                if dispatch_time < float(token.not_before):
+                    db.rollback()
+                    return False, None
+                inserted = db.execute(
+                    """INSERT OR IGNORE INTO sharing_intent_claims
+                    (channel_uuid, revision, intent_epoch, action, claim_nonce, claimed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (token.channel_uuid, token.revision, token.intent_epoch,
+                     token.action.value, nonce, dispatch_time),
+                ).rowcount
+                if inserted != 1:
+                    db.rollback()
+                    return False, None
+                db.commit()
+            # Refresh the native/current-lease proof once more after the
+            # durable claim. Its effect boundary must still use a native CAS.
+            if fresh_validate(token) is not True:
+                return False, None
+            if self._finite_time(self.clock(), "clock") < float(token.not_before):
+                return False, None
             current = self.read(token.channel_uuid)
             if current is None or current.intent != token:
+                return False, None
+            if self._finite_time(self.clock(), "clock") < float(token.not_before):
                 return False, None
             return True, side_effect(token)
