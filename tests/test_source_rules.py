@@ -303,6 +303,32 @@ class SourceRulesTests(unittest.TestCase):
         with self.assertRaisesRegex(SourceRuleError, "excluded by include filter"):
             self.compile(document)
 
+    def test_final_policy_can_replace_filter_and_priority_in_later_exception(self):
+        result = self.compile(
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    include: [Synthetic Source A]\n"
+            "    priority: {Synthetic Source A: 10}\n"
+            "  - channels: {names: [Synthetic Channel A]}\n"
+            "    include: [Synthetic Source B]\n"
+            "    priority: {Synthetic Source B: 20}\n"
+        )
+        policy = result.source_policies[CHANNEL_A]
+        self.assertEqual(frozenset({"12"}), policy.include_account_ids)
+        self.assertEqual((("12", 20),), policy.priorities)
+
+    def test_final_policy_still_rejects_unreplaced_incompatible_priority(self):
+        document = (
+            "version: 1\nprofile: all\nrules:\n"
+            "  - channels: {profile: Synthetic Profile All}\n"
+            "    include: [Synthetic Source A]\n"
+            "    priority: {Synthetic Source A: 10}\n"
+            "  - channels: {names: [Synthetic Channel A]}\n"
+            "    include: [Synthetic Source B]\n"
+        )
+        with self.assertRaisesRegex(SourceRuleError, "excluded by include filter"):
+            self.compile(document)
+
     def test_empty_priority_mapping_clears_inherited_map(self):
         result = self.compile(
             "version: 1\nprofile: all\nrules:\n"
