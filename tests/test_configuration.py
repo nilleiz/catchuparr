@@ -139,7 +139,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual("rule 1", validated["channels"][0]["configuration_origin"]["source_filter"])
         self.assertEqual("rule 1", validated["channels"][0]["configuration_origin"]["priority"])
 
-    def test_v5_snapshot_contains_settings_schedules_and_configuration_origins(self):
+    def test_v6_snapshot_contains_settings_schedules_origins_and_sharing_defaults(self):
         settings = dict(
             self.settings,
             filter_config=(
@@ -151,7 +151,7 @@ class ConfigurationTests(unittest.TestCase):
         apply_configuration(settings, self.catalog, self.active_path)
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
         active = load_active_configuration(self.active_path)
-        self.assertEqual(5, snapshot["version"])
+        self.assertEqual(6, snapshot["version"])
         self.assertEqual(True, snapshot["settings"]["recording_enabled"])
         self.assertEqual("INFO", snapshot["settings"]["log_level"])
         self.assertEqual(
@@ -170,6 +170,15 @@ class ConfigurationTests(unittest.TestCase):
             {"source_filter", "priority", "schedule_days"},
             set(snapshot["configuration_origins"][CHANNEL_A]),
         )
+        self.assertEqual(
+            {
+                "enabled": False,
+                "live_stability_seconds": 5,
+                "last_viewer_return_seconds": 30,
+                "min_switch_interval_seconds": 60,
+            },
+            snapshot["connection_sharing"][CHANNEL_A],
+        )
         sidecar = json.loads(
             (self.active_path.parent / ".catchuparr-recorder-control.json").read_text(
                 encoding="utf-8"
@@ -185,11 +194,91 @@ class ConfigurationTests(unittest.TestCase):
             control.configuration_generation,
         )
 
+    def test_connection_sharing_config_resolves_per_channel_and_applies_once(self):
+        settings = dict(
+            self.settings,
+            connection_sharing_config=(
+                "version: 1\n"
+                "default:\n"
+                "  enabled: true\n"
+                "  last_viewer_return_seconds: 0\n"
+                "rules:\n"
+                "  - channels: {numbers: [7]}\n"
+                "    live_stability_seconds: 12\n"
+            ),
+        )
+        validated = validate_configuration(settings, self.catalog)
+        applied = apply_configuration(settings, self.catalog, self.active_path)
+        active = load_active_configuration(self.active_path)
+        expected = {
+            CHANNEL_A: {
+                "enabled": True,
+                "live_stability_seconds": 12,
+                "last_viewer_return_seconds": 0,
+                "min_switch_interval_seconds": 60,
+            },
+            CHANNEL_B: {
+                "enabled": True,
+                "live_stability_seconds": 5,
+                "last_viewer_return_seconds": 0,
+                "min_switch_interval_seconds": 60,
+            },
+        }
+        self.assertEqual(expected, active["connection_sharing"])
+        self.assertEqual(expected, json.loads(self.active_path.read_text())["connection_sharing"])
+        self.assertEqual(
+            expected,
+            {item["channel_uuid"]: item["connection_sharing"] for item in validated["channels"]},
+        )
+        self.assertTrue(applied["applied"])
+
+    def test_connection_sharing_invalid_value_keeps_active_snapshot_and_control(self):
+        initial = apply_configuration(self.settings, self.catalog, self.active_path)
+        before = self.active_path.read_bytes()
+        control_path = self.active_path.with_name(".catchuparr-recorder-control.json")
+        control_before = control_path.read_bytes()
+        for value in (True, 1.5, "5", -1, 3601):
+            invalid = dict(
+                self.settings,
+                connection_sharing_config=(
+                    "version: 1\ndefault:\n"
+                    f"  live_stability_seconds: {json.dumps(value)}\n"
+                ),
+            )
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "integer from 0 to 3600"
+            ):
+                apply_configuration(invalid, self.catalog, self.active_path)
+            self.assertEqual(before, self.active_path.read_bytes())
+            self.assertEqual(control_before, control_path.read_bytes())
+        self.assertTrue(initial["applied"])
+
+    def test_legacy_v5_snapshot_reads_sharing_as_disabled_defaults(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        snapshot = json.loads(self.active_path.read_text())
+        snapshot["version"] = 5
+        snapshot.pop("connection_sharing")
+        self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        active = load_active_configuration(self.active_path)
+        self.assertEqual(
+            {
+                channel: {
+                    "enabled": False,
+                    "live_stability_seconds": 5,
+                    "last_viewer_return_seconds": 30,
+                    "min_switch_interval_seconds": 60,
+                }
+                for channel in (CHANNEL_A, CHANNEL_B)
+            },
+            active["connection_sharing"],
+        )
+
     def test_v4_snapshot_without_origins_remains_readable(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
         snapshot["version"] = 4
         snapshot.pop("configuration_origins")
+        snapshot.pop("connection_sharing")
         self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
         active = load_active_configuration(self.active_path)
         self.assertEqual(4, active["version"])
@@ -1253,6 +1342,7 @@ class ConfigurationTests(unittest.TestCase):
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
         snapshot["version"] = 3
         snapshot.pop("configuration_origins")
+        snapshot.pop("connection_sharing")
         snapshot["settings"].pop("recording_enabled")
         snapshot["settings"].pop("log_level")
         snapshot["settings"].pop("public_base_url")
@@ -1273,6 +1363,7 @@ class ConfigurationTests(unittest.TestCase):
         snapshot["version"] = 2
         snapshot.pop("recording_schedule")
         snapshot.pop("configuration_origins")
+        snapshot.pop("connection_sharing")
         snapshot["settings"].pop("recording_enabled")
         snapshot["settings"].pop("show_archive_playback_in_stats")
         snapshot["settings"].pop("hide_recorders_in_stats")

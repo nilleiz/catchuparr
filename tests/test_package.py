@@ -28,6 +28,7 @@ class PackageTest(unittest.TestCase):
             self.assertEqual(Path(archive_path).name, "catchuparr-0.5.1.zip")
             field_ids = [field["id"] for field in manifest["fields"]]
             self.assertIn("filter_config", field_ids)
+            self.assertIn("connection_sharing_config", field_ids)
             self.assertIn("recording_enabled", field_ids)
             self.assertIn("log_level", field_ids)
             self.assertIn("public_base_url", field_ids)
