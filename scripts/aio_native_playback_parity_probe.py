@@ -9,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
+
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
@@ -45,17 +46,16 @@ def probe():
 
     sys.path.insert(0, "/data/plugins")
 
-    from django.test import RequestFactory
-    from django.utils import timezone
-
     from apps.accounts.models import User
     from apps.channels.models import Channel, ChannelProfile, ChannelProfileMembership
     from apps.epg.models import EPGData, ProgramData
     from apps.plugins.models import PluginConfig
+    from django.test import RequestFactory
     from django.urls import resolve
+    from django.utils import timezone
     from version import __version__
 
-    from catchuparr import runtime, views
+    from catchuparr import runtime
     from catchuparr.configuration import active_settings_path, load_active_configuration
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.native_output_security import create_native_capability
