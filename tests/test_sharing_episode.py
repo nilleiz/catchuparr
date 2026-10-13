@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -170,8 +171,15 @@ class BorrowEpisodeTests(unittest.TestCase):
                 control_generation=7, recorder_fence=11, identity=IDENTITY,
                 lease_digest=LEASE_DIGEST, ordinary_viewer_ids=(), checked_at=140,
             )
+        closing = self.ledger.update_viewers(
+            waiting.episode_id, expected_version=waiting.version,
+            ordinary_viewer_ids=("late-viewer",), observed_at=140,
+            return_seconds=30, minimum_switch_seconds=0,
+        )
+        self.assertEqual(closing.phase, "closing")
+        self.assertIsNone(closing.return_deadline)
         revoked = self.ledger.revoke(
-            waiting.episode_id, expected_version=waiting.version, reason="stop",
+            closing.episode_id, expected_version=closing.version, reason="stop",
             cleanup_acknowledged=False,
         )
         self.assertEqual(revoked.phase, "cleanup_pending")
@@ -196,6 +204,92 @@ class BorrowEpisodeTests(unittest.TestCase):
             expected_version=closed.version,
         )
         self.assertNotEqual(next_opening.episode_id, closed.episode_id)
+
+    def test_future_last_switch_is_clamped_before_return_deadline(self):
+        opening = self.ledger.begin_open(attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY)
+        active = self.ledger.activate(
+            opening.episode_id, expected_version=opening.version, client_id="client-1",
+            connected_at="100.5", ordinary_viewer_ids=("viewer-1",),
+        )
+        for future_switch in (3600, 3601, 7200):
+            with self.subTest(future_switch=future_switch):
+                # Each transition is independently exercised on a fresh DB row.
+                if future_switch != 3600:
+                    active = self.ledger.update_viewers(
+                        active.episode_id, expected_version=active.version,
+                        ordinary_viewer_ids=("viewer-1",), observed_at=101,
+                        return_seconds=30, minimum_switch_seconds=60,
+                    )
+                waiting = self.ledger.update_viewers(
+                    active.episode_id, expected_version=active.version,
+                    ordinary_viewer_ids=(), observed_at=101,
+                    return_seconds=30, minimum_switch_seconds=60,
+                    last_switch_at=future_switch,
+                )
+                self.assertEqual(waiting.return_deadline, 161)
+                active = self.ledger.update_viewers(
+                    waiting.episode_id, expected_version=waiting.version,
+                    ordinary_viewer_ids=("viewer-1",), observed_at=102,
+                    return_seconds=30, minimum_switch_seconds=60,
+                )
+
+    def test_backwards_clock_future_switch_does_not_extend_grace(self):
+        opening = self.ledger.begin_open(attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY)
+        active = self.ledger.activate(
+            opening.episode_id, expected_version=opening.version, client_id="client-1",
+            connected_at="100.5", ordinary_viewer_ids=("viewer-1",),
+        )
+        waiting = self.ledger.update_viewers(
+            active.episode_id, expected_version=active.version, ordinary_viewer_ids=(),
+            observed_at=99, return_seconds=30, minimum_switch_seconds=60,
+            last_switch_at=100,
+        )
+        self.assertEqual(waiting.return_deadline, 159)
+
+    def test_corrupt_persisted_grace_and_malformed_direct_snapshot_fail_closed(self):
+        opening = self.ledger.begin_open(attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY)
+        active = self.ledger.activate(
+            opening.episode_id, expected_version=opening.version, client_id="client-1",
+            connected_at="100.5", ordinary_viewer_ids=("viewer-1",),
+        )
+        waiting = self.ledger.update_viewers(
+            active.episode_id, expected_version=active.version, ordinary_viewer_ids=(),
+            observed_at=101, return_seconds=30, minimum_switch_seconds=0,
+        )
+        with self.ledger._db() as db:
+            db.execute(
+                "UPDATE sharing_borrow_episodes SET return_deadline=? WHERE channel_uuid=?",
+                (float("inf"), CHANNEL),
+            )
+        with self.assertRaises(BorrowEpisodeRejected):
+            self.ledger.read(CHANNEL)
+        with self.assertRaises(ValueError):
+            replace(waiting, return_deadline=float("nan"))
+
+    def test_persisted_phase_client_mismatch_and_malformed_proof_are_rejected(self):
+        opening = self.ledger.begin_open(attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY)
+        with self.ledger._db() as db:
+            db.execute(
+                "UPDATE sharing_borrow_episodes SET phase='active' WHERE channel_uuid=?",
+                (CHANNEL,),
+            )
+        with self.assertRaises(BorrowEpisodeRejected):
+            self.ledger.read(CHANNEL)
+
+        valid = BorrowEpisodeLedger(Path(self.temp.name) / "valid.sqlite", clock=self.clock)
+        opening = valid.begin_open(attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY)
+        active = valid.activate(
+            opening.episode_id, expected_version=opening.version, client_id="client-1",
+            connected_at="100.5", ordinary_viewer_ids=("viewer-1",),
+        )
+        with self.assertRaises(BorrowEpisodeRejected):
+            valid.authorize_snapshot(
+                active, episode_id=active.episode_id,
+                configuration_generation=active.configuration_generation,
+                control_generation=True, recorder_fence=active.recorder_fence,
+                identity=active.identity, lease_digest=active.lease_digest,
+                ordinary_viewer_ids=("viewer-1",), checked_at=100,
+            )
 
     def test_manager_is_task_local_and_never_mutates_native_shared_mapping(self):
         redis = FakeRedis(decode=True)

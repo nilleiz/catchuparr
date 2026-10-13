@@ -44,6 +44,48 @@ class BorrowEpisodeSnapshot:
     last_viewer_left_at: float | None
     return_deadline: float | None
 
+    def __post_init__(self) -> None:
+        if (not isinstance(self.episode_id, str) or not self.episode_id
+                or not isinstance(self.channel_uuid, str) or not self.channel_uuid):
+            raise ValueError("episode and channel identity must be non-empty strings")
+        if self.phase not in {"opening", "active", "wait_return", "closing", "cleanup_pending", "closed"}:
+            raise ValueError("episode phase is invalid")
+        if not isinstance(self.configuration_generation, str) or not self.configuration_generation:
+            raise ValueError("configuration_generation must be non-empty")
+        for name in ("control_generation", "recorder_fence", "intent_epoch", "version"):
+            value = getattr(self, name)
+            minimum = 1 if name == "version" else 0
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"{name} is invalid")
+        if (not isinstance(self.identity, tuple) or len(self.identity) != 8
+                or any(not isinstance(part, str) or not part for part in self.identity)
+                or self.identity[0] != self.channel_uuid):
+            raise ValueError("identity must be the exact eight-field channel binding")
+        if (not isinstance(self.lease_digest, str) or len(self.lease_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.lease_digest)):
+            raise ValueError("lease_digest is invalid")
+        if self.client_id is not None and (not isinstance(self.client_id, str) or not self.client_id):
+            raise ValueError("client_id must be non-empty or null")
+        if self.connected_at is not None and (not isinstance(self.connected_at, str) or not self.connected_at):
+            raise ValueError("connected_at must be non-empty or null")
+        for name in ("last_viewer_left_at", "return_deadline"):
+            value = getattr(self, name)
+            if value is not None:
+                _finite_time(value, name)
+        if self.phase == "opening" and (self.client_id is not None or self.connected_at is not None):
+            raise ValueError("opening episode cannot already own a client")
+        if self.phase in {"active", "wait_return"} and (self.client_id is None or self.connected_at is None):
+            raise ValueError("active episode must bind its exact native client")
+        if self.phase == "active" and (self.last_viewer_left_at is not None or self.return_deadline is not None):
+            raise ValueError("active episode cannot retain last-viewer grace")
+        if self.phase == "wait_return":
+            if self.last_viewer_left_at is None or self.return_deadline is None:
+                raise ValueError("wait_return episode requires finite grace timestamps")
+            if self.return_deadline < self.last_viewer_left_at:
+                raise ValueError("return deadline cannot precede last-viewer time")
+        if self.phase in {"closing", "cleanup_pending", "closed"} and self.return_deadline is not None:
+            raise ValueError("revoked episode cannot retain return grace")
+
 
 def _finite_time(value: float, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(float(value)):
@@ -200,14 +242,20 @@ class BorrowEpisodeLedger:
                 db.rollback()
                 raise BorrowEpisodeRejected("active episode is stale or revoked")
             if ordinary_viewer_ids:
-                phase, left, deadline = "active", None, None
+                if row["phase"] == "wait_return" and now >= float(row["return_deadline"]):
+                    phase, left, deadline = "closing", row["last_viewer_left_at"], None
+                else:
+                    phase, left, deadline = "active", None, None
             elif row["phase"] == "wait_return":
                 phase, left, deadline = row["phase"], row["last_viewer_left_at"], row["return_deadline"]
             else:
                 phase, left = "wait_return", now
-                deadline = max(now + return_seconds, (switch_at + minimum_switch_seconds) if switch_at is not None else now)
+                # Recovery may observe a backwards wall-clock jump. Do not let
+                # any future last-switch timestamp extend cooldown/grace.
+                normalized_switch = min(switch_at, now) if switch_at is not None else now
+                deadline = max(now + return_seconds, normalized_switch + minimum_switch_seconds)
             if not ordinary_viewer_ids and (deadline is None or now >= float(deadline)):
-                phase = "closing"
+                phase, deadline = "closing", None
             version = expected_version + 1
             cur = db.execute("UPDATE sharing_borrow_episodes SET phase=?,last_viewer_left_at=?,return_deadline=?,version=?,updated_at=? WHERE episode_id=? AND version=?",
                              (phase, left, deadline, version, now, episode_id, expected_version))
@@ -240,18 +288,28 @@ class BorrowEpisodeLedger:
         return self.read(row["channel_uuid"])
 
     def read(self, channel_uuid: str) -> BorrowEpisodeSnapshot:
+        if not isinstance(channel_uuid, str) or not channel_uuid:
+            raise ValueError("channel_uuid must be non-empty")
         with self._db() as db:
             row = db.execute("SELECT * FROM sharing_borrow_episodes WHERE channel_uuid=?", (channel_uuid,)).fetchone()
         if row is None:
             raise BorrowEpisodeRejected("no active borrow episode")
-        return BorrowEpisodeSnapshot(
-            episode_id=row["episode_id"], channel_uuid=row["channel_uuid"], phase=row["phase"],
-            configuration_generation=row["configuration_generation"], control_generation=row["control_generation"],
-            recorder_fence=row["recorder_fence"], intent_epoch=row["intent_epoch"],
-            identity=tuple(json.loads(row["identity_json"])), lease_digest=row["lease_digest"],
-            client_id=row["client_id"], connected_at=row["connected_at"], version=row["version"],
-            last_viewer_left_at=row["last_viewer_left_at"], return_deadline=row["return_deadline"],
-        )
+        try:
+            identity = json.loads(row["identity_json"], parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid JSON constant")))
+            if not isinstance(identity, list):
+                raise ValueError("persisted identity must be a list")
+            updated_at = row["updated_at"]
+            _finite_time(updated_at, "updated_at")
+            return BorrowEpisodeSnapshot(
+                episode_id=row["episode_id"], channel_uuid=row["channel_uuid"], phase=row["phase"],
+                configuration_generation=row["configuration_generation"],
+                control_generation=row["control_generation"], recorder_fence=row["recorder_fence"],
+                intent_epoch=row["intent_epoch"], identity=tuple(identity), lease_digest=row["lease_digest"],
+                client_id=row["client_id"], connected_at=row["connected_at"], version=row["version"],
+                last_viewer_left_at=row["last_viewer_left_at"], return_deadline=row["return_deadline"],
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise BorrowEpisodeRejected("persisted borrow episode is malformed") from exc
 
     @staticmethod
     def authorize_snapshot(snapshot: BorrowEpisodeSnapshot, *, episode_id: str,
@@ -259,6 +317,19 @@ class BorrowEpisodeLedger:
                            recorder_fence: int, identity: tuple[str, ...], lease_digest: str,
                            ordinary_viewer_ids: tuple[str, ...], checked_at: float) -> float | None:
         """Return only the authenticated episode grace deadline; never opens without viewers."""
+        if not isinstance(snapshot, BorrowEpisodeSnapshot):
+            raise BorrowEpisodeRejected("borrow episode snapshot is unavailable")
+        try:
+            snapshot.__post_init__()
+            _finite_time(checked_at, "checked_at")
+        except (TypeError, ValueError) as exc:
+            raise BorrowEpisodeRejected("borrow episode snapshot is malformed") from exc
+        if (not isinstance(episode_id, str) or not isinstance(configuration_generation, str)
+                or type(control_generation) is not int or control_generation < 0
+                or type(recorder_fence) is not int or recorder_fence < 0
+                or not isinstance(identity, tuple) or len(identity) != 8
+                or not isinstance(lease_digest, str) or len(lease_digest) != 64):
+            raise BorrowEpisodeRejected("borrow proof identity is malformed")
         now = _finite_time(checked_at, "checked_at")
         if (snapshot.episode_id != episode_id or snapshot.phase not in {"active", "wait_return"}
                 or snapshot.configuration_generation != configuration_generation
