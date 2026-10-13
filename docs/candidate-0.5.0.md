@@ -1,10 +1,9 @@
-# 0.5.0 candidate: native output archive integration
+# 0.5.0 native output archive integration
 
-This candidate optionally adds Catchuparr archive catch-up metadata to
-Dispatcharr's native M3U and XMLTV output. The setting is disabled by default.
-The 433-test local suite, package checks and full native AIO probes on both
-pinned Dispatcharr versions pass. Required CI, isolated Dev verification and
-player-specific acceptance remain pending; this candidate is not release-ready.
+Version 0.5.0 adds optional Catchuparr archive catch-up metadata to Dispatcharr's
+native M3U and XMLTV output. The setting is disabled by default. Implementation
+and user acceptance are complete; publication awaits the required release
+workflow.
 
 ## Enable native output
 
@@ -82,22 +81,30 @@ fail closed; apply the settings again and refresh native outputs. Keep no more
 than two verified task-owned application/configuration backups. Do not include
 the archive, recordings or archive database in these backups.
 
-## Candidate evidence
+## Implementation and acceptance evidence
 
-The implementation passes 433 local tests, Ruff, Python compilation and package
-validation. The 30-entry package has SHA-256
+The earlier implementation passed 433 tests, Ruff, Python compilation and
+package validation. The earlier 30-entry package had SHA-256
 `e710fb265a70ed4c12b585ff750e02c4912a31bab417593d2f258c386996434a`.
+
+The final 30-entry package has SHA-256
+`ac24d28af19312f4f107f04a3b7e4263e43d619311105334b0cbfec8b7954fe8`.
 
 The full synthetic AIO probe passed on Dispatcharr 0.31.0
 (`f81924fa3dbfeb463b3908be7e086bf58aacbd2ba56062bfb555ee3a471acf8f`) and
-0.32.0 (`b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a`).
-Each version passed 32 engine tests and the complete integration gates,
-including native M3U/XMLTV output, signed archive access, byte ranges, current
-permission and session checks, Stats Stop, and cleanup. The two version runs
-passed separately; they were not a concurrent-run test. No container data,
-recordings or credentials were retained as artifacts.
+0.32.0 (`b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`).
+Each run passed 32 AIO tests and the integration gates for native M3U/XMLTV
+output, signed archive access, byte ranges, current permission and session
+checks, Stats Stop and cleanup. The runs completed separately; they do not
+establish concurrent-run behavior. No container data, recordings or credentials
+were retained as artifacts.
 
-Independent review and the exact package contents were verified. Required CI,
-isolated Dev verification and player-specific behavior remain pending. This
-server-side evidence does not claim player compatibility, archive output-profile
-transcoding or frame-accurate seeking.
+The final parity correction makes standard and add-on playback routes share the
+same archive manifest selection for current, completed and gapped archives. It
+passed four focused native 0.32.0 cases, including authorization and HEAD
+cleanup. The complete historical suite and 0.31.0 probes were not rerun after
+that correction. The final correction received independent review.
+
+User acceptance is complete. The server-side evidence does not establish every
+player's compatibility, archive output-profile transcoding or frame-accurate
+seeking. Required release CI remains the publication gate.

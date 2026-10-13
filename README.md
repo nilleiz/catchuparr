@@ -15,19 +15,20 @@ archive is local to the Dispatcharr installation and is not a cloud service.
 
 ## Compatibility and status
 
-- Version 0.4.0 is released. Version 0.5.0 is the only release currently in
-  development; both pinned native AIO checks pass, while required CI, isolated
-  Dev verification and player acceptance remain pending.
+- Version 0.4.0 is released. Version 0.5.0 implementation and user acceptance
+  are complete; publication awaits the required release workflow and it is not
+  yet published.
 - Dispatcharr 0.31.0 and 0.32.0 are the supported versions covered by the
   repository's pinned native integration checks.
 - The primary path is M3U/XMLTV with HLS playback using MPEG-TS segments.
 - Native XC playback is implemented behind guarded Dispatcharr hooks. Native
   server integration is covered by synthetic checks; player-specific XC
   acceptance is still separate and should be verified with the client in use.
-- The 0.5.0 candidate adds an optional native M3U/XMLTV archive toggle. Its
-  433-test local suite and full pinned AIO probes pass on Dispatcharr 0.31.0 and
-  0.32.0. CI, isolated Dev verification and player acceptance remain pending;
-  see the [0.5.0 candidate guide](docs/candidate-0.5.0.md).
+- The 0.5.0 native output integration adds an optional M3U/XMLTV archive
+  toggle. The earlier implementation passed 433 tests and full pinned AIO probes
+  on Dispatcharr 0.31.0 and 0.32.0; its final parity correction passed four
+  focused native 0.32.0 cases. User acceptance is complete; required release CI
+  remains pending. See the [0.5.0 guide](docs/candidate-0.5.0.md).
 - Playback follows the selected user's Dispatcharr permissions, channel access,
   catch-up permission and stream/session limits. It does not provide transcoding
   or frame-accurate seeking.
@@ -74,7 +75,7 @@ a draft alone does not alter the active recorder configuration.
 | **Catchuparr log level** | Catchuparr-only log verbosity: `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 | **Show archive playback in Stats** | Add active Catchuparr archive viewers to native Timeshift Stats. Enabled by default. |
 | **Hide recorders in Stats** | Hide positively identified Catchuparr recorder clients from live Stats details. Enabled by default. |
-| **Add Catchuparr catch-up to native output** | Optional 0.5.0 candidate setting. Adds local archive metadata to eligible native Dispatcharr M3U/XMLTV output. Disabled by default; use the same unified Apply as other settings. |
+| **Add Catchuparr catch-up to native output** | Optional 0.5.0 setting. Adds local archive metadata to eligible native Dispatcharr M3U/XMLTV output. Disabled by default; use the same unified Apply as other settings. |
 
 ### Select channels and sources
 
@@ -344,16 +345,17 @@ ruff check .
 python3 scripts/build_plugin.py
 ```
 
-## Optional native output archive (0.5.0 candidate)
+## Optional native output archive (0.5.0)
 
-The candidate adds local archive metadata to Dispatcharr's native M3U/XMLTV
+Version 0.5.0 adds local archive metadata to Dispatcharr's native M3U/XMLTV
 exports when **Add Catchuparr catch-up to native output** is enabled and applied.
 It preserves the native channel/profile output and provider catch-up fields.
 Native archive playback serves stored MPEG-TS segments; a live output profile
-does not transcode archive media. The setting defaults off. The 433-test local
-suite and full pinned native AIO probes pass; required CI, isolated Dev
-verification and player acceptance remain pending. Read the
-[candidate guide](docs/candidate-0.5.0.md) before enabling it.
+does not transcode archive media. The setting defaults off. The earlier
+implementation passed 433 tests and full pinned native AIO probes; the final
+parity correction passed four focused native 0.32.0 cases. User acceptance is
+complete; required release CI remains pending. Read the
+[guide](docs/candidate-0.5.0.md) before enabling it.
 
 CI also runs synthetic integration against pinned Dispatcharr AIO images for
 0.31.0 and 0.32.0. See [development and deployment](docs/development.md) for an

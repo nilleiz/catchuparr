@@ -4,23 +4,31 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
-## [0.5.0] - Development candidate, not published
+## [0.5.0] - 2026-10-12
 
 ### Added
 
 - Add a disabled-by-default unified-Apply setting to annotate eligible native
   Dispatcharr M3U output with Catchuparr archive catch-up metadata and merge
   covered local programme history into native XMLTV output.
-- Add signed channel/profile-scoped capabilities and native archive/segment
-  routes that recheck current user access, network scope and session limits.
+- Add signed, channel- and profile-scoped capabilities for native archive and
+  segment routes. Requests recheck current user access, network scope and
+  session limits.
+
+### Fixed
+
+- Make standard and add-on playback routes share the same archive manifest
+  selection for current, completed and gapped archives.
 
 ### Notes
 
-- The 433-test local suite and full native AIO probes on pinned Dispatcharr
-  0.31.0 and 0.32.0 pass. Required CI, isolated Dev verification and
-  player-specific acceptance remain pending; this candidate is not published.
-  See the [0.5.0 candidate guide](docs/candidate-0.5.0.md) for boundaries and
-  status.
+- The 433-test suite and full native AIO probes on Dispatcharr 0.31.0 and 0.32.0
+  passed before the final parity correction. That correction passed four focused
+  native 0.32.0 cases, including authorization and HEAD cleanup; the complete
+  historical suite and 0.31.0 probes were not rerun afterward. User acceptance
+  is complete. Required release CI remains a gate, and this version is not yet
+  published.
+  See the [0.5.0 guide](docs/candidate-0.5.0.md) for boundaries and status.
 
 ## [0.4.0] - 2026-10-12
 
