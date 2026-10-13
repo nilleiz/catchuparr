@@ -1273,6 +1273,7 @@ def probe_actual_recorder_media(root: Path) -> None:
         from apps.proxy.live_proxy.server import ProxyServer
 
         native_server = ProxyServer.get_instance()
+        expected_native_owner = _redis_text(native_server.worker_id)
         native_buffer = native_server.get_buffer(attempt_b.worker_id, profile=None)
         native_yield_tracker = _NativeBufferYieldTracker(native_buffer)
         parent_iterator = iter(
@@ -1282,7 +1283,7 @@ def probe_actual_recorder_media(root: Path) -> None:
             parent_iterator, minimum_bytes=188 * 512, timeout=20, close=response.close,
             diagnostic_label="parent_initial",
             diagnostic_context=lambda: _native_media_reader_diagnostic_context(
-                redis_client, native_server, attempt_b.worker_id, native_owner,
+                redis_client, native_server, attempt_b.worker_id, expected_native_owner,
                 redis_keys=RedisKeys,
                 metadata_key=RedisKeys.channel_metadata(attempt_b.worker_id),
                 metadata_field=ChannelMetadataField, channel_state=ChannelState,

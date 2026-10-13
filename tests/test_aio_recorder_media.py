@@ -196,6 +196,74 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertEqual(diagnostic["termination"], "stop_iteration")
         self.assertNotIn("synthetic-payload", str(diagnostic))
 
+    def test_initial_media_exhaustion_keeps_native_diagnostic_before_readiness_wait(self):
+        class Redis:
+            @staticmethod
+            def get(_key):
+                return b"synthetic-owner"
+
+            @staticmethod
+            def hget(_key, _field):
+                return b"ACTIVE"
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker_id: "owner")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        manager = SimpleNamespace(running=True)
+        native_server = SimpleNamespace(
+            worker_id="synthetic-owner",
+            stream_managers={"worker": manager},
+            client_managers={"worker": object()},
+        )
+        expected_native_owner = probe._redis_text(native_server.worker_id)
+
+        with self.assertRaises(probe._MediaReadDiagnosticError) as raised:
+            probe._read_stream_iterator(
+                iter(()),
+                minimum_bytes=96256,
+                timeout=1,
+                diagnostic_label="parent_initial",
+                diagnostic_context=lambda: probe._native_media_reader_diagnostic_context(
+                    Redis(),
+                    native_server,
+                    "worker",
+                    expected_native_owner,
+                    metadata_key="metadata",
+                    redis_keys=Keys,
+                    metadata_field=Fields,
+                    channel_state=States,
+                    binding=None,
+                    capability_binding_current_fn=lambda *_args: False,
+                    load_applied_state_fn=lambda: (None, None),
+                    configuration_generation_fn=lambda _active: "generation",
+                ),
+            )
+
+        diagnostic = raised.exception.diagnostic
+        self.assertEqual(diagnostic["callsite"], "parent_initial")
+        self.assertEqual(diagnostic["termination"], "stop_iteration")
+        self.assertEqual(
+            diagnostic["native"],
+            {
+                "owner_present": True,
+                "owner_matches": True,
+                "manager_present": True,
+                "manager_running": True,
+                "client_manager_present": True,
+                "metadata_active": True,
+                "metadata_stopping": False,
+                "metadata_error": False,
+                "capability_binding_current": False,
+                "control_binding_current": False,
+            },
+        )
+
     def test_follower_child_media_diagnostic_is_preserved_by_parent(self):
         child_diagnostic = {
             "callsite": "follower_initial",
