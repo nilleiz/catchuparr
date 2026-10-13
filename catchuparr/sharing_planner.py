@@ -17,6 +17,7 @@ class SharingPhase(str, Enum):
     WAIT_LIVE = "wait_live"
     BORROWED = "borrowed"
     WAIT_RETURN = "wait_return"
+    PAUSED = "paused"
     STOPPED = "stopped"
     FAILED = "failed"
 
@@ -112,8 +113,8 @@ class BorrowTarget:
 
     @property
     def stability_identity(self) -> tuple[str, ...]:
-        """Include ordinary clients so a changed live target restarts stability."""
-        return self.connection_identity + tuple(sorted(self.ordinary_client_ids))
+        """Keep stability across viewer-count changes on the same connection."""
+        return self.connection_identity
 
     def healthy_existing_connection(self, channel_uuid: str) -> bool:
         """Checks reusable native identity without applying source-policy filters."""
@@ -274,13 +275,17 @@ def restore_state(
     ):
         return blank
 
-    def valid_time(value: Any) -> float | None:
+    def valid_time(value: Any, *, allow_future: bool = False) -> float | None:
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         numeric = float(value)
-        if not math.isfinite(numeric) or numeric > now or now - numeric > 3600:
+        if (
+            not math.isfinite(numeric)
+            or (numeric > now and (not allow_future or numeric - now > 3600))
+            or now - numeric > 3600
+        ):
             return None
         return numeric
 
@@ -300,7 +305,7 @@ def restore_state(
         connection_identity = None
     candidate_since = valid_time(snapshot.get("candidate_since"))
     last_viewer_left = valid_time(snapshot.get("last_viewer_left_at"))
-    last_switch = valid_time(snapshot.get("last_switch_at"))
+    last_switch = valid_time(snapshot.get("last_switch_at"), allow_future=True)
     if identity is None or connection_identity is None or candidate_since is None:
         identity = None
         connection_identity = None
@@ -617,7 +622,7 @@ def resolve_transition(
     if action in {SharingAction.RETURN_TO_ALLOWED, SharingAction.PAUSE_NO_ALLOWED_SOURCE}:
         return replace(
             state,
-            phase=(SharingPhase.DEDICATED if action == SharingAction.RETURN_TO_ALLOWED else SharingPhase.STOPPED),
+            phase=(SharingPhase.DEDICATED if action == SharingAction.RETURN_TO_ALLOWED else SharingPhase.PAUSED),
             borrowed_identity=None,
             candidate_identity=None,
             candidate_connection_identity=None,
