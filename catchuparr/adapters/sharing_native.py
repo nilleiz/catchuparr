@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from ..sharing_episode import BorrowEpisodeSnapshot
@@ -106,7 +106,7 @@ class NativeEpisodeGrant:
     recorder_fence: int
     intent_epoch: int
     version: int
-    lease_value: str
+    lease_value: str = field(repr=False)
     worker_id: str
     owner_lock_value: str
     metadata_owner: str
@@ -166,34 +166,53 @@ class NativeEpisodeGrant:
             raise ValueError("return deadline cannot precede viewer departure")
 
 
-def _private_client(redis: Any, channel_uuid: str, client_id: str) -> bool:
-    """Classify only server-ledger clients; never infer privacy from user-agent."""
-    episode_id = redis.hget(f"catchuparr:sharing:private:{channel_uuid}", client_id)
+def _private_client(redis: Any, channel_uuid: str, client_id: str) -> bool | None:
+    """Return private/ordinary/unknown using only server-ledger evidence."""
+    private_key = f"catchuparr:sharing:private:{channel_uuid}"
+    private_type = _text(redis.type(private_key))
+    if private_type not in {"none", "hash"}:
+        return None
+    episode_id = redis.hget(private_key, client_id) if private_type == "hash" else None
     if episode_id is not None:
         try:
             episode = redis.hgetall(f"catchuparr:sharing:episode:{channel_uuid}") or {}
             values = {_text(key): _text(value) for key, value in episode.items()}
             if _text(episode_id) == values.get("episode_id"):
                 return True
+            return None
         except (UnicodeError, ValueError):
-            return False
+            return None
 
     # Dedicated recorder clients have an existing exact capability marker.
-    marker = redis.get(f"catchuparr:stats:recorder-client:{channel_uuid}:{client_id}")
+    marker_key = f"catchuparr:stats:recorder-client:{channel_uuid}:{client_id}"
+    marker_type = _text(redis.type(marker_key))
+    if marker_type == "none":
+        return False
+    if marker_type != "string":
+        return None
+    marker = redis.get(marker_key)
     if marker is None:
         return False
     try:
         digest, separator, marked_channel = _text(marker).partition("|")
         if not separator or not digest or marked_channel != channel_uuid:
-            return False
-        cap = redis.get(f"catchuparr:recorder:stats-cap:{digest}")
-        lease = redis.get(f"catchuparr:recorder:{channel_uuid}")
+            return None
+        cap_key = f"catchuparr:recorder:stats-cap:{digest}"
+        cap_type = _text(redis.type(cap_key))
+        lease_key = f"catchuparr:recorder:{channel_uuid}"
+        lease_type = _text(redis.type(lease_key))
+        if cap_type != "string" or lease_type != "string":
+            return None
+        cap = redis.get(cap_key)
+        lease = redis.get(lease_key)
         if cap is None or lease is None:
-            return False
+            return None
         cap_channel, cap_separator, cap_lease = _text(cap).partition("|")
-        return bool(cap_separator and cap_channel == channel_uuid and cap_lease == _text(lease))
+        if cap_separator and cap_channel == channel_uuid and cap_lease == _text(lease):
+            return True
+        return None
     except (UnicodeError, ValueError):
-        return False
+        return None
 
 
 def observe_native_connection(
@@ -279,7 +298,10 @@ def observe_native_connection(
         ordinary: list[str] = []
         for raw_client_id in redis.smembers(clients_key):
             client_id = _text(raw_client_id)
-            if _private_client(redis, channel_uuid, client_id):
+            private = _private_client(redis, channel_uuid, client_id)
+            if private is None:
+                return None
+            if private:
                 continue
             record = redis.hgetall(f"live:channel:{channel_uuid}:clients:{client_id}") or {}
             fields = {_text(key): _text(value) for key, value in record.items()}
@@ -385,22 +407,26 @@ return 1
 _REGISTER_BORROWED_CLIENT_LUA = """
 local function private_client(id, channel)
   local episode_id = redis.call('HGET', KEYS[11], id)
-  if episode_id and episode_id == redis.call('HGET', KEYS[1], 'episode_id') then return true end
+  if episode_id then
+    if episode_id == redis.call('HGET', KEYS[1], 'episode_id') then return true end
+    return nil
+  end
   local marker_key = 'catchuparr:stats:recorder-client:' .. channel .. ':' .. id
   local marker_type = redis.call('TYPE', marker_key).ok
-  if marker_type ~= 'none' and marker_type ~= 'string' then return false end
+  if marker_type ~= 'none' and marker_type ~= 'string' then return nil end
   local marker = redis.call('GET', marker_key)
   if not marker then return false end
   local digest, marked_channel = string.match(marker, '^([^|]+)|([^|]+)$')
-  if not digest or marked_channel ~= channel then return false end
+  if not digest or marked_channel ~= channel then return nil end
   local cap_key = 'catchuparr:recorder:stats-cap:' .. digest
   local cap_type = redis.call('TYPE', cap_key).ok
-  if cap_type ~= 'none' and cap_type ~= 'string' then return false end
+  if cap_type ~= 'none' and cap_type ~= 'string' then return nil end
   local cap = redis.call('GET', cap_key)
   local lease = redis.call('GET', KEYS[3])
-  if not cap or not lease then return false end
+  if not cap or not lease then return nil end
   local cap_channel, cap_lease = string.match(cap, '^([^|]+)|(.+)$')
-  return cap_channel == channel and cap_lease == lease
+  if cap_channel == channel and cap_lease == lease then return true end
+  return nil
 end
 local expected = {'hash', 'hash', 'string', 'string', 'string', 'hash', 'none', 'none', 'none', 'none', 'none', 'string', 'none'}
 local allowed = {{'hash'}, {'hash'}, {'string'}, {'string'}, {'string'}, {'hash'},
@@ -465,7 +491,9 @@ for _, id in ipairs(redis.call('SMEMBERS', KEYS[10])) do
      or (stop_type ~= 'none' and stop_type ~= 'string') then return 0 end
   local connected_at = client_type == 'hash' and tonumber(redis.call('HGET', client_key, 'connected_at') or '') or nil
   local worker_id = client_type == 'hash' and redis.call('HGET', client_key, 'worker_id') or nil
-  if not private_client(id, ARGV[15]) and client_type == 'hash'
+  local private = private_client(id, ARGV[15])
+  if private == nil then return 0 end
+  if not private and client_type == 'hash'
      and connected_at and connected_at > 0 and connected_at == connected_at
      and connected_at < math.huge and worker_id and worker_id ~= '' and stop_type == 'none' then
     ordinary = ordinary + 1
@@ -494,22 +522,26 @@ return {1, nowstr, tostring(version)}
 _CHECK_AND_TOUCH_EPISODE_LUA = """
 local function private_client(id, channel)
   local own_episode = redis.call('HGET', KEYS[10], id)
-  if own_episode and own_episode == ARGV[7] then return true end
+  if own_episode then
+    if own_episode == ARGV[7] then return true end
+    return nil
+  end
   local marker_key = 'catchuparr:stats:recorder-client:' .. channel .. ':' .. id
   local marker_type = redis.call('TYPE', marker_key).ok
-  if marker_type ~= 'none' and marker_type ~= 'string' then return false end
+  if marker_type ~= 'none' and marker_type ~= 'string' then return nil end
   local marker = redis.call('GET', marker_key)
   if not marker then return false end
   local digest, marked_channel = string.match(marker, '^([^|]+)|([^|]+)$')
-  if not digest or marked_channel ~= channel then return false end
+  if not digest or marked_channel ~= channel then return nil end
   local cap_key = 'catchuparr:recorder:stats-cap:' .. digest
   local cap_type = redis.call('TYPE', cap_key).ok
-  if cap_type ~= 'none' and cap_type ~= 'string' then return false end
+  if cap_type ~= 'none' and cap_type ~= 'string' then return nil end
   local cap = redis.call('GET', cap_key)
   local lease = redis.call('GET', KEYS[3])
-  if not cap or not lease then return false end
+  if not cap or not lease then return nil end
   local cap_channel, cap_lease = string.match(cap, '^([^|]+)|(.+)$')
-  return cap_channel == channel and cap_lease == lease
+  if cap_channel == channel and cap_lease == lease then return true end
+  return nil
 end
 local allowed = {{'hash'}, {'hash'}, {'string'}, {'string'}, {'string'}, {'hash'},
   {'none', 'string'}, {'hash'}, {'none', 'set'}, {'none', 'hash'},
@@ -582,7 +614,9 @@ for _, id in ipairs(redis.call('SMEMBERS', KEYS[9])) do
      or (stop_type ~= 'none' and stop_type ~= 'string') then return 0 end
   local connected_at = client_type == 'hash' and tonumber(redis.call('HGET', client_key, 'connected_at') or '') or nil
   local worker_id = client_type == 'hash' and redis.call('HGET', client_key, 'worker_id') or nil
-  if not private_client(id, ARGV[10]) and client_type == 'hash'
+  local private = private_client(id, ARGV[10])
+  if private == nil then return 0 end
+  if not private and client_type == 'hash'
      and connected_at and connected_at > 0 and connected_at == connected_at
      and connected_at < math.huge and worker_id and worker_id ~= '' and stop_type == 'none' then
     ordinary = ordinary + 1

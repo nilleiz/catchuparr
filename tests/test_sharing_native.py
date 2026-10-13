@@ -85,6 +85,17 @@ class NativeObservationRedis:
     def get(self, key):
         return self.strings.get(key)
 
+    def type(self, key):
+        if key in self.strings:
+            return "string"
+        if key in self.hashes:
+            return "hash"
+        if key in self.sets:
+            return "set"
+        if key in self.zsets:
+            return "zset"
+        return "none"
+
     def hgetall(self, key):
         return self.hashes.get(key, {})
 
@@ -158,6 +169,47 @@ class NativeSharingTests(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.ordinary_viewer_ids, ())
+
+    def test_stale_recorder_capability_marker_fails_closed(self):
+        redis = NativeObservationRedis()
+        redis.strings[
+            f"catchuparr:stats:recorder-client:{CHANNEL}:viewer-synthetic-1"
+        ] = f"missing-capability-synthetic|{CHANNEL}"
+        source = NativeAssignedSource(
+            channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],
+            m3u_profile_id=IDENTITY[6], input_profile_id=IDENTITY[7], assigned=True,
+            account_active=True, profile_active=True, media_compatible=True,
+        )
+        result = observe_native_connection(
+            redis, CHANNEL, catalog_generation="catalog-synthetic-4",
+            assigned_sources=(source,), observed_at=101,
+        )
+        self.assertIsNone(result)
+
+    def test_wrong_type_recorder_capability_markers_fail_closed(self):
+        source = NativeAssignedSource(
+            channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],
+            m3u_profile_id=IDENTITY[6], input_profile_id=IDENTITY[7], assigned=True,
+            account_active=True, profile_active=True, media_compatible=True,
+        )
+        marker = f"catchuparr:stats:recorder-client:{CHANNEL}:viewer-synthetic-1"
+        cap = "catchuparr:recorder:stats-cap:digest-wrong-type-synthetic"
+        lease_key = f"catchuparr:recorder:{CHANNEL}"
+        for wrong_key in (marker, cap):
+            with self.subTest(wrong_key=wrong_key):
+                redis = NativeObservationRedis()
+                redis.strings[marker] = f"digest-wrong-type-synthetic|{CHANNEL}"
+                redis.strings[lease_key] = "lease-wrong-type-synthetic"
+                if wrong_key == marker:
+                    redis.strings.pop(marker)
+                    redis.hashes[marker] = {"marker": "wrong-type"}
+                else:
+                    redis.hashes[cap] = {"cap": "wrong-type"}
+                result = observe_native_connection(
+                    redis, CHANNEL, catalog_generation="catalog-synthetic-4",
+                    assigned_sources=(source,), observed_at=101,
+                )
+                self.assertIsNone(result)
 
     def test_native_observation_fails_closed_on_profile_or_owner_mismatch(self):
         source = NativeAssignedSource(
