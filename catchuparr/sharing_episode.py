@@ -166,7 +166,12 @@ class BorrowEpisodeLedger:
         episode_id = uuid.uuid4().hex
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT version,phase FROM sharing_borrow_episodes WHERE channel_uuid=?", (token.channel_uuid,)).fetchone()
+            row = db.execute("SELECT * FROM sharing_borrow_episodes WHERE channel_uuid=?", (token.channel_uuid,)).fetchone()
+            if row is not None:
+                # A transition may not repair or overwrite a corrupt authority
+                # row. Validate the complete row before trusting its phase or
+                # version, while the write transaction is still held.
+                self._snapshot_from_row(row)
             if (row is None) != (expected_version is None) or (row is not None and row["version"] != expected_version):
                 db.rollback()
                 raise BorrowEpisodeRejected("episode changed before opening")
@@ -211,6 +216,8 @@ class BorrowEpisodeLedger:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM sharing_borrow_episodes WHERE episode_id=?", (episode_id,)).fetchone()
+            if row is not None:
+                self._snapshot_from_row(row)
             if row is None or row["phase"] != "opening" or row["version"] != expected_version:
                 db.rollback()
                 raise BorrowEpisodeRejected("opening episode is stale")
@@ -238,6 +245,8 @@ class BorrowEpisodeLedger:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM sharing_borrow_episodes WHERE episode_id=?", (episode_id,)).fetchone()
+            if row is not None:
+                self._snapshot_from_row(row)
             if row is None or row["phase"] not in {"active", "wait_return"} or row["version"] != expected_version:
                 db.rollback()
                 raise BorrowEpisodeRejected("active episode is stale or revoked")
@@ -275,7 +284,9 @@ class BorrowEpisodeLedger:
         phase = "closed" if cleanup_acknowledged else "cleanup_pending"
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT channel_uuid,version FROM sharing_borrow_episodes WHERE episode_id=?", (episode_id,)).fetchone()
+            row = db.execute("SELECT * FROM sharing_borrow_episodes WHERE episode_id=?", (episode_id,)).fetchone()
+            if row is not None:
+                self._snapshot_from_row(row)
             if row is None or row["version"] != expected_version:
                 db.rollback()
                 raise BorrowEpisodeRejected("episode changed before revocation")
@@ -294,6 +305,11 @@ class BorrowEpisodeLedger:
             row = db.execute("SELECT * FROM sharing_borrow_episodes WHERE channel_uuid=?", (channel_uuid,)).fetchone()
         if row is None:
             raise BorrowEpisodeRejected("no active borrow episode")
+        return self._snapshot_from_row(row)
+
+    @staticmethod
+    def _snapshot_from_row(row: sqlite3.Row) -> BorrowEpisodeSnapshot:
+        """Decode and validate a persisted row before any transition trusts it."""
         try:
             identity = json.loads(row["identity_json"], parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid JSON constant")))
             if not isinstance(identity, list):

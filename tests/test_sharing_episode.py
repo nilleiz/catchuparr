@@ -261,8 +261,24 @@ class BorrowEpisodeTests(unittest.TestCase):
                 "UPDATE sharing_borrow_episodes SET return_deadline=? WHERE channel_uuid=?",
                 (float("inf"), CHANNEL),
             )
+            before = db.execute(
+                "SELECT phase,version,return_deadline FROM sharing_borrow_episodes WHERE channel_uuid=?",
+                (CHANNEL,),
+            ).fetchone()
         with self.assertRaises(BorrowEpisodeRejected):
             self.ledger.read(CHANNEL)
+        with self.assertRaises(BorrowEpisodeRejected):
+            self.ledger.update_viewers(
+                waiting.episode_id, expected_version=waiting.version,
+                ordinary_viewer_ids=("viewer-returned",), observed_at=110,
+                return_seconds=30, minimum_switch_seconds=60,
+            )
+        with self.ledger._db() as db:
+            after = db.execute(
+                "SELECT phase,version,return_deadline FROM sharing_borrow_episodes WHERE channel_uuid=?",
+                (CHANNEL,),
+            ).fetchone()
+        self.assertEqual(tuple(after), tuple(before))
         with self.assertRaises(ValueError):
             replace(waiting, return_deadline=float("nan"))
 
