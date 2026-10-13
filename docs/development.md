@@ -16,10 +16,10 @@ when naming the ZIP.
 For released 0.4.0, see [its guide](candidate-0.4.0.md) for native Stats
 projection behavior, settings and validation limits.
 
-For the 0.5.0 native output candidate, see [its guide](candidate-0.5.0.md).
-It is disabled by default. The local suite and package checks pass, while the
-exact native probe still needs to pass in both pinned AIO images before native
-server acceptance is recorded.
+For the 0.5.0 native output integration, see [its guide](candidate-0.5.0.md).
+It is disabled by default. The earlier implementation passed full probes in
+both pinned AIO images; the final parity correction passed four focused native
+0.32.0 cases. User acceptance is complete; required release CI remains pending.
 
 For the 0.5.1 named-profile inheritance prerelease, see [its candidate guide](candidate-0.5.1.md).
 Its CI, pinned AIO verification, isolated Dev verification and publication
@@ -73,7 +73,8 @@ extra provider duration padding is never required for local archive coverage.
 Use the plugin XMLTV endpoint with the plugin M3U export. Native XC M3U tags
 do not extend the core XMLTV endpoint's historical guide. The optional 0.5.0
 integration targets Dispatcharr's native `/output/m3u` and `/output/epg`
-endpoints; it remains a candidate pending pinned AIO verification.
+endpoints. Its final parity correction passed focused native 0.32.0 checks;
+release publication awaits the required workflow.
 
 ## Backup and rollback scope
 
@@ -84,7 +85,7 @@ restore point has been verified. Include archive data only with explicit
 authorization. An application/configuration-only restore point cannot recover
 archive files or database content that was lost or overwritten.
 
-For the native output candidate, include the private Catchuparr state files
+For native output integration, include the private Catchuparr state files
 `.catchuparr-active-settings.json` and `.catchuparr-native-output-keys.json`
 with the matching Dispatcharr configuration backup. They sit beside the
 replaceable plugin directory, outside both the plugin ZIP and archive directory.

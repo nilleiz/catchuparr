@@ -2,10 +2,29 @@
 
 Sections for 0.2.0 through 0.3.1 are historical candidate checkpoints; their
 pending release gates describe the status at that time. Version 0.4.0 is
-released. Version 0.5.0 remains under native-output acceptance; the 0.5.1
-profile-inheritance prerelease is implemented, with CI, AIO, Dev and publication
-gates pending. The 0.5.0 evidence and limitations are recorded below; see the
-[0.5.1 candidate guide](candidate-0.5.1.md) for its acceptance state.
+released. Version 0.5.0 implementation and user acceptance are complete, with
+publication pending its required release workflow. The 0.5.1 prerelease has 453
+unit tests passing, and both pinned native full AIO probes passed on their
+respective images. CI, isolated Dev verification and publication remain pending.
+The initial 0.32.0 media run failed before 96,256 bytes; a later diagnostic-only
+run passed, but the original cause remains unknown. See the
+[0.5.1 candidate guide](candidate-0.5.1.md) and the 0.5.0 evidence below.
+
+## 0.5.1 named profile inheritance prerelease
+
+The candidate passed 453 unit tests, Ruff, Python compilation and package
+validation. Its full native AIO integration passed on pinned Dispatcharr 0.31.0
+(image `f81924fa3dbfeb463b3908be7e086bf58aacbd2ba56062bfb555ee3a471acf8f`) and
+0.32.0 (image `b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`).
+The same 30-entry package, SHA-256
+`4afaa35f2b4f3258eac48b80b642f1d58ec9477587b80b0f4c161ea7336b230a`, was used
+for both runs and matches the runtime source. Independent evidence review
+confirmed the full mandatory probes ran.
+
+An earlier 0.32.0 media attempt failed before 96,256 accepted bytes. A later
+diagnostic-only full run passed without runtime changes. The original failure
+site and cause were not retained, so its cause remains unknown. Required CI and
+isolated Dev verification remain pending; the candidate is not published.
 
 ## Released baseline: 0.1.4
 

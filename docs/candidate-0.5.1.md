@@ -2,8 +2,9 @@
 
 Version 0.5.1 adds inherited source filters and recording schedules for named
 channel profiles. It preserves Dispatcharr's enabled profile membership. The
-candidate is not published; CI, pinned AIO verification, isolated Dev
-verification and publication gates remain pending.
+candidate is not published. Its 453-test suite and full pinned AIO probes
+passed on Dispatcharr 0.31.0 and 0.32.0. Required CI, isolated Dev
+verification and publication remain pending.
 
 ## Configuration behavior
 
@@ -36,6 +37,8 @@ for complete synthetic YAML examples, including invalid overlapping rules.
 
 ## Release state
 
-The local package version is 0.5.1. The candidate has not passed the required
-CI or pinned AIO verification, and it has not been installed in isolated Dev or
-published. Release claims must be updated only after those gates complete.
+The local package version is 0.5.1. The 453-test suite and full pinned AIO
+probes passed on Dispatcharr 0.31.0 and 0.32.0. Required CI, isolated Dev verification and publication remain
+pending. An initial 0.32.0 short-media attempt failed before 96,256 accepted
+bytes; a later diagnostic-only run passed, but the original cause remains
+unknown. The candidate has not been installed in isolated Dev or published.
