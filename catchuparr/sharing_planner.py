@@ -192,11 +192,12 @@ class SharingState:
     last_viewer_left_at: float | None = None
     last_switch_at: float | None = None
     pending_action: SharingAction | None = None
+    intent_epoch: int = 0
 
     def to_snapshot(self) -> dict[str, Any]:
         """Persist only cooldown evidence; never persist a borrowed binding."""
         return {
-            "version": 1,
+            "version": 2,
             "channel_uuid": self.channel_uuid,
             "configuration_generation": self.configuration_generation,
             "control_generation": self.control_generation,
@@ -209,6 +210,7 @@ class SharingState:
             "candidate_since": self.candidate_since,
             "last_viewer_left_at": self.last_viewer_left_at,
             "last_switch_at": self.last_switch_at,
+            "intent_epoch": self.intent_epoch,
         }
 
 
@@ -257,15 +259,18 @@ def restore_state(
     blank = SharingState(channel_uuid, configuration_generation, control_generation, recorder_fence)
     if not isinstance(snapshot, Mapping):
         return blank
-    expected = {
+    expected_v1 = {
         "version", "channel_uuid", "configuration_generation", "control_generation",
         "phase", "candidate_identity", "candidate_connection_identity", "candidate_since",
         "last_viewer_left_at", "last_switch_at",
     }
+    expected_v2 = expected_v1 | {"intent_epoch"}
+    snapshot_version = snapshot.get("version")
     if (
-        set(snapshot) != expected
+        (snapshot_version == 1 and set(snapshot) != expected_v1)
+        or (snapshot_version == 2 and set(snapshot) != expected_v2)
+        or snapshot_version not in {1, 2}
         or type(snapshot.get("version")) is not int
-        or snapshot["version"] != 1
         or snapshot.get("channel_uuid") != channel_uuid
         or snapshot.get("configuration_generation") != configuration_generation
         or type(snapshot.get("control_generation")) is not int
@@ -281,12 +286,14 @@ def restore_state(
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         numeric = float(value)
-        if (
-            not math.isfinite(numeric)
-            or (numeric > now and (not allow_future or numeric - now > 3600))
-            or now - numeric > 3600
-        ):
+        if not math.isfinite(numeric) or now - numeric > 3600:
             return None
+        if numeric > now:
+            if not allow_future:
+                return None
+            # Clamp all future skew, including unreasonable values, to now so
+            # the configured minimum interval still starts at this observation.
+            return now
         return numeric
 
     identity = snapshot.get("candidate_identity")
@@ -306,6 +313,9 @@ def restore_state(
     candidate_since = valid_time(snapshot.get("candidate_since"))
     last_viewer_left = valid_time(snapshot.get("last_viewer_left_at"))
     last_switch = valid_time(snapshot.get("last_switch_at"), allow_future=True)
+    intent_epoch = snapshot.get("intent_epoch", 0)
+    if type(intent_epoch) is not int or intent_epoch < 0:
+        intent_epoch = 0
     if identity is None or connection_identity is None or candidate_since is None:
         identity = None
         connection_identity = None
@@ -326,6 +336,7 @@ def restore_state(
         borrowed_identity=None,
         last_viewer_left_at=last_viewer_left,
         last_switch_at=last_switch,
+        intent_epoch=intent_epoch,
     )
 
 
@@ -409,6 +420,32 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
                 else SharingAction.PAUSE_NO_ALLOWED_SOURCE
             )
             return _intent(current, action, SharingPhase.FAILED, "sharing disabled")
+        if current.phase == SharingPhase.PAUSED:
+            if observation.dedicated_source_available:
+                return _intent(
+                    current,
+                    SharingAction.RETURN_TO_ALLOWED,
+                    SharingPhase.PAUSED,
+                    "sharing disabled; an allowed source can resume recording",
+                )
+            return SharingDecision(
+                SharingAction.NOOP,
+                current,
+                reason="sharing disabled; recorder remains paused without an allowed source",
+            )
+        if not observation.dedicated_source_available:
+            return SharingDecision(
+                SharingAction.NOOP,
+                replace(
+                    current,
+                    phase=SharingPhase.PAUSED,
+                    candidate_identity=None,
+                    candidate_connection_identity=None,
+                    candidate_since=None,
+                    pending_action=None,
+                ),
+                reason="sharing disabled and no allowed source is available",
+            )
         return SharingDecision(
             SharingAction.NOOP,
             replace(current, phase=SharingPhase.DEDICATED, pending_action=None),
@@ -495,6 +532,39 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
         return _intent(current, action, SharingPhase.WAIT_RETURN, "last-viewer return deadline elapsed", left_at=left_at)
 
     if not new_target or target is None:
+        if current.phase == SharingPhase.PAUSED:
+            if observation.dedicated_source_available:
+                return _intent(
+                    current,
+                    SharingAction.RETURN_TO_ALLOWED,
+                    SharingPhase.PAUSED,
+                    "allowed source is available; resume dedicated recording",
+                )
+            return SharingDecision(
+                SharingAction.NOOP,
+                replace(
+                    current,
+                    candidate_identity=None,
+                    candidate_connection_identity=None,
+                    candidate_since=None,
+                    pending_action=None,
+                ),
+                reason="recorder remains paused until a viewer or allowed source appears",
+            )
+        if not observation.dedicated_source_available:
+            return SharingDecision(
+                SharingAction.NOOP,
+                replace(
+                    current,
+                    phase=SharingPhase.PAUSED,
+                    candidate_identity=None,
+                    candidate_connection_identity=None,
+                    candidate_since=None,
+                    last_viewer_left_at=None,
+                    pending_action=None,
+                ),
+                reason="no eligible live viewer or allowed source is available",
+            )
         cleared = replace(
             current,
             phase=SharingPhase.DEDICATED,
@@ -567,6 +637,7 @@ def _intent(
         state,
         phase=phase,
         pending_action=action,
+        intent_epoch=state.intent_epoch + 1,
         last_viewer_left_at=(left_at if left_at is not None else state.last_viewer_left_at),
     )
     return SharingDecision(action, pending, reason=reason)
@@ -578,9 +649,11 @@ def resolve_transition(
     *,
     succeeded: bool,
     now: float,
+    current_state: SharingState,
+    current_observation: SharingObservation,
 ) -> SharingState:
     """Commit only successful route changes; failures never advance switch time."""
-    if not isinstance(state, SharingState):
+    if not isinstance(state, SharingState) or not isinstance(current_state, SharingState):
         raise ValueError("state must be SharingState")
     if not isinstance(action, SharingAction):
         raise ValueError("action must be SharingAction")
@@ -588,12 +661,86 @@ def resolve_transition(
         raise ValueError("succeeded must be boolean")
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(float(now)):
         raise ValueError("now must be a finite timestamp")
-    if state.pending_action != action:
-        return state
+    if not isinstance(current_observation, SharingObservation):
+        raise ValueError("current_observation must be a fresh SharingObservation")
+    if (
+        not current_observation.lease_is_current
+        or current_observation.channel_uuid != state.channel_uuid
+        or current_observation.recorder_fence != state.recorder_fence
+        or current_observation.configuration_generation != state.configuration_generation
+        or current_observation.control_generation != state.control_generation
+        or current_state.recorder_fence != state.recorder_fence
+        or current_state.channel_uuid != state.channel_uuid
+        or current_state.configuration_generation != state.configuration_generation
+        or current_state.control_generation != state.control_generation
+        or current_state.intent_epoch != state.intent_epoch
+        or current_state.pending_action != action
+        or state.pending_action != action
+    ):
+        return current_state
+    if action == SharingAction.ATTACH_BORROW:
+        target = current_observation.target
+        if (
+            not current_observation.settings.enabled
+            or not current_observation.recording_enabled
+            or not current_observation.schedule_open
+            or current_observation.explicit_stop
+            or target is None
+            or not target.eligible_for_new_borrow(current_observation.channel_uuid)
+            or target.connection_identity != current_state.candidate_connection_identity
+            or target.stability_identity != current_state.candidate_identity
+        ):
+            return current_state
+    if action in {
+        SharingAction.RETURN_TO_ALLOWED,
+        SharingAction.PAUSE_NO_ALLOWED_SOURCE,
+    }:
+        if (
+            action == SharingAction.RETURN_TO_ALLOWED
+            and not current_observation.dedicated_source_available
+        ) or (
+            action == SharingAction.PAUSE_NO_ALLOWED_SOURCE
+            and current_observation.dedicated_source_available
+        ):
+            return current_state
+        if (
+            not current_observation.recording_enabled
+            or not current_observation.schedule_open
+            or current_observation.explicit_stop
+        ):
+            return current_state
+        borrowed_identity = current_state.borrowed_identity
+        current_target = current_observation.target
+        same_borrow_has_viewers = bool(
+            borrowed_identity is not None
+            and current_target is not None
+            and current_target.connection_identity == borrowed_identity
+            and current_target.ordinary_client_ids
+        )
+        if same_borrow_has_viewers and (
+            action == SharingAction.PAUSE_NO_ALLOWED_SOURCE
+            or (
+                action == SharingAction.RETURN_TO_ALLOWED
+                and current_observation.settings.enabled
+            )
+        ):
+            return current_state
+    state = current_state
     if not succeeded:
         return replace(
             state,
-            phase=(SharingPhase.STOPPED if action == SharingAction.STOP else SharingPhase.FAILED),
+            phase=(
+                SharingPhase.STOPPED
+                if action == SharingAction.STOP
+                else (
+                    SharingPhase.PAUSED
+                    if action in {
+                        SharingAction.RETURN_TO_ALLOWED,
+                        SharingAction.PAUSE_NO_ALLOWED_SOURCE,
+                    } and state.borrowed_identity is None
+                    else SharingPhase.FAILED
+                )
+            ),
             candidate_identity=None,
             candidate_connection_identity=None,
             candidate_since=None,

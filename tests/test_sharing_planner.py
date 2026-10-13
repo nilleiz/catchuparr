@@ -7,8 +7,10 @@ from catchuparr.sharing_planner import (
     SharingPhase,
     SharingSettings,
     observe,
-    resolve_transition,
     restore_state,
+)
+from catchuparr.sharing_planner import (
+    resolve_transition as _resolve_transition,
 )
 
 CHANNEL = "00000000-0000-0000-0000-000000000007"
@@ -68,6 +70,59 @@ def observation(
     }
     values.update(overrides)
     return SharingObservation(**values)
+
+
+def target_from_identity(identity, *, clients=("viewer-1",)):
+    if identity is None:
+        return None
+    (
+        channel_uuid,
+        worker_uuid,
+        owner_lock_value,
+        metadata_owner,
+        stream_id,
+        account_id,
+        m3u_profile_id,
+        input_profile_id,
+    ) = identity
+    return target(
+        clients=clients,
+        channel_uuid=channel_uuid,
+        worker=worker_uuid,
+        owner=owner_lock_value,
+        metadata_owner=metadata_owner,
+        stream_id=stream_id,
+        account_id=account_id,
+        m3u_profile_id=m3u_profile_id,
+        input_profile_id=input_profile_id,
+    )
+
+
+def resolve_transition(state, action, *, succeeded, now):
+    identity = (
+        state.candidate_connection_identity
+        if action == SharingAction.ATTACH_BORROW
+        else state.borrowed_identity
+    )
+    current_observation = observation(
+        now,
+        candidate=target_from_identity(
+            identity,
+            clients=() if action != SharingAction.ATTACH_BORROW else ("viewer-1",),
+        ),
+        fence=state.recorder_fence,
+        generation=state.configuration_generation,
+        control=state.control_generation,
+        dedicated_source_available=action != SharingAction.PAUSE_NO_ALLOWED_SOURCE,
+    )
+    return _resolve_transition(
+        state,
+        action,
+        succeeded=succeeded,
+        now=now,
+        current_state=state,
+        current_observation=current_observation,
+    )
 
 
 class SharingPlannerTests(unittest.TestCase):
@@ -176,6 +231,99 @@ class SharingPlannerTests(unittest.TestCase):
         self.assertEqual(SharingAction.PAUSE_NO_ALLOWED_SOURCE, due.action)
         paused = resolve_transition(due.state, due.action, succeeded=True, now=70)
         self.assertEqual(SharingPhase.PAUSED, paused.phase)
+        still_paused = observe(
+            paused,
+            observation(
+                71,
+                candidate=target(clients=()),
+                settings=fast,
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingAction.NOOP, still_paused.action)
+        self.assertEqual(SharingPhase.PAUSED, still_paused.state.phase)
+        recovery = observe(
+            still_paused.state,
+            observation(
+                72,
+                candidate=target(clients=()),
+                settings=fast,
+                dedicated_source_available=True,
+            ),
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, recovery.action)
+        failed_recovery = resolve_transition(
+            recovery.state, recovery.action, succeeded=False, now=72
+        )
+        self.assertEqual(SharingPhase.PAUSED, failed_recovery.phase)
+        retry_recovery = observe(
+            failed_recovery,
+            observation(
+                73,
+                candidate=target(clients=()),
+                settings=fast,
+                dedicated_source_available=True,
+            ),
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, retry_recovery.action)
+        resumed = resolve_transition(
+            retry_recovery.state, retry_recovery.action, succeeded=True, now=73
+        )
+        self.assertEqual(SharingPhase.DEDICATED, resumed.phase)
+
+    def test_disabled_sharing_does_not_clear_paused_state_without_allowed_source(self):
+        fast = SharingSettings(
+            True,
+            live_stability_seconds=0,
+            last_viewer_return_seconds=0,
+            min_switch_interval_seconds=0,
+        )
+        attach = observe(None, observation(10, candidate=target(), settings=fast))
+        borrowed = resolve_transition(attach.state, attach.action, succeeded=True, now=10)
+        pause = observe(
+            borrowed,
+            observation(
+                11,
+                candidate=target(clients=()),
+                settings=fast,
+                dedicated_source_available=False,
+            ),
+        )
+        paused = resolve_transition(pause.state, pause.action, succeeded=True, now=11)
+        disabled = observe(
+            paused,
+            observation(
+                12,
+                candidate=target(clients=()),
+                settings=SharingSettings(),
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingAction.NOOP, disabled.action)
+        self.assertEqual(SharingPhase.PAUSED, disabled.state.phase)
+        source_returns = observe(
+            disabled.state,
+            observation(
+                13,
+                candidate=target(clients=()),
+                settings=SharingSettings(),
+                dedicated_source_available=True,
+            ),
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, source_returns.action)
+
+    def test_disabled_sharing_with_no_allowed_source_enters_paused_phase(self):
+        decision = observe(
+            None,
+            observation(
+                10,
+                candidate=target(clients=()),
+                settings=SharingSettings(),
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingAction.NOOP, decision.action)
+        self.assertEqual(SharingPhase.PAUSED, decision.state.phase)
 
     def test_paused_recorder_can_borrow_when_an_ordinary_viewer_returns(self):
         no_wait = SharingSettings(
@@ -304,13 +452,154 @@ class SharingPlannerTests(unittest.TestCase):
             recorder_fence=12,
             now=99,
         )
-        self.assertEqual(100, restarted.last_switch_at)
+        self.assertEqual(99, restarted.last_switch_at)
         retried = observe(
             restarted,
             observation(99, candidate=target(worker="native-worker-2"), fence=12, settings=fast),
         )
         self.assertEqual(SharingAction.WAIT, retried.action)
-        self.assertEqual(160, retried.deadline)
+        self.assertEqual(159, retried.deadline)
+
+    def test_future_switch_clock_is_clamped_to_now_for_all_skew_sizes(self):
+        fast = SharingSettings(
+            True,
+            live_stability_seconds=0,
+            last_viewer_return_seconds=0,
+            min_switch_interval_seconds=60,
+        )
+        for skew in (3600, 3601, 7200):
+            with self.subTest(skew=skew):
+                attach = observe(None, observation(100, candidate=target(), settings=fast))
+                borrowed = resolve_transition(
+                    attach.state, attach.action, succeeded=True, now=100
+                )
+                snapshot = borrowed.to_snapshot()
+                snapshot["last_switch_at"] = 100 + skew
+                restored = restore_state(
+                    snapshot,
+                    channel_uuid=CHANNEL,
+                    configuration_generation="config-a",
+                    control_generation=3,
+                    recorder_fence=12,
+                    now=100,
+                )
+                self.assertEqual(100, restored.last_switch_at)
+                waiting = observe(
+                    restored,
+                    observation(100, candidate=target(), fence=12, settings=fast),
+                )
+                self.assertEqual(SharingAction.WAIT, waiting.action)
+                self.assertEqual(160, waiting.deadline)
+
+    def test_stale_completion_cannot_resolve_newer_same_action_intent(self):
+        pending = observe(None, observation(100, candidate=target()))
+        newer = pending.state.__class__(
+            **{
+                **pending.state.__dict__,
+                "intent_epoch": pending.state.intent_epoch + 1,
+            }
+        )
+        fresh = observation(105, candidate=target())
+        result = _resolve_transition(
+            pending.state,
+            pending.action,
+            succeeded=True,
+            now=105,
+            current_state=newer,
+            current_observation=fresh,
+        )
+        self.assertIs(newer, result)
+        self.assertEqual(SharingPhase.WAIT_LIVE, result.phase)
+        self.assertIsNone(result.borrowed_identity)
+
+    def test_same_action_completion_rejects_a_changed_native_target(self):
+        pending = observe(None, observation(100, candidate=target()))
+        changed_target = target(worker="native-worker-2", owner="native-owner-2")
+        result = _resolve_transition(
+            pending.state,
+            pending.action,
+            succeeded=True,
+            now=105,
+            current_state=pending.state,
+            current_observation=observation(105, candidate=changed_target),
+        )
+        self.assertIs(pending.state, result)
+        self.assertIsNone(result.borrowed_identity)
+
+    def test_return_and_pause_completion_recheck_viewers_on_same_borrow(self):
+        no_wait = SharingSettings(
+            True,
+            live_stability_seconds=0,
+            last_viewer_return_seconds=0,
+            min_switch_interval_seconds=0,
+        )
+        attach = observe(None, observation(10, candidate=target(), settings=no_wait))
+        borrowed = resolve_transition(attach.state, attach.action, succeeded=True, now=10)
+        returning = observe(
+            borrowed,
+            observation(11, candidate=target(clients=()), settings=no_wait),
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, returning.action)
+        viewer_rejoined = observation(
+            12,
+            candidate=target(clients=("viewer-2",)),
+            settings=no_wait,
+        )
+        stale_return = _resolve_transition(
+            returning.state,
+            returning.action,
+            succeeded=True,
+            now=12,
+            current_state=returning.state,
+            current_observation=viewer_rejoined,
+        )
+        self.assertIs(returning.state, stale_return)
+
+        pause = observe(
+            borrowed,
+            observation(
+                11,
+                candidate=target(clients=()),
+                settings=no_wait,
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingAction.PAUSE_NO_ALLOWED_SOURCE, pause.action)
+        viewer_rejoined_no_source = observation(
+            12,
+            candidate=target(clients=("viewer-2",)),
+            settings=no_wait,
+            dedicated_source_available=False,
+        )
+        stale_pause = _resolve_transition(
+            pause.state,
+            pause.action,
+            succeeded=True,
+            now=12,
+            current_state=pause.state,
+            current_observation=viewer_rejoined_no_source,
+        )
+        self.assertIs(pause.state, stale_pause)
+
+    def test_stale_lease_or_generation_cannot_complete_pending_intent(self):
+        pending = observe(None, observation(100, candidate=target()))
+        for current in (
+            observation(105, candidate=target(), lease=False),
+            observation(105, candidate=target(), fence=12),
+            observation(105, candidate=target(), generation="config-b"),
+            observation(105, candidate=target(), control=4),
+        ):
+            with self.subTest(current=current):
+                result = _resolve_transition(
+                    pending.state,
+                    pending.action,
+                    succeeded=True,
+                    now=105,
+                    current_state=pending.state,
+                    current_observation=current,
+                )
+                self.assertIs(pending.state, result)
+                self.assertIsNone(result.borrowed_identity)
 
     def test_new_fence_preserves_successful_switch_cooldown_but_drops_target(self):
         fast = SharingSettings(
@@ -463,6 +752,22 @@ class SharingPlannerTests(unittest.TestCase):
             now=104,
         )
         self.assertIsNone(future.candidate_since)
+
+    def test_restore_accepts_previous_v1_snapshot_without_pending_intent_epoch(self):
+        pending = observe(None, observation(100, candidate=target()))
+        snapshot = pending.state.to_snapshot()
+        snapshot.pop("intent_epoch")
+        snapshot["version"] = 1
+        restored = restore_state(
+            snapshot,
+            channel_uuid=CHANNEL,
+            configuration_generation="config-a",
+            control_generation=3,
+            recorder_fence=12,
+            now=104,
+        )
+        self.assertEqual(0, restored.intent_epoch)
+        self.assertEqual(100, restored.candidate_since)
 
     def test_restore_and_transition_reject_invalid_fences_and_timestamps(self):
         snapshot = observe(None, observation(100, candidate=target())).state.to_snapshot()
