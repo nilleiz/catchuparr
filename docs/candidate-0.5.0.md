@@ -84,12 +84,15 @@ the archive, recordings or archive database in these backups.
 ## Implementation and acceptance evidence
 
 The earlier implementation passed 433 tests, Ruff, Python compilation and
-package validation. The 30-entry package had SHA-256
+package validation. The earlier 30-entry package had SHA-256
 `e710fb265a70ed4c12b585ff750e02c4912a31bab417593d2f258c386996434a`.
+
+The final 30-entry package has SHA-256
+`ac24d28af19312f4f107f04a3b7e4263e43d619311105334b0cbfec8b7954fe8`.
 
 The full synthetic AIO probe passed on Dispatcharr 0.31.0
 (`f81924fa3dbfeb463b3908be7e086bf58aacbd2ba56062bfb555ee3a471acf8f`) and
-0.32.0 (`b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a`).
+0.32.0 (`b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`).
 Each run passed 32 AIO tests and the integration gates for native M3U/XMLTV
 output, signed archive access, byte ranges, current permission and session
 checks, Stats Stop and cleanup. The runs completed separately; they do not
