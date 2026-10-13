@@ -1,6 +1,6 @@
 # Catchuparr roadmap
 
-Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Production deployment is outside this roadmap. Release 0.5.0 acceptance remains pending; the 0.5.1 configuration-inheritance prerelease is implemented, with validation and publication gates pending. Later work is planned, not implemented.
+Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Version 0.5.0 implementation and user acceptance are complete; publication awaits the required release workflow. The 0.5.1 configuration-inheritance prerelease is implemented, with its full pinned AIO probes passed; CI, isolated Dev verification and publication remain pending. Production deployment is outside this roadmap. Later work is planned, not implemented.
 
 ## Workflow and release gates
 
@@ -19,8 +19,8 @@ Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed w
 | 0.3.0 | YAML schedules, global recorder control and consistent logging | Medium | Implemented; superseded by the 0.3.1 candidate and not published separately |
 | 0.3.1 | Weekly schedule day groups, timezone resolution, unified Apply and M3U token links | Medium | Superseded development version; included in released 0.4.0 |
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
-| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | Both pinned AIO probes, 433 local tests, package checks and independent review pass; required CI, isolated Dev verification and player acceptance remain pending |
-| 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Implemented in the prerelease candidate; CI, AIO verification and publication gates remain pending |
+| 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | User acceptance complete; final parity correction passed four focused native 0.32.0 cases; required release workflow remains pending; not yet published |
+| 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Implemented in the prerelease candidate; the 453-test suite and full pinned AIO probes passed; CI and isolated Dev verification remain pending |
 | 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.1 acceptance is complete |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
@@ -321,8 +321,8 @@ acceptance remain release gates; see the [validation record](validation.md).
 
 This is a configuration step between 0.5.0 and 0.6.0. The behavior below is
 implemented in the 0.5.1 prerelease candidate and is not supported by released
-0.5.0. CI, pinned AIO verification, Dev verification and publication remain
-pending. It does not change
+0.5.0. The 453-test suite and full pinned AIO probes passed. CI, isolated Dev
+verification and publication remain pending. It does not change
 enabled profile membership or add connection sharing; 0.6.0 sharing and its
 cooldown design remain as described below.
 

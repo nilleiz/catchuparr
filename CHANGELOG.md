@@ -15,11 +15,12 @@ included here to explain the feature history leading to 0.4.0.
 
 ### Notes
 
-- This candidate is not published. Required CI, pinned AIO verification, Dev
-  verification and publication gates remain pending. See the [0.5.1 candidate
+- This candidate is not published. The 453-test suite and full pinned AIO probes
+  passed for both supported Dispatcharr versions. Required CI and isolated Dev
+  verification remain pending. See the [0.5.1 candidate
   guide](docs/candidate-0.5.1.md).
 
-## [0.5.0] - Development candidate, not published
+## [0.5.0] - 2026-10-12
 
 ### Added
 
@@ -31,9 +32,10 @@ included here to explain the feature history leading to 0.4.0.
 
 ### Notes
 
-- The 433-test local suite and full native AIO probes on pinned Dispatcharr
-  0.31.0 and 0.32.0 pass. Required CI, isolated Dev verification and
-  player-specific acceptance remain pending; this candidate is not published.
+- The 433-test suite and full native AIO probes passed before the final parity
+  correction. That correction passed four focused native 0.32.0 cases. User
+  acceptance is complete; required release CI remains pending and the version
+  is not published.
   See the [0.5.0 candidate guide](docs/candidate-0.5.0.md) for boundaries and
   status.
 

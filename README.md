@@ -15,22 +15,25 @@ archive is local to the Dispatcharr installation and is not a cloud service.
 
 ## Compatibility and status
 
-- Version 0.4.0 is released. The 0.5.0 candidate's CI, isolated Dev verification
-  and player acceptance remain pending. The 0.5.1 prerelease candidate adds
-  named-profile filter and schedule inheritance; its CI and pinned AIO checks,
-  Dev verification and publication remain pending.
+- Version 0.4.0 is released. Version 0.5.0 implementation and user acceptance
+  are complete; publication awaits the required release workflow and it is not
+  yet published. Version 0.5.1 is a prerelease candidate; its 453-test suite
+  and full pinned AIO probes pass. CI, isolated Dev verification and publication
+  remain pending.
 - Dispatcharr 0.31.0 and 0.32.0 are the supported versions covered by the
   repository's pinned native integration checks.
 - The primary path is M3U/XMLTV with HLS playback using MPEG-TS segments.
 - Native XC playback is implemented behind guarded Dispatcharr hooks. Native
   server integration is covered by synthetic checks; player-specific XC
   acceptance is still separate and should be verified with the client in use.
-- The 0.5.0 candidate adds an optional native M3U/XMLTV archive toggle. Its
-  433-test local suite and full pinned AIO probes pass on Dispatcharr 0.31.0 and
-  0.32.0. CI, isolated Dev verification and player acceptance remain pending;
-  see the [0.5.0 candidate guide](docs/candidate-0.5.0.md).
+- Version 0.5.0 adds an optional native M3U/XMLTV archive toggle. The earlier
+  implementation passed 433 tests and full pinned AIO probes on Dispatcharr
+  0.31.0 and 0.32.0. Its final parity correction passed four focused native
+  0.32.0 cases; required release CI remains pending. See the
+  [0.5.0 guide](docs/candidate-0.5.0.md).
 - The 0.5.1 prerelease candidate adds named-profile configuration inheritance.
-  It is not yet published; see the [0.5.1 candidate guide](docs/candidate-0.5.1.md).
+  CI, isolated Dev verification and publication remain pending; see the
+  [0.5.1 candidate guide](docs/candidate-0.5.1.md).
 - Playback follows the selected user's Dispatcharr permissions, channel access,
   catch-up permission and stream/session limits. It does not provide transcoding
   or frame-accurate seeking.
