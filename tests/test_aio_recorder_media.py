@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 import unittest
@@ -141,6 +142,176 @@ class RecorderMediaProbeTests(unittest.TestCase):
             self.assertIn("after_pause_private_cleanup", message)
             self.assertIn(f'"{failed_name}": false', message)
             self.assertNotIn("synthetic-owner-value", message)
+
+    def test_early_exhaustion_diagnostic_counts_accepted_and_filtered_chunks(self):
+        decisions = iter((False, True, True))
+        iterator = iter((b"filtered", b"accepted", b"tail"))
+
+        with self.assertRaises(probe._MediaReadDiagnosticError) as raised:
+            probe._read_stream_iterator(
+                iterator,
+                minimum_bytes=20,
+                timeout=1,
+                diagnostic_label="parent_after_follower",
+                accept_chunk=lambda: next(decisions),
+                diagnostic_fields=lambda: {
+                    "publication_floor": 7,
+                    "current_head": 9,
+                    "last_yield_index": 8,
+                },
+            )
+
+        self.assertEqual(
+            raised.exception.diagnostic,
+            {
+                "callsite": "parent_after_follower",
+                "accepted_bytes": len(b"accepted") + len(b"tail"),
+                "accepted_chunks": 2,
+                "discarded_bytes": len(b"filtered"),
+                "discarded_chunks": 1,
+                "minimum_bytes": 20,
+                "termination": "stop_iteration",
+                "publication_floor": 7,
+                "current_head": 9,
+                "last_yield_index": 8,
+            },
+        )
+
+    def test_filtered_stream_exhaustion_reports_static_callsite_and_no_payload(self):
+        with self.assertRaises(probe._MediaReadDiagnosticError) as raised:
+            probe._read_stream_iterator(
+                iter((b"synthetic-payload",)),
+                minimum_bytes=100,
+                timeout=1,
+                diagnostic_label="follower_initial",
+                accept_chunk=lambda: False,
+            )
+
+        diagnostic = raised.exception.diagnostic
+        self.assertEqual(diagnostic["callsite"], "follower_initial")
+        self.assertEqual(diagnostic["accepted_bytes"], 0)
+        self.assertEqual(diagnostic["accepted_chunks"], 0)
+        self.assertEqual(diagnostic["discarded_bytes"], len(b"synthetic-payload"))
+        self.assertEqual(diagnostic["discarded_chunks"], 1)
+        self.assertEqual(diagnostic["termination"], "stop_iteration")
+        self.assertNotIn("synthetic-payload", str(diagnostic))
+
+    def test_initial_media_exhaustion_keeps_native_diagnostic_before_readiness_wait(self):
+        class Redis:
+            @staticmethod
+            def get(_key):
+                return b"synthetic-owner"
+
+            @staticmethod
+            def hget(_key, _field):
+                return b"ACTIVE"
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker_id: "owner")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        manager = SimpleNamespace(running=True)
+        native_server = SimpleNamespace(
+            worker_id="synthetic-owner",
+            stream_managers={"worker": manager},
+            client_managers={"worker": object()},
+        )
+        expected_native_owner = probe._redis_text(native_server.worker_id)
+
+        with self.assertRaises(probe._MediaReadDiagnosticError) as raised:
+            probe._read_stream_iterator(
+                iter(()),
+                minimum_bytes=96256,
+                timeout=1,
+                diagnostic_label="parent_initial",
+                diagnostic_context=lambda: probe._native_media_reader_diagnostic_context(
+                    Redis(),
+                    native_server,
+                    "worker",
+                    expected_native_owner,
+                    metadata_key="metadata",
+                    redis_keys=Keys,
+                    metadata_field=Fields,
+                    channel_state=States,
+                    binding=None,
+                    capability_binding_current_fn=lambda *_args: False,
+                    load_applied_state_fn=lambda: (None, None),
+                    configuration_generation_fn=lambda _active: "generation",
+                ),
+            )
+
+        diagnostic = raised.exception.diagnostic
+        self.assertEqual(diagnostic["callsite"], "parent_initial")
+        self.assertEqual(diagnostic["termination"], "stop_iteration")
+        self.assertEqual(
+            diagnostic["native"],
+            {
+                "owner_present": True,
+                "owner_matches": True,
+                "manager_present": True,
+                "manager_running": True,
+                "client_manager_present": True,
+                "metadata_active": True,
+                "metadata_stopping": False,
+                "metadata_error": False,
+                "capability_binding_current": False,
+                "control_binding_current": False,
+            },
+        )
+
+    def test_follower_child_media_diagnostic_is_preserved_by_parent(self):
+        child_diagnostic = {
+            "callsite": "follower_initial",
+            "accepted_bytes": 17,
+            "accepted_chunks": 1,
+            "discarded_bytes": 0,
+            "discarded_chunks": 0,
+            "minimum_bytes": 96256,
+            "termination": "stop_iteration",
+            "native": {"owner_matches": True},
+        }
+        output = (
+            b"CATCHUPARR_RECORDER_FOLLOWER_MEDIA_DIAGNOSTIC "
+            + json.dumps(child_diagnostic).encode("utf-8")
+            + b"\n"
+        )
+        attempt = SimpleNamespace(
+            capability="synthetic-capability",
+            worker_id="synthetic-worker",
+            config_generation="synthetic-generation",
+        )
+
+        with patch.object(
+            probe.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=1, stdout=output),
+        ):
+            with self.assertRaises(probe._MediaReadDiagnosticError) as raised:
+                probe._run_fresh_process_follower(
+                    attempt,
+                    channel_uuid="synthetic-channel",
+                    stream_id="synthetic-stream",
+                    account_id="synthetic-account",
+                    profile_id=7,
+                    expected_profile_count=3,
+                    ffprobe="ffprobe",
+                    native_owner="synthetic-owner",
+                    parent_client_count=1,
+                    diagnostic_context=lambda: {"synthetic_source_requests": {"source-b.ts": 1}},
+                )
+
+        self.assertEqual(raised.exception.diagnostic["callsite"], "follower_initial")
+        self.assertEqual(raised.exception.diagnostic["termination"], "stop_iteration")
+        self.assertEqual(raised.exception.diagnostic["native"], {"owner_matches": True})
+        self.assertEqual(
+            raised.exception.diagnostic["parent_synthetic_source"],
+            {"synthetic_source_requests": {"source-b.ts": 1}},
+        )
 
     def test_live_route_tone_assertion_requires_expected_source(self):
         probe._assert_tone_matches(441, 440, "Synthetic live A")

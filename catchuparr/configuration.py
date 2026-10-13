@@ -25,8 +25,8 @@ from .native_output_security import ensure_native_key, native_key_id_valid
 from .runtime import PLUGIN_KEY, parse_settings
 
 ACTIVE_CONFIG_NAME = ".catchuparr-active-settings.json"
-ACTIVE_CONFIG_VERSION = 4
-SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, ACTIVE_CONFIG_VERSION})
+ACTIVE_CONFIG_VERSION = 5
+SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, 4, ACTIVE_CONFIG_VERSION})
 RESET_REQUIRED_NAME = ".catchuparr-configuration-reset-required"
 ACTIVATION_STATE_NAME = ".catchuparr-configuration-activation.json"
 ACTIVATION_BACKUP_NAME = ".catchuparr-configuration-activation-previous.json"
@@ -219,6 +219,7 @@ def compile_draft(
                 for channel_uuid in compiled.channel_uuids
             },
         },
+        "configuration_origins": compiled.channel_origins,
         "recording_enabled": recording_enabled,
         "log_level": log_level,
     }, catalog, previews
@@ -313,6 +314,7 @@ def _apply_configuration_locked(
         "channel_profile_ids": active["channel_profile_ids"],
         "source_policies": active["source_policies"],
         "recording_schedule": active["recording_schedule"],
+        "configuration_origins": active["configuration_origins"],
     }
     _prevalidate_archive_root(document["settings"]["archive_root"])
     try:
@@ -1341,6 +1343,8 @@ def _validate_active_document(data: dict[str, Any]) -> None:
     }
     if version >= 3:
         expected_fields.add("recording_schedule")
+    if version >= 5:
+        expected_fields.add("configuration_origins")
     if set(data) != expected_fields:
         raise ValueError("Active Catchuparr configuration fields are invalid")
     settings = data["settings"]
@@ -1376,6 +1380,24 @@ def _validate_active_document(data: dict[str, Any]) -> None:
         normalized_channels.append(channel_uuid)
     if len(normalized_channels) != len(set(normalized_channels)):
         raise ValueError("Active Catchuparr channel IDs contain duplicates")
+    if version >= 5:
+        origins = data.get("configuration_origins")
+        if not isinstance(origins, dict) or set(origins) != set(normalized_channels):
+            raise ValueError("Active Catchuparr configuration origins are invalid")
+        weekdays = {
+            "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
+        }
+        for origin in origins.values():
+            if (
+                not isinstance(origin, dict)
+                or set(origin) != {"source_filter", "priority", "schedule_days"}
+                or not isinstance(origin.get("source_filter"), str)
+                or not isinstance(origin.get("priority"), str)
+                or not isinstance(origin.get("schedule_days"), dict)
+                or set(origin["schedule_days"]) != weekdays
+                or any(not isinstance(value, str) for value in origin["schedule_days"].values())
+            ):
+                raise ValueError("Active Catchuparr configuration origins are invalid")
     profile_ids = data.get("channel_profile_ids")
     if (
         not isinstance(profile_ids, list)

@@ -1,6 +1,7 @@
 """Start and clean up a disposable AIO for synthetic compatibility checks."""
 
 import argparse
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -21,6 +22,11 @@ def _manage_script_exec(script_path: str) -> str:
 def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True)
+    parser.add_argument(
+        "--configuration-only",
+        action="store_true",
+        help="Run source-rule unit tests and the provider-free Django configuration probe, then stop.",
+    )
     args = parser.parse_args()
     name = f"catchuparr-ci-{time.time_ns()}"
 
@@ -62,13 +68,41 @@ def run():
                f"{name}:/tmp/aio_stats_gevent_probe.py")
         docker("cp", str(ROOT / "scripts/aio_native_redis_diagnostic.py"),
                f"{name}:/tmp/aio_native_redis_diagnostic.py")
+        docker("cp", str(ROOT / "scripts/aio_051_configuration_probe.py"),
+               f"{name}:/tmp/aio_051_configuration_probe.py")
         docker("cp", str(ROOT / "scripts/aio_recorder_failover.py"), f"{name}:/tmp/aio_recorder_failover.py")
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
         docker("cp", str(ROOT / "tests"), f"{name}:/tmp/tests")
         docker("exec", "--workdir", "/tmp", "-e", "PYTHONPATH=/data/plugins:/tmp",
                name, "/dispatcharrpy/bin/python", "-m", "unittest",
+               "tests.test_source_rules", "tests.test_schedule",
                "tests.test_engine_recorder", "tests.test_engine_playlist",
                "tests.test_engine_store", "-q", timeout=120)
+        with (ROOT / "scripts/aio_051_configuration_probe.py").open("rb") as script:
+            result = docker(
+                "exec", "-i", name, "/dispatcharrpy/bin/python", "-c",
+                "import os,sys; from pathlib import Path; "
+                "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
+                "sys.argv=['gunicorn','shell']; "
+                + _manage_script_exec("/app/manage.py"),
+                stdin=script,
+                stdout=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+        receipts = []
+        for line in result.stdout.splitlines():
+            try:
+                receipt = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(receipt, dict) and receipt.get("status") == "pass":
+                receipts.append(receipt)
+        if not receipts or receipts[-1].get("provider_connections") != 0:
+            raise RuntimeError("Native 0.5.1 Django configuration probe did not pass cleanly")
+        print(json.dumps(receipts[-1], sort_keys=True))
+        if args.configuration_only:
+            return
         with (ROOT / "scripts/aio_integration_probe.py").open("rb") as script:
             docker("exec", "-i", name, "/dispatcharrpy/bin/python", "-c",
                    "import os,sys; from pathlib import Path; "
