@@ -1015,6 +1015,51 @@ class SharingReaderTests(unittest.TestCase):
         self.assertEqual([("mark", CLIENT_ID, "100.0"), ("unmark", CLIENT_ID, "100.0")], events)
         self.assertEqual(1, manager.stop_calls)
 
+    def test_cleanup_after_read_proof_is_revoked_uses_exact_registration_cas(self):
+        manager = FakeClientManager()
+        events = []
+        registration = BorrowedClientRegistration(
+            manager, binding(), lambda: self.registration_proof(manager),
+            client_id=CLIENT_ID, client_ip="192.0.2.10", user_agent="Synthetic recorder",
+            owns_client_manager=True,
+            register_private_marker=lambda client_id, epoch: events.append(("mark", client_id, epoch)) or True,
+            remove_private_marker=lambda client_id, epoch: events.append(("unmark", client_id, epoch)) or True,
+            activity_writer=self.activity_writer, cleanup_clock=lambda: 123.0,
+        )
+        registration.proof_reader = lambda: self.registration_proof(manager)
+        registration.open(task_local_buffer(redis_client=manager.redis_client))
+        # The read lease is revoked. Cleanup remains authorized only by this
+        # exact native registration epoch and the private marker epoch.
+        registration.proof_reader = lambda: (_ for _ in ()).throw(BorrowBindingLost("revoked"))
+        registration.close()
+        self.assertFalse(manager.redis_client.exists(f"live:channel:{manager.channel_id}:clients:{CLIENT_ID}"))
+        self.assertFalse(manager.redis_client.sismember(manager.client_set_key, CLIENT_ID))
+        self.assertEqual([("mark", CLIENT_ID, "100.0"), ("unmark", CLIENT_ID, "100.0")], events)
+        self.assertEqual(1, manager.stop_calls)
+
+    def test_invalid_local_cleanup_clock_keeps_registration_for_safe_retry(self):
+        manager = FakeClientManager()
+        now = [float("nan")]
+        registration = BorrowedClientRegistration(
+            manager, binding(), lambda: self.registration_proof(manager),
+            client_id=CLIENT_ID, client_ip="192.0.2.10", user_agent="Synthetic recorder",
+            owns_client_manager=True, activity_writer=self.activity_writer,
+            cleanup_clock=lambda: now[0],
+        )
+        registration.proof_reader = lambda: self.registration_proof(manager)
+        registration.open(task_local_buffer(redis_client=manager.redis_client))
+        with self.assertRaises(BorrowReaderUnavailable):
+            registration.close()
+        client_key = f"live:channel:{manager.channel_id}:clients:{CLIENT_ID}"
+        self.assertTrue(manager.redis_client.exists(client_key))
+        self.assertIn(CLIENT_ID, manager.clients)
+        self.assertEqual(0, manager.stop_calls)
+        now[0] = 124.0
+        registration.proof_reader = lambda: (_ for _ in ()).throw(BorrowBindingLost("revoked"))
+        registration.close()
+        self.assertFalse(manager.redis_client.exists(client_key))
+        self.assertEqual(1, manager.stop_calls)
+
     def test_owned_manager_stays_open_until_private_marker_absence_is_confirmed(self):
         manager = FakeClientManager()
         marker_results = iter((False, True))
