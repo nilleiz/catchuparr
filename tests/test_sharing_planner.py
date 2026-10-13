@@ -110,6 +110,7 @@ def resolve_transition(state, action, *, succeeded, now):
             identity,
             clients=() if action != SharingAction.ATTACH_BORROW else ("viewer-1",),
         ),
+        settings=SharingSettings(True, 0, 0, 0),
         fence=state.recorder_fence,
         generation=state.configuration_generation,
         control=state.control_generation,
@@ -580,6 +581,224 @@ class SharingPlannerTests(unittest.TestCase):
             current_observation=viewer_rejoined_no_source,
         )
         self.assertIs(pause.state, stale_pause)
+
+    def test_forced_failure_cleanup_completes_even_when_viewers_remain(self):
+        no_wait = SharingSettings(True, 0, 0, 0)
+        attach = observe(None, observation(10, candidate=target(), settings=no_wait))
+        borrowed = resolve_transition(attach.state, attach.action, succeeded=True, now=10)
+        failure = observe(
+            borrowed,
+            observation(11, candidate=target(), settings=no_wait, recorder_failure=True),
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, failure.action)
+        recovered = _resolve_transition(
+            failure.state,
+            failure.action,
+            succeeded=True,
+            now=11,
+            current_state=failure.state,
+            current_observation=observation(
+                11, candidate=target(), settings=no_wait
+            ),
+        )
+        self.assertEqual(SharingPhase.DEDICATED, recovered.phase)
+        self.assertIsNone(recovered.borrowed_identity)
+
+        failed_recovery = observe(
+            borrowed,
+            observation(12, candidate=target(), settings=no_wait, recorder_failure=True),
+        )
+        failed = _resolve_transition(
+            failed_recovery.state,
+            failed_recovery.action,
+            succeeded=False,
+            now=12,
+            current_state=failed_recovery.state,
+            current_observation=observation(12, candidate=target(), settings=no_wait),
+        )
+        retried = observe(
+            failed,
+            observation(13, candidate=target(), settings=no_wait, recorder_failure=True),
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, retried.action)
+
+    def test_unhealthy_borrow_and_disabled_sharing_can_complete_forced_cleanup(self):
+        no_wait = SharingSettings(True, 0, 0, 0)
+        attach = observe(None, observation(10, candidate=target(), settings=no_wait))
+        borrowed = resolve_transition(attach.state, attach.action, succeeded=True, now=10)
+
+        unhealthy = observe(
+            borrowed,
+            observation(
+                11,
+                candidate=target(owner_heartbeat_healthy=False),
+                settings=no_wait,
+            ),
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, unhealthy.action)
+        unhealthy_complete = _resolve_transition(
+            unhealthy.state,
+            unhealthy.action,
+            succeeded=True,
+            now=11,
+            current_state=unhealthy.state,
+            current_observation=observation(
+                11,
+                candidate=target(owner_heartbeat_healthy=False),
+                settings=no_wait,
+            ),
+        )
+        self.assertEqual(SharingPhase.DEDICATED, unhealthy_complete.phase)
+
+        paused = observe(
+            borrowed,
+            observation(
+                12,
+                candidate=target(),
+                settings=SharingSettings(),
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingAction.PAUSE_NO_ALLOWED_SOURCE, paused.action)
+        paused_complete = _resolve_transition(
+            paused.state,
+            paused.action,
+            succeeded=True,
+            now=12,
+            current_state=paused.state,
+            current_observation=observation(
+                12,
+                candidate=target(),
+                settings=SharingSettings(),
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingPhase.PAUSED, paused_complete.phase)
+
+    def test_attach_and_return_recheck_deadlines_at_completion_and_on_clock_rollback(self):
+        settings = SharingSettings(True, 5, 30, 60)
+        attach = observe(None, observation(100, candidate=target(), settings=settings))
+        self.assertEqual(SharingAction.WAIT, attach.action)
+        due_attach = observe(
+            attach.state,
+            observation(105, candidate=target(), settings=settings),
+        )
+        self.assertEqual(SharingAction.ATTACH_BORROW, due_attach.action)
+
+        early_attach = _resolve_transition(
+            due_attach.state,
+            due_attach.action,
+            succeeded=True,
+            now=104,
+            current_state=due_attach.state,
+            current_observation=observation(104, candidate=target(), settings=settings),
+        )
+        self.assertIs(due_attach.state, early_attach)
+        rollback_attach = _resolve_transition(
+            due_attach.state,
+            due_attach.action,
+            succeeded=True,
+            now=105,
+            current_state=due_attach.state,
+            current_observation=observation(104, candidate=target(), settings=settings),
+        )
+        self.assertIs(due_attach.state, rollback_attach)
+        attached = _resolve_transition(
+            due_attach.state,
+            due_attach.action,
+            succeeded=True,
+            now=105,
+            current_state=due_attach.state,
+            current_observation=observation(105, candidate=target(), settings=settings),
+        )
+        self.assertEqual(SharingPhase.BORROWED, attached.phase)
+
+        left = observe(
+            attached,
+            observation(106, candidate=target(clients=()), settings=settings),
+        )
+        self.assertEqual(SharingAction.WAIT, left.action)
+        due_return = observe(
+            left.state,
+            observation(165, candidate=target(clients=()), settings=settings),
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, due_return.action)
+        early_return = _resolve_transition(
+            due_return.state,
+            due_return.action,
+            succeeded=True,
+            now=164,
+            current_state=due_return.state,
+            current_observation=observation(164, candidate=target(clients=()), settings=settings),
+        )
+        self.assertIs(due_return.state, early_return)
+        rollback_return = _resolve_transition(
+            due_return.state,
+            due_return.action,
+            succeeded=True,
+            now=165,
+            current_state=due_return.state,
+            current_observation=observation(164, candidate=target(clients=()), settings=settings),
+        )
+        self.assertIs(due_return.state, rollback_return)
+        returned = _resolve_transition(
+            due_return.state,
+            due_return.action,
+            succeeded=True,
+            now=165,
+            current_state=due_return.state,
+            current_observation=observation(165, candidate=target(clients=()), settings=settings),
+        )
+        self.assertEqual(SharingPhase.DEDICATED, returned.phase)
+
+        no_source_pause = observe(
+            attached,
+            observation(
+                106,
+                candidate=target(clients=()),
+                settings=settings,
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingAction.WAIT, no_source_pause.action)
+        due_pause = observe(
+            no_source_pause.state,
+            observation(
+                165,
+                candidate=target(clients=()),
+                settings=settings,
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingAction.PAUSE_NO_ALLOWED_SOURCE, due_pause.action)
+        early_pause = _resolve_transition(
+            due_pause.state,
+            due_pause.action,
+            succeeded=True,
+            now=164,
+            current_state=due_pause.state,
+            current_observation=observation(
+                164,
+                candidate=target(clients=()),
+                settings=settings,
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertIs(due_pause.state, early_pause)
+        paused = _resolve_transition(
+            due_pause.state,
+            due_pause.action,
+            succeeded=True,
+            now=165,
+            current_state=due_pause.state,
+            current_observation=observation(
+                165,
+                candidate=target(clients=()),
+                settings=settings,
+                dedicated_source_available=False,
+            ),
+        )
+        self.assertEqual(SharingPhase.PAUSED, paused.phase)
 
     def test_stale_lease_or_generation_cannot_complete_pending_intent(self):
         pending = observe(None, observation(100, candidate=target()))
