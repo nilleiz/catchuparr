@@ -585,49 +585,160 @@ def _wait_for_native_active(
         time.sleep(min(0.1, remaining))
 
 
+class _MediaReadDiagnosticError(RuntimeError):
+    """A sanitized media-reader failure that can cross the follower process boundary."""
+
+    def __init__(self, diagnostic: dict) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(json.dumps(diagnostic, sort_keys=True))
+
+
+def _native_media_reader_diagnostic_context(
+    redis_client, proxy_server, worker_id, expected_owner, *, metadata_key,
+    redis_keys, metadata_field, channel_state, binding, capability_binding_current_fn,
+    load_applied_state_fn, configuration_generation_fn, source_server=None,
+):
+    """Return only safe native state flags and synthetic source counts."""
+    owner = None
+    state = None
+    try:
+        owner = _redis_text(redis_client.get(redis_keys.channel_owner(worker_id)))
+        state = _redis_text(redis_client.hget(metadata_key, metadata_field.STATE))
+    except Exception:
+        pass
+    manager = getattr(proxy_server, "stream_managers", {}).get(worker_id)
+    client_manager = getattr(proxy_server, "client_managers", {}).get(worker_id)
+    try:
+        capability_current = bool(
+            binding is not None and capability_binding_current_fn(redis_client, binding)
+        )
+    except Exception:
+        capability_current = False
+    control_current = False
+    try:
+        active, control = load_applied_state_fn()
+        control_current = bool(
+            binding is not None
+            and active is not None
+            and not control.paused
+            and int(control.generation) == int(binding.get("control_generation", -1))
+            and str(configuration_generation_fn(active)) == str(binding.get("config_generation"))
+        )
+    except Exception:
+        pass
+    result = {
+        "owner_present": owner is not None,
+        "owner_matches": owner == expected_owner,
+        "manager_present": manager is not None,
+        "manager_running": bool(getattr(manager, "running", False)),
+        "client_manager_present": client_manager is not None,
+        "metadata_active": state == _constant_text(channel_state.ACTIVE),
+        "metadata_stopping": state == _constant_text(getattr(channel_state, "STOPPING", "__missing__")),
+        "metadata_error": state == _constant_text(getattr(channel_state, "ERROR", "__missing__")),
+        "capability_binding_current": capability_current,
+        "control_binding_current": control_current,
+    }
+    if source_server is not None:
+        try:
+            counts, active = source_server.snapshot()
+            result["synthetic_source_requests"] = {
+                name: int(counts.get(name, 0))
+                for name in ("source-a.ts", "source-b.ts", "source-c.ts")
+            }
+            result["synthetic_source_connections"] = {
+                name: int(active.get(name, 0))
+                for name in ("source-a.ts", "source-b.ts", "source-c.ts")
+            }
+        except Exception:
+            result["synthetic_source_status_available"] = False
+    return result
+
+
 def _read_stream_iterator(
     iterator, *, minimum_bytes: int, timeout: float, close=None, accept_chunk=None,
+    diagnostic_label: str = "media_reader",
+    diagnostic_context=None,
+    diagnostic_fields=None,
 ) -> bytes:
     chunks = []
     total = 0
-    failures = []
+    accepted_chunks = 0
+    discarded_bytes = 0
+    discarded_chunks = 0
+    termination = None
 
     def consume() -> None:
-        nonlocal total
+        nonlocal total, accepted_chunks, discarded_bytes, discarded_chunks, termination
         try:
             while total < minimum_bytes:
                 chunk = next(iterator)
                 if accept_chunk is not None and not accept_chunk():
+                    discarded_chunks += 1
+                    discarded_bytes += len(chunk)
                     continue
-                chunks.append(bytes(chunk))
-                total += len(chunk)
+                media_chunk = bytes(chunk)
+                chunks.append(media_chunk)
+                accepted_chunks += 1
+                total += len(media_chunk)
         except StopIteration:
-            return
+            termination = "stop_iteration"
         except Exception as exc:  # Keep exception/URL data out of CI logs.
-            failures.append(type(exc).__name__)
+            termination = type(exc).__name__
 
     reader = threading.Thread(target=consume, name="catchuparr-media-reader", daemon=True)
     reader.start()
     reader.join(timeout)
+
+    def failure(kind: str) -> _MediaReadDiagnosticError:
+        diagnostic = {
+            "callsite": diagnostic_label,
+            "accepted_bytes": total,
+            "accepted_chunks": accepted_chunks,
+            "discarded_bytes": discarded_bytes,
+            "discarded_chunks": discarded_chunks,
+            "minimum_bytes": int(minimum_bytes),
+            "termination": kind,
+        }
+        for callback, key in ((diagnostic_context, "native"), (diagnostic_fields, None)):
+            if callback is None:
+                continue
+            try:
+                fields = callback()
+                if isinstance(fields, dict):
+                    if key is None:
+                        diagnostic.update(fields)
+                    else:
+                        diagnostic[key] = fields
+            except Exception:
+                if key is not None:
+                    diagnostic[key] = {"available": False}
+        return _MediaReadDiagnosticError(diagnostic)
+
     if reader.is_alive():
+        error = failure("timeout")
         if close is not None:
             try:
                 close()
             except Exception:
                 pass
         reader.join(3)
-        raise RuntimeError("Synthetic recorder route did not deliver media before timeout")
-    if failures:
-        raise RuntimeError("Synthetic recorder media reader failed")
+        raise error
+    if termination is not None:
+        raise failure(termination)
     media = b"".join(chunks)
-    _require(len(media) >= minimum_bytes, "Synthetic recorder route returned too little media")
+    if len(media) < minimum_bytes:
+        raise failure("stop_iteration")
     return media
 
 
-def _read_stream_response(response, *, minimum_bytes: int, timeout: float) -> bytes:
+def _read_stream_response(
+    response, *, minimum_bytes: int, timeout: float, diagnostic_label="media_reader",
+    diagnostic_context=None,
+) -> bytes:
     return _read_stream_iterator(
         iter(response.streaming_content), minimum_bytes=minimum_bytes, timeout=timeout,
-        close=response.close,
+        close=response.close, diagnostic_label=diagnostic_label,
+        diagnostic_context=diagnostic_context,
     )
 
 
@@ -675,6 +786,7 @@ def _run_fresh_process_follower(
     ffprobe: str,
     native_owner: str,
     parent_client_count: int,
+    diagnostic_context=None,
 ) -> None:
     """Attach from a fresh Django process using the same private capability."""
     bootstrap = (
@@ -687,6 +799,7 @@ def _run_fresh_process_follower(
     route_path = f"/catchuparr/recorder/{channel_uuid}"
     child_script = f"""
 import os
+import json
 import sys
 sys.path.insert(0, "/data/plugins")
 sys.path.insert(0, "/tmp")
@@ -698,13 +811,16 @@ from apps.proxy.live_proxy.server import ProxyServer
 from core.utils import RedisClient
 from catchuparr import runtime
 from catchuparr.adapters.recorder_proxy import read_worker_record
-from catchuparr.configuration import load_active_configuration
+from catchuparr.configuration import load_active_configuration, load_applied_state
 from catchuparr.recorder_proxy import (
     capability_binding_current,
     configuration_generation,
     verify_recorder_capability,
 )
-from aio_recorder_media import _constant_text, _read_stream_response, _redis_text, _verify_media_identity
+from aio_recorder_media import (
+    _MediaReadDiagnosticError, _constant_text, _native_media_reader_diagnostic_context,
+    _read_stream_response, _redis_text, _verify_media_identity,
+)
 
 def follower_require(condition):
     if not condition:
@@ -768,7 +884,25 @@ try:
     follower_require(not response.get("Location"))
     follower_require(getattr(response, "streaming", False))
     follower_require(worker_id not in proxy_server.stream_managers)
-    media = _read_stream_response(response, minimum_bytes=188 * 512, timeout=20)
+    try:
+        media = _read_stream_response(
+            response, minimum_bytes=188 * 512, timeout=20,
+            diagnostic_label="follower_initial",
+            diagnostic_context=lambda: _native_media_reader_diagnostic_context(
+                redis_client, proxy_server, worker_id, expected_owner,
+                redis_keys=RedisKeys, metadata_key=metadata_key,
+                metadata_field=ChannelMetadataField, channel_state=ChannelState,
+                binding=binding,
+                capability_binding_current_fn=capability_binding_current,
+                load_applied_state_fn=load_applied_state,
+                configuration_generation_fn=configuration_generation,
+            ),
+        )
+    except _MediaReadDiagnosticError as exc:
+        print("CATCHUPARR_RECORDER_FOLLOWER_MEDIA_DIAGNOSTIC " + json.dumps(
+            exc.diagnostic, sort_keys=True,
+        ))
+        raise
     _verify_media_identity({ffprobe!r}, media)
     client_manager = proxy_server.client_managers.get(worker_id)
     follower_require(client_manager is not None and client_manager.get_client_count() == 1)
@@ -810,6 +944,29 @@ print("CATCHUPARR_RECORDER_FOLLOWER_OK")
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("Fresh-process recorder follower exceeded its bounded timeout") from None
+    diagnostic_line = next(
+        (line for line in result.stdout.splitlines()
+         if line.startswith(b"CATCHUPARR_RECORDER_FOLLOWER_MEDIA_DIAGNOSTIC ")),
+        None,
+    )
+    if diagnostic_line is not None:
+        try:
+            child_diagnostic = json.loads(
+                diagnostic_line.split(b" ", 1)[1].decode("utf-8")
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            child_diagnostic = {
+                "callsite": "follower_initial",
+                "termination": "diagnostic_unavailable",
+            }
+        if diagnostic_context is not None:
+            try:
+                fields = diagnostic_context()
+                if isinstance(fields, dict):
+                    child_diagnostic["parent_synthetic_source"] = fields
+            except Exception:
+                child_diagnostic["parent_synthetic_source"] = {"available": False}
+        raise _MediaReadDiagnosticError(child_diagnostic)
     _require(
         result.returncode == 0
         and b"CATCHUPARR_RECORDER_FOLLOWER_OK" in result.stdout.splitlines(),
@@ -1123,6 +1280,17 @@ def probe_actual_recorder_media(root: Path) -> None:
         )
         media = _read_stream_iterator(
             parent_iterator, minimum_bytes=188 * 512, timeout=20, close=response.close,
+            diagnostic_label="parent_initial",
+            diagnostic_context=lambda: _native_media_reader_diagnostic_context(
+                redis_client, native_server, attempt_b.worker_id, native_owner,
+                redis_keys=RedisKeys,
+                metadata_key=RedisKeys.channel_metadata(attempt_b.worker_id),
+                metadata_field=ChannelMetadataField, channel_state=ChannelState,
+                binding=verify_recorder_capability(redis_client, attempt_b.capability),
+                capability_binding_current_fn=capability_binding_current,
+                load_applied_state_fn=load_applied_state, source_server=source_server,
+                configuration_generation_fn=configuration_generation,
+            ),
         )
         _verify_media_identity(ffprobe, media)
         counts, _ = source_server.snapshot()
@@ -1200,6 +1368,16 @@ def probe_actual_recorder_media(root: Path) -> None:
             ffprobe=ffprobe,
             native_owner=native_owner,
             parent_client_count=parent_client_count,
+            diagnostic_context=lambda: _native_media_reader_diagnostic_context(
+                redis_client, native_server, attempt_b.worker_id, native_owner,
+                redis_keys=RedisKeys,
+                metadata_key=RedisKeys.channel_metadata(attempt_b.worker_id),
+                metadata_field=ChannelMetadataField, channel_state=ChannelState,
+                binding=verify_recorder_capability(redis_client, attempt_b.capability),
+                capability_binding_current_fn=capability_binding_current,
+                load_applied_state_fn=load_applied_state, source_server=source_server,
+                configuration_generation_fn=configuration_generation,
+            ),
         )
         counts_after_follower, active_after_follower = source_server.snapshot()
         _require(
@@ -1271,10 +1449,26 @@ def probe_actual_recorder_media(root: Path) -> None:
             minimum_bytes=188 * 512,
             timeout=20,
             close=response.close,
+            diagnostic_label="parent_after_follower",
             accept_chunk=lambda: (
                 native_yield_tracker.last_yielded_index is not None
                 and native_yield_tracker.last_yielded_index > publication_floor
             ),
+            diagnostic_context=lambda: _native_media_reader_diagnostic_context(
+                redis_client, native_server, attempt_b.worker_id, native_owner,
+                redis_keys=RedisKeys,
+                metadata_key=RedisKeys.channel_metadata(attempt_b.worker_id),
+                metadata_field=ChannelMetadataField, channel_state=ChannelState,
+                binding=verify_recorder_capability(redis_client, attempt_b.capability),
+                capability_binding_current_fn=capability_binding_current,
+                load_applied_state_fn=load_applied_state, source_server=source_server,
+                configuration_generation_fn=configuration_generation,
+            ),
+            diagnostic_fields=lambda: {
+                "publication_floor": int(publication_floor),
+                "current_head": int(native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0),
+                "last_yield_index": int(native_yield_tracker.last_yielded_index or 0),
+            },
         )
         published_head = int(
             native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
