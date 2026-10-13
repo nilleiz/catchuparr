@@ -711,18 +711,25 @@ def resolve_transition(
             return current_state
         borrowed_identity = current_state.borrowed_identity
         current_target = current_observation.target
-        same_borrow_has_viewers = bool(
-            borrowed_identity is not None
+        ordinary_return_has_healthy_viewers = bool(
+            current_state.phase == SharingPhase.WAIT_RETURN
+            and borrowed_identity is not None
             and current_target is not None
             and current_target.connection_identity == borrowed_identity
+            and current_target.healthy_existing_connection(current_observation.channel_uuid)
             and current_target.ordinary_client_ids
         )
-        if same_borrow_has_viewers and (
-            action == SharingAction.PAUSE_NO_ALLOWED_SOURCE
-            or (
-                action == SharingAction.RETURN_TO_ALLOWED
-                and current_observation.settings.enabled
-            )
+        if ordinary_return_has_healthy_viewers:
+            return current_state
+
+    if succeeded and action in {
+        SharingAction.ATTACH_BORROW,
+        SharingAction.RETURN_TO_ALLOWED,
+        SharingAction.PAUSE_NO_ALLOWED_SOURCE,
+    }:
+        deadline = _completion_deadline(current_state, current_observation, action)
+        if deadline is not None and (
+            float(now) < deadline or float(current_observation.now) < deadline
         ):
             return current_state
     state = current_state
@@ -781,3 +788,37 @@ def resolve_transition(
     if action == SharingAction.STOP:
         return replace(state, phase=SharingPhase.STOPPED, pending_action=None)
     return replace(state, pending_action=None)
+
+
+def _completion_deadline(
+    state: SharingState,
+    observation: SharingObservation,
+    action: SharingAction,
+) -> float | None:
+    """Recheck normal switching deadlines at transition completion.
+
+    Forced cleanup and paused recovery carry FAILED/PAUSED phases and therefore
+    bypass cooldowns. Only ordinary viewer-driven transitions are delayed.
+    """
+    if action == SharingAction.ATTACH_BORROW:
+        if state.phase != SharingPhase.WAIT_LIVE or state.candidate_since is None:
+            return None
+        return _later_deadline(
+            state.candidate_since,
+            observation.settings.live_stability_seconds,
+            state.last_switch_at,
+            observation.settings.min_switch_interval_seconds,
+        )
+    if action in {
+        SharingAction.RETURN_TO_ALLOWED,
+        SharingAction.PAUSE_NO_ALLOWED_SOURCE,
+    }:
+        if state.phase != SharingPhase.WAIT_RETURN or state.last_viewer_left_at is None:
+            return None
+        return _later_deadline(
+            state.last_viewer_left_at,
+            observation.settings.last_viewer_return_seconds,
+            state.last_switch_at,
+            observation.settings.min_switch_interval_seconds,
+        )
+    return None
