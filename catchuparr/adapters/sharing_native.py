@@ -192,7 +192,10 @@ def _private_client(redis: Any, channel_uuid: str, client_id: str) -> bool | Non
         return None
     marker = redis.get(marker_key)
     if marker is None:
-        return False
+        # The marker vanished between TYPE and GET (for example, an expiring
+        # recorder marker). Do not reinterpret that ambiguous client as a
+        # positive ordinary-viewer signal.
+        return None
     try:
         digest, separator, marked_channel = _text(marker).partition("|")
         if not separator or not digest or marked_channel != channel_uuid:

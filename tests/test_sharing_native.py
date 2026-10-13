@@ -211,6 +211,28 @@ class NativeSharingTests(unittest.TestCase):
                 )
                 self.assertIsNone(result)
 
+    def test_recorder_marker_vanishing_after_type_check_fails_closed(self):
+        class VanishingMarkerRedis(NativeObservationRedis):
+            def get(self, key):
+                if key == f"catchuparr:stats:recorder-client:{CHANNEL}:viewer-synthetic-1":
+                    self.strings.pop(key, None)
+                    return None
+                return super().get(key)
+
+        redis = VanishingMarkerRedis()
+        marker = f"catchuparr:stats:recorder-client:{CHANNEL}:viewer-synthetic-1"
+        redis.strings[marker] = f"vanishing-marker-synthetic|{CHANNEL}"
+        source = NativeAssignedSource(
+            channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],
+            m3u_profile_id=IDENTITY[6], input_profile_id=IDENTITY[7], assigned=True,
+            account_active=True, profile_active=True, media_compatible=True,
+        )
+        result = observe_native_connection(
+            redis, CHANNEL, catalog_generation="catalog-synthetic-4",
+            assigned_sources=(source,), observed_at=101,
+        )
+        self.assertIsNone(result)
+
     def test_native_observation_fails_closed_on_profile_or_owner_mismatch(self):
         source = NativeAssignedSource(
             channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],

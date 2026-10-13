@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -177,17 +178,25 @@ class NativeLuaRedisTests(unittest.TestCase):
             "output_format", "mpegts", "output_profile_id", "",
         )
 
-    def _opening_projection(self, *, episode=None):
+    def _opening_projection(self, *, episode=None, return_seconds=30,
+                            minimum_switch_seconds=60, last_switch_at=95):
         episode = episode or _episode()
         self._base_authority()
         self.assertTrue(project_opening_episode(
             self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
-            return_seconds=30, minimum_switch_seconds=60, last_switch_at=95,
+            return_seconds=return_seconds,
+            minimum_switch_seconds=minimum_switch_seconds,
+            last_switch_at=last_switch_at,
         ))
         return episode
 
-    def _register(self, *, client_id: str = CLIENT):
-        episode = self._opening_projection()
+    def _register(self, *, client_id: str = CLIENT, return_seconds=30,
+                  minimum_switch_seconds=60, last_switch_at=95):
+        episode = self._opening_projection(
+            return_seconds=return_seconds,
+            minimum_switch_seconds=minimum_switch_seconds,
+            last_switch_at=last_switch_at,
+        )
         self._native_source_and_viewer()
         ack = register_borrowed_client(
             self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
@@ -297,6 +306,52 @@ class NativeLuaRedisTests(unittest.TestCase):
                 self.assertEqual(self.redis.command("TYPE", keys["private"]),
                                  ["string"] if wrong_key == "private" else ["none"])
 
+    def test_registration_rejection_matrix_preserves_opening_authority(self):
+        cases = (
+            "channel_stop", "client_stop", "owner_changed", "profile_changed",
+            "heartbeat_expired", "lease_expired", "current_generation_changed",
+            "buffer_chunk_missing", "invalid_ttl",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.redis.command("FLUSHDB")
+                episode = self._opening_projection()
+                self._native_source_and_viewer()
+                keys = _keys()
+                if case == "channel_stop":
+                    self.redis.command("SET", f"live:channel:{CHANNEL}:stopping", "1")
+                elif case == "client_stop":
+                    self.redis.command(
+                        "SET", f"live:channel:{CHANNEL}:client:{CLIENT}:stop", "1"
+                    )
+                elif case == "owner_changed":
+                    self.redis.command("SET", keys["owner"], "replacement-owner-synthetic", "EX", 600)
+                elif case == "profile_changed":
+                    self.redis.command("HSET", keys["metadata"], "stream_profile", "replacement-profile-synthetic")
+                elif case == "heartbeat_expired":
+                    self.redis.command("DEL", keys["heartbeat"])
+                elif case == "lease_expired":
+                    self.redis.command("DEL", keys["lease"])
+                elif case == "current_generation_changed":
+                    self.redis.command("HSET", keys["current"], "catalog_generation", "catalog-new-synthetic")
+                elif case == "buffer_chunk_missing":
+                    self.redis.command("DEL", keys["chunk"])
+                elif case != "invalid_ttl":
+                    self.fail(f"unknown registration case {case}")
+                before_projection = self.redis.hgetall(keys["episode"])
+                before_clients = self.redis.smembers(keys["clients"])
+                result = register_borrowed_client(
+                    self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+                    client_id=CLIENT, local_worker_id=TASK_WORKER,
+                    user_agent="Synthetic Player", client_ip="192.0.2.60",
+                    client_record_ttl=0 if case == "invalid_ttl" else 60,
+                )
+                self.assertIsNone(result)
+                self.assertEqual(self.redis.hgetall(keys["episode"]), before_projection)
+                self.assertEqual(self.redis.smembers(keys["clients"]), before_clients)
+                self.assertFalse(self.redis.exists(keys["client"]))
+                self.assertIsNone(self.redis.hget(keys["private"], CLIENT))
+
     def test_check_type_preflight_prevents_partial_heartbeat_or_projection_writes(self):
         self._register()
         keys = _keys()
@@ -352,6 +407,98 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(self.redis.hget(keys["client"], "last_active"), before)
 
+    def test_active_check_rejection_matrix_preserves_client_and_projection(self):
+        cases = (
+            "channel_stop", "client_stop", "owner_changed", "profile_changed",
+            "heartbeat_expired", "lease_expired", "current_generation_changed",
+            "connected_at_replaced", "stale_grant_version", "invalid_ttl",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.redis.command("FLUSHDB")
+                self._register()
+                keys = _keys()
+                grant = read_native_episode_grant(self.redis, CHANNEL)
+                if case == "channel_stop":
+                    self.redis.command("SET", f"live:channel:{CHANNEL}:stopping", "1")
+                elif case == "client_stop":
+                    self.redis.command(
+                        "SET", f"live:channel:{CHANNEL}:client:{CLIENT}:stop", "1"
+                    )
+                elif case == "owner_changed":
+                    self.redis.command("SET", keys["owner"], "replacement-owner-synthetic", "EX", 600)
+                elif case == "profile_changed":
+                    self.redis.command("HSET", keys["metadata"], "m3u_profile", "replacement-m3u-synthetic")
+                elif case == "heartbeat_expired":
+                    self.redis.command("DEL", keys["heartbeat"])
+                elif case == "lease_expired":
+                    self.redis.command("DEL", keys["lease"])
+                elif case == "current_generation_changed":
+                    self.redis.command("HSET", keys["current"], "control_generation", "8")
+                elif case == "connected_at_replaced":
+                    self.redis.command("HSET", keys["client"], "connected_at", "replacement-time-synthetic")
+                elif case == "stale_grant_version":
+                    self.redis.command("HINCRBY", keys["episode"], "version", 1)
+                elif case != "invalid_ttl":
+                    self.fail(f"unknown active check case {case}")
+                before_projection = self.redis.hgetall(keys["episode"])
+                before_client = self.redis.hgetall(keys["client"])
+                before_members = self.redis.smembers(keys["clients"])
+                ok, _, _ = check_and_touch_borrowed_client(
+                    self.redis, grant, client_record_ttl=0 if case == "invalid_ttl" else 60
+                )
+                self.assertFalse(ok)
+                self.assertEqual(self.redis.hgetall(keys["episode"]), before_projection)
+                self.assertEqual(self.redis.hgetall(keys["client"]), before_client)
+                self.assertEqual(self.redis.smembers(keys["clients"]), before_members)
+
+    def test_dynamic_grace_deadline_retention_and_cooldown_boundaries(self):
+        # A very old/future clock record is clamped conservatively at the Redis
+        # observation, then retained exactly while the same absence continues.
+        self._register(return_seconds=0, minimum_switch_seconds=3600,
+                       last_switch_at=10**12)
+        keys = _keys()
+        self.redis.command("SREM", keys["clients"], VIEWER)
+        self.redis.command("DEL", keys["viewer"])
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        observed_before = time.time()
+        ok, deadline, version = check_and_touch_borrowed_client(self.redis, grant)
+        observed_after = time.time()
+        self.assertTrue(ok)
+        self.assertIsNotNone(deadline)
+        self.assertGreaterEqual(deadline, observed_before + 3590)
+        self.assertLessEqual(deadline, observed_after + 3601)
+        self.assertEqual(version, grant.version + 1)
+        stored_deadline = self.redis.hget(keys["episode"], "return_deadline")
+        self.assertEqual(float(stored_deadline), deadline)
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        ok, retained_deadline, retained_version = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertTrue(ok)
+        self.assertEqual(retained_deadline, deadline)
+        self.assertEqual(retained_version, grant.version)
+
+        # The maximum supported viewer-return grace also remains within the
+        # documented bound when no switch cooldown is requested.
+        self.redis.command("FLUSHDB")
+        self._register(return_seconds=3600, minimum_switch_seconds=0,
+                       last_switch_at=time.time())
+        keys = _keys()
+        self.redis.command("SREM", keys["clients"], VIEWER)
+        self.redis.command("DEL", keys["viewer"])
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        observed_before = time.time()
+        ok, max_deadline, _ = check_and_touch_borrowed_client(self.redis, grant)
+        observed_after = time.time()
+        self.assertTrue(ok)
+        self.assertIsNotNone(max_deadline)
+        self.assertGreaterEqual(max_deadline, observed_before + 3590)
+        self.assertLessEqual(max_deadline, observed_after + 3601)
+
+        self.redis.command("DEL", f"live:channel:{CHANNEL}:stopping")
+        # Reinitialize the first episode for the expired-deadline rejection.
+        self.redis.command("FLUSHDB")
+        self._register()
+        keys = _keys()
         self.redis.command("DEL", f"live:channel:{CHANNEL}:stopping")
         self.redis.command("HSET", keys["episode"], "phase", "wait_return",
                            "viewer_left_at", "1", "return_deadline", "1")
