@@ -99,6 +99,11 @@ class ConfigurationTests(unittest.TestCase):
             set(result["channels"][0]["configuration_origin"]["schedule_days"].values()),
         )
         self.assertTrue(applied["applied"])
+        self.assertEqual(result["channels"], applied["channels"])
+        self.assertEqual(
+            {"include": None, "exclude": [], "priority": {}},
+            result["channels"][0]["effective_source_policy"],
+        )
         self.assertEqual(ACTIVE_CONFIG_VERSION, saved["version"])
         self.assertEqual([CHANNEL_A, CHANNEL_B], saved["channel_uuids"])
         self.assertEqual(["7"], saved["channel_profile_ids"])
@@ -108,6 +113,31 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("Synthetic Channel", serialized)
         self.assertNotIn("filter_config", serialized)
         self.assertNotIn("https://provider.invalid", serialized)
+
+    def test_validate_and_apply_return_same_effective_policy_and_origins(self):
+        settings = dict(
+            self.settings,
+            filter_config=(
+                "version: 1\nprofile: all\nrules:\n"
+                "  - channels: {profile: Synthetic Profile All}\n"
+                "    include: [Synthetic Provider]\n"
+                "    priority: {Synthetic Provider: 20}\n"
+            ),
+        )
+        validated = validate_configuration(settings, self.catalog)
+        applied = apply_configuration(settings, self.catalog, self.active_path)
+
+        self.assertEqual(validated["channels"], applied["channels"])
+        self.assertEqual(
+            {
+                "include": ["Synthetic Provider"],
+                "exclude": [],
+                "priority": {"Synthetic Provider": 20},
+            },
+            validated["channels"][0]["effective_source_policy"],
+        )
+        self.assertEqual("rule 1", validated["channels"][0]["configuration_origin"]["source_filter"])
+        self.assertEqual("rule 1", validated["channels"][0]["configuration_origin"]["priority"])
 
     def test_v5_snapshot_contains_settings_schedules_and_configuration_origins(self):
         settings = dict(

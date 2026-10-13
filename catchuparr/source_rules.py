@@ -427,17 +427,6 @@ def _effective_filter(
     priorities = patch.priorities
     if priorities is None:
         priorities = inherited.priorities if inherited is not None else ()
-    for account_id, _score in priorities:
-        if include_ids is not None and account_id not in include_ids:
-            raise SourceRuleError(
-                f"line {line}, field priority: account is excluded by include filter"
-            )
-        if account_id in exclude_ids:
-            raise SourceRuleError(
-                f"line {line}, field priority: account is excluded by source filter"
-            )
-    if patch.priorities is not None and patch.filter_kind is None and inherited is None:
-        raise SourceRuleError(f"line {line}, field priority: requires include or exclude")
     if patch.filter_kind is None and patch.priorities is None:
         return inherited
     known_ids = frozenset(known_account_ids)
@@ -718,6 +707,26 @@ def compile_filter_config(
                     schedule_origins = {day: f"rule {direct_entry['index']}" for day in days}
         else:
             effective_policy = inherited_policy
+        if effective_policy is not None:
+            if (
+                effective_policy.priorities
+                and effective_policy.include_account_ids is None
+                and not effective_policy.exclude_account_ids
+                and origin["source_filter"] is None
+            ):
+                raise SourceRuleError("field priority: requires include or exclude")
+            for account_id, _score in effective_policy.priorities:
+                if (
+                    effective_policy.include_account_ids is not None
+                    and account_id not in effective_policy.include_account_ids
+                ):
+                    raise SourceRuleError(
+                        "field priority: account is excluded by include filter"
+                    )
+                if account_id in effective_policy.exclude_account_ids:
+                    raise SourceRuleError(
+                        "field priority: account is excluded by source filter"
+                    )
         channel_schedule = (
             CONTINUOUS_SCHEDULE
             if len(inherited_days) == 7 and all(
@@ -736,6 +745,9 @@ def compile_filter_config(
     channel_schedules: dict[str, RecordingSchedule] = {}
     preview_by_uuid: dict[str, dict[str, Any]] = {}
     channel_origins: dict[str, dict[str, Any]] = {}
+    account_name_by_id = {
+        str(item.get("id")): str(item.get("name") or "") for item in accounts
+    }
     for channel_uuid in sorted(selected_ids):
         policy, channel_schedule, origins = effective[channel_uuid]
         channel_origins[channel_uuid] = origins
@@ -764,6 +776,22 @@ def compile_filter_config(
             "channel_group": str(channel.get("group") or ""),
             "candidates": candidate_views,
             "source_override": channel_uuid in source_policies,
+            "effective_source_policy": {
+                "include": (
+                    sorted(account_name_by_id[account_id]
+                           for account_id in policy.include_account_ids)
+                    if policy is not None and policy.include_account_ids is not None else None
+                ),
+                "exclude": sorted(
+                    account_name_by_id[account_id]
+                    for account_id in (policy.exclude_account_ids if policy is not None else ())
+                ),
+                "priority": (
+                    {account_name_by_id[account_id]: score
+                     for account_id, score in policy.priorities}
+                    if policy is not None else {}
+                ),
+            },
             "recording_schedule": channel_schedule.to_snapshot(),
             "configuration_origin": origins,
             "warning": (
