@@ -185,6 +185,7 @@ class BorrowReadBinding:
     control_generation: int
     recorder_fence: int
     pending_return_deadline: float | None = None
+    dynamic_grace: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -199,6 +200,8 @@ class BorrowReadBinding:
             raise ValueError("control_generation must be a non-negative integer")
         if type(self.recorder_fence) is not int or self.recorder_fence < 0:
             raise ValueError("recorder_fence must be a non-negative integer")
+        if type(self.dynamic_grace) is not bool:
+            raise ValueError("dynamic_grace must be boolean")
         if self.pending_return_deadline is not None:
             import math
 
@@ -294,10 +297,11 @@ def validate_borrow_read_proof(binding: BorrowReadBinding, proof: BorrowReadProo
         raise BorrowBindingLost("native connection is no longer safe to read")
     if proof.ordinary_viewer_ids:
         return
-    deadline = binding.pending_return_deadline
+    deadline = proof.pending_return_deadline if binding.dynamic_grace else binding.pending_return_deadline
     if (
         deadline is None
-        or proof.pending_return_deadline != deadline
+        or (not binding.dynamic_grace and proof.pending_return_deadline != deadline)
+        or (binding.dynamic_grace and not proof.borrowed_client_current)
         or float(proof.checked_at) >= float(deadline)
     ):
         raise BorrowBindingLost("no ordinary viewer remains for this borrow")

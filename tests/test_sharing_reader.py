@@ -32,13 +32,14 @@ PACKET = b"\x47" + b"\x00" * 187
 CLIENT_ID = "catchuparr-client-synthetic-7"
 
 
-def binding(*, deadline=None, fence=11, generation="config-a", control=3):
+def binding(*, deadline=None, fence=11, generation="config-a", control=3, dynamic_grace=False):
     return BorrowReadBinding(
         IDENTITY,
         generation,
         control,
         fence,
         pending_return_deadline=deadline,
+        dynamic_grace=dynamic_grace,
     )
 
 
@@ -483,6 +484,23 @@ class SharingReaderTests(unittest.TestCase):
                     validate_borrow_read_proof(expected, invalid)
         with self.assertRaises(BorrowBindingLost):
             validate_borrow_read_proof(binding(), proof(viewers=()))
+
+    def test_authenticated_dynamic_grace_accepts_current_deadline_after_viewer_departure(self):
+        dynamic = binding(dynamic_grace=True)
+        validate_borrow_read_proof(
+            dynamic,
+            proof(viewers=(), now=101, deadline=130, borrowed_client_current=True),
+        )
+        with self.assertRaises(BorrowBindingLost):
+            validate_borrow_read_proof(
+                dynamic,
+                proof(viewers=(), now=101, deadline=130, borrowed_client_current=False),
+            )
+        with self.assertRaises(BorrowBindingLost):
+            validate_borrow_read_proof(
+                dynamic,
+                proof(viewers=(), now=130, deadline=130, borrowed_client_current=True),
+            )
 
     def test_reader_yields_only_aligned_chunks_after_repeated_identity_checks(self):
         buffer = task_local_buffer(index=5, batches=[([PACKET, PACKET], 7)])
