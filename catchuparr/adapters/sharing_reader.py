@@ -7,12 +7,81 @@ binds the reader to the current native owner and recorder fences.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping
 
 _TASK_LOCAL_BUFFER_MARKER = object()
+
+
+def redis_backend_signature(redis_client: Any) -> str:
+    """Return an opaque signature for a supported Redis transport/database.
+
+    The signature intentionally includes authentication and TLS configuration in
+    the digest so the binary and text pools must reach the same backend. Raw
+    credentials and TLS key material are never returned or logged. Decode mode
+    and pool tuning are excluded because Dispatcharr deliberately uses separate
+    pools for binary and text operations.
+    """
+    pool = getattr(redis_client, "connection_pool", None)
+    kwargs = getattr(pool, "connection_kwargs", None)
+    connection_class = getattr(pool, "connection_class", None)
+    if not isinstance(kwargs, Mapping) or connection_class is None:
+        raise BorrowReaderUnavailable("Redis transport identity is unsupported")
+    class_name = getattr(connection_class, "__name__", "")
+    module_name = getattr(connection_class, "__module__", "")
+    if module_name != "redis.connection" or class_name not in {
+        "Connection", "SSLConnection", "UnixDomainSocketConnection",
+    }:
+        raise BorrowReaderUnavailable("Redis transport type is unsupported")
+    if type(kwargs.get("decode_responses")) is not bool:
+        raise BorrowReaderUnavailable("Redis response decoding mode is unknown")
+    if class_name == "UnixDomainSocketConnection":
+        if not isinstance(kwargs.get("path"), str) or not kwargs["path"]:
+            raise BorrowReaderUnavailable("Redis Unix socket identity is incomplete")
+    elif (
+        not isinstance(kwargs.get("host"), str)
+        or not kwargs["host"]
+        or type(kwargs.get("port")) is not int
+        or not 1 <= kwargs["port"] <= 65535
+    ):
+        raise BorrowReaderUnavailable("Redis endpoint identity is incomplete")
+    database = kwargs.get("db")
+    if type(database) is not int or database < 0:
+        raise BorrowReaderUnavailable("Redis database identity is incomplete")
+    fields = (
+        "host", "port", "db", "username", "password", "path", "unix_socket_path",
+        "ssl",
+        "ssl_cert_reqs", "ssl_ca_certs", "ssl_ca_data", "ssl_keyfile", "ssl_certfile",
+        "ssl_password", "ssl_check_hostname", "ssl_min_version", "ssl_max_version",
+    )
+    if class_name == "SSLConnection" and kwargs.get("ssl") is False:
+        raise BorrowReaderUnavailable("Redis TLS configuration is inconsistent")
+    material: dict[str, Any] = {"connection_class": class_name}
+    for key in fields:
+        value = kwargs.get(key)
+        if isinstance(value, bytes):
+            value = {"bytes_sha256": hashlib.sha256(value).hexdigest()}
+        elif value is not None and type(value) not in (str, int, float, bool):
+            raise BorrowReaderUnavailable("Redis transport configuration is unsupported")
+        material[key] = value
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_native_buffer_namespace(buffer: Any, channel_uuid: str) -> None:
+    expected = {
+        "channel_id": channel_uuid,
+        "buffer_index_key": f"live:channel:{channel_uuid}:input:buffer:index",
+        "buffer_prefix": f"live:channel:{channel_uuid}:input:buffer:chunk:",
+        "chunk_timestamps_key": f"live:channel:{channel_uuid}:input:buffer:chunk_timestamps",
+    }
+    if any(getattr(buffer, name, None) != value for name, value in expected.items()):
+        raise BorrowReaderUnavailable("native input buffer namespace is unsupported")
 
 
 class BorrowBindingLost(RuntimeError):
@@ -49,9 +118,6 @@ def native_read_api_supported(buffer_type: Any, client_manager_type: Any) -> boo
             getattr(client_manager_type, "add_client", None),
             {"client_id", "client_ip", "user_agent", "user", "output_format", "output_profile_id"},
         )
-        and _has_parameters(
-            getattr(client_manager_type, "remove_client", None), {"client_id"}
-        )
     )
 
 
@@ -68,17 +134,18 @@ def make_task_local_input_buffer(buffer_type: Any, channel_uuid: str, redis_clie
     ):
         raise BorrowReaderUnavailable("native input-buffer reader API is unsupported")
     buffer = buffer_type(channel_id=channel_uuid, redis_client=redis_client)
-    expected_key = f"live:channel:{channel_uuid}:input:buffer:index"
     if type(getattr(buffer, "index", None)) is not int:
         raise BorrowReaderUnavailable("native input buffer has no valid read position")
+    _validate_native_buffer_namespace(buffer, channel_uuid)
     if (
-        str(getattr(buffer, "channel_id", "")) != channel_uuid
-        or getattr(buffer, "redis_client", None) is not redis_client
-        or not isinstance(getattr(buffer, "buffer_index_key", None), str)
-        or buffer.buffer_index_key != expected_key
+        getattr(buffer, "redis_client", None) is not redis_client
         or not callable(getattr(redis_client, "get", None))
     ):
-        raise BorrowReaderUnavailable("native input buffer namespace is unsupported")
+        raise BorrowReaderUnavailable("native input buffer Redis client is unsupported")
+    redis_backend_signature(redis_client)
+    connection_kwargs = redis_client.connection_pool.connection_kwargs
+    if connection_kwargs.get("decode_responses") is not False:
+        raise BorrowReaderUnavailable("native input buffer must preserve binary Redis responses")
     chunk_size = getattr(buffer, "target_chunk_size", None)
     if type(chunk_size) is not int or chunk_size <= 0 or chunk_size % 188:
         raise BorrowReaderUnavailable("native input buffer does not preserve TS packet boundaries")
@@ -216,9 +283,13 @@ def validate_borrow_read_proof(binding: BorrowReadBinding, proof: BorrowReadProo
 _TOUCH_NATIVE_CLIENT_LUA = """
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then return 0 end
 if redis.call('EXISTS', KEYS[2]) == 0 then return 0 end
+if redis.call('EXISTS', KEYS[7]) ~= 0 then return 0 end
+if redis.call('EXISTS', KEYS[8]) ~= 0 then return 0 end
 if redis.call('GET', KEYS[3]) ~= ARGV[2] then return 0 end
 if redis.call('HGET', KEYS[4], 'owner') ~= ARGV[3] then return 0 end
 if redis.call('HGET', KEYS[4], 'stream_id') ~= ARGV[4] then return 0 end
+if redis.call('HGET', KEYS[4], 'm3u_profile') ~= ARGV[13] then return 0 end
+if redis.call('HGET', KEYS[4], 'stream_profile') ~= ARGV[14] then return 0 end
 local state = redis.call('HGET', KEYS[4], 'state')
 if state ~= 'active' and state ~= 'waiting_for_clients' then return 0 end
 if redis.call('EXISTS', KEYS[5]) == 0 then return 0 end
@@ -230,9 +301,28 @@ if redis.call('HGET', KEYS[2], 'ip_address') ~= ARGV[9] then return 0 end
 if redis.call('HGET', KEYS[2], 'user_id') ~= ARGV[10] then return 0 end
 if redis.call('HGET', KEYS[2], 'output_format') ~= ARGV[11] then return 0 end
 if redis.call('HGET', KEYS[2], 'output_profile_id') ~= ARGV[12] then return 0 end
-redis.call('HSET', KEYS[2], 'last_active', ARGV[13])
-redis.call('EXPIRE', KEYS[2], ARGV[14])
-redis.call('EXPIRE', KEYS[1], ARGV[14])
+redis.call('HSET', KEYS[2], 'last_active', ARGV[15])
+redis.call('EXPIRE', KEYS[2], ARGV[16])
+redis.call('EXPIRE', KEYS[1], ARGV[16])
+return 1
+"""
+
+_REMOVE_EXACT_NATIVE_CLIENT_LUA = """
+if redis.call('EXISTS', KEYS[2]) == 0 then return 0 end
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then return 0 end
+if redis.call('HGET', KEYS[2], 'connected_at') ~= ARGV[2] then return 0 end
+if redis.call('HGET', KEYS[2], 'worker_id') ~= ARGV[3] then return 0 end
+if redis.call('HGET', KEYS[2], 'user_agent') ~= ARGV[4] then return 0 end
+if redis.call('HGET', KEYS[2], 'ip_address') ~= ARGV[5] then return 0 end
+if redis.call('HGET', KEYS[2], 'user_id') ~= ARGV[6] then return 0 end
+if redis.call('HGET', KEYS[2], 'output_format') ~= ARGV[7] then return 0 end
+if redis.call('HGET', KEYS[2], 'output_profile_id') ~= ARGV[8] then return 0 end
+redis.call('SREM', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[2])
+local remaining = redis.call('SCARD', KEYS[1])
+if remaining == 0 then
+  redis.call('SET', KEYS[3], ARGV[9], 'EX', ARGV[10])
+end
 return 1
 """
 
@@ -304,16 +394,20 @@ class NativeClientActivityGuard:
         channel_metadata_key = f"live:channel:{channel_id}:metadata"
         worker_heartbeat_key = f"live:worker:{metadata_owner}:heartbeat"
         recorder_lease_key = f"catchuparr:recorder:{channel_id}"
+        client_stop_key = f"live:channel:{channel_id}:client:{client_id}:stop"
+        channel_stopping_key = f"live:channel:{channel_id}:stopping"
         try:
             result = self.redis.eval(
                 _TOUCH_NATIVE_CLIENT_LUA,
-                6,
+                8,
                 client_set_key,
                 client_key,
                 owner_key,
                 channel_metadata_key,
                 worker_heartbeat_key,
                 recorder_lease_key,
+                client_stop_key,
+                channel_stopping_key,
                 client_id,
                 owner_value,
                 metadata_owner,
@@ -326,6 +420,8 @@ class NativeClientActivityGuard:
                 values["user_id"],
                 values["output_format"],
                 values["output_profile_id"],
+                binding.connection_identity[6],
+                binding.connection_identity[7],
                 str(float(proof.checked_at)),
                 self.client_record_ttl,
             )
@@ -347,6 +443,7 @@ class ReadOnlyTsBufferReader:
     ) -> None:
         if type(getattr(buffer, "index", None)) is not int:
             raise BorrowReaderUnavailable("native input buffer has no valid read position")
+        _validate_native_buffer_namespace(buffer, binding.connection_identity[0])
         if (
             getattr(buffer, "_catchuparr_task_local_reader_marker", None)
             is not _TASK_LOCAL_BUFFER_MARKER
@@ -358,6 +455,10 @@ class ReadOnlyTsBufferReader:
             raise BorrowReaderUnavailable("native input buffer reader API is unsupported")
         if not callable(proof_reader):
             raise BorrowReaderUnavailable("native borrow proof callback is missing")
+        redis_client = getattr(buffer, "redis_client", None)
+        redis_backend_signature(redis_client)
+        if redis_client.connection_pool.connection_kwargs.get("decode_responses") is not False:
+            raise BorrowReaderUnavailable("native input buffer must preserve binary Redis responses")
         if (
             isinstance(poll_interval, bool)
             or not isinstance(poll_interval, (int, float))
@@ -451,8 +552,8 @@ class BorrowedClientRegistration:
         client_ip: str,
         user_agent: str,
         owns_client_manager: bool = False,
-        register_private_marker: Callable[[str], bool] | None = None,
-        remove_private_marker: Callable[[str], bool] | None = None,
+        register_private_marker: Callable[[str, str], bool] | None = None,
+        remove_private_marker: Callable[[str, str], bool] | None = None,
         activity_writer: Callable[
             [BorrowReadBinding, str, BorrowReadProof, Mapping[str, str]], bool
         ] | None = None,
@@ -466,12 +567,16 @@ class BorrowedClientRegistration:
         if not _has_parameters(
             getattr(client_manager, "add_client", None),
             {"client_id", "client_ip", "user_agent", "user", "output_format", "output_profile_id"},
-        ) or not _has_parameters(
-            getattr(client_manager, "remove_client", None), {"client_id"}
         ):
-            raise BorrowReaderUnavailable("native client manager lifecycle API is unsupported")
+            raise BorrowReaderUnavailable("native client manager registration API is unsupported")
         if type(getattr(client_manager, "clients", None)) is not set:
             raise BorrowReaderUnavailable("native client manager has no auditable client set")
+        if (
+            not hasattr(client_manager, "lock")
+            or type(getattr(client_manager, "_registered_clients", None)) is not set
+            or not isinstance(getattr(client_manager, "last_heartbeat_time", None), dict)
+        ):
+            raise BorrowReaderUnavailable("native client manager registration state is unsupported")
         channel_uuid = binding.connection_identity[0]
         if (
             str(getattr(client_manager, "channel_id", "")) != channel_uuid
@@ -483,6 +588,9 @@ class BorrowedClientRegistration:
             or not callable(getattr(client_manager.redis_client, "hgetall", None))
         ):
             raise BorrowReaderUnavailable("native client manager namespace is unsupported")
+        redis_backend_signature(client_manager.redis_client)
+        if client_manager.redis_client.connection_pool.connection_kwargs.get("decode_responses") is not True:
+            raise BorrowReaderUnavailable("native client manager must use text Redis responses")
         if type(owns_client_manager) is not bool:
             raise ValueError("owns_client_manager must be boolean")
         if not callable(activity_writer):
@@ -502,6 +610,8 @@ class BorrowedClientRegistration:
         self._attempted = False
         self._marker_attempted = False
         self._client_fields: dict[str, str] | None = None
+        self._registration_attempted = False
+        self._replacement_present = False
         self._last_activity_at: float | None = None
         self.reader: ReadOnlyTsBufferReader | None = None
 
@@ -539,6 +649,66 @@ class BorrowedClientRegistration:
         fields = {self._text(key): self._text(value) for key, value in raw.items()}
         return all(fields.get(key) == value for key, value in self._client_fields.items())
 
+    def _capture_client_fields(self) -> dict[str, str] | None:
+        _, metadata_key = self._client_keys()
+        raw = self.client_manager.redis_client.hgetall(metadata_key)
+        fields = {self._text(key): self._text(value) for key, value in raw.items()}
+        expected = {
+            "user_agent": self.user_agent,
+            "ip_address": self.client_ip,
+            "worker_id": str(getattr(self.client_manager, "worker_id", None) or "unknown"),
+            "user_id": "0",
+            "output_format": "mpegts",
+            "output_profile_id": "",
+        }
+        if not fields.get("connected_at") or not all(fields.get(k) == v for k, v in expected.items()):
+            return None
+        return expected | {"connected_at": fields["connected_at"]}
+
+    def _remove_exact_client(self) -> bool:
+        if self._client_fields is None:
+            # No complete registration identity means no safe deletion is possible.
+            return not self._client_records_exist()
+        channel_id = self.binding.connection_identity[0]
+        set_key, metadata_key = self._client_keys()
+        disconnect_key = f"live:channel:{channel_id}:last_client_disconnect_time"
+        fields = self._client_fields
+        result = self.client_manager.redis_client.eval(
+            _REMOVE_EXACT_NATIVE_CLIENT_LUA,
+            3,
+            set_key,
+            metadata_key,
+            disconnect_key,
+            self.client_id,
+            fields["connected_at"],
+            fields["worker_id"],
+            fields["user_agent"],
+            fields["ip_address"],
+            fields["user_id"],
+            fields["output_format"],
+            fields["output_profile_id"],
+            str(self.proof_reader().checked_at),
+            int(getattr(self.client_manager, "client_ttl", 60)),
+        )
+        if type(result) is not int or result not in (0, 1):
+            raise RuntimeError("exact native client cleanup returned an invalid result")
+        with self.client_manager.lock:
+            if result == 1:
+                self.client_manager.clients.discard(self.client_id)
+                self.client_manager._registered_clients.discard(self.client_id)
+                self.client_manager.last_heartbeat_time.pop(self.client_id, None)
+            present = self.client_id in self.client_manager.clients
+        raw = self.client_manager.redis_client.hgetall(metadata_key)
+        current = {self._text(k): self._text(v) for k, v in raw.items()}
+        # A replacement generation is not ours and must remain untouched.
+        replacement = bool(current) and current.get("connected_at") != fields["connected_at"]
+        self._replacement_present = replacement
+        redis_own_record = bool(current) and all(current.get(k) == v for k, v in fields.items())
+        member = bool(self.client_manager.redis_client.sismember(set_key, self.client_id))
+        if replacement:
+            return True
+        return not present and not redis_own_record and not (member and not current)
+
     def open(self, buffer: Any) -> ReadOnlyTsBufferReader:
         if self._closed or self.registered:
             raise BorrowReaderUnavailable("borrowed client registration is not reusable")
@@ -554,11 +724,13 @@ class BorrowedClientRegistration:
                 raise BorrowBindingLost("recorder client was counted as an ordinary viewer")
             return proof
 
+        _validate_native_buffer_namespace(buffer, self.binding.connection_identity[0])
+        buffer_signature = redis_backend_signature(getattr(buffer, "redis_client", None))
+        manager_signature = redis_backend_signature(self.client_manager.redis_client)
         if (
-            str(getattr(buffer, "channel_id", "")) != self.binding.connection_identity[0]
-            or getattr(buffer, "redis_client", None) is not self.client_manager.redis_client
-            or getattr(buffer, "buffer_index_key", None)
-            != f"live:channel:{self.binding.connection_identity[0]}:input:buffer:index"
+            buffer_signature != manager_signature
+            or buffer.redis_client.connection_pool.connection_kwargs.get("decode_responses") is not False
+            or self.client_manager.redis_client.connection_pool.connection_kwargs.get("decode_responses") is not True
         ):
             raise BorrowReaderUnavailable("reader buffer does not match the native manager namespace")
         reader = ReadOnlyTsBufferReader(buffer, self.binding, current_proof)
@@ -567,6 +739,7 @@ class BorrowedClientRegistration:
         if self._client_records_exist():
             raise BorrowReaderUnavailable("borrowed client ID is already registered")
         self._attempted = True
+        self._registration_attempted = True
         try:
             result = self.client_manager.add_client(
                 self.client_id,
@@ -577,6 +750,7 @@ class BorrowedClientRegistration:
                 output_profile_id=None,
             )
         except Exception as exc:
+            self._client_fields = self._capture_client_fields()
             try:
                 self.close()
             except Exception as cleanup_error:
@@ -584,6 +758,8 @@ class BorrowedClientRegistration:
                     "native recorder registration failed and cleanup remains pending"
                 ) from cleanup_error
             raise BorrowReaderUnavailable("native recorder client registration failed") from exc
+        # Capture exact generation immediately, including partial native adds.
+        self._client_fields = self._capture_client_fields()
         if (
             type(result) is bool
             or not isinstance(result, int)
@@ -597,19 +773,7 @@ class BorrowedClientRegistration:
                     "native recorder registration was rejected and cleanup remains pending"
                 ) from cleanup_error
             raise BorrowReaderUnavailable("native recorder client could not be registered")
-        redis_hash = self.client_manager.redis_client.hgetall(self._client_keys()[1])
-        actual_fields = {self._text(key): self._text(value) for key, value in redis_hash.items()}
-        expected = {
-            "user_agent": self.user_agent,
-            "ip_address": self.client_ip,
-            "worker_id": str(getattr(self.client_manager, "worker_id", None) or "unknown"),
-            "user_id": "0",
-            "output_format": "mpegts",
-            "output_profile_id": "",
-        }
-        if not actual_fields.get("connected_at") or not all(
-            actual_fields.get(key) == value for key, value in expected.items()
-        ):
+        if self._client_fields is None:
             try:
                 self.close()
             except Exception as cleanup_error:
@@ -617,13 +781,12 @@ class BorrowedClientRegistration:
                     "native recorder client identity is incomplete and cleanup remains pending"
                 ) from cleanup_error
             raise BorrowReaderUnavailable("native recorder client identity could not be verified")
-        self._client_fields = expected | {"connected_at": actual_fields["connected_at"]}
         self.registered = True
         self.reader = reader
         try:
             if self.register_private_marker is not None:
                 self._marker_attempted = True
-                if self.register_private_marker(self.client_id) is not True:
+                if self.register_private_marker(self.client_id, self._client_fields["connected_at"]) is not True:
                     raise BorrowReaderUnavailable("private recorder marker could not be registered")
             # Revalidate after registration before permitting the first byte.
             reader._verify()
@@ -664,26 +827,27 @@ class BorrowedClientRegistration:
         if self._closed:
             return
         error = None
-        client_removed = not self._attempted
-        if self._attempted:
+        client_removed = not self._registration_attempted
+        if self._registration_attempted:
             try:
-                if self._client_records_exist():
-                    self.client_manager.remove_client(self.client_id)
-                client_removed = not self._client_records_exist()
+                client_removed = self._remove_exact_client()
                 if not client_removed:
-                    raise RuntimeError("native client registration remains in Redis or the client manager")
+                    raise RuntimeError("exact native client generation remains or cannot be identified")
             except Exception as exc:  # Continue marker and owned-manager cleanup.
                 error = exc
         marker_removed = not self._marker_attempted
         if self._marker_attempted and client_removed and self.remove_private_marker is not None:
             try:
-                removed = self.remove_private_marker(self.client_id)
+                removed = self.remove_private_marker(
+                    self.client_id,
+                    self._client_fields["connected_at"] if self._client_fields else "",
+                )
                 marker_removed = removed is True
                 if not marker_removed:
                     raise RuntimeError("private recorder marker remains registered")
             except Exception as exc:
                 error = error or exc
-        if self.owns_client_manager and client_removed and marker_removed:
+        if self.owns_client_manager and client_removed and marker_removed and not self._replacement_present:
             stop = getattr(self.client_manager, "stop", None)
             if callable(stop):
                 try:
