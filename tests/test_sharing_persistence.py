@@ -89,7 +89,7 @@ def _claim_from_process(database_path, token, barrier, results):
     calls = [0]
     def validate(_token):
         calls[0] += 1
-        if calls[0] == 1:
+        if calls[0] == 1 and barrier is not None:
             barrier.wait(timeout=10)
         return True
 
@@ -221,6 +221,129 @@ class SharingPersistenceTests(unittest.TestCase):
             self.assertEqual(index == 0, ran)
         self.assertEqual(["effect"], effects)
 
+    def test_same_logical_intent_resaved_at_new_revision_cannot_dispatch_twice(self):
+        first = self.save_attach()
+        effects = []
+        ran, _ = self.ledger.run_if_current(
+            first.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("first"),
+        )
+        self.assertTrue(ran)
+        second = self.ledger.save(
+            first.state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=first.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        self.assertEqual(first.intent.intent_epoch, second.intent.intent_epoch)
+        self.assertNotEqual(first.revision, second.revision)
+        ran, _ = self.ledger.run_if_current(
+            second.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("duplicate"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual(["first"], effects)
+
+    def test_coalesced_revision_update_during_callback_cannot_redrive_intent(self):
+        first = self.save_attach()
+        effects = []
+        def callback(_token):
+            effects.append("effect")
+            self.ledger.save(
+                first.state, action=SharingAction.ATTACH_BORROW,
+                expected_revision=first.revision, target_identity=IDENTITY,
+                target_admitted=True, not_before=105.0,
+            )
+        ran, _ = self.ledger.run_if_current(
+            first.intent, fresh_validate=lambda _token: True, side_effect=callback,
+        )
+        self.assertTrue(ran)
+        current = self.ledger.read(CHANNEL)
+        self.assertNotEqual(first.revision, current.revision)
+        ran, _ = self.ledger.run_if_current(
+            current.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("duplicate"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual(["effect"], effects)
+
+    def test_explicit_new_intent_epoch_can_dispatch_with_fresh_proof(self):
+        first = self.save_attach()
+        effects = []
+        ran, _ = self.ledger.run_if_current(
+            first.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append(1),
+        )
+        self.assertTrue(ran)
+        retry_state = replace(first.state, intent_epoch=first.state.intent_epoch + 1)
+        retry = self.ledger.save(
+            retry_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=first.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        ran, _ = self.ledger.run_if_current(
+            retry.intent, fresh_validate=lambda token: token.intent_epoch == 2,
+            side_effect=lambda _token: effects.append(2),
+        )
+        self.assertTrue(ran)
+        self.assertEqual([1, 2], effects)
+
+    def test_cross_process_revision_update_cannot_redrive_claimed_logical_intent(self):
+        first = self.save_attach()
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+        first_process = context.Process(
+            target=_claim_from_process,
+            args=(str(self.ledger.database_path), first.intent, None, results),
+        )
+        first_process.start()
+        first_process.join(15)
+        self.assertEqual(0, first_process.exitcode)
+        self.assertEqual(["effect", "ran"], [results.get(timeout=2), results.get(timeout=2)])
+        second = self.ledger.save(
+            first.state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=first.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        second_process = context.Process(
+            target=_claim_from_process,
+            args=(str(self.ledger.database_path), second.intent, None, results),
+        )
+        second_process.start()
+        second_process.join(15)
+        self.assertEqual(0, second_process.exitcode)
+        self.assertEqual(["denied"], [results.get(timeout=2)])
+
+    def test_old_revision_claims_migrate_to_conservative_epoch_tombstones(self):
+        saved = self.save_attach()
+        with self.ledger._connect() as db:
+            db.execute("""INSERT INTO sharing_intent_claims
+                (channel_uuid, revision, intent_epoch, action, claim_nonce, claimed_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (CHANNEL, saved.revision, saved.intent.intent_epoch, saved.intent.action.value,
+                 "synthetic-old-claim", 105.0))
+            db.execute("DROP TABLE sharing_logical_intent_claims")
+            db.execute("DROP TABLE sharing_legacy_intent_claims")
+            db.execute("DROP TABLE sharing_schema_meta")
+        migrated = SharingIntentLedger(self.ledger.database_path, clock=lambda: 105.0)
+        with migrated._connect() as db:
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM sharing_legacy_intent_claims").fetchone()[0])
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM sharing_intent_claims").fetchone()[0])
+        ran, _ = migrated.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: self.fail("migrated consumed claim ran again"),
+        )
+        self.assertFalse(ran)
+        retry = replace(saved.state, intent_epoch=saved.state.intent_epoch + 1)
+        current = migrated.save(
+            retry, action=SharingAction.ATTACH_BORROW, expected_revision=saved.revision,
+            target_identity=IDENTITY, target_admitted=True, not_before=105.0,
+        )
+        ran, _ = migrated.run_if_current(
+            current.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: "fresh epoch",
+        )
+        self.assertTrue(ran)
+
     def test_two_os_processes_cannot_claim_the_same_intent(self):
         saved = self.save_attach()
         context = multiprocessing.get_context("fork")
@@ -315,6 +438,7 @@ class SharingPersistenceTests(unittest.TestCase):
             lambda snapshot: snapshot.update(last_switch_at=True),
             lambda snapshot: snapshot.update(control_generation=True),
             lambda snapshot: snapshot.update(candidate_connection_identity=["other-channel", *IDENTITY[1:]]),
+            lambda snapshot: snapshot.update(candidate_identity=[*IDENTITY[:4], "other-stream", *IDENTITY[5:]]),
         )
         for index, mutate in enumerate(mutators):
             with self.subTest(index=index):
@@ -341,6 +465,36 @@ class SharingPersistenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.ledger.read(CHANNEL)
         self.assertEqual(1, saved.revision)
+
+    def test_attach_intent_requires_wait_live_candidate_phase(self):
+        saved = self.save_attach()
+        snapshot = saved.state.to_snapshot()
+        snapshot["phase"] = SharingPhase.DEDICATED.value
+        with self.ledger._connect() as db:
+            db.execute("UPDATE sharing_runtime SET state_json=? WHERE channel_uuid=?",
+                       (json.dumps(snapshot), CHANNEL))
+        with self.assertRaises(ValueError):
+            self.ledger.read(CHANNEL)
+
+    def test_recovery_discards_mismatched_advisory_candidate_pair(self):
+        saved = self.save_attach()
+        snapshot = saved.state.to_snapshot()
+        wrong = list(IDENTITY)
+        wrong[4] = "other-stream"
+        snapshot["candidate_identity"] = wrong
+        snapshot["last_switch_at"] = 101.0
+        with self.ledger._connect() as db:
+            db.execute("UPDATE sharing_runtime SET state_json=? WHERE channel_uuid=?",
+                       (json.dumps(snapshot), CHANNEL))
+        recovered = self.ledger.recover(
+            CHANNEL, configuration_generation="config-a", control_generation=3,
+            recorder_fence=12, now=106, expected_revision=saved.revision,
+            recovery_is_current=lambda *_args: True,
+        )
+        self.assertIsNone(recovered.state.candidate_identity)
+        self.assertIsNone(recovered.state.candidate_connection_identity)
+        self.assertIsNone(recovered.state.candidate_since)
+        self.assertEqual(101.0, recovered.state.last_switch_at)
 
     def test_recovery_rejects_stale_revision_fence_and_control(self):
         saved = self.save_attach()
@@ -369,13 +523,11 @@ class SharingPersistenceTests(unittest.TestCase):
     def test_recovery_keeps_cooldown_clocks_but_drops_borrow_and_pending_authority(self):
         saved = self.save_attach()
         persisted = dict(self.ledger.read(CHANNEL).state.to_snapshot())
-        # Simulate persisted borrowed/planned route metadata; recovery may retain
-        # only planner clocks and must issue a new epoch before later actions.
+        # The persisted candidate is still only a planner suggestion; recovery
+        # retains its cooldown clock but never restores borrowed authority.
         borrowed_state = replace(
             saved.state,
-            phase=SharingPhase.BORROWED,
-            borrowed_identity=IDENTITY,
-            pending_action=SharingAction.ATTACH_BORROW,
+            last_switch_at=101.0,
         )
         self.ledger.save(
             borrowed_state,

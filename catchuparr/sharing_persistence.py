@@ -162,6 +162,59 @@ class SharingIntentLedger:
                     PRIMARY KEY (channel_uuid, revision)
                 )"""
             )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS sharing_logical_intent_claims (
+                    channel_uuid TEXT NOT NULL,
+                    configuration_generation TEXT NOT NULL,
+                    control_generation INTEGER NOT NULL,
+                    recorder_fence INTEGER NOT NULL,
+                    intent_epoch INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    claim_nonce TEXT NOT NULL,
+                    claimed_at REAL NOT NULL,
+                    PRIMARY KEY (
+                        channel_uuid, configuration_generation, control_generation,
+                        recorder_fence, intent_epoch, action
+                    )
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS sharing_legacy_intent_claims (
+                    channel_uuid TEXT NOT NULL,
+                    intent_epoch INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    PRIMARY KEY (channel_uuid, intent_epoch, action)
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS sharing_schema_meta (
+                    schema_key TEXT PRIMARY KEY,
+                    schema_value TEXT NOT NULL
+                )"""
+            )
+            db.execute("BEGIN IMMEDIATE")
+            schema = db.execute(
+                "SELECT schema_value FROM sharing_schema_meta WHERE schema_key='intent_claims'"
+            ).fetchone()
+            if schema is None:
+                # Older claims were revision keyed and lack historical config
+                # and lease identity. Preserve them as conservative epoch/action
+                # tombstones instead of guessing the missing fields or resetting
+                # authority during this schema upgrade.
+                db.execute(
+                    """INSERT OR IGNORE INTO sharing_legacy_intent_claims
+                    (channel_uuid, intent_epoch, action)
+                    SELECT channel_uuid, intent_epoch, action
+                    FROM sharing_intent_claims
+                    WHERE intent_epoch IS NOT NULL AND action IS NOT NULL"""
+                )
+                db.execute(
+                    "INSERT INTO sharing_schema_meta (schema_key, schema_value) VALUES ('intent_claims', '2')"
+                )
+            elif schema["schema_value"] != "2":
+                db.rollback()
+                raise ValueError("unsupported sharing persistence schema version")
+            db.commit()
 
     @staticmethod
     def _channel(channel_uuid: str) -> str:
@@ -209,6 +262,38 @@ class SharingIntentLedger:
         if not isinstance(state, SharingState):
             raise ValueError("state must be SharingState")
         channel = self._channel(state.channel_uuid)
+        if (
+            not isinstance(state.configuration_generation, str)
+            or not state.configuration_generation
+            or not isinstance(state.phase, SharingPhase)
+            or type(state.control_generation) is not int
+            or state.control_generation < 0
+            or type(state.recorder_fence) is not int
+            or state.recorder_fence < 0
+            or type(state.intent_epoch) is not int
+            or state.intent_epoch < 0
+        ):
+            raise ValueError("sharing state identity and fences must be valid")
+        if (
+            (state.candidate_identity is None) != (state.candidate_connection_identity is None)
+            or state.candidate_identity != state.candidate_connection_identity
+            or (state.candidate_identity is None) != (state.candidate_since is None)
+        ):
+            raise ValueError("candidate identity pair and clock must be consistent")
+        for identity in (state.candidate_identity, state.candidate_connection_identity):
+            if identity is not None and (
+                not isinstance(identity, tuple)
+                or len(identity) != 8
+                or any(not isinstance(part, str) or not part for part in identity)
+                or identity[0] != channel
+            ):
+                raise ValueError("candidate identity must be an exact channel binding")
+        if state.candidate_since is not None:
+            self._finite_time(state.candidate_since, "candidate_since")
+        for name in ("last_viewer_left_at", "last_switch_at"):
+            value = getattr(state, name)
+            if value is not None:
+                self._finite_time(value, name)
         if action is None:
             if target_identity is not None or target_admitted or not_before is not None:
                 raise ValueError("state-only writes cannot contain pending intent fields")
@@ -220,6 +305,16 @@ class SharingIntentLedger:
             )
             if not pending_matches or action not in _INTENT_ACTIONS:
                 raise ValueError("persisted intent must match the planner's pending action")
+            if action == SharingAction.ATTACH_BORROW and (
+                state.phase != SharingPhase.WAIT_LIVE
+                or state.candidate_connection_identity is None
+                or state.candidate_since is None
+            ):
+                raise ValueError("attach intent requires a live candidate in WAIT_LIVE")
+            if action in {SharingAction.RETURN_TO_ALLOWED, SharingAction.PAUSE_NO_ALLOWED_SOURCE} and state.phase not in {
+                SharingPhase.FAILED, SharingPhase.WAIT_RETURN, SharingPhase.PAUSED,
+            }:
+                raise ValueError("return intent phase is inconsistent")
             if not_before is None:
                 raise ValueError("pending intent requires its exact not-before deadline")
             not_before = self._finite_time(not_before, "not_before")
@@ -251,7 +346,7 @@ class SharingIntentLedger:
         with self.action_lock(channel), self._database() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT revision FROM sharing_runtime WHERE channel_uuid=?", (channel,)
+                "SELECT * FROM sharing_runtime WHERE channel_uuid=?", (channel,)
             ).fetchone()
             if (row is None) != (expected_revision is None):
                 db.rollback()
@@ -260,6 +355,17 @@ class SharingIntentLedger:
             if row is not None and int(row["revision"]) != expected_revision:
                 db.rollback()
                 raise StaleSharingIntent("sharing state revision changed")
+            if row is not None:
+                current = self._decode(row)
+                if state.intent_epoch < current.state.intent_epoch:
+                    db.rollback()
+                    raise StaleSharingIntent("sharing intent epoch cannot move backwards")
+                if (
+                    state.control_generation < current.state.control_generation
+                    or state.recorder_fence < current.state.recorder_fence
+                ):
+                    db.rollback()
+                    raise StaleSharingIntent("sharing control or recorder fence cannot move backwards")
             values = (
                 state_json,
                 action.value if action is not None else None,
@@ -371,6 +477,8 @@ class SharingIntentLedger:
             raise ValueError("persisted candidate connection identity is invalid")
         if (candidate is None) != (candidate_connection is None):
             raise ValueError("persisted candidate identities are inconsistent")
+        if candidate is not None and candidate != candidate_connection:
+            raise ValueError("persisted candidate identity pair does not match")
         for name in ("candidate_since", "last_viewer_left_at", "last_switch_at"):
             value = snapshot.get(name)
             if value is not None and (
@@ -399,6 +507,17 @@ class SharingIntentLedger:
             or isinstance(row["not_before"], bool)
             or not isinstance(row["not_before"], (int, float))
             or not math.isfinite(float(row["not_before"]))
+            or (
+                action_value == SharingAction.ATTACH_BORROW.value
+                and (phase != SharingPhase.WAIT_LIVE or candidate is None or snapshot.get("candidate_since") is None)
+            )
+            or (
+                action_value in {
+                    SharingAction.RETURN_TO_ALLOWED.value,
+                    SharingAction.PAUSE_NO_ALLOWED_SOURCE.value,
+                }
+                and phase not in {SharingPhase.FAILED, SharingPhase.WAIT_RETURN, SharingPhase.PAUSED}
+            )
         ):
             raise ValueError("persisted sharing intent is inconsistent")
         # The snapshot never includes borrowed_identity; loading cannot restore it.
@@ -516,8 +635,27 @@ class SharingIntentLedger:
                 if control_generation < int(row["control_generation"]):
                     db.rollback()
                     raise StaleSharingIntent("recovery control generation cannot move backwards")
+                recovery_snapshot = self._strict_json_loads(row["state_json"])
+                if isinstance(recovery_snapshot, dict):
+                    candidate = recovery_snapshot.get("candidate_identity")
+                    connection = recovery_snapshot.get("candidate_connection_identity")
+                    if (
+                        not isinstance(candidate, list)
+                        or not isinstance(connection, list)
+                        or len(candidate) != 8
+                        or len(connection) != 8
+                        or candidate != connection
+                        or any(not isinstance(part, str) or not part for part in candidate)
+                        or candidate[0] != channel
+                    ):
+                        # Candidate observations are advisory. A mismatched or
+                        # malformed pair is discarded during explicit recovery;
+                        # it never becomes a borrowed route or a fresh intent.
+                        recovery_snapshot["candidate_identity"] = None
+                        recovery_snapshot["candidate_connection_identity"] = None
+                        recovery_snapshot["candidate_since"] = None
                 restored = restore_state(
-                    self._strict_json_loads(row["state_json"]),
+                    recovery_snapshot,
                     channel_uuid=channel,
                     configuration_generation=configuration_generation,
                     control_generation=control_generation,
@@ -611,16 +749,34 @@ class SharingIntentLedger:
                 if dispatch_time < float(token.not_before):
                     db.rollback()
                     return False, None
-                inserted = db.execute(
-                    """INSERT OR IGNORE INTO sharing_intent_claims
-                    (channel_uuid, revision, intent_epoch, action, claim_nonce, claimed_at)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
-                    (token.channel_uuid, token.revision, token.intent_epoch,
-                     token.action.value, nonce, dispatch_time),
+                legacy = db.execute(
+                    """SELECT 1 FROM sharing_legacy_intent_claims
+                    WHERE channel_uuid=? AND intent_epoch=? AND action=?""",
+                    (token.channel_uuid, token.intent_epoch, token.action.value),
+                ).fetchone()
+                revision_claim = db.execute(
+                    """SELECT 1 FROM sharing_intent_claims
+                    WHERE channel_uuid=? AND revision=?""",
+                    (token.channel_uuid, token.revision),
+                ).fetchone()
+                inserted = 0 if legacy is not None or revision_claim is not None else db.execute(
+                    """INSERT OR IGNORE INTO sharing_logical_intent_claims
+                    (channel_uuid, configuration_generation, control_generation,
+                     recorder_fence, intent_epoch, action, claim_nonce, claimed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (token.channel_uuid, token.configuration_generation, token.control_generation,
+                     token.recorder_fence, token.intent_epoch, token.action.value, nonce, dispatch_time),
                 ).rowcount
                 if inserted != 1:
                     db.rollback()
                     return False, None
+                db.execute(
+                    """INSERT INTO sharing_intent_claims
+                    (channel_uuid, revision, intent_epoch, action, claim_nonce, claimed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (token.channel_uuid, token.revision, token.intent_epoch,
+                     token.action.value, nonce, dispatch_time),
+                )
                 db.commit()
             # Refresh the native/current-lease proof once more after the
             # durable claim. Its effect boundary must still use a native CAS.
