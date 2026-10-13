@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping
 
@@ -588,6 +590,7 @@ class BorrowedClientRegistration:
         activity_writer: Callable[
             [BorrowReadBinding, str, BorrowReadProof, Mapping[str, str]], bool
         ] | None = None,
+        cleanup_clock: Callable[[], float] = time.time,
     ) -> None:
         if not isinstance(client_id, str) or not client_id.startswith("catchuparr-client-"):
             raise ValueError("borrowed client ID must use the private recorder prefix")
@@ -626,6 +629,8 @@ class BorrowedClientRegistration:
             raise ValueError("owns_client_manager must be boolean")
         if not callable(activity_writer):
             raise BorrowReaderUnavailable("guarded recorder activity writer is missing")
+        if not callable(cleanup_clock):
+            raise ValueError("cleanup_clock must be callable")
         self.client_manager = client_manager
         self.binding = binding
         self.proof_reader = proof_reader
@@ -636,6 +641,7 @@ class BorrowedClientRegistration:
         self.register_private_marker = register_private_marker
         self.remove_private_marker = remove_private_marker
         self.activity_writer = activity_writer
+        self.cleanup_clock = cleanup_clock
         self.registered = False
         self._closed = False
         self._attempted = False
@@ -704,6 +710,9 @@ class BorrowedClientRegistration:
         set_key, metadata_key = self._client_keys()
         disconnect_key = f"live:channel:{channel_id}:last_client_disconnect_time"
         fields = self._client_fields
+        cleanup_time = self.cleanup_clock()
+        if isinstance(cleanup_time, bool) or not isinstance(cleanup_time, (int, float)) or not math.isfinite(float(cleanup_time)):
+            raise RuntimeError("local cleanup clock returned an invalid timestamp")
         result = self.client_manager.redis_client.eval(
             _REMOVE_EXACT_NATIVE_CLIENT_LUA,
             3,
@@ -718,7 +727,7 @@ class BorrowedClientRegistration:
             fields["user_id"],
             fields["output_format"],
             fields["output_profile_id"],
-            str(self.proof_reader().checked_at),
+            str(float(cleanup_time)),
             int(getattr(self.client_manager, "client_ttl", 60)),
         )
         if type(result) is not int or result not in (0, 1):
