@@ -156,6 +156,7 @@ def record_channel(
     from .logging_utils import error, event
     from .recorder_proxy import (
         candidate_is_current,
+        current_sharing_authority_context,
         issue_recorder_attempt,
         ranked_source_candidates,
         stop_recorder_attempt,
@@ -190,12 +191,18 @@ def record_channel(
     stop_event = None
     monitor = None
     attempt_state_lock = threading.Lock()
-    attempt_state = {"attempt": None, "candidate": None}
+    attempt_state = {"attempt": None, "candidate": None, "switch": None}
     try:
         stop_event = threading.Event()
-        candidates = ranked_source_candidates(channel_uuid, active)
-        # A missing filter override keeps Dispatcharr's default live route and
-        # its shared worker.
+        sharing = active.get("connection_sharing")
+        sharing_setting = sharing.get(channel_uuid) if isinstance(sharing, dict) else None
+        sharing_enabled = isinstance(sharing_setting, dict) and sharing_setting.get("enabled") is True
+        candidates = ranked_source_candidates(
+            channel_uuid, active, all_sources=sharing_enabled,
+        )
+        # Sharing-enabled channels use the all-assigned-source ordering even
+        # when the user did not add a source filter. The legacy channel route
+        # remains unchanged while sharing is disabled.
         if candidates is not None and not candidates:
             return {"status": "no_permitted_sources"}
         if candidates is not None and not core_api_supported():
@@ -240,7 +247,13 @@ def record_channel(
                     with attempt_state_lock:
                         current_attempt = attempt_state["attempt"]
                         current_candidate = attempt_state["candidate"]
-                    if current_attempt is not None and not current_attempt.renew(redis):
+                        current_switch = attempt_state["switch"]
+                    if current_attempt is not None and current_switch is not None:
+                        if current_attempt.operation_needs_switch(redis):
+                            current_switch.request()
+                        elif not current_attempt.renew(redis):
+                            current_switch.request()
+                    elif current_attempt is not None and not current_attempt.renew(redis):
                         stop_event.set()
                         return
                     if current_candidate is not None and not candidate_is_current(
@@ -277,6 +290,18 @@ def record_channel(
             for index, candidate in enumerate(candidates):
                 if stop_event.is_set():
                     break
+                sharing_authority = None
+                attempt_switch = None
+                if sharing_enabled:
+                    sharing_authority = current_sharing_authority_context(
+                        redis, channel_uuid, config_generation=generation,
+                        control_generation=expected_control_generation,
+                    )
+                    if sharing_authority is None:
+                        return {"status": "sharing_authority_unavailable"}
+                    from .engine.recorder import RecorderAttemptSwitch
+
+                    attempt_switch = RecorderAttemptSwitch()
                 attempt = issue_recorder_attempt(
                     redis,
                     lease,
@@ -285,56 +310,63 @@ def record_channel(
                     config_generation=generation,
                     control_generation=expected_control_generation,
                     internal_base_url=proxy_base_url,
+                    sharing_authority=sharing_authority,
                 )
                 with attempt_state_lock:
                     attempt_state["attempt"] = attempt
                     attempt_state["candidate"] = candidate
-                current_state = _recorder_admission_state(
-                    channel_uuid, expected_generation, expected_control_generation
-                )
-                if current_state["status"] != "ready":
-                    attempt.revoke(redis)
-                    stop_recorder_attempt(redis, attempt, lease)
-                    with attempt_state_lock:
-                        attempt_state["attempt"] = None
-                        attempt_state["candidate"] = None
-                    return {"status": current_state["status"]}
-                recorder = FFmpegCopyRecorder(
-                    store,
-                    channel_uuid,
-                    attempt.input_url,
-                    config.archive_root / "work",
-                    fencing_token=fence,
-                    input_headers={
-                        **attempt.input_headers,
-                        "X-Catchuparr-Stats-Recorder": stats_capability,
-                    },
-                    require_media_progress=True,
-                )
-                if index:
-                    recorder._mark_next_discontinuity = True
+                    attempt_state["switch"] = attempt_switch
+                admission_status = None
+                result = None
                 try:
-                    result = recorder.run_candidate(
-                        stop_event,
-                        startup_timeout=60,
-                        media_idle_timeout=120,
+                    current_state = _recorder_admission_state(
+                        channel_uuid, expected_generation, expected_control_generation
                     )
-                except Exception:
-                    error("recorder_worker_stopped")
-                    result = None
+                    if current_state["status"] != "ready":
+                        admission_status = current_state["status"]
+                    else:
+                        recorder = FFmpegCopyRecorder(
+                            store,
+                            channel_uuid,
+                            attempt.input_url,
+                            config.archive_root / "work",
+                            fencing_token=fence,
+                            input_headers={
+                                **attempt.input_headers,
+                                "X-Catchuparr-Stats-Recorder": stats_capability,
+                            },
+                            require_media_progress=True,
+                        )
+                        if index:
+                            recorder._mark_next_discontinuity = True
+                        try:
+                            result = recorder.run_candidate(
+                                stop_event,
+                                startup_timeout=60,
+                                media_idle_timeout=120,
+                                **({"attempt_switch": attempt_switch}
+                                   if attempt_switch is not None else {}),
+                            )
+                        except Exception:
+                            error("recorder_worker_stopped")
                 finally:
-                    attempt.revoke(redis)
+                    revoked = attempt.revoke(redis)
                     cleanup_ok = False
                     try:
                         cleanup_ok = stop_recorder_attempt(redis, attempt, lease)
+                        if cleanup_ok and sharing_authority is not None:
+                            cleanup_ok = attempt.acknowledge_reaped(redis)
                     except Exception:
                         error("supervision_failed")
-                    if not cleanup_ok:
+                    if not revoked or not cleanup_ok:
                         stop_event.set()
                     with attempt_state_lock:
                         if attempt_state["attempt"] is attempt:
                             attempt_state["attempt"] = None
                             attempt_state["candidate"] = None
+                            attempt_state["switch"] = None
+                if admission_status is not None:
+                    return {"status": admission_status}
                 if result is not None and result.status == "stopped":
                     break
     finally:
