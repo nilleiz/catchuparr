@@ -81,11 +81,13 @@ class NativeClientRegistrationAck:
     redis_backend_signature: str
     connected_at: str
     projection_version: int
+    user_agent: str = field(repr=False)
+    client_ip: str = field(repr=False)
 
     def __post_init__(self) -> None:
         for name in (
             "channel_uuid", "episode_id", "client_id", "local_worker_id",
-            "redis_backend_signature", "connected_at",
+            "redis_backend_signature", "connected_at", "user_agent", "client_ip",
         ):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
@@ -417,8 +419,9 @@ local function private_client(id, channel)
   local marker_key = 'catchuparr:stats:recorder-client:' .. channel .. ':' .. id
   local marker_type = redis.call('TYPE', marker_key).ok
   if marker_type ~= 'none' and marker_type ~= 'string' then return nil end
+  if marker_type == 'none' then return false end
   local marker = redis.call('GET', marker_key)
-  if not marker then return false end
+  if not marker then return nil end
   local digest, marked_channel = string.match(marker, '^([^|]+)|([^|]+)$')
   if not digest or marked_channel ~= channel then return nil end
   local cap_key = 'catchuparr:recorder:stats-cap:' .. digest
@@ -532,8 +535,9 @@ local function private_client(id, channel)
   local marker_key = 'catchuparr:stats:recorder-client:' .. channel .. ':' .. id
   local marker_type = redis.call('TYPE', marker_key).ok
   if marker_type ~= 'none' and marker_type ~= 'string' then return nil end
+  if marker_type == 'none' then return false end
   local marker = redis.call('GET', marker_key)
-  if not marker then return false end
+  if not marker then return nil end
   local digest, marked_channel = string.match(marker, '^([^|]+)|([^|]+)$')
   if not digest or marked_channel ~= channel then return nil end
   local cap_key = 'catchuparr:recorder:stats-cap:' .. digest
@@ -796,28 +800,92 @@ def register_borrowed_client(redis: Any, episode: BorrowEpisodeSnapshot, *,
         f"catchuparr:sharing:private:{channel}", f"live:channel:{channel}:input:buffer:index",
         f"live:channel:{channel}:input:buffer:chunk_timestamps",
     ]
-    result = redis.eval(
-        _REGISTER_BORROWED_CLIENT_LUA, len(keys), *keys,
-        episode.configuration_generation, str(episode.control_generation), catalog_generation,
-        str(episode.recorder_fence), str(episode.version), lease_value, episode.episode_id,
-        identity[2], identity[1], identity[3], identity[4], identity[5], identity[6],
-        identity[7], identity[0], client_id, user_agent, client_ip, local_worker_id,
-        client_record_ttl, str(episode.intent_epoch),
-    )
+    try:
+        result = redis.eval(
+            _REGISTER_BORROWED_CLIENT_LUA, len(keys), *keys,
+            episode.configuration_generation, str(episode.control_generation), catalog_generation,
+            str(episode.recorder_fence), str(episode.version), lease_value, episode.episode_id,
+            identity[2], identity[1], identity[3], identity[4], identity[5], identity[6],
+            identity[7], identity[0], client_id, user_agent, client_ip, local_worker_id,
+            client_record_ttl, str(episode.intent_epoch),
+        )
+    except Exception:
+        # Redis may have committed the Lua transaction while its reply was
+        # lost. Recover only from the full exact projection/hash/set/marker
+        # tuple; never retry registration or infer authority from a client ID.
+        return _recover_registration_ack(
+            redis, episode, client_id=client_id, local_worker_id=local_worker_id,
+            user_agent=user_agent, client_ip=client_ip,
+            backend_signature=backend_signature,
+        )
     if not isinstance(result, (list, tuple)) or len(result) != 3 or result[0] != 1:
         return None
     try:
         connected_at = _text(result[1])
         version = int(_text(result[2]))
         if not math.isfinite(float(connected_at)) or version != episode.version + 1:
-            return None
+            return _recover_registration_ack(
+                redis, episode, client_id=client_id, local_worker_id=local_worker_id,
+                user_agent=user_agent, client_ip=client_ip,
+                backend_signature=backend_signature,
+            )
     except (TypeError, ValueError, UnicodeError, OverflowError):
-        return None
+        return _recover_registration_ack(
+            redis, episode, client_id=client_id, local_worker_id=local_worker_id,
+            user_agent=user_agent, client_ip=client_ip,
+            backend_signature=backend_signature,
+        )
     return NativeClientRegistrationAck(
         channel_uuid=channel, episode_id=episode.episode_id, client_id=client_id,
         local_worker_id=local_worker_id, redis_backend_signature=backend_signature,
         connected_at=connected_at, projection_version=version,
+        user_agent=user_agent, client_ip=client_ip,
     )
+
+
+def _recover_registration_ack(redis: Any, episode: BorrowEpisodeSnapshot, *,
+                              client_id: str, local_worker_id: str, user_agent: str,
+                              client_ip: str, backend_signature: str) -> NativeClientRegistrationAck | None:
+    """Reconcile a lost Lua reply from exact committed native records."""
+    try:
+        grant = read_native_episode_grant(redis, episode.channel_uuid)
+        if grant is None or not (
+            grant.episode_id == episode.episode_id and grant.phase == "active"
+            and grant.configuration_generation == episode.configuration_generation
+            and grant.control_generation == episode.control_generation
+            and grant.recorder_fence == episode.recorder_fence
+            and grant.intent_epoch == episode.intent_epoch
+            and grant.client_id == client_id and grant.client_worker_id == local_worker_id
+            and grant.version == episode.version + 1
+        ):
+            return None
+        client_key = f"live:channel:{episode.channel_uuid}:clients:{client_id}"
+        client_raw = redis.hgetall(client_key) or {}
+        client = {_text(key): _text(value) for key, value in client_raw.items()}
+        private_key = f"catchuparr:sharing:private:{episode.channel_uuid}"
+        if (
+            client.get("connected_at") != grant.connected_at
+            or client.get("worker_id") != local_worker_id
+            or client.get("user_agent") != user_agent
+            or client.get("ip_address") != client_ip
+            or client.get("user_id") != "0"
+            or client.get("output_format") != "mpegts"
+            or client.get("output_profile_id") != ""
+            or _text(redis.hget(private_key, client_id)) != episode.episode_id
+            or client_id not in {_text(value) for value in redis.smembers(
+                f"live:channel:{episode.channel_uuid}:clients"
+            )}
+            or int(redis.ttl(client_key)) <= 0
+        ):
+            return None
+        return NativeClientRegistrationAck(
+            channel_uuid=episode.channel_uuid, episode_id=episode.episode_id,
+            client_id=client_id, local_worker_id=local_worker_id,
+            redis_backend_signature=backend_signature, connected_at=grant.connected_at,
+            projection_version=grant.version, user_agent=user_agent, client_ip=client_ip,
+        )
+    except (AttributeError, TypeError, ValueError, UnicodeError, OverflowError):
+        return None
 
 
 def adopt_registered_client_in_manager(manager: Any, ack: NativeClientRegistrationAck) -> bool:
@@ -853,6 +921,115 @@ def adopt_registered_client_in_manager(manager: Any, ack: NativeClientRegistrati
         heartbeat_times[ack.client_id] = time.time()
         if hasattr(manager, "last_active_time"):
             manager.last_active_time = time.time()
+    return True
+
+
+_CLEANUP_BORROWED_CLIENT_LUA = """
+local function kind(key)
+  return redis.call('TYPE', key).ok
+end
+local client_type = kind(KEYS[1])
+local clients_type = kind(KEYS[2])
+local private_type = kind(KEYS[3])
+local disconnect_type = kind(KEYS[4])
+local episode_type = kind(KEYS[5])
+if (client_type ~= 'none' and client_type ~= 'hash')
+   or (clients_type ~= 'none' and clients_type ~= 'set')
+   or (private_type ~= 'none' and private_type ~= 'hash')
+   or (disconnect_type ~= 'none' and disconnect_type ~= 'string')
+   or (episode_type ~= 'none' and episode_type ~= 'hash') then return 0 end
+local marked_episode = redis.call('HGET', KEYS[3], ARGV[1])
+if marked_episode and marked_episode ~= ARGV[2] then return 0 end
+if client_type == 'hash' then
+  if redis.call('HGET', KEYS[1], 'connected_at') ~= ARGV[3]
+     or redis.call('HGET', KEYS[1], 'worker_id') ~= ARGV[4]
+     or redis.call('HGET', KEYS[1], 'user_agent') ~= ARGV[5]
+     or redis.call('HGET', KEYS[1], 'ip_address') ~= ARGV[6]
+     or redis.call('HGET', KEYS[1], 'user_id') ~= '0'
+     or redis.call('HGET', KEYS[1], 'output_format') ~= 'mpegts'
+     or redis.call('HGET', KEYS[1], 'output_profile_id') ~= '' then return 0 end
+end
+local close_episode = episode_type == 'hash'
+   and redis.call('HGET', KEYS[5], 'episode_id') == ARGV[2]
+   and redis.call('HGET', KEYS[5], 'client_id') == ARGV[1]
+   and redis.call('HGET', KEYS[5], 'connected_at') == ARGV[3]
+   and redis.call('HGET', KEYS[5], 'client_worker_id') == ARGV[4]
+local episode_version = close_episode and tonumber(redis.call('HGET', KEYS[5], 'version') or '') or nil
+if close_episode and (not episode_version or episode_version < 2
+   or episode_version % 1 ~= 0) then return 0 end
+-- All key types and exact registration fields were checked before mutation.
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('DEL', KEYS[1])
+if marked_episode == ARGV[2] then redis.call('HDEL', KEYS[3], ARGV[1]) end
+if kind(KEYS[3]) == 'hash' and redis.call('HLEN', KEYS[3]) == 0 then redis.call('DEL', KEYS[3]) end
+if close_episode then
+  redis.call('HSET', KEYS[5], 'phase', 'closed', 'viewer_left_at', '',
+    'return_deadline', '', 'version', tostring(episode_version + 1))
+end
+if redis.call('SCARD', KEYS[2]) == 0 then
+  redis.call('SET', KEYS[4], ARGV[7], 'EX', ARGV[8])
+end
+return 1
+"""
+
+
+def cleanup_borrowed_client(redis: Any, ack: NativeClientRegistrationAck, *,
+                            episode_id: str, manager: Any, timestamp: float | None = None,
+                            ttl_seconds: int = 60) -> bool:
+    """Remove only the exact acknowledged client under its native heartbeat lock.
+
+    The private marker remains until the exact hash/set registration disappears
+    in the same Lua operation. No native owner, source, manager map, or unrelated
+    client can be stopped or removed by this cleanup.
+    """
+    if (not isinstance(ack, NativeClientRegistrationAck)
+            or not isinstance(episode_id, str) or episode_id != ack.episode_id
+            or getattr(manager, "channel_id", None) != ack.channel_uuid
+            or getattr(manager, "worker_id", None) != ack.local_worker_id
+            or type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 720):
+        return False
+    now = time.time() if timestamp is None else timestamp
+    if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(float(now)):
+        return False
+    try:
+        if redis_backend_signature(redis) != ack.redis_backend_signature:
+            return False
+        if redis_backend_signature(getattr(manager, "redis_client", None)) != ack.redis_backend_signature:
+            return False
+    except BorrowReaderUnavailable:
+        return False
+    lock = getattr(manager, "lock", None)
+    clients = getattr(manager, "clients", None)
+    registered = getattr(manager, "_registered_clients", None)
+    heartbeat_times = getattr(manager, "last_heartbeat_time", None)
+    if (lock is None or not hasattr(lock, "__enter__") or not hasattr(lock, "__exit__")
+            or not isinstance(clients, set) or not isinstance(registered, set)
+            or not isinstance(heartbeat_times, dict)):
+        return False
+    channel = ack.channel_uuid
+    keys = (
+        f"live:channel:{channel}:clients:{ack.client_id}",
+        f"live:channel:{channel}:clients",
+        f"catchuparr:sharing:private:{channel}",
+        f"live:channel:{channel}:last_client_disconnect_time",
+        episode_projection_key(channel),
+    )
+    with lock:
+        try:
+            result = redis.eval(
+                _CLEANUP_BORROWED_CLIENT_LUA, len(keys), *keys,
+                ack.client_id, episode_id, ack.connected_at, ack.local_worker_id,
+                ack.user_agent, ack.client_ip, str(float(now)), ttl_seconds,
+            )
+        except Exception:
+            return False
+        if type(result) is not int or result != 1:
+            return False
+        clients.discard(ack.client_id)
+        registered.discard(ack.client_id)
+        heartbeat_times.pop(ack.client_id, None)
+        if hasattr(manager, "last_active_time"):
+            manager.last_active_time = float(now)
     return True
 
 
