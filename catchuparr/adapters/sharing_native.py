@@ -385,6 +385,7 @@ redis.call('HSET', KEYS[3],
   'worker_id', ARGV[7], 'owner_lock_value', ARGV[8], 'metadata_owner', ARGV[9],
   'stream_id', ARGV[10], 'account_id', ARGV[11],
   'm3u_profile_id', ARGV[12], 'input_profile_id', ARGV[13],
+  'client_id', ARGV[22],
   'return_seconds', ARGV[14], 'minimum_switch_seconds', ARGV[15],
   'last_switch_at', ARGV[16], 'version', ARGV[17])
 redis.call('EXPIRE', KEYS[3], ttl)
@@ -461,6 +462,7 @@ if redis.call('HGET', KEYS[2], 'configuration_generation') ~= ARGV[1]
    or redis.call('TTL', KEYS[1]) <= 0
    or redis.call('HGET', KEYS[1], 'phase') ~= 'opening'
    or redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[7]
+   or redis.call('HGET', KEYS[1], 'client_id') ~= ARGV[16]
    or redis.call('HGET', KEYS[1], 'worker_id') ~= ARGV[9]
    or redis.call('HGET', KEYS[1], 'owner_lock_value') ~= ARGV[8]
    or redis.call('HGET', KEYS[1], 'metadata_owner') ~= ARGV[10]
@@ -742,7 +744,9 @@ def project_opening_episode(redis: Any, episode: BorrowEpisodeSnapshot, *, lease
     """Project an acknowledged coordinator opening for native Lua admission."""
     if (episode.phase != "opening" or not isinstance(lease_value, str) or not lease_value
             or hashlib.sha256(lease_value.encode()).hexdigest() != episode.lease_digest
-            or not isinstance(catalog_generation, str) or not catalog_generation):
+            or not isinstance(catalog_generation, str) or not catalog_generation
+            or not isinstance(episode.client_id, str)
+            or not episode.client_id.startswith("catchuparr-client-")):
         return False
     for name, value in (("return_seconds", return_seconds), ("minimum_switch_seconds", minimum_switch_seconds)):
         if type(value) is not int or not 0 <= value <= 3600:
@@ -766,7 +770,7 @@ def project_opening_episode(redis: Any, episode: BorrowEpisodeSnapshot, *, lease
         episode.identity[4], episode.identity[5], episode.identity[6], episode.identity[7],
         str(return_seconds), str(minimum_switch_seconds), str(switch_at),
         str(episode.version), str(ttl_seconds), episode.channel_uuid,
-        str(episode.intent_epoch), episode.lease_digest,
+        str(episode.intent_epoch), episode.lease_digest, episode.client_id,
     )
     return type(status) is int and status == 1
 
@@ -779,6 +783,7 @@ def register_borrowed_client(redis: Any, episode: BorrowEpisodeSnapshot, *,
     identity = episode.identity
     if (episode.phase != "opening" or not isinstance(client_id, str)
             or not client_id.startswith("catchuparr-client-")
+            or episode.client_id != client_id
             or identity[1] != identity[2] or identity[1] != identity[3]
             or not all(isinstance(x, str) and x for x in (local_worker_id, user_agent, client_ip))
             or not isinstance(lease_value, str) or not lease_value
@@ -895,6 +900,7 @@ local version = tonumber(ARGV[2])
 if not version or version < 1 or version > 9007199254740990
    or version % 1 ~= 0 then return 0 end
 if redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[1]
+   or redis.call('HGET', KEYS[1], 'client_id') ~= ARGV[17]
    or redis.call('HGET', KEYS[1], 'channel_uuid') ~= ARGV[3]
    or redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[4]
    or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[5]
@@ -936,6 +942,8 @@ def fence_unregistered_opening(redis: Any, episode: BorrowEpisodeSnapshot, *,
     this CAS succeeds, a delayed registration command cannot create a client.
     """
     if (not isinstance(episode, BorrowEpisodeSnapshot) or episode.phase != "opening"
+            or not isinstance(episode.client_id, str)
+            or not episode.client_id.startswith("catchuparr-client-")
             or not isinstance(catalog_generation, str) or not catalog_generation):
         return False
     try:
@@ -946,7 +954,7 @@ def fence_unregistered_opening(redis: Any, episode: BorrowEpisodeSnapshot, *,
             str(episode.control_generation), catalog_generation,
             str(episode.recorder_fence), str(episode.intent_epoch), episode.identity[1],
             episode.identity[2], episode.identity[3], episode.identity[4], episode.identity[5],
-            episode.identity[6], episode.identity[7], episode.lease_digest,
+            episode.identity[6], episode.identity[7], episode.lease_digest, episode.client_id,
         )
     except Exception:
         return False
@@ -993,6 +1001,7 @@ local version = tonumber(ARGV[2])
 if not version or version < 1 or version > 9007199254740989
    or version % 1 ~= 0 then return 0 end
 if redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[1]
+   or redis.call('HGET', KEYS[1], 'client_id') ~= ARGV[18]
    or redis.call('HGET', KEYS[1], 'channel_uuid') ~= ARGV[3]
    or redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[4]
    or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[5]
@@ -1023,7 +1032,8 @@ def close_fenced_unregistered_opening(redis: Any, episode: BorrowEpisodeSnapshot
     """Atomically close a fenced opening only when all exact client resources are absent."""
     if (not isinstance(episode, BorrowEpisodeSnapshot) or episode.phase != "opening"
             or not isinstance(catalog_generation, str) or not catalog_generation
-            or not isinstance(client_id, str) or not client_id.startswith("catchuparr-client-")):
+            or not isinstance(client_id, str) or not client_id.startswith("catchuparr-client-")
+            or episode.client_id != client_id):
         return False
     channel = episode.channel_uuid
     keys = (
@@ -1040,7 +1050,7 @@ def close_fenced_unregistered_opening(redis: Any, episode: BorrowEpisodeSnapshot
             catalog_generation, str(episode.recorder_fence), str(episode.intent_epoch),
             episode.identity[1], episode.identity[2], episode.identity[3],
             episode.identity[4], episode.identity[5], episode.identity[6],
-            episode.identity[7], episode.lease_digest, client_id,
+            episode.identity[7], episode.lease_digest, client_id, episode.client_id,
         )
     except Exception:
         return False
