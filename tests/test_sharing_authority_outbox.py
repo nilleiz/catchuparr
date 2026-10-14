@@ -69,9 +69,14 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         self.assertEqual((), result.completed_event_ids)
         self.assertEqual(event, self.outbox.pending()[0])
 
-        result = self.drain()
+        retries = []
+        result = self.drain(
+            read_prior=lambda *_args: self.fail("prior episode must come from durable snapshot"),
+            invalidate=lambda _redis, prior, _event: retries.append(prior) or True,
+        )
         self.assertEqual((event.event_id,), result.completed_event_ids)
         self.assertEqual((), result.pending_event_ids)
+        self.assertEqual(["exact-old-episode"], retries)
         second = self.outbox.stage("next-activation", (self.target,))[0]
         self.assertEqual(1, second.expected_revision)
         self.assertEqual(2, second.authority_revision)
@@ -132,6 +137,28 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         )
         self.assertEqual((event.event_id,), result.completed_event_ids)
         self.assertEqual([("exact-old-episode", "1")], seen)
+
+    def test_claimed_event_cannot_be_cancelled_during_publication(self):
+        event = self.stage()
+        cancel_results = []
+
+        def publish_during_claim(redis, current):
+            cancel_results.append(self.outbox.cancel_event(current.event_id))
+            return self.publish(redis, current)
+
+        result = self.drain(publish=publish_during_claim)
+        self.assertEqual([False], cancel_results)
+        self.assertEqual((event.event_id,), result.completed_event_ids)
+        self.assertEqual("complete", self.outbox.latest_for_channel(self.target.channel_uuid).status)
+
+    def test_latest_channel_event_uses_revision_when_wall_clock_moves_back(self):
+        first = self.stage("first-clock-event")
+        self.assertEqual((first.event_id,), self.drain().completed_event_ids)
+        self.now[0] = 90.0
+        second = self.outbox.stage("second-clock-event", (self.target,))[0]
+        latest = self.outbox.latest_for_channel(self.target.channel_uuid)
+        self.assertEqual(second, latest.event)
+        self.assertEqual(2, latest.event.authority_revision)
 
 
 if __name__ == "__main__":

@@ -8,10 +8,11 @@ module performs no ORM work and is never used by the media chunk iterator.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -85,11 +86,25 @@ class SharingAuthorityOutbox:
                     control_generation INTEGER NOT NULL,
                     catalog_generation TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('pending','complete','cancelled')),
+                    prior_json TEXT,
+                    prior_observed INTEGER NOT NULL DEFAULT 0 CHECK(prior_observed IN (0,1)),
+                    claimed_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(activation_id, channel_uuid)
                 )"""
             )
+            # Upgrade databases created by the first 0.6 outbox checkpoint.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(sharing_authority_outbox)")}
+            if "prior_json" not in columns:
+                db.execute("ALTER TABLE sharing_authority_outbox ADD COLUMN prior_json TEXT")
+            if "prior_observed" not in columns:
+                db.execute(
+                    "ALTER TABLE sharing_authority_outbox ADD COLUMN prior_observed "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(prior_observed IN (0,1))"
+                )
+            if "claimed_at" not in columns:
+                db.execute("ALTER TABLE sharing_authority_outbox ADD COLUMN claimed_at REAL")
             db.execute(
                 "CREATE INDEX IF NOT EXISTS sharing_authority_pending "
                 "ON sharing_authority_outbox(status, activation_id, channel_uuid)"
@@ -134,8 +149,10 @@ class SharingAuthorityOutbox:
                         target.control_generation, target.catalog_generation,
                     )
                     db.execute(
-                        """INSERT INTO sharing_authority_outbox VALUES
-                        (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                        """INSERT INTO sharing_authority_outbox
+                        (event_id,activation_id,channel_uuid,expected_revision,authority_revision,
+                         configuration_generation,control_generation,catalog_generation,status,created_at,updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
                         (event.event_id, event.activation_id, event.channel_uuid,
                          event.expected_revision, event.authority_revision,
                          event.configuration_generation, event.control_generation,
@@ -156,7 +173,7 @@ class SharingAuthorityOutbox:
             db.execute("BEGIN IMMEDIATE")
             changed = db.execute(
                 "UPDATE sharing_authority_outbox SET status='cancelled',updated_at=? "
-                "WHERE activation_id=? AND status='pending'",
+                "WHERE activation_id=? AND status='pending' AND claimed_at IS NULL",
                 (now, activation_id),
             ).rowcount
             db.commit()
@@ -170,7 +187,7 @@ class SharingAuthorityOutbox:
             db.execute("BEGIN IMMEDIATE")
             changed = db.execute(
                 "UPDATE sharing_authority_outbox SET status='cancelled',updated_at=? "
-                "WHERE event_id=? AND status='pending'",
+                "WHERE event_id=? AND status='pending' AND claimed_at IS NULL",
                 (now, event_id),
             ).rowcount
             db.commit()
@@ -197,7 +214,10 @@ class SharingAuthorityOutbox:
         with self._db() as db:
             row = db.execute(
                 "SELECT * FROM sharing_authority_outbox WHERE channel_uuid=? "
-                "ORDER BY created_at DESC,event_id DESC LIMIT 1",
+                # Wall clocks can move backwards. The revision is the durable
+                # authority order; rowid breaks ties between cancelled/retried
+                # intents that share that revision.
+                "ORDER BY authority_revision DESC,rowid DESC LIMIT 1",
                 (channel_uuid,),
             ).fetchone()
         if row is None:
@@ -212,6 +232,8 @@ class SharingAuthorityOutbox:
         read_prior: Callable[[Any, str], Any],
         publish: Callable[[Any, SharingAuthorityOutboxEvent], bool],
         invalidate: Callable[[Any, Any, SharingAuthorityOutboxEvent], bool],
+        encode_prior: Callable[[Any], Any] | None = None,
+        decode_prior: Callable[[Any], Any] | None = None,
     ) -> SharingAuthorityDrain:
         if not all(callable(item) for item in (read_prior, publish, invalidate)):
             raise ValueError("authority drain callbacks are required")
@@ -223,7 +245,20 @@ class SharingAuthorityOutbox:
         pending: list[str] = []
         for event in events:
             try:
-                prior = read_prior(redis, event.channel_uuid)
+                record = self._claim(event)
+                if record is None:
+                    continue
+                observed, stored = record
+                if not observed:
+                    prior = read_prior(redis, event.channel_uuid)
+                    encoded = encode_prior(prior) if encode_prior is not None else self._json_safe(prior)
+                    stored = self._json_dump(encoded)
+                    if not self._store_prior(event, stored):
+                        pending.append(event.event_id)
+                        continue
+                prior = None if stored is None else self._json_load(stored)
+                if prior is not None and decode_prior is not None:
+                    prior = decode_prior(prior)
                 published = publish(redis, event)
                 if published is not True:
                     # A lost Lua reply is accepted only when the exact target
@@ -240,6 +275,41 @@ class SharingAuthorityOutbox:
             else:
                 completed.append(event.event_id)
         return SharingAuthorityDrain(tuple(completed), tuple(pending))
+
+    def _claim(self, event: SharingAuthorityOutboxEvent) -> tuple[bool, str | None] | None:
+        """Fence cancellation before callbacks can publish an authority."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status,prior_observed,prior_json,claimed_at FROM sharing_authority_outbox WHERE event_id=?",
+                (event.event_id,),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                db.rollback()
+                return None
+            if row["claimed_at"] is None:
+                changed = db.execute(
+                    "UPDATE sharing_authority_outbox SET claimed_at=?,updated_at=? "
+                    "WHERE event_id=? AND status='pending' AND claimed_at IS NULL",
+                    (self._time(self.clock()), self._time(self.clock()), event.event_id),
+                ).rowcount
+                if changed != 1:
+                    db.rollback()
+                    return None
+            result = (bool(row["prior_observed"]), row["prior_json"])
+            db.commit()
+            return result
+
+    def _store_prior(self, event: SharingAuthorityOutboxEvent, payload: str | None) -> bool:
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                "UPDATE sharing_authority_outbox SET prior_json=?,prior_observed=1,updated_at=? "
+                "WHERE event_id=? AND status='pending' AND claimed_at IS NOT NULL AND prior_observed=0",
+                (payload, self._time(self.clock()), event.event_id),
+            ).rowcount
+            db.commit()
+        return changed == 1
 
     def _target_is_current(self, redis: Any, event: SharingAuthorityOutboxEvent) -> bool:
         try:
@@ -267,7 +337,7 @@ class SharingAuthorityOutbox:
                 db.rollback()
                 raise RuntimeError("authority event disappeared")
             current = self._event(row)
-            if current != event:
+            if current != event or row["status"] != "pending" or row["claimed_at"] is None:
                 db.rollback()
                 raise RuntimeError("authority event changed before acknowledgment")
             revision = db.execute(
@@ -283,12 +353,37 @@ class SharingAuthorityOutbox:
                 "ON CONFLICT(channel_uuid) DO UPDATE SET acknowledged_revision=excluded.acknowledged_revision",
                 (event.channel_uuid, event.authority_revision),
             )
-            db.execute(
+            changed = db.execute(
                 "UPDATE sharing_authority_outbox SET status='complete',updated_at=? "
-                "WHERE event_id=? AND status='pending'",
+                "WHERE event_id=? AND status='pending' AND claimed_at IS NOT NULL",
                 (now, event.event_id),
-            )
+            ).rowcount
+            if changed != 1:
+                db.rollback()
+                raise RuntimeError("authority event is no longer claimed")
             db.commit()
+
+    @classmethod
+    def _json_safe(cls, value: Any) -> Any:
+        if value is None or type(value) in (str, int, float, bool):
+            return value
+        if is_dataclass(value) and not isinstance(value, type):
+            return {key: cls._json_safe(item) for key, item in asdict(value).items()}
+        if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+            return {key: cls._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [cls._json_safe(item) for item in value]
+        raise ValueError("prior authority snapshot is not safely serializable")
+
+    @staticmethod
+    def _json_dump(value: Any) -> str | None:
+        if value is None:
+            return None
+        return json.dumps(value, separators=(",", ":"), allow_nan=False)
+
+    @staticmethod
+    def _json_load(value: str) -> Any:
+        return json.loads(value, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid JSON number")))
 
     @staticmethod
     def _event(row: sqlite3.Row) -> SharingAuthorityOutboxEvent:
