@@ -243,6 +243,11 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             waiting, SharingAction.ATTACH_BORROW, succeeded=True, now=105.0,
             current_state=waiting, current_observation=opening_observation,
         )
+        # The supervisor saw the first zero-viewer time before reader teardown.
+        borrowed = replace(
+            borrowed, phase=type(borrowed.phase).WAIT_RETURN,
+            last_viewer_left_at=100.0,
+        )
         saved_borrowed = self.intent_ledger.save(
             borrowed, action=None, expected_revision=self.saved.revision,
             updated_at=105.0,
@@ -304,7 +309,22 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertEqual(105.0, pending.state.last_switch_at)
         self.assertEqual("wait_return", pending.state.phase.value)
         self.assertEqual(SharingAction.RETURN_TO_ALLOWED, pending.intent.action)
-        self.assertEqual(230.0, pending.intent.not_before)
+        self.assertEqual(165.0, pending.intent.not_before)
+
+        # Simulate worker restart after native cleanup but before useful
+        # dedicated media: recovery rebinds the return intent, never the borrow.
+        recovered = self.intent_ledger.recover(
+            CHANNEL, configuration_generation="config-synthetic", control_generation=2,
+            recorder_fence=8, now=201.0, expected_revision=pending.revision,
+            recovery_is_current=lambda *_args: True,
+        )
+        pending = recovered
+        coordinator.recorder_fence = 8
+        coordinator.state_record = recovered
+        return_receipt = coordinator._read_return_receipt()
+        self.assertIsNotNone(return_receipt)
+        self.assertEqual(opening.episode_id, return_receipt.episode_id)
+        self.assertEqual(7, return_receipt.recorder_fence)
 
         attempt = SimpleNamespace(
             channel_uuid=CHANNEL, config_generation="config-synthetic",
@@ -314,7 +334,7 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         )
         allowed_candidate = {"id": "stream-synthetic", "account_id": "account-synthetic"}
         with (
-            patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged", return_value=True),
             patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
             patch("catchuparr.recorder_proxy.candidate_is_current", return_value=True),
             patch("catchuparr.recorder_proxy.sharing_operation_is_current", return_value=False),
@@ -324,11 +344,11 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             patch.object(coordinator, "_recovery_is_current", return_value=True),
         ):
             self.assertFalse(coordinator.acknowledge_return_media(
-                prepared, pending.intent, attempt, allowed_candidate, media_at=270.0,
+                return_receipt, pending.intent, attempt, allowed_candidate, media_at=270.0,
             ))
             self.assertEqual(pending.intent, self.intent_ledger.read(CHANNEL).intent)
         with (
-            patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged", return_value=True),
             patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
             patch("catchuparr.recorder_proxy.candidate_is_current", return_value=True),
             patch("catchuparr.recorder_proxy.sharing_operation_is_current", return_value=True),
@@ -338,10 +358,10 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             patch.object(coordinator, "_recovery_is_current", return_value=True),
         ):
             self.assertFalse(coordinator.acknowledge_return_media(
-                prepared, pending.intent, attempt, allowed_candidate, media_at=229.0,
+                return_receipt, pending.intent, attempt, allowed_candidate, media_at=164.0,
             ))
             self.assertTrue(coordinator.acknowledge_return_media(
-                prepared, pending.intent, attempt, allowed_candidate, media_at=270.0,
+                return_receipt, pending.intent, attempt, allowed_candidate, media_at=270.0,
             ))
         reloaded = self.intent_ledger.read(CHANNEL)
         self.assertEqual(270.0, reloaded.state.last_switch_at)
@@ -349,12 +369,99 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         next_observation = SharingObservation(
             channel_uuid=CHANNEL, now=275.0,
             configuration_generation="config-synthetic", control_generation=2,
-            recorder_fence=7, lease_is_current=True,
+            recorder_fence=8, lease_is_current=True,
             settings=SharingSettings(True, 5, 30, 60), target=target(),
         )
         decision = observe(reloaded.state, next_observation)
         self.assertEqual(SharingAction.WAIT, decision.action)
         self.assertEqual(330.0, decision.deadline)
+
+
+    def test_failure_cleanup_bypasses_return_and_switch_cooldowns(self):
+        channel = CHANNEL + "-failure"
+        borrowed = replace(
+            attach_state(), channel_uuid=channel,
+            phase=type(attach_state().phase).BORROWED,
+            candidate_identity=None, candidate_connection_identity=None,
+            candidate_since=None, borrowed_identity=None,
+            last_viewer_left_at=None, last_switch_at=105.0,
+            pending_action=None, intent_epoch=4,
+        )
+        saved = self.intent_ledger.save(
+            borrowed, action=None, expected_revision=None, updated_at=105.0,
+        )
+        from catchuparr.adapters.sharing_borrow_route import sign_borrow_capability
+
+        capability = sign_borrow_capability(
+            secret=b"runtime-failure-return-synthetic-secret",
+            channel_uuid=channel, episode_id="episode-failure-return-synthetic",
+            user_id="0", configuration_generation="config-synthetic",
+            catalog_generation="catalog-synthetic", control_generation=2,
+            recorder_fence=7, intent_epoch=4,
+            connection_identity=(channel, *IDENTITY[1:]),
+            episode_version=2, expires_at=500.0, nonce="d" * 32,
+        )
+        prepared = PreparedBorrowOpening(
+            "episode-failure-return-synthetic", 2,
+            "catchuparr-client-failure-return-synthetic", capability,
+        )
+        coordinator = object.__new__(RecorderBorrowCoordinator)
+        coordinator.channel_uuid = channel
+        coordinator.redis = object()
+        coordinator.intent_ledger = self.intent_ledger
+        coordinator.episode_ledger = self.episode_ledger
+        coordinator.state_record = saved
+        coordinator.dedicated_source_available = True
+        coordinator.configuration_generation = "config-synthetic"
+        coordinator.control_generation = 2
+        coordinator.recorder_fence = 7
+        coordinator.lease_value = LEASE
+        coordinator.catalog_generation = "catalog-synthetic"
+        coordinator.active = {"connection_sharing": {channel: {
+            "enabled": True, "live_stability_seconds": 5,
+            "last_viewer_return_seconds": 30, "min_switch_interval_seconds": 60,
+        }}}
+        with (
+            patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+        ):
+            self.assertTrue(RecorderBorrowCoordinator.record_return_after_cleanup(
+                coordinator, prepared, now=400.0, outcome="failure",
+            ))
+        self.assertEqual(400.0, self.intent_ledger.read(channel).intent.not_before)
+
+    def test_native_viewer_grace_first_zero_time_is_persisted(self):
+        current = self.intent_ledger.read(CHANNEL)
+        borrowed = resolve_transition(
+            current.state, SharingAction.ATTACH_BORROW, succeeded=True, now=105.0,
+            current_state=current.state,
+            current_observation=SharingObservation(
+                channel_uuid=CHANNEL, now=105.0,
+                configuration_generation="config-synthetic", control_generation=2,
+                recorder_fence=7, lease_is_current=True,
+                settings=SharingSettings(True, 5, 30, 60), target=target(),
+            ),
+        )
+        self.intent_ledger.save(
+            borrowed, action=None, expected_revision=current.revision, updated_at=105.0,
+        )
+        coordinator = object.__new__(RecorderBorrowCoordinator)
+        coordinator.channel_uuid = CHANNEL
+        coordinator.intent_ledger = self.intent_ledger
+        coordinator.state_record = current
+        coordinator.configuration_generation = "config-synthetic"
+        coordinator.control_generation = 2
+        coordinator.recorder_fence = 7
+        grant = SimpleNamespace(
+            phase="wait_return", configuration_generation="config-synthetic",
+            control_generation=2, recorder_fence=7,
+            intent_epoch=borrowed.intent_epoch, last_viewer_left_at=110.0,
+        )
+        coordinator._sync_viewer_grace(grant)
+        saved = self.intent_ledger.read(CHANNEL)
+        self.assertEqual("wait_return", saved.state.phase.value)
+        self.assertEqual(110.0, saved.state.last_viewer_left_at)
 
     def test_cleanup_without_allowed_source_keeps_state_paused_without_return_clock(self):
         waiting = attach_state()

@@ -709,6 +709,8 @@ class SharingIntentLedger:
                     settings=SharingSettings(),
                 ))
                 revision = 1
+                recovered_action = None
+                recovered_not_before = None
             else:
                 if recorder_fence < int(row["recorder_fence"]):
                     db.rollback()
@@ -744,39 +746,56 @@ class SharingIntentLedger:
                     now=now,
                 )
                 old_epoch = int(row["intent_epoch"] or 0)
+                preserve_return = bool(
+                    row["action"] == SharingAction.RETURN_TO_ALLOWED.value
+                    and isinstance(recovery_snapshot, dict)
+                    and recovery_snapshot.get("phase") == SharingPhase.WAIT_RETURN.value
+                    and type(row["intent_epoch"]) is int
+                    and int(row["intent_epoch"]) == recovery_snapshot.get("intent_epoch")
+                    and row["target_identity_json"] is None
+                    and row["target_admitted"] == 0
+                    and row["not_before"] is not None
+                    and row["configuration_generation"] == configuration_generation
+                    and int(row["control_generation"]) == control_generation
+                )
                 state = replace(
                     restored,
-                    phase=SharingPhase.DEDICATED,
+                    phase=(SharingPhase.WAIT_RETURN if preserve_return else SharingPhase.DEDICATED),
                     borrowed_identity=None,
-                    pending_action=None,
+                    pending_action=(SharingAction.RETURN_TO_ALLOWED if preserve_return else None),
                     intent_epoch=max(restored.intent_epoch, old_epoch) + 1,
                 )
                 revision = int(row["revision"]) + 1
+                recovered_action = SharingAction.RETURN_TO_ALLOWED if preserve_return else None
+                recovered_not_before = float(row["not_before"]) if preserve_return else None
             db.execute(
                 """INSERT INTO sharing_runtime (
                     channel_uuid, revision, state_json, action, intent_epoch,
                     configuration_generation, control_generation, recorder_fence,
                     target_identity_json, target_admitted, not_before, updated_at
-                ) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, NULL, 0, NULL, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)
                 ON CONFLICT(channel_uuid) DO UPDATE SET
                     revision=excluded.revision,
                     state_json=excluded.state_json,
-                    action=NULL,
-                    intent_epoch=NULL,
+                    action=excluded.action,
+                    intent_epoch=excluded.intent_epoch,
                     configuration_generation=excluded.configuration_generation,
                     control_generation=excluded.control_generation,
                     recorder_fence=excluded.recorder_fence,
                     target_identity_json=NULL,
                     target_admitted=0,
-                    not_before=NULL,
+                    not_before=excluded.not_before,
                     updated_at=excluded.updated_at""",
                 (
                     channel,
                     revision,
                     self._state_json(state),
+                    recovered_action.value if recovered_action is not None else None,
+                    state.intent_epoch if recovered_action is not None else None,
                     configuration_generation,
                     control_generation,
                     recorder_fence,
+                    recovered_not_before,
                     now,
                 ),
             )

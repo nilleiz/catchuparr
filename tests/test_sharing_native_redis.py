@@ -145,6 +145,20 @@ class RedisCli:
         values = self.command("HGET", key, field)
         return values[0] if values else None
 
+    def hset(self, key: str, field: str, value: str):
+        values = self.command("HSET", key, field, value)
+        if len(values) != 1 or not values[0].isdigit():
+            raise AssertionError("Redis HSET returned an invalid count")
+        return int(values[0])
+
+    def delete(self, *keys: str):
+        if not keys:
+            return 0
+        values = self.command("DEL", *keys)
+        if len(values) != 1 or not values[0].isdigit():
+            raise AssertionError("Redis DEL returned an invalid count")
+        return int(values[0])
+
     def hgetall(self, key: str):
         # JSON preserves empty hash values. `redis-cli --raw` prints an empty
         # final field as a blank line, which loses output_profile_id=''
@@ -509,12 +523,16 @@ class NativeLuaRedisTests(unittest.TestCase):
                 self.redis, channel, config_generation=config_generation,
                 control_generation=3,
             )
+            self.assertIsNotNone(authority)
             attempt = recorder_proxy.issue_recorder_attempt(
                 self.redis, lease, channel_uuid=channel,
                 candidate={"id": "stream-expired-synthetic", "account_id": "account-expired-synthetic"},
                 config_generation=config_generation, control_generation=3,
                 internal_base_url="http://dispatcharr.invalid", sharing_authority=authority,
             )
+        self.assertTrue(self.redis.exists(
+            recorder_proxy._sharing_operation_key(channel, attempt.sharing_operation_id),
+        ))
         self.redis.command("DEL", attempt.capability_key)
         replacement_lease = "11:new-lease-expired-capability-synthetic"
         self.redis.command("SET", lease_key, replacement_lease, "EX", 600)
@@ -971,10 +989,34 @@ class NativeLuaRedisTests(unittest.TestCase):
             self.redis, episode, client_id=CLIENT,
         ))
         self.assertEqual(tombstone_value, self.redis.get(tombstone_key))
-
-        self.redis.command("HSET", keys["current"], "authority_revision", "2")
-        self.assertFalse(tombstone_expired_unprojected_opening(
+        # Re-acknowledging the immutable exact tombstone after lease turnover
+        # is safe; it cannot project or register the old opening.
+        self.redis.command(
+            "SET", keys["lease"], "replacement-lease-tombstone-synthetic", "EX", "60",
+        )
+        self.assertTrue(tombstone_expired_unprojected_opening(
             self.redis, episode, client_id=CLIENT,
+        ))
+        self.assertEqual(tombstone_value, self.redis.get(tombstone_key))
+        class AuthorityRace:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+                self.changed = False
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+            def eval(self, *args):
+                if not self.changed:
+                    self.wrapped.command("HSET", keys["current"], "authority_revision", "2")
+                    self.changed = True
+                return self.wrapped.eval(*args)
+
+        # Change authority after the helper captured its current hash but
+        # before its atomic Lua CAS. A pre-call mutation would only test that
+        # the helper rereads current state, not that the CAS rejects a race.
+        self.assertFalse(tombstone_expired_unprojected_opening(
+            AuthorityRace(self.redis), episode, client_id=CLIENT,
         ))
         self.assertEqual(tombstone_value, self.redis.get(tombstone_key))
 

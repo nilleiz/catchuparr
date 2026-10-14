@@ -137,6 +137,51 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(1, len(acknowledgements))
         self.assertGreater(acknowledgements[0], 0)
 
+    def test_first_media_ack_retries_after_false_result(self):
+        class ProgressiveProcess:
+            def __init__(self, command, **_kwargs):
+                self.output = Path(command[-1]).parent
+                self.listing = Path(command[command.index("-segment_list") + 1])
+                first = self.output / "first.ts"
+                first.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                self.listing.write_text("first.ts,0,6\n", encoding="utf-8")
+                self.polls = 0
+
+            def poll(self):
+                self.polls += 1
+                if self.polls == 2:
+                    second = self.output / "second.ts"
+                    second.write_bytes(
+                        RecorderTests._ts_packet(257, start=True)
+                        + RecorderTests._ts_packet(257)
+                    )
+                    self.listing.write_text(
+                        "first.ts,0,6\nsecond.ts,6,12\n", encoding="utf-8",
+                    )
+                return 0 if self.polls >= 3 else None
+
+        recorder = FFmpegCopyRecorder(
+            self.store, "ch1", "http://dispatcharr/proxy/ts/stream/id",
+            self.root / "callback-retry-work", require_media_progress=True,
+        )
+        acknowledgements = []
+
+        def acknowledge(media_at):
+            acknowledgements.append(media_at)
+            return len(acknowledgements) >= 2
+
+        with patch("catchuparr.engine.recorder.subprocess.Popen", ProgressiveProcess):
+            result = recorder.run_candidate(
+                threading.Event(), on_first_media=acknowledge,
+            )
+
+        self.assertEqual("exited", result.status)
+        self.assertEqual(2, result.useful_segments)
+        self.assertEqual(2, len(acknowledgements))
+
     def test_candidate_stop_terminates_ffmpeg_before_indexing_final_segment(self):
         events = []
 
