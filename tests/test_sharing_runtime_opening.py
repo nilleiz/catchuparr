@@ -17,7 +17,13 @@ from catchuparr.sharing_planner import (
     SharingSettings,
     observe,
 )
-from catchuparr.sharing_runtime import acknowledge_opened_borrow, prepare_borrow_opening
+from catchuparr.sharing_runtime import (
+    PreparedBorrowOpening,
+    RecorderBorrowCoordinator,
+    acknowledge_opened_borrow,
+    borrow_cleanup_acknowledged,
+    prepare_borrow_opening,
+)
 
 CHANNEL = "channel-runtime-opening-synthetic"
 IDENTITY = (
@@ -125,6 +131,104 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         second, _projector, _cleanup = self.prepare()
         self.assertEqual((False, None), second)
         projector.assert_called_once()
+
+    def test_consumed_attach_recovers_only_after_exact_episode_and_native_absence(self):
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-runtime-recovery-synthetic",
+        )
+        self.episode_ledger.revoke(
+            opening.episode_id,
+            expected_version=opening.version,
+            reason="closed",
+            cleanup_acknowledged=True,
+        )
+        coordinator = object.__new__(RecorderBorrowCoordinator)
+        coordinator.channel_uuid = CHANNEL
+        coordinator.redis = object()
+        coordinator.intent_ledger = self.intent_ledger
+        coordinator.episode_ledger = self.episode_ledger
+        coordinator.state_record = self.saved
+        coordinator.configuration_generation = "config-synthetic"
+        coordinator.control_generation = 2
+        coordinator.recorder_fence = 7
+        coordinator.lease_value = LEASE
+        coordinator._recovery_is_current = lambda *_args: True
+
+        with patch(
+            "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+            return_value=SimpleNamespace(state="unknown"),
+        ), patch(
+            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            return_value=True,
+        ):
+            self.assertFalse(RecorderBorrowCoordinator._recover_closed_attach(coordinator))
+        self.assertIsNotNone(coordinator.state_record.intent)
+
+        with patch(
+            "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+            return_value=SimpleNamespace(state="known_revoked"),
+        ), patch(
+            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            return_value=True,
+        ):
+            self.assertTrue(RecorderBorrowCoordinator._recover_closed_attach(coordinator))
+        self.assertIsNone(coordinator.state_record.intent)
+        self.assertGreater(coordinator.state_record.state.intent_epoch, self.saved.state.intent_epoch)
+
+    def test_borrow_cleanup_gate_requires_closed_episode_and_absent_native_client(self):
+        from catchuparr.adapters.sharing_borrow_route import sign_borrow_capability
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-runtime-cleanup-synthetic",
+        )
+        capability = sign_borrow_capability(
+            secret=b"runtime-cleanup-synthetic-secret-00000",
+            channel_uuid=CHANNEL,
+            episode_id=opening.episode_id,
+            user_id="0",
+            configuration_generation=opening.configuration_generation,
+            catalog_generation="catalog-synthetic",
+            control_generation=opening.control_generation,
+            recorder_fence=opening.recorder_fence,
+            intent_epoch=opening.intent_epoch,
+            connection_identity=IDENTITY,
+            episode_version=opening.version,
+            expires_at=200.0,
+            nonce="a" * 32,
+        )
+        prepared = PreparedBorrowOpening(
+            opening.episode_id, opening.version, opening.client_id, capability,
+        )
+        redis = object()
+        with patch(
+            "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+            return_value=SimpleNamespace(state="known_revoked"),
+        ), patch(
+            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            return_value=True,
+        ):
+            self.assertFalse(borrow_cleanup_acknowledged(redis, self.episode_ledger, prepared))
+        self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        with patch(
+            "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+            return_value=SimpleNamespace(state="known_revoked"),
+        ), patch(
+            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            return_value=True,
+        ) as absent:
+            self.assertTrue(borrow_cleanup_acknowledged(redis, self.episode_ledger, prepared))
+        absent.assert_called_once_with(
+            redis, channel_uuid=CHANNEL, client_id=opening.client_id,
+        )
 
     def test_stale_claim_never_creates_episode_or_projects(self):
         result, projector, cleanup = self.prepare(validate=lambda _token: False)

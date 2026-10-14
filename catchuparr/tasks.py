@@ -6,6 +6,7 @@ import hashlib
 import logging
 import secrets
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 from celery import shared_task
@@ -333,7 +334,11 @@ def record_channel(
                     channel_uuid, expected_generation, expected_control_generation
                 )
                 if current_state["status"] != "ready":
-                    return False
+                    # The opening claim has been consumed. Do not fall through
+                    # to an allowlisted recorder while its native registration
+                    # may still be present.
+                    stop_event.set()
+                    return True
                 from .adapters.sharing_borrow_route import encode_borrow_capability
 
                 recorder = FFmpegCopyRecorder(
@@ -355,6 +360,34 @@ def record_channel(
                     )
                 except Exception:
                     error("borrowed_recorder_worker_stopped")
+                cleanup_acknowledged = False
+                try:
+                    from .sharing_episode import BorrowEpisodeLedger
+                    from .sharing_runtime import (
+                        borrow_cleanup_acknowledged,
+                        retry_durable_open_cleanups,
+                        retry_pending_open_cleanups,
+                    )
+
+                    episode_ledger = BorrowEpisodeLedger(
+                        config.archive_root / ".catchuparr-sharing.sqlite3",
+                    )
+                    # run_candidate has reaped FFmpeg, so exact reader cleanup
+                    # may now be retried. Never switch inputs while its native
+                    # client or episode projection can still be live.
+                    retry_durable_open_cleanups(
+                        episode_ledger, redis, now=time.time(),
+                        stale_after=0,
+                    )
+                    retry_pending_open_cleanups()
+                    cleanup_acknowledged = borrow_cleanup_acknowledged(
+                        redis, episode_ledger, prepared,
+                    )
+                except Exception:
+                    cleanup_acknowledged = False
+                if not cleanup_acknowledged:
+                    error("borrow_cleanup_pending")
+                    stop_event.set()
                 return True
 
             candidate_index = 0

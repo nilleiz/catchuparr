@@ -126,6 +126,52 @@ class RecorderBorrowCoordinator:
         except Exception:
             return False
 
+    def _recover_closed_attach(self) -> bool:
+        """Release a consumed ATTACH only after its exact opening is closed."""
+        token = self.state_record.intent
+        if token is None or token.action is not SharingAction.ATTACH_BORROW:
+            return False
+        try:
+            episode = self.episode_ledger.read(self.channel_uuid)
+            if (
+                episode.phase != "closed"
+                or episode.intent_epoch != token.intent_epoch
+                or episode.configuration_generation != token.configuration_generation
+                or episode.control_generation != token.control_generation
+                or episode.recorder_fence != token.recorder_fence
+                or episode.identity != token.target_identity
+                or not episode.client_id
+            ):
+                return False
+            from .adapters.sharing_native import (
+                native_registration_is_absent,
+                observe_native_episode_for_authority_drain,
+            )
+
+            projection = observe_native_episode_for_authority_drain(
+                self.redis, self.channel_uuid,
+            )
+            if getattr(projection, "state", None) not in {"absent", "known_revoked"}:
+                return False
+            if not native_registration_is_absent(
+                self.redis, channel_uuid=self.channel_uuid,
+                client_id=episode.client_id,
+            ):
+                return False
+            recovered = self.intent_ledger.recover(
+                self.channel_uuid,
+                configuration_generation=self.configuration_generation,
+                control_generation=self.control_generation,
+                recorder_fence=self.recorder_fence,
+                now=time.time(),
+                expected_revision=self.state_record.revision,
+                recovery_is_current=self._recovery_is_current,
+            )
+            self.state_record = recovered
+            return True
+        except Exception:
+            return False
+
     def poll(self, *, active: dict[str, Any], control_generation: int) -> PreparedBorrowOpening | None:
         """Persist cooldown observations and claim an ATTACH only at its deadline."""
         latest = self.intent_ledger.read(self.channel_uuid)
@@ -144,6 +190,12 @@ class RecorderBorrowCoordinator:
             or control_generation != self.control_generation
             or active.get("connection_sharing", {}).get(self.channel_uuid, {}).get("enabled") is not True
         ):
+            if (
+                self.state_record.intent is not None
+                and control_generation == self.control_generation
+                and active.get("connection_sharing", {}).get(self.channel_uuid, {}).get("enabled") is True
+            ):
+                self._recover_closed_attach()
             return None
         from .configuration import _sharing_catalog_generation
         from .recorder_proxy import configuration_generation
@@ -261,6 +313,46 @@ class RecorderBorrowCoordinator:
         )
         self.state_record = self.intent_ledger.read(self.channel_uuid)
         return prepared if claimed else None
+
+
+def borrow_cleanup_acknowledged(
+    redis: Any, ledger: BorrowEpisodeLedger, prepared: PreparedBorrowOpening,
+) -> bool:
+    """Require exact durable and native absence before another source can start."""
+    if (not isinstance(ledger, BorrowEpisodeLedger)
+            or not isinstance(prepared, PreparedBorrowOpening)):
+        return False
+    try:
+        episode = ledger.read(prepared.capability.channel_uuid)
+        if (
+            episode.phase != "closed"
+            or episode.episode_id != prepared.episode_id
+            or episode.version < prepared.episode_version
+            or episode.client_id != prepared.client_id
+            or episode.identity != prepared.capability.connection_identity
+            or episode.configuration_generation != prepared.capability.configuration_generation
+            or episode.control_generation != prepared.capability.control_generation
+            or episode.recorder_fence != prepared.capability.recorder_fence
+            or episode.intent_epoch != prepared.capability.intent_epoch
+        ):
+            return False
+        from .adapters.sharing_native import (
+            native_registration_is_absent,
+            observe_native_episode_for_authority_drain,
+        )
+
+        projection = observe_native_episode_for_authority_drain(
+            redis, prepared.capability.channel_uuid,
+        )
+        if getattr(projection, "state", None) not in {"absent", "known_revoked"}:
+            return False
+        return native_registration_is_absent(
+            redis,
+            channel_uuid=prepared.capability.channel_uuid,
+            client_id=prepared.client_id,
+        )
+    except Exception:
+        return False
 
 
 def acknowledge_opened_borrow(
