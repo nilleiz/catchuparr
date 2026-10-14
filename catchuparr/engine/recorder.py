@@ -25,6 +25,7 @@ class RecorderAttemptResult:
     status: str
     useful_segments: int
     return_code: int | None
+    attempt_switch_id: str | None = None
 
 
 class RecorderAttemptSwitch:
@@ -37,6 +38,7 @@ class RecorderAttemptSwitch:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._requested = threading.Event()
+        self.attempt_id = uuid.uuid4().hex
 
     def request(self) -> None:
         with self._lock:
@@ -293,7 +295,14 @@ class FFmpegCopyRecorder:
                 self._mark_next_discontinuity = True
             if status == "exited" and useful == 0:
                 status = "no_media"
-            return RecorderAttemptResult(status, useful, return_code)
+            return RecorderAttemptResult(
+                status, useful, return_code,
+                attempt_switch_id=(
+                    attempt_switch.attempt_id
+                    if status == "switch_requested" and attempt_switch is not None
+                    else None
+                ),
+            )
         finally:
             if process is not None and process.poll() is None:
                 process.kill()

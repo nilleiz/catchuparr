@@ -228,6 +228,7 @@ def return_to_allowed_after_reap(
     token: SharingIntentToken,
     *,
     switch_intent: SharingIntentToken,
+    attempt_switch: RecorderAttemptSwitch,
     ledger: SharingIntentLedger,
     fresh_validate: Callable[[SharingIntentToken], bool],
     exact_cleanup_acknowledged: Callable[[], bool],
@@ -244,6 +245,8 @@ def return_to_allowed_after_reap(
     """
     if (not isinstance(result, RecorderAttemptResult)
             or result.status != "switch_requested"
+            or not isinstance(attempt_switch, RecorderAttemptSwitch)
+            or result.attempt_switch_id != attempt_switch.attempt_id
             or not isinstance(token, SharingIntentToken)
             or token.action != SharingAction.RETURN_TO_ALLOWED
             or not isinstance(switch_intent, SharingIntentToken)
