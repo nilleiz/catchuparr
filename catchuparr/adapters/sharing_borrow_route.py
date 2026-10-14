@@ -8,10 +8,13 @@ manager-map mutation.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
 import math
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -213,6 +216,70 @@ def sign_borrow_capability(
         unsigned.recorder_fence, unsigned.intent_epoch, unsigned.connection_identity,
         unsigned.episode_version, unsigned.expires_at, unsigned.nonce, signature,
     )
+
+
+_CAPABILITY_FIELDS = frozenset({
+    "channel_uuid", "episode_id", "user_id", "configuration_generation",
+    "catalog_generation", "control_generation", "recorder_fence", "intent_epoch",
+    "connection_identity", "episode_version", "expires_at", "nonce",
+})
+
+
+def encode_borrow_capability(capability: SignedBorrowCapability) -> str:
+    """Encode a short-lived capability for the private recorder URL."""
+    if not isinstance(capability, SignedBorrowCapability):
+        raise ValueError("signed borrow capability is required")
+    envelope = json.loads(capability.payload().decode("utf-8"))
+    envelope["signature"] = capability.signature
+    payload = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def decode_borrow_capability(token: str) -> SignedBorrowCapability:
+    """Decode a bounded capability without accepting duplicate or extra fields."""
+    if not isinstance(token, str) or not 1 <= len(token) <= 4096:
+        raise ValueError("borrow capability token is invalid")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
+        raise ValueError("borrow capability token is invalid")
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+
+        def reject_duplicates(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate capability field")
+                result[key] = value
+            return result
+
+        envelope = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError, binascii.Error, ValueError):
+        raise ValueError("borrow capability token is invalid") from None
+    if not isinstance(envelope, dict) or set(envelope) != _CAPABILITY_FIELDS | {"signature"}:
+        raise ValueError("borrow capability fields are invalid")
+    identity = envelope.get("connection_identity")
+    if not isinstance(identity, list):
+        raise ValueError("borrow capability identity is invalid")
+    try:
+        capability = SignedBorrowCapability(
+            channel_uuid=envelope["channel_uuid"],
+            episode_id=envelope["episode_id"],
+            user_id=envelope["user_id"],
+            configuration_generation=envelope["configuration_generation"],
+            catalog_generation=envelope["catalog_generation"],
+            control_generation=envelope["control_generation"],
+            recorder_fence=envelope["recorder_fence"],
+            intent_epoch=envelope["intent_epoch"],
+            connection_identity=tuple(identity),
+            episode_version=envelope["episode_version"],
+            expires_at=envelope["expires_at"],
+            nonce=envelope["nonce"],
+            signature=envelope["signature"],
+        )
+    except (TypeError, ValueError, KeyError):
+        raise ValueError("borrow capability fields are invalid") from None
+    return capability
 
 
 _CONSUME_BORROW_CAPABILITY_LUA = """
