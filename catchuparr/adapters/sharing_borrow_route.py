@@ -25,8 +25,8 @@ from .sharing_native import (
     adopt_registered_client_in_manager,
     check_and_touch_borrowed_client,
     cleanup_borrowed_client,
+    close_fenced_unregistered_opening,
     fence_unregistered_opening,
-    native_registration_is_absent,
     observe_native_connection,
     read_native_episode_grant,
     register_borrowed_client,
@@ -633,8 +633,8 @@ class BorrowedReaderSession:
                         fence_unregistered_opening(
                             redis_text, episode, catalog_generation=catalog_generation,
                         )
-                        and native_registration_is_absent(
-                            redis_text, channel_uuid=episode.channel_uuid,
+                        and close_fenced_unregistered_opening(
+                            redis_text, episode, catalog_generation=catalog_generation,
                             client_id=client_id,
                         )
                     ),

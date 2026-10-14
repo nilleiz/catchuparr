@@ -975,6 +975,75 @@ def native_registration_is_absent(redis: Any, *, channel_uuid: str, client_id: s
         return False
 
 
+_CLOSE_FENCED_OPENING_LUA = """
+local episode_type = redis.call('TYPE', KEYS[1]).ok
+local client_type = redis.call('TYPE', KEYS[2]).ok
+local clients_type = redis.call('TYPE', KEYS[3]).ok
+local private_type = redis.call('TYPE', KEYS[4]).ok
+if episode_type ~= 'hash' or (client_type ~= 'none' and client_type ~= 'hash')
+   or (clients_type ~= 'none' and clients_type ~= 'set')
+   or (private_type ~= 'none' and private_type ~= 'hash') then return 0 end
+if redis.call('TTL', KEYS[1]) <= 0 then return 0 end
+local version = tonumber(ARGV[2])
+if not version or version < 1 or version > 9007199254740989
+   or version % 1 ~= 0 then return 0 end
+if redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[1]
+   or redis.call('HGET', KEYS[1], 'channel_uuid') ~= ARGV[3]
+   or redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[4]
+   or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[5]
+   or redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[6]
+   or redis.call('HGET', KEYS[1], 'recorder_fence') ~= ARGV[7]
+   or redis.call('HGET', KEYS[1], 'intent_epoch') ~= ARGV[8]
+   or redis.call('HGET', KEYS[1], 'worker_id') ~= ARGV[9]
+   or redis.call('HGET', KEYS[1], 'owner_lock_value') ~= ARGV[10]
+   or redis.call('HGET', KEYS[1], 'metadata_owner') ~= ARGV[11]
+   or redis.call('HGET', KEYS[1], 'stream_id') ~= ARGV[12]
+   or redis.call('HGET', KEYS[1], 'account_id') ~= ARGV[13]
+   or redis.call('HGET', KEYS[1], 'm3u_profile_id') ~= ARGV[14]
+   or redis.call('HGET', KEYS[1], 'input_profile_id') ~= ARGV[15]
+   or redis.call('HGET', KEYS[1], 'lease_digest') ~= ARGV[16] then return 0 end
+local phase = redis.call('HGET', KEYS[1], 'phase')
+local stored_version = tonumber(redis.call('HGET', KEYS[1], 'version') or '')
+if phase ~= 'closing' or stored_version ~= version + 1 then
+  if phase == 'closed' and stored_version == version + 2 then return 2 end
+  return 0
+end
+if client_type ~= 'none' or (clients_type == 'set' and redis.call('SISMEMBER', KEYS[3], ARGV[17]) ~= 0)
+   or (private_type == 'hash' and redis.call('HGET', KEYS[4], ARGV[17]) ~= false) then return 0 end
+redis.call('HSET', KEYS[1], 'phase', 'closed', 'version', tostring(version + 2))
+return 1
+"""
+
+
+def close_fenced_unregistered_opening(redis: Any, episode: BorrowEpisodeSnapshot, *,
+                                      catalog_generation: str, client_id: str) -> bool:
+    """Atomically close a fenced opening only when all exact client resources are absent."""
+    if (not isinstance(episode, BorrowEpisodeSnapshot) or episode.phase != "opening"
+            or not isinstance(catalog_generation, str) or not catalog_generation
+            or not isinstance(client_id, str) or not client_id.startswith("catchuparr-client-")):
+        return False
+    channel = episode.channel_uuid
+    keys = (
+        episode_projection_key(channel),
+        f"live:channel:{channel}:clients:{client_id}",
+        f"live:channel:{channel}:clients",
+        f"catchuparr:sharing:private:{channel}",
+    )
+    try:
+        result = redis.eval(
+            _CLOSE_FENCED_OPENING_LUA, len(keys), *keys,
+            episode.episode_id, str(episode.version), channel,
+            episode.configuration_generation, str(episode.control_generation),
+            catalog_generation, str(episode.recorder_fence), str(episode.intent_epoch),
+            episode.identity[1], episode.identity[2], episode.identity[3],
+            episode.identity[4], episode.identity[5], episode.identity[6],
+            episode.identity[7], episode.lease_digest, client_id,
+        )
+    except Exception:
+        return False
+    return type(result) is int and result in {1, 2}
+
+
 def adopt_registered_client_in_manager(manager: Any, ack: NativeClientRegistrationAck) -> bool:
     """Install only local bookkeeping after Lua atomically registered the client.
 
