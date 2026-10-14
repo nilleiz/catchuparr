@@ -242,13 +242,18 @@ class SharingPersistenceTests(unittest.TestCase):
             operation_id, exact_resources_absent=lambda attempt: False,
         ))
         self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), (pending,))
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            exact_resources_absent=lambda attempt: True,
+        ))
         self.assertTrue(self.ledger.reconcile_effect_attempt(
             operation_id,
-            exact_resources_absent=lambda attempt: (
+            dispatch_cancel_acknowledged=lambda attempt: (
                 attempt.operation_id == operation_id
                 and attempt.target_identity == IDENTITY
                 and attempt.status == "cleanup_pending"
             ),
+            exact_resources_absent=lambda attempt: True,
         ))
         self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
         next_saved = self.ledger.save(
@@ -355,7 +360,12 @@ class SharingPersistenceTests(unittest.TestCase):
             exact_resources_absent=lambda _attempt: absence_probes.append(True) or True,
         ))
         self.assertEqual(absence_probes, [])
-        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL)[0].status, "dispatching")
+        pending = self.ledger.mark_effect_cleanup_pending(operation_id)
+        self.assertEqual(pending.status, "cleanup_pending")
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL)[0].status, "cleanup_pending")
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id, exact_resources_absent=lambda _attempt: True,
+        ))
         def cancel_at_native_boundary(_attempt):
             with cancellation_lock:
                 cancelled["value"] = True

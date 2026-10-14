@@ -1028,7 +1028,11 @@ class SharingIntentLedger:
             return False
         if attempt.status == "closed":
             return True
-        if attempt.status == "dispatching":
+        dispatch_outcome_unknown = (
+            attempt.status == "dispatching"
+            or (attempt.status == "cleanup_pending" and attempt.resource_id is None)
+        )
+        if dispatch_outcome_unknown:
             if not callable(dispatch_cancel_acknowledged):
                 return False
             try:
