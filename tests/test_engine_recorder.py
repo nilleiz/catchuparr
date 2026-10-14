@@ -126,11 +126,16 @@ class RecorderTests(unittest.TestCase):
             require_media_progress=True,
         )
         with patch("catchuparr.engine.recorder.subprocess.Popen", FinishedProcess):
-            result = recorder.run_candidate(threading.Event())
+            acknowledgements = []
+            result = recorder.run_candidate(
+                threading.Event(), on_first_media=acknowledgements.append,
+            )
 
         self.assertEqual("exited", result.status)
         self.assertEqual(1, result.useful_segments)
         self.assertEqual(1, len(self.store.segments("ch1")))
+        self.assertEqual(1, len(acknowledgements))
+        self.assertGreater(acknowledgements[0], 0)
 
     def test_candidate_stop_terminates_ffmpeg_before_indexing_final_segment(self):
         events = []
