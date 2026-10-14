@@ -22,6 +22,7 @@ from catchuparr.adapters.sharing_borrow_route import (
 from catchuparr.adapters.sharing_native import (
     check_and_touch_borrowed_client,
     cleanup_borrowed_client,
+    close_fenced_unregistered_opening,
     fence_unregistered_opening,
     native_registration_is_absent,
     project_opening_episode,
@@ -269,20 +270,39 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertTrue(native_registration_is_absent(
             self.redis, channel_uuid=CHANNEL, client_id=CLIENT,
         ))
+        self.assertTrue(close_fenced_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
+        ))
         self.assertTrue(fence_unregistered_opening(
             self.redis, episode, catalog_generation=CATALOG,
         ))
+        self.assertTrue(close_fenced_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
+        ))
+        self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closed")
+        next_episode = _episode(epoch=episode.intent_epoch + 1)
+        self.assertTrue(self._opening_projection(episode=next_episode))
 
-    def test_fenced_opening_does_not_treat_replacement_resources_as_absent(self):
-        episode = self._opening_projection()
-        self.assertTrue(fence_unregistered_opening(
-            self.redis, episode, catalog_generation=CATALOG,
-        ))
-        client = f"live:channel:{CHANNEL}:clients:{CLIENT}"
-        self.redis.command("HSET", client, "connected_at", "replacement-synthetic")
-        self.assertFalse(native_registration_is_absent(
-            self.redis, channel_uuid=CHANNEL, client_id=CLIENT,
-        ))
+    def test_fenced_opening_close_rejects_hash_membership_and_marker_resources(self):
+        for resource in ("hash", "membership", "marker"):
+            with self.subTest(resource=resource):
+                self.redis.command("FLUSHDB")
+                episode = self._opening_projection()
+                self.assertTrue(fence_unregistered_opening(
+                    self.redis, episode, catalog_generation=CATALOG,
+                ))
+                if resource == "hash":
+                    self.redis.command(
+                        "HSET", _keys()["client"], "connected_at", "replacement-synthetic",
+                    )
+                elif resource == "membership":
+                    self.redis.command("SADD", _keys()["clients"], CLIENT)
+                else:
+                    self.redis.command("HSET", _keys()["private"], CLIENT, "other-episode-synthetic")
+                self.assertFalse(close_fenced_unregistered_opening(
+                    self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
+                ))
+                self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closing")
 
     def test_signed_opening_capability_rejects_stale_authority_without_nonce_write(self):
         episode = self._opening_projection()

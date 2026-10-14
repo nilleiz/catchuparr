@@ -377,7 +377,7 @@ class SharingBorrowRouteTests(unittest.TestCase):
             "catchuparr.adapters.sharing_borrow_route.fence_unregistered_opening",
             return_value=True,
         ), patch(
-            "catchuparr.adapters.sharing_borrow_route.native_registration_is_absent",
+            "catchuparr.adapters.sharing_borrow_route.close_fenced_unregistered_opening",
             return_value=True,
         ):
             with self.assertRaises(BorrowOpenCleanupPending) as raised:
