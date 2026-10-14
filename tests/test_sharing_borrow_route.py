@@ -188,7 +188,7 @@ class SharingBorrowRouteTests(unittest.TestCase):
             phase="opening", configuration_generation="config-route-synthetic",
             control_generation=3, recorder_fence=9, intent_epoch=7,
             identity=IDENTITY, lease_digest=sha256(b"synthetic-route-lease").hexdigest(),
-            client_id=None, connected_at=None, version=1,
+            client_id="catchuparr-client-route-synthetic", connected_at=None, version=1,
             last_viewer_left_at=None, return_deadline=None,
         )
 

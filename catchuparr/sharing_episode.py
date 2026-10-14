@@ -72,8 +72,8 @@ class BorrowEpisodeSnapshot:
             value = getattr(self, name)
             if value is not None:
                 _finite_time(value, name)
-        if self.phase == "opening" and (self.client_id is not None or self.connected_at is not None):
-            raise ValueError("opening episode cannot already own a client")
+        if self.phase == "opening" and self.connected_at is not None:
+            raise ValueError("opening episode cannot already have a connected client")
         if self.phase in {"active", "wait_return"} and (self.client_id is None or self.connected_at is None):
             raise ValueError("active episode must bind its exact native client")
         if self.phase == "active" and (self.last_viewer_left_at is not None or self.return_deadline is not None):
@@ -153,13 +153,18 @@ class BorrowEpisodeLedger:
             raise ValueError("identity must be the exact eight-field native channel identity")
 
     def begin_open(self, token: SharingIntentToken, *, lease_digest: str,
-                   identity: tuple[str, ...], expected_version: int | None = None) -> BorrowEpisodeSnapshot:
-        """Record a provisional opening after the durable logical claim was consumed."""
+                   identity: tuple[str, ...], client_id: str | None = None,
+                   expected_version: int | None = None) -> BorrowEpisodeSnapshot:
+        """Persist the exact private client attempt before any Redis side effect."""
         if not isinstance(token, SharingIntentToken) or token.action is not SharingAction.ATTACH_BORROW:
             raise ValueError("opening requires a consumed ATTACH_BORROW token")
         self._valid_identity(identity, token.channel_uuid)
         if identity != token.target_identity or not token.target_admitted:
             raise ValueError("opening identity differs from admitted intent target")
+        if client_id is not None and (
+            not isinstance(client_id, str) or not client_id.startswith("catchuparr-client-")
+        ):
+            raise ValueError("opening client_id must be a private recorder client id")
         if not isinstance(lease_digest, str) or len(lease_digest) != 64 or any(c not in "0123456789abcdef" for c in lease_digest):
             raise ValueError("lease_digest must be a lowercase SHA-256 digest")
         now = _finite_time(self.clock(), "clock")
@@ -190,15 +195,15 @@ class BorrowEpisodeLedger:
                 db.rollback()
                 raise BorrowEpisodeRejected("logical opening claim was already consumed")
             db.execute(
-                """INSERT INTO sharing_borrow_episodes VALUES (?, ?, 'opening', ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, ?)
+                """INSERT INTO sharing_borrow_episodes VALUES (?, ?, 'opening', ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?)
                 ON CONFLICT(channel_uuid) DO UPDATE SET episode_id=excluded.episode_id,phase='opening',
                 configuration_generation=excluded.configuration_generation,control_generation=excluded.control_generation,
                 recorder_fence=excluded.recorder_fence,intent_epoch=excluded.intent_epoch,identity_json=excluded.identity_json,
-                lease_digest=excluded.lease_digest,client_id=NULL,connected_at=NULL,version=excluded.version,
+                lease_digest=excluded.lease_digest,client_id=excluded.client_id,connected_at=NULL,version=excluded.version,
                 last_viewer_left_at=NULL,return_deadline=NULL,updated_at=excluded.updated_at""",
                 (token.channel_uuid, episode_id, token.configuration_generation, token.control_generation,
                  token.recorder_fence, token.intent_epoch, json.dumps(identity, separators=(",", ":")),
-                 lease_digest, version, now),
+                 lease_digest, client_id, version, now),
             )
             db.commit()
         return self.read(token.channel_uuid)
@@ -306,6 +311,16 @@ class BorrowEpisodeLedger:
         if row is None:
             raise BorrowEpisodeRejected("no active borrow episode")
         return self._snapshot_from_row(row)
+
+    def pending_cleanup(self) -> tuple[BorrowEpisodeSnapshot, ...]:
+        """List durable non-closed episodes for exact startup reconciliation."""
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT * FROM sharing_borrow_episodes WHERE phase != 'closed' ORDER BY updated_at"
+            ).fetchall()
+        # A malformed row aborts the snapshot; callers must fail closed instead
+        # of skipping an operation whose native resources might still exist.
+        return tuple(self._snapshot_from_row(row) for row in rows)
 
     @staticmethod
     def _snapshot_from_row(row: sqlite3.Row) -> BorrowEpisodeSnapshot:

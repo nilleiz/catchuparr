@@ -915,6 +915,11 @@ if phase == 'closing' then
   if closed_version == version + 1 then return 2 end
   return 0
 end
+if phase == 'closed' then
+  local closed_version = tonumber(redis.call('HGET', KEYS[1], 'version') or '')
+  if closed_version == version + 2 then return 2 end
+  return 0
+end
 if phase ~= 'opening' then return 0 end
 if redis.call('HGET', KEYS[1], 'version') ~= ARGV[2] then return 0 end
 redis.call('HSET', KEYS[1], 'phase', 'closing', 'viewer_left_at', '',
@@ -1004,12 +1009,10 @@ if redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[1]
    or redis.call('HGET', KEYS[1], 'lease_digest') ~= ARGV[16] then return 0 end
 local phase = redis.call('HGET', KEYS[1], 'phase')
 local stored_version = tonumber(redis.call('HGET', KEYS[1], 'version') or '')
-if phase ~= 'closing' or stored_version ~= version + 1 then
-  if phase == 'closed' and stored_version == version + 2 then return 2 end
-  return 0
-end
 if client_type ~= 'none' or (clients_type == 'set' and redis.call('SISMEMBER', KEYS[3], ARGV[17]) ~= 0)
    or (private_type == 'hash' and redis.call('HGET', KEYS[4], ARGV[17]) ~= false) then return 0 end
+if phase == 'closed' and stored_version == version + 2 then return 2 end
+if phase ~= 'closing' or stored_version ~= version + 1 then return 0 end
 redis.call('HSET', KEYS[1], 'phase', 'closed', 'version', tostring(version + 2))
 return 1
 """

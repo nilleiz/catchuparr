@@ -113,10 +113,7 @@ class RedisCli:
         )
         if result.returncode:
             raise RuntimeError("isolated redis-cli command failed")
-        values = json.loads(result.stdout)
-        if not isinstance(values, list) or len(values) % 2:
-            raise AssertionError("Redis returned malformed HGETALL JSON")
-        return dict(zip(values[::2], values[1::2]))
+        return _decode_hgetall_json(result.stdout)
 
     def smembers(self, key: str):
         return set(self.command("SMEMBERS", key))
@@ -126,6 +123,41 @@ class RedisCli:
 
     def ttl(self, key: str):
         return int(self.command("TTL", key)[0])
+
+
+def _decode_hgetall_json(payload: str) -> dict[str, str]:
+    """Decode Redis 7 JSON objects without losing empty hash values."""
+    values = json.loads(payload)
+    if isinstance(values, dict):
+        if any(not isinstance(key, str) or not isinstance(value, str)
+               for key, value in values.items()):
+            raise AssertionError("Redis returned malformed HGETALL object")
+        return values
+    # Keep compatibility with redis-cli builds that represent RESP arrays as
+    # flat JSON arrays. Unlike --raw, both forms preserve empty strings.
+    if (isinstance(values, list) and len(values) % 2 == 0
+            and all(isinstance(value, str) for value in values)):
+        return dict(zip(values[::2], values[1::2]))
+    raise AssertionError("Redis returned malformed HGETALL JSON")
+
+
+class RedisCliJsonTests(unittest.TestCase):
+    def test_hgetall_json_object_preserves_empty_native_profile_field(self):
+        self.assertEqual(
+            _decode_hgetall_json('{"output_profile_id":"","worker_id":"worker-synthetic"}'),
+            {"output_profile_id": "", "worker_id": "worker-synthetic"},
+        )
+
+    def test_hgetall_json_flat_array_preserves_empty_native_profile_field(self):
+        self.assertEqual(
+            _decode_hgetall_json('["output_profile_id","","worker_id","worker-synthetic"]'),
+            {"output_profile_id": "", "worker_id": "worker-synthetic"},
+        )
+
+    def test_hgetall_json_rejects_null_or_wrong_shape(self):
+        for payload in ('{"output_profile_id":null}', '["field"]', '1'):
+            with self.subTest(payload=payload), self.assertRaises(AssertionError):
+                _decode_hgetall_json(payload)
 
 
 def _episode(*, epoch: int = 9) -> BorrowEpisodeSnapshot:
@@ -303,6 +335,45 @@ class NativeLuaRedisTests(unittest.TestCase):
                     self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
                 ))
                 self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closing")
+
+    def test_closed_opening_retry_requires_resources_still_absent(self):
+        episode = self._opening_projection()
+        self.assertTrue(fence_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG,
+        ))
+        self.assertTrue(close_fenced_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
+        ))
+        self.assertTrue(fence_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG,
+        ))
+        self.assertTrue(close_fenced_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
+        ))
+        for resource in ("hash", "membership", "marker"):
+            with self.subTest(resource=resource):
+                self.redis.command("FLUSHDB")
+                episode = self._opening_projection()
+                self.assertTrue(fence_unregistered_opening(
+                    self.redis, episode, catalog_generation=CATALOG,
+                ))
+                self.assertTrue(close_fenced_unregistered_opening(
+                    self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
+                ))
+                if resource == "hash":
+                    self.redis.command(
+                        "HSET", _keys()["client"], "connected_at", "replacement-synthetic",
+                    )
+                elif resource == "membership":
+                    self.redis.command("SADD", _keys()["clients"], CLIENT)
+                else:
+                    self.redis.command(
+                        "HSET", _keys()["private"], CLIENT, "replacement-episode-synthetic",
+                    )
+                self.assertFalse(close_fenced_unregistered_opening(
+                    self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
+                ))
+                self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closed")
 
     def test_signed_opening_capability_rejects_stale_authority_without_nonce_write(self):
         episode = self._opening_projection()
