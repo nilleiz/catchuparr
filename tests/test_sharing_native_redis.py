@@ -81,6 +81,43 @@ class RedisCli:
             raise RuntimeError("isolated redis-cli command failed")
         return result.stdout.rstrip("\n").splitlines() if result.stdout else []
 
+    def set(self, key: str, value: str, *, ex=None, px=None, nx=False, xx=False,
+            keepttl=False, get=False):
+        """Match the redis-py SET options used by recorder capability tests."""
+        if nx and xx:
+            raise ValueError("NX and XX are mutually exclusive")
+        if ex is not None and px is not None:
+            raise ValueError("EX and PX are mutually exclusive")
+        args = ["SET", key, value]
+        if ex is not None:
+            if type(ex) is not int or ex <= 0:
+                raise ValueError("EX must be a positive integer")
+            args.extend(("EX", str(ex)))
+        if px is not None:
+            if type(px) is not int or px <= 0:
+                raise ValueError("PX must be a positive integer")
+            args.extend(("PX", str(px)))
+        if keepttl:
+            if ex is not None or px is not None:
+                raise ValueError("KEEPTTL cannot be combined with EX or PX")
+            args.append("KEEPTTL")
+        if nx:
+            args.append("NX")
+        if xx:
+            args.append("XX")
+        if get:
+            args.append("GET")
+        values = self.command(*args)
+        # With --raw, Redis's null bulk reply is an empty output. Successful
+        # SET replies are exactly "OK"; never turn a nil NX/XX reply into True.
+        if get:
+            return values[0] if values else None
+        if values == ["OK"]:
+            return True
+        if not values:
+            return None
+        raise AssertionError("Redis SET returned an unexpected response")
+
     def eval(self, script: str, numkeys: int, *args: object):
         self.last_invocation = (numkeys, len(args), script[-100:])
         result = subprocess.run(
@@ -263,6 +300,23 @@ class RedisCliJsonTests(unittest.TestCase):
         ) as run:
             self.assertEqual(cli.type("key-synthetic"), "hash")
         self.assertEqual(run.call_args.args[0][-2:], ["TYPE", "key-synthetic"])
+
+    def test_set_facade_preserves_success_nil_and_expiry_options(self):
+        cli = RedisCli("synthetic-test-container")
+        with patch(
+            "tests.test_sharing_native_redis.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="OK\n"),
+        ) as run:
+            self.assertTrue(cli.set("key-synthetic", "value-synthetic", ex=45, nx=True))
+        self.assertEqual(
+            run.call_args.args[0][-6:],
+            ["SET", "key-synthetic", "value-synthetic", "EX", "45", "NX"],
+        )
+        with patch(
+            "tests.test_sharing_native_redis.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=""),
+        ):
+            self.assertIsNone(cli.set("key-synthetic", "value-synthetic", nx=True))
 
     def test_sismember_facade_matches_redis_py_boolean_shape(self):
         cli = RedisCli("synthetic-test-container")
@@ -903,6 +957,88 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertEqual(self.redis.type(keys["client"]), "none")
         self.assertFalse(self.redis.sismember(keys["clients"], CLIENT))
         self.assertIsNone(self.redis.hget(keys["private"], CLIENT))
+
+    def test_expired_opening_tombstone_is_idempotent_and_denies_changed_authority(self):
+        episode = self._opening_projection()
+        keys = _keys()
+        self.redis.command("DEL", keys["episode"])
+        self.assertTrue(tombstone_expired_unprojected_opening(
+            self.redis, episode, client_id=CLIENT,
+        ))
+        tombstone_key = f"catchuparr:sharing:opening-tombstone:{CHANNEL}:{episode.episode_id}"
+        tombstone_value = self.redis.get(tombstone_key)
+        self.assertTrue(tombstone_expired_unprojected_opening(
+            self.redis, episode, client_id=CLIENT,
+        ))
+        self.assertEqual(tombstone_value, self.redis.get(tombstone_key))
+
+        self.redis.command("HSET", keys["current"], "authority_revision", "2")
+        self.assertFalse(tombstone_expired_unprojected_opening(
+            self.redis, episode, client_id=CLIENT,
+        ))
+        self.assertEqual(tombstone_value, self.redis.get(tombstone_key))
+
+    def test_expired_opening_tombstone_denial_matrix_has_no_partial_writes(self):
+        cases = (
+            "replacement_projection", "client_hash", "client_membership",
+            "private_marker", "projection_wrong_type", "client_wrong_type",
+            "clients_wrong_type", "private_wrong_type", "lease_wrong_type",
+            "tombstone_wrong_type", "changed_lease",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.redis.command("FLUSHDB")
+                episode = self._opening_projection()
+                keys = _keys()
+                self.redis.command("DEL", keys["episode"])
+                tombstone_key = (
+                    f"catchuparr:sharing:opening-tombstone:{CHANNEL}:{episode.episode_id}"
+                )
+                if case == "replacement_projection":
+                    self.redis.command("HSET", keys["episode"], "episode_id", "replacement")
+                elif case == "client_hash":
+                    self.redis.command("HSET", keys["client"], "connected_at", "replacement")
+                elif case == "client_membership":
+                    self.redis.command("SADD", keys["clients"], CLIENT)
+                elif case == "private_marker":
+                    self.redis.command("HSET", keys["private"], CLIENT, "replacement-episode")
+                elif case == "projection_wrong_type":
+                    self.redis.command("SET", keys["episode"], "wrong-type")
+                elif case == "client_wrong_type":
+                    self.redis.command("SET", keys["client"], "wrong-type")
+                elif case == "clients_wrong_type":
+                    self.redis.command("HSET", keys["clients"], "wrong-type", "member")
+                elif case == "private_wrong_type":
+                    self.redis.command("SET", keys["private"], "wrong-type")
+                elif case == "lease_wrong_type":
+                    self.redis.command("DEL", keys["lease"])
+                    self.redis.command("HSET", keys["lease"], "wrong-type", "lease")
+                elif case == "tombstone_wrong_type":
+                    self.redis.command("HSET", tombstone_key, "wrong-type", "value")
+                elif case == "changed_lease":
+                    self.redis.command("SET", keys["lease"], "replacement-lease", "EX", 600)
+                else:
+                    self.fail(f"unknown tombstone case {case}")
+
+                def snapshot(key):
+                    key_type = self.redis.type(key)
+                    if key_type == "hash":
+                        content = self.redis.hgetall(key)
+                    elif key_type == "set":
+                        content = self.redis.smembers(key)
+                    elif key_type == "string":
+                        content = self.redis.get(key)
+                    else:
+                        content = None
+                    return key_type, content
+
+                protected = (keys["current"], keys["episode"], keys["lease"],
+                             keys["client"], keys["clients"], keys["private"], tombstone_key)
+                before = {key: snapshot(key) for key in protected}
+                self.assertFalse(tombstone_expired_unprojected_opening(
+                    self.redis, episode, client_id=CLIENT,
+                ))
+                self.assertEqual(before, {key: snapshot(key) for key in protected})
 
     def test_registration_rejects_client_id_different_from_persisted_attempt(self):
         episode = self._opening_projection()

@@ -212,6 +212,7 @@ class FFmpegCopyRecorder:
         media_idle_timeout: float = 120.0,
         poll_interval: float = 0.5,
         attempt_switch: RecorderAttemptSwitch | None = None,
+        on_first_media: Callable[[float], None] | None = None,
     ) -> RecorderAttemptResult:
         """Run a single source until it stops or useful media stalls.
 
@@ -222,6 +223,8 @@ class FFmpegCopyRecorder:
             raise ValueError("recorder attempt timeouts must be positive")
         if attempt_switch is not None and not isinstance(attempt_switch, RecorderAttemptSwitch):
             raise ValueError("attempt_switch must be a RecorderAttemptSwitch")
+        if on_first_media is not None and not callable(on_first_media):
+            raise ValueError("on_first_media must be callable")
         self.work_root.mkdir(parents=True, exist_ok=True)
         output_dir = self.work_root / f"{self.channel_id}-{uuid.uuid4().hex}"
         output_dir.mkdir()
@@ -233,6 +236,20 @@ class FFmpegCopyRecorder:
         last_useful_at = start_clock
         status = "exited"
         return_code = None
+        first_media_notified = False
+
+        def notify_first_media(committed: int) -> None:
+            nonlocal first_media_notified
+            if committed and not first_media_notified:
+                first_media_notified = True
+                if on_first_media is not None:
+                    try:
+                        on_first_media(time.time())
+                    except Exception:
+                        # Media publication is already committed; admission
+                        # bookkeeping can fail closed without invalidating it.
+                        pass
+
         try:
             process = subprocess.Popen(
                 self.command(output_dir),
@@ -254,6 +271,7 @@ class FFmpegCopyRecorder:
                     # sets the signal immediately after that commit.
                     useful += committed
                     last_useful_at = time.monotonic()
+                    notify_first_media(committed)
                 if attempt_switch is not None and attempt_switch.is_set():
                     status = "switch_requested"
                     break
@@ -289,6 +307,7 @@ class FFmpegCopyRecorder:
                     attempt_switch=attempt_switch,
                 )
                 useful += committed
+                notify_first_media(committed)
             else:
                 # A new source attempt starts a fresh mux session. Do not flush
                 # any old-input rows after the switch was requested.

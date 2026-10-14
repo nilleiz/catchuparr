@@ -194,7 +194,10 @@ def record_channel(
     stop_event = None
     monitor = None
     attempt_state_lock = threading.Lock()
-    attempt_state = {"attempt": None, "candidate": None, "switch": None, "borrow": None}
+    attempt_state = {
+        "attempt": None, "candidate": None, "switch": None, "borrow": None,
+        "return_prepared": None,
+    }
     try:
         stop_event = threading.Event()
         sharing = active.get("connection_sharing")
@@ -402,6 +405,12 @@ def record_channel(
                     cleanup_acknowledged = sharing_coordinator.record_return_after_cleanup(
                         prepared, now=time.time(),
                     )
+                    if cleanup_acknowledged:
+                        return_token = sharing_coordinator.pending_return_intent()
+                        if (return_token is not None
+                                and return_token.intent_epoch > prepared.capability.intent_epoch):
+                            with attempt_state_lock:
+                                attempt_state["return_prepared"] = prepared
                 if not cleanup_acknowledged:
                     error("borrow_cleanup_pending")
                     stop_event.set()
@@ -411,6 +420,24 @@ def record_channel(
             while candidate_index < len(candidates):
                 if run_prepared_borrow():
                     continue
+                return_prepared = None
+                return_token = None
+                with attempt_state_lock:
+                    return_prepared = attempt_state["return_prepared"]
+                if return_prepared is not None and sharing_coordinator is not None:
+                    return_token = sharing_coordinator.pending_return_intent()
+                    if (return_token is None
+                            or return_token.intent_epoch <= return_prepared.capability.intent_epoch):
+                        # The dedicated source is not authorized until the
+                        # exact post-borrow RETURN intent exists.
+                        if stop_event.wait(0.5):
+                            break
+                        continue
+                    remaining = return_token.not_before - time.time()
+                    if remaining > 0:
+                        if stop_event.wait(min(remaining, 0.5)):
+                            break
+                        continue
                 index = candidate_index
                 candidate = candidates[index]
                 if stop_event.is_set():
@@ -462,6 +489,7 @@ def record_channel(
                     attempt_state["attempt"] = attempt
                     attempt_state["candidate"] = candidate
                     attempt_state["switch"] = attempt_switch
+                    attempt_state["return_token"] = return_token
                 admission_status = None
                 result = None
                 try:
@@ -485,6 +513,19 @@ def record_channel(
                         )
                         if index:
                             recorder._mark_next_discontinuity = True
+                        first_media_callback = None
+                        if (return_token is not None and return_prepared is not None
+                                and sharing_coordinator is not None):
+                            def acknowledge_return_media(media_at):
+                                if sharing_coordinator.acknowledge_return_media(
+                                    return_prepared, return_token, attempt, candidate,
+                                    media_at=media_at,
+                                ):
+                                    with attempt_state_lock:
+                                        if attempt_state.get("return_prepared") is return_prepared:
+                                            attempt_state["return_prepared"] = None
+
+                            first_media_callback = acknowledge_return_media
                         try:
                             result = recorder.run_candidate(
                                 stop_event,
@@ -492,6 +533,8 @@ def record_channel(
                                 media_idle_timeout=120,
                                 **({"attempt_switch": attempt_switch}
                                    if attempt_switch is not None else {}),
+                                **({"on_first_media": first_media_callback}
+                                   if first_media_callback is not None else {}),
                             )
                         except Exception:
                             error("recorder_worker_stopped")
@@ -511,6 +554,7 @@ def record_channel(
                             attempt_state["attempt"] = None
                             attempt_state["candidate"] = None
                             attempt_state["switch"] = None
+                            attempt_state["return_token"] = None
                 if admission_status is not None:
                     return {"status": admission_status}
                 if result is not None and result.status == "stopped":

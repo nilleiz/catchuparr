@@ -1337,6 +1337,12 @@ def tombstone_expired_unprojected_opening(
             current_lease = current_lease.decode("utf-8", errors="strict")
         if current_lease is not None and not isinstance(current_lease, str):
             return False
+        if (current_lease is not None
+                and hashlib.sha256(current_lease.encode("utf-8")).hexdigest()
+                != episode.lease_digest):
+            # A replacement recorder lease is a newer owner, not evidence that
+            # this expired opening can safely be closed.
+            return False
         keys = (
             current_key, episode_projection_key(channel), lease_key,
             f"live:channel:{channel}:clients:{client_id}",
