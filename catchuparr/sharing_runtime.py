@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -43,6 +44,91 @@ class PreparedBorrowOpening:
     episode_version: int
     client_id: str
     capability: SignedBorrowCapability
+
+
+_pending_open_cleanup_lock = threading.Lock()
+_pending_open_cleanups: dict[str, Any] = {}
+
+
+def retain_open_cleanup_pending(error: BaseException) -> None:
+    """Keep the exact open-failure cleanup owner reachable in this web process."""
+    from .adapters.sharing_borrow_route import BorrowOpenCleanupPending
+
+    if not isinstance(error, BorrowOpenCleanupPending):
+        return
+    episode = getattr(error, "_episode", None)
+    episode_id = getattr(episode, "episode_id", None)
+    if not isinstance(episode_id, str) or not episode_id:
+        return
+    with _pending_open_cleanup_lock:
+        _pending_open_cleanups[episode_id] = error
+
+
+def retain_session_cleanup_pending(session: BorrowedReaderSession) -> None:
+    """Retain an exact session whose HTTP close has not been acknowledged."""
+    ack = getattr(session, "ack", None)
+    episode_id = getattr(ack, "episode_id", None)
+    if not isinstance(episode_id, str) or not episode_id:
+        return
+    with _pending_open_cleanup_lock:
+        _pending_open_cleanups[episode_id] = session
+
+
+def retry_pending_open_cleanups() -> tuple[int, int]:
+    """Retry retained exact cleanup handles; never infer closure from a timeout."""
+    completed = 0
+    pending = 0
+    with _pending_open_cleanup_lock:
+        items = tuple(_pending_open_cleanups.items())
+    for episode_id, operation in items:
+        try:
+            done = operation.retry_cleanup() is True
+        except Exception:
+            done = False
+        with _pending_open_cleanup_lock:
+            if _pending_open_cleanups.get(episode_id) is not operation:
+                continue
+            if done:
+                del _pending_open_cleanups[episode_id]
+                completed += 1
+            else:
+                pending += 1
+    return completed, pending
+
+
+class BorrowedSessionStream:
+    """Ensure a response closed before its first iteration still releases ownership."""
+
+    def __init__(self, session: BorrowedReaderSession):
+        self.session = session
+        self._iterator = None
+        self._closed = False
+
+    def __iter__(self):
+        if self._closed:
+            return iter(())
+        if self._iterator is None:
+            self._iterator = iter(self.session.iter_chunks())
+        return self._iterator
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        iterator = self._iterator
+        if iterator is not None:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        try:
+            cleaned = self.session.close() is True
+        except Exception:
+            cleaned = False
+        if not cleaned:
+            retain_session_cleanup_pending(self.session)
 
 
 def prepare_borrow_opening(
@@ -266,6 +352,11 @@ def open_borrow_session(capability: SignedBorrowCapability) -> BorrowedReaderSes
     """Open a signed route only while its exact current native grant is valid."""
     if not isinstance(capability, SignedBorrowCapability):
         raise BorrowEpisodeRejected("signed sharing capability is invalid")
+    if not capability.verify(
+        _django_secret(), user_id=capability.user_id, now=time.time(),
+    ):
+        raise BorrowEpisodeRejected("signed sharing capability is invalid or expired")
+    retry_pending_open_cleanups()
     from core.utils import RedisClient
 
     from .configuration import load_applied_state

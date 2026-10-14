@@ -123,6 +123,43 @@ class SignedBorrowCapability:
         return hmac.compare_digest(expected, self.signature)
 
 
+def _mark_episode_cleanup_pending(
+    ledger: BorrowEpisodeLedger | None, episode: BorrowEpisodeSnapshot,
+) -> bool:
+    """Persist the exact episode as non-authorizing before a failed open escapes."""
+    if ledger is None:
+        return False
+    try:
+        current = ledger.read(episode.channel_uuid)
+        if current.episode_id != episode.episode_id:
+            return False
+        if current.phase == "cleanup_pending":
+            return True
+        if current.phase == "closed":
+            return True
+        ledger.revoke(
+            current.episode_id, expected_version=current.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _mark_current_episode_cleanup_pending(
+    ledger: BorrowEpisodeLedger | None, episode_id: str, channel_uuid: str,
+) -> bool:
+    if ledger is None:
+        return False
+    try:
+        current = ledger.read(channel_uuid)
+    except Exception:
+        return False
+    if current.episode_id != episode_id:
+        return False
+    return _mark_episode_cleanup_pending(ledger, current)
+
+
 class BorrowOpenCleanupPending(BorrowEpisodeRejected):
     """An exact registration could not be confirmed absent during failed open.
 
@@ -136,7 +173,7 @@ class BorrowOpenCleanupPending(BorrowEpisodeRejected):
                  ledger: BorrowEpisodeLedger, episode: BorrowEpisodeSnapshot,
                  reconcile: Callable[[], NativeClientRegistrationAck | None] | None = None,
                  confirm_absent: Callable[[], bool] | None = None,
-                 native_removed: bool = False) -> None:
+                 native_removed: bool = False, manager_stopped: bool = False) -> None:
         super().__init__(message)
         self.ack = ack
         self.manager = manager
@@ -147,8 +184,10 @@ class BorrowOpenCleanupPending(BorrowEpisodeRejected):
         self._reconcile = reconcile
         self._confirm_absent = confirm_absent
         self._native_removed = native_removed
+        self._manager_stopped = manager_stopped
         self._ledger_closed = False
         self._completed = False
+        self.cleanup_pending_persisted = _mark_episode_cleanup_pending(ledger, episode)
 
     def retry_cleanup(self) -> bool:
         """Retry only a known exact registration; retain ownership on failure."""
@@ -176,12 +215,7 @@ class BorrowOpenCleanupPending(BorrowEpisodeRejected):
             if not removed:
                 return False
             self._native_removed = True
-        if not self._ledger_closed:
-            BorrowedReaderSession._close_episode_ledger(
-                self._ledger, self._episode.episode_id, self._episode.channel_uuid,
-            )
-            self._ledger_closed = True
-        if self.owns_manager:
+        if self.owns_manager and not self._manager_stopped:
             stop = getattr(self.manager, "stop", None)
             if not callable(stop):
                 return False
@@ -189,6 +223,16 @@ class BorrowOpenCleanupPending(BorrowEpisodeRejected):
                 stop()
             except Exception:
                 return False
+            self._manager_stopped = True
+        if not self._ledger_closed:
+            if not BorrowedReaderSession._close_episode_ledger(
+                self._ledger, self._episode.episode_id, self._episode.channel_uuid,
+            ):
+                self.cleanup_pending_persisted = _mark_episode_cleanup_pending(
+                    self._ledger, self._episode,
+                )
+                return False
+            self._ledger_closed = True
         self.ack = None
         self._completed = True
         return True
@@ -508,6 +552,8 @@ class BorrowedReaderSession:
         self.episode_ledger = episode_ledger
         self.cleanup_clock = cleanup_clock
         self._closed = False
+        self._native_removed = False
+        self._manager_stopped = False
         self._close_lock = threading.Lock()
 
     @classmethod
@@ -658,25 +704,35 @@ class BorrowedReaderSession:
                 except Exception:
                     removed = False
                 if removed:
-                    cls._close_episode_ledger(ledger, episode.episode_id, episode.channel_uuid)
-                if owns_manager and removed:
-                    stop = getattr(manager, "stop", None)
-                    if not callable(stop):
+                    manager_stopped = False
+                    if owns_manager:
+                        stop = getattr(manager, "stop", None)
+                        if not callable(stop):
+                            raise BorrowOpenCleanupPending(
+                                "native client is absent but owned manager shutdown is pending",
+                                ack=ack, manager=manager, owns_manager=owns_manager,
+                                cleanup=cleanup, ledger=ledger, episode=episode,
+                                native_removed=True,
+                            ) from exc
+                        try:
+                            stop()
+                            manager_stopped = True
+                        except Exception as stop_error:
+                            raise BorrowOpenCleanupPending(
+                                "native client is absent but owned manager shutdown is pending",
+                                ack=ack, manager=manager, owns_manager=owns_manager,
+                                cleanup=cleanup, ledger=ledger, episode=episode,
+                                native_removed=True,
+                            ) from stop_error
+                    if not cls._close_episode_ledger(
+                        ledger, episode.episode_id, episode.channel_uuid,
+                    ):
                         raise BorrowOpenCleanupPending(
-                            "native client is absent but owned manager shutdown is pending",
+                            "native client and manager are closed but episode recovery state is pending",
                             ack=ack, manager=manager, owns_manager=owns_manager,
                             cleanup=cleanup, ledger=ledger, episode=episode,
-                            native_removed=True,
+                            native_removed=True, manager_stopped=manager_stopped,
                         ) from exc
-                    try:
-                        stop()
-                    except Exception as stop_error:
-                        raise BorrowOpenCleanupPending(
-                            "native client is absent but owned manager shutdown is pending",
-                            ack=ack, manager=manager, owns_manager=owns_manager,
-                            cleanup=cleanup, ledger=ledger, episode=episode,
-                            native_removed=True,
-                        ) from stop_error
                 else:
                     raise BorrowOpenCleanupPending(
                         "borrowed registration cleanup is pending; retain its exact handle",
@@ -710,7 +766,15 @@ class BorrowedReaderSession:
             elif owns_manager:
                 stop = getattr(manager, "stop", None)
                 if callable(stop):
-                    stop()
+                    try:
+                        stop()
+                    except Exception as stop_error:
+                        raise BorrowOpenCleanupPending(
+                            "owned manager shutdown is pending after an empty open",
+                            ack=None, manager=manager, owns_manager=True,
+                            cleanup=cleanup, ledger=ledger, episode=episode,
+                            confirm_absent=lambda: True,
+                        ) from stop_error
             raise
 
     def iter_chunks(self, stop: threading.Event | None = None) -> Iterator[bytes]:
@@ -722,47 +786,64 @@ class BorrowedReaderSession:
     @staticmethod
     def _close_episode_ledger(
         ledger: BorrowEpisodeLedger | None, episode_id: str, channel_uuid: str,
-    ) -> None:
+    ) -> bool:
         if ledger is None:
-            return
+            return True
         try:
             current = ledger.read(channel_uuid)
-            if current.episode_id == episode_id and current.phase != "closed":
+            if current.episode_id != episode_id:
+                return True
+            if current.phase != "closed":
                 ledger.revoke(
                     episode_id, expected_version=current.version, reason="closed",
                     cleanup_acknowledged=True,
                 )
+            return True
         except Exception:
-            # Native Redis cleanup is the serving authority. A failed advisory
-            # SQLite close must never restore access; startup reconciliation can
-            # mark the stale row closed after confirming native cleanup.
-            return
+            return False
 
     def close(self) -> bool:
         """Clean only the exact registration; retain owned manager on no ACK."""
         with self._close_lock:
             if self._closed:
                 return True
-            try:
-                removed = self.cleanup_callback(
-                    self.ack, self.client_manager, self.owns_client_manager,
-                )
-            except Exception:
-                removed = False
-            if not removed:
-                return False
-            self._closed = True
-            self._close_episode_ledger(
-                self.episode_ledger, self.ack.episode_id, self.ack.channel_uuid,
-            )
-            if self.owns_client_manager:
+            if not self._native_removed:
+                try:
+                    self._native_removed = self.cleanup_callback(
+                        self.ack, self.client_manager, self.owns_client_manager,
+                    ) is True
+                except Exception:
+                    self._native_removed = False
+                if not self._native_removed:
+                    _mark_current_episode_cleanup_pending(
+                        self.episode_ledger, self.ack.episode_id, self.ack.channel_uuid,
+                    )
+                    return False
+            if self.owns_client_manager and not self._manager_stopped:
                 stop = getattr(self.client_manager, "stop", None)
                 if not callable(stop):
-                    self._closed = False
+                    _mark_current_episode_cleanup_pending(
+                        self.episode_ledger, self.ack.episode_id, self.ack.channel_uuid,
+                    )
                     return False
                 try:
                     stop()
                 except Exception:
-                    self._closed = False
+                    _mark_current_episode_cleanup_pending(
+                        self.episode_ledger, self.ack.episode_id, self.ack.channel_uuid,
+                    )
                     return False
+                self._manager_stopped = True
+            if not self._close_episode_ledger(
+                self.episode_ledger, self.ack.episode_id, self.ack.channel_uuid,
+            ):
+                _mark_current_episode_cleanup_pending(
+                    self.episode_ledger, self.ack.episode_id, self.ack.channel_uuid,
+                )
+                return False
+            self._closed = True
             return True
+
+    def retry_cleanup(self) -> bool:
+        """Retry an exact close retained after a streaming response ended."""
+        return self.close()
