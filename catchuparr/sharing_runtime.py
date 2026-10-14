@@ -576,11 +576,11 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
         NativeClientRegistrationAck,
         cleanup_borrowed_client,
         close_fenced_unregistered_opening,
-        episode_projection_key,
         fence_unregistered_opening,
         native_registration_is_absent,
         read_native_episode_cleanup_binding,
         read_native_episode_grant,
+        tombstone_expired_unprojected_opening,
     )
     from .adapters.sharing_reader import redis_backend_signature
 
@@ -633,34 +633,24 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                         # an unknown/prepared attempt.
                         client_id = registration.client_id if registration is not None else snapshot.client_id
                         cutoff = float(observed_at) - max(120.0, float(stale_after))
-                        try:
-                            projection_type = redis_text.type(
-                                episode_projection_key(snapshot.channel_uuid),
-                            )
-                            if isinstance(projection_type, bytes):
-                                projection_type = projection_type.decode("ascii", errors="strict")
-                        except Exception:
-                            projection_type = None
                         if (
                             isinstance(client_id, str)
                             and client_id.startswith("catchuparr-client-")
-                            and projection_type == "none"
                             and ledger.registration_attempt_is_stale(snapshot, before=cutoff)
-                            and native_registration_is_absent(
-                                redis_text, channel_uuid=snapshot.channel_uuid,
-                                client_id=client_id,
-                            )
                         ):
                             current = ledger.read(snapshot.channel_uuid)
                             if (current.episode_id == snapshot.episode_id
                                     and current.version == snapshot.version
                                     and current.phase in {"opening", "cleanup_pending"}):
-                                ledger.revoke(
-                                    current.episode_id, expected_version=current.version,
-                                    reason="closed", cleanup_acknowledged=True,
-                                )
-                                completed += 1
-                                continue
+                                if tombstone_expired_unprojected_opening(
+                                    redis_text, current, client_id=client_id,
+                                ):
+                                    ledger.revoke(
+                                        current.episode_id, expected_version=current.version,
+                                        reason="closed", cleanup_acknowledged=True,
+                                    )
+                                    completed += 1
+                                    continue
                         pending += 1
                         continue
                     catalog_generation = "expired-registration-projection"

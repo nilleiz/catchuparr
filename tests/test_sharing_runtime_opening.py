@@ -472,7 +472,7 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertEqual(1, managers[0].stopped)
         self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
 
-    def test_expired_unregistered_opening_closes_only_after_projection_and_client_absence(self):
+    def test_expired_unregistered_opening_closes_only_after_atomic_tombstone(self):
         from catchuparr.sharing_runtime import retry_durable_open_cleanups
 
         opening = self.episode_ledger.begin_open(
@@ -485,7 +485,8 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             opening.episode_id, expected_version=opening.version,
             reason="cleanup_pending", cleanup_acknowledged=False,
         )
-        redis_text = SimpleNamespace(type=lambda _key: "none")
+        expired_snapshot = self.episode_ledger.read(CHANNEL)
+        redis_text = object()
         with patch(
             "catchuparr.adapters.sharing_reader.redis_backend_signature",
             return_value="f" * 64,
@@ -496,19 +497,16 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             "catchuparr.adapters.sharing_native.read_native_episode_cleanup_binding",
             return_value=None,
         ), patch(
-            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            "catchuparr.adapters.sharing_native.tombstone_expired_unprojected_opening",
             return_value=True,
-        ) as absent, patch(
-            "catchuparr.adapters.sharing_native.fence_unregistered_opening",
-        ) as fence:
+        ) as tombstone:
             self.assertEqual((1, 0), retry_durable_open_cleanups(
                 self.episode_ledger, redis_text, now=300.0,
             ))
-        absent.assert_called_once_with(
-            redis_text, channel_uuid=CHANNEL,
+        tombstone.assert_called_once_with(
+            redis_text, expired_snapshot,
             client_id=opening.client_id,
         )
-        fence.assert_not_called()
         self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
 
     def test_retained_cleanup_callbacks_keep_each_channel_ack_and_manager(self):

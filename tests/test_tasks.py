@@ -323,6 +323,14 @@ class RecorderTaskTests(unittest.TestCase):
                         raise AssertionError("media must not start after the admission fence")
 
                 modules = _recording_task_fake_modules(redis)
+                adapter_package = _fake_module("catchuparr.adapters")
+                recorder_proxy_adapter = _fake_module(
+                    "catchuparr.adapters.recorder_proxy",
+                    core_api_supported=lambda: True,
+                    install_proxyserver_cleanup_hook=lambda: True,
+                )
+                modules["catchuparr.adapters"] = adapter_package
+                modules["catchuparr.adapters.recorder_proxy"] = recorder_proxy_adapter
                 with _isolated_plugin_modules(modules):
                     tasks = importlib.import_module("catchuparr.tasks")
                     lease_module = importlib.import_module("catchuparr.engine.leases")
@@ -341,8 +349,6 @@ class RecorderTaskTests(unittest.TestCase):
                         patch("catchuparr.engine.recorder.FFmpegCopyRecorder", FakeRecorder),
                         patch("catchuparr.tasks.threading.Event", threading.Event),
                         patch("catchuparr.recorder_proxy.ranked_source_candidates", return_value=candidates),
-                        patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
-                        patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
                         patch(
                             "catchuparr.recorder_proxy.issue_recorder_attempt",
                             side_effect=lambda *_args, **_kwargs: (attempts.append(Attempt()) or attempts[-1]),
