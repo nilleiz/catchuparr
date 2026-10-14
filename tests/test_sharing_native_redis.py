@@ -24,6 +24,7 @@ from catchuparr.adapters.sharing_native import (
     cleanup_borrowed_client,
     close_fenced_unregistered_opening,
     fence_unregistered_opening,
+    invalidate_native_episode,
     native_registration_is_absent,
     project_opening_episode,
     publish_current_authority,
@@ -428,6 +429,52 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertEqual(self.redis.hget(_keys()["current"], "authority_revision"), "5")
         self.assertEqual(self.redis.hget(_keys()["current"], "configuration_generation"), "config-next")
 
+    def test_committed_authority_change_invalidates_only_exact_prior_episode(self):
+        _episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.assertIsNotNone(grant)
+        self.assertTrue(publish_current_authority(
+            self.redis, CHANNEL, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            expected_revision=4, authority_revision=5,
+        ))
+        self.assertTrue(invalidate_native_episode(
+            self.redis, grant, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            authority_revision=5,
+        ))
+        self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closing")
+        self.assertEqual(self.redis.hget(_keys()["episode"], "version"), str(grant.version + 1))
+        self.assertFalse(invalidate_native_episode(
+            self.redis, grant, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            authority_revision=5,
+        ))
+
+    def test_current_authority_invalidation_rejects_stale_revision_and_projection(self):
+        _episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.assertIsNotNone(grant)
+        self.assertTrue(publish_current_authority(
+            self.redis, CHANNEL, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            expected_revision=4, authority_revision=5,
+        ))
+        self.assertFalse(invalidate_native_episode(
+            self.redis, grant, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            authority_revision=6,
+        ))
+        self.redis.command("HSET", _keys()["episode"], "client_id", "replacement-client-synthetic")
+        self.assertFalse(invalidate_native_episode(
+            self.redis, grant, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            authority_revision=5,
+        ))
+        self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "active")
+
     def test_project_rejects_wrong_projection_type_without_replacing_key(self):
         self._base_authority()
         keys = _keys()
@@ -467,6 +514,19 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "opening")
         self.assertEqual(self.redis.hget(_keys()["episode"], "client_id"), CLIENT)
         self.assertFalse(self.redis.exists(_keys()["client"]))
+
+    def test_cleanup_fences_only_the_persisted_client_attempt(self):
+        episode = self._opening_projection()
+        wrong_client = _episode(client_id="catchuparr-client-wrong-synthetic")
+        self.assertFalse(fence_unregistered_opening(
+            self.redis, wrong_client, catalog_generation=CATALOG,
+        ))
+        self.assertFalse(close_fenced_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG,
+            client_id="catchuparr-client-wrong-synthetic",
+        ))
+        self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "opening")
+        self.assertEqual(self.redis.hget(_keys()["episode"], "client_id"), CLIENT)
 
     def test_registration_lost_reply_recovers_exact_committed_ack(self):
         episode = self._opening_projection()

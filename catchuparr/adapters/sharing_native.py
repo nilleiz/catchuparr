@@ -737,6 +737,66 @@ def publish_current_authority(redis: Any, channel_uuid: str, *, configuration_ge
     return type(status) is int and status == 1
 
 
+_INVALIDATE_NATIVE_EPISODE_LUA = """
+if redis.call('TYPE', KEYS[1]).ok ~= 'hash'
+   or redis.call('TYPE', KEYS[2]).ok ~= 'hash' then return 0 end
+local version = tonumber(ARGV[9])
+if not version or version < 2 or version > 9007199254740990
+   or version % 1 ~= 0 or redis.call('TTL', KEYS[2]) <= 0 then return 0 end
+if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
+   or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[2]
+   or redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[3]
+   or redis.call('HGET', KEYS[1], 'authority_revision') ~= ARGV[4]
+   or redis.call('HGET', KEYS[2], 'episode_id') ~= ARGV[5]
+   or redis.call('HGET', KEYS[2], 'version') ~= ARGV[9]
+   or redis.call('HGET', KEYS[2], 'phase') ~= ARGV[10]
+   or redis.call('HGET', KEYS[2], 'configuration_generation') ~= ARGV[11]
+   or redis.call('HGET', KEYS[2], 'control_generation') ~= ARGV[12]
+   or redis.call('HGET', KEYS[2], 'catalog_generation') ~= ARGV[13]
+   or redis.call('HGET', KEYS[2], 'recorder_fence') ~= ARGV[14]
+   or redis.call('HGET', KEYS[2], 'intent_epoch') ~= ARGV[15]
+   or redis.call('HGET', KEYS[2], 'client_id') ~= ARGV[6]
+   or redis.call('HGET', KEYS[2], 'connected_at') ~= ARGV[7]
+   or redis.call('HGET', KEYS[2], 'worker_id') ~= ARGV[8]
+   or redis.call('HGET', KEYS[2], 'stream_id') ~= ARGV[16]
+   or redis.call('HGET', KEYS[2], 'account_id') ~= ARGV[17]
+   or redis.call('HGET', KEYS[2], 'm3u_profile_id') ~= ARGV[18]
+   or redis.call('HGET', KEYS[2], 'input_profile_id') ~= ARGV[19]
+   or redis.call('HGET', KEYS[2], 'lease_digest') ~= ARGV[20]
+   or (ARGV[10] ~= 'active' and ARGV[10] ~= 'wait_return') then return 0 end
+redis.call('HSET', KEYS[2], 'phase', 'closing', 'viewer_left_at', '',
+  'return_deadline', '', 'version', tostring(version + 1))
+return 1
+"""
+
+
+def invalidate_native_episode(redis: Any, grant: NativeEpisodeGrant, *,
+                              configuration_generation: str, control_generation: int,
+                              catalog_generation: str, authority_revision: int) -> bool:
+    """Fence one exact old borrowed episode after a durable authority change."""
+    if (not isinstance(grant, NativeEpisodeGrant)
+            or not isinstance(configuration_generation, str) or not configuration_generation
+            or type(control_generation) is not int or control_generation < 0
+            or not isinstance(catalog_generation, str) or not catalog_generation
+            or type(authority_revision) is not int or authority_revision < 1):
+        return False
+    channel = grant.channel_uuid
+    keys = (
+        f"catchuparr:sharing:current:{channel}", episode_projection_key(channel),
+    )
+    result = redis.eval(
+        _INVALIDATE_NATIVE_EPISODE_LUA, len(keys), *keys,
+        configuration_generation, str(control_generation), catalog_generation,
+        str(authority_revision), grant.episode_id, grant.client_id, grant.connected_at,
+        grant.worker_id, str(grant.version), grant.phase,
+        grant.configuration_generation, str(grant.control_generation),
+        grant.catalog_generation, str(grant.recorder_fence), str(grant.intent_epoch),
+        grant.stream_id, grant.account_id, grant.m3u_profile_id, grant.input_profile_id,
+        hashlib.sha256(grant.lease_value.encode("utf-8")).hexdigest(),
+    )
+    return type(result) is int and result == 1
+
+
 def project_opening_episode(redis: Any, episode: BorrowEpisodeSnapshot, *, lease_value: str,
                             catalog_generation: str, return_seconds: int,
                             minimum_switch_seconds: int, last_switch_at: float | None,
