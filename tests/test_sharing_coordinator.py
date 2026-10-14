@@ -67,9 +67,10 @@ def _return_token(ledger: SharingIntentLedger):
 
 def _switch_and_fallback_tokens(ledger: SharingIntentLedger):
     switch_intent = _return_token(ledger)
-    claimed, _ = ledger.run_if_current(
-        switch_intent, fresh_validate=lambda _token: True,
-        side_effect=lambda _token: "switch-requested",
+    attempt_switch = RecorderAttemptSwitch()
+    claimed = coordinator.request_source_switch(
+        attempt_switch, switch_intent, ledger=ledger,
+        fresh_validate=lambda _token: True,
     )
     assert claimed
     persisted = ledger.read(CHANNEL)
@@ -92,7 +93,7 @@ def _switch_and_fallback_tokens(ledger: SharingIntentLedger):
         next_decision.state, action=next_decision.action,
         expected_revision=saved_failure.revision, not_before=100.0,
     )
-    return switch_intent, saved_fallback.intent
+    return switch_intent, saved_fallback.intent, attempt_switch
 
 
 class SharingCoordinatorTests(unittest.TestCase):
@@ -166,11 +167,15 @@ class SharingCoordinatorTests(unittest.TestCase):
     def test_fallback_requires_reaped_attempt_and_exact_cleanup_ack(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = SharingIntentLedger(Path(directory) / "state.sqlite", clock=lambda: 100.0)
-            switch_intent, token = _switch_and_fallback_tokens(ledger)
+            switch_intent, token, attempt_switch = _switch_and_fallback_tokens(ledger)
             launched = []
             result = coordinator.return_to_allowed_after_reap(
-                RecorderAttemptResult("switch_requested", 2, 0), token,
+                RecorderAttemptResult(
+                    "switch_requested", 2, 0,
+                    attempt_switch_id=attempt_switch.attempt_id,
+                ), token,
                 switch_intent=switch_intent,
+                attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: False,
                 candidate={"identity": "synthetic"},
@@ -183,11 +188,15 @@ class SharingCoordinatorTests(unittest.TestCase):
     def test_fallback_consumes_current_intent_once_after_cleanup_and_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = SharingIntentLedger(Path(directory) / "state.sqlite", clock=lambda: 100.0)
-            switch_intent, token = _switch_and_fallback_tokens(ledger)
+            switch_intent, token, attempt_switch = _switch_and_fallback_tokens(ledger)
             events = []
             result = coordinator.return_to_allowed_after_reap(
-                RecorderAttemptResult("switch_requested", 2, 0), token,
+                RecorderAttemptResult(
+                    "switch_requested", 2, 0,
+                    attempt_switch_id=attempt_switch.attempt_id,
+                ), token,
                 switch_intent=switch_intent,
+                attempt_switch=attempt_switch,
                 ledger=ledger,
                 fresh_validate=lambda _token: events.append("validate") or True,
                 exact_cleanup_acknowledged=lambda: events.append("cleanup") or True,
@@ -200,8 +209,12 @@ class SharingCoordinatorTests(unittest.TestCase):
             # claim boundary, then performs exactly one fallback side effect.
             self.assertEqual(events, ["cleanup", "validate", "validate", "launch"])
             again = coordinator.return_to_allowed_after_reap(
-                RecorderAttemptResult("switch_requested", 2, 0), token,
+                RecorderAttemptResult(
+                    "switch_requested", 2, 0,
+                    attempt_switch_id=attempt_switch.attempt_id,
+                ), token,
                 switch_intent=switch_intent,
+                attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: True,
                 candidate={"identity": "synthetic"},
@@ -213,10 +226,14 @@ class SharingCoordinatorTests(unittest.TestCase):
     def test_fallback_rejects_unallowed_candidate_without_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = SharingIntentLedger(Path(directory) / "state.sqlite", clock=lambda: 100.0)
-            switch_intent, token = _switch_and_fallback_tokens(ledger)
+            switch_intent, token, attempt_switch = _switch_and_fallback_tokens(ledger)
             outcome = coordinator.return_to_allowed_after_reap(
-                RecorderAttemptResult("switch_requested", 0, 0), token,
+                RecorderAttemptResult(
+                    "switch_requested", 0, 0,
+                    attempt_switch_id=attempt_switch.attempt_id,
+                ), token,
                 switch_intent=switch_intent,
+                attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: True,
                 candidate={"identity": "synthetic"},
@@ -225,13 +242,34 @@ class SharingCoordinatorTests(unittest.TestCase):
             )
             self.assertEqual(outcome, ("stale", None))
 
+    def test_old_attempt_switch_result_cannot_launch_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = SharingIntentLedger(Path(directory) / "state.sqlite", clock=lambda: 100.0)
+            switch_intent, token, attempt_switch = _switch_and_fallback_tokens(ledger)
+            unrelated_attempt = RecorderAttemptSwitch()
+            outcome = coordinator.return_to_allowed_after_reap(
+                RecorderAttemptResult(
+                    "switch_requested", 0, 0,
+                    attempt_switch_id=unrelated_attempt.attempt_id,
+                ), token,
+                switch_intent=switch_intent,
+                attempt_switch=attempt_switch,
+                ledger=ledger, fresh_validate=lambda _token: True,
+                exact_cleanup_acknowledged=lambda: self.fail("stale cleanup check"),
+                candidate={"identity": "synthetic"},
+                candidate_is_currently_allowed=lambda _candidate: True,
+                launch_allowed_candidate=lambda *_args: self.fail("stale fallback launch"),
+            )
+            self.assertEqual(outcome, ("not_a_return_switch", None))
+
     def test_old_attempt_completion_does_not_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = SharingIntentLedger(Path(directory) / "state.sqlite", clock=lambda: 100.0)
-            switch_intent, token = _switch_and_fallback_tokens(ledger)
+            switch_intent, token, attempt_switch = _switch_and_fallback_tokens(ledger)
             outcome = coordinator.return_to_allowed_after_reap(
                 RecorderAttemptResult("global_stop", 0, 0), token,
                 switch_intent=switch_intent,
+                attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: True,
                 candidate={"identity": "synthetic"},
