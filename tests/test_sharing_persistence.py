@@ -100,6 +100,20 @@ def _claim_from_process(database_path, token, barrier, results):
     results.put("ran" if ran else "denied")
 
 
+def _save_new_epoch_while_effect_pending(database_path, state, expected_revision, results):
+    ledger = SharingIntentLedger(Path(database_path), clock=lambda: 105.0)
+    try:
+        ledger.save(
+            state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=expected_revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+    except StaleSharingIntent:
+        results.put("blocked")
+    else:
+        results.put("incorrectly-admitted")
+
+
 class SharingPersistenceTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -184,6 +198,88 @@ class SharingPersistenceTests(unittest.TestCase):
         )
         self.assertTrue(ran)
         self.assertEqual(["attach_borrow"], effects)
+
+    def test_unknown_effect_outcome_blocks_new_intent_until_exact_cleanup_ack(self):
+        saved = self.save_attach()
+        operation_id = "a" * 32
+        dispatched_resources = []
+
+        def dispatch(token):
+            attempt = self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            self.assertEqual(attempt.status, "dispatching")
+            dispatched_resources.append(attempt.operation_id)
+            raise RuntimeError("synthetic lost dispatch ACK")
+
+        with self.assertRaisesRegex(RuntimeError, "lost dispatch ACK"):
+            self.ledger.run_if_current(
+                saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+            )
+        self.assertEqual(dispatched_resources, [operation_id])
+        pending = self.ledger.mark_effect_cleanup_pending(operation_id)
+        self.assertEqual(pending.status, "cleanup_pending")
+
+        newer_state = replace(saved.state, intent_epoch=saved.state.intent_epoch + 1)
+        with self.assertRaisesRegex(StaleSharingIntent, "exact cleanup ACK"):
+            self.ledger.save(
+                newer_state, action=SharingAction.ATTACH_BORROW,
+                expected_revision=saved.revision, target_identity=IDENTITY,
+                target_admitted=True, not_before=105.0,
+            )
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+        process = context.Process(
+            target=_save_new_epoch_while_effect_pending,
+            args=(str(self.ledger.database_path), newer_state, saved.revision, results),
+        )
+        process.start()
+        process.join(15)
+        self.assertEqual(0, process.exitcode)
+        self.assertEqual("blocked", results.get(timeout=2))
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id, exact_resources_absent=lambda attempt: False,
+        ))
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), (pending,))
+        self.assertTrue(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            exact_resources_absent=lambda attempt: (
+                attempt.operation_id == operation_id
+                and attempt.target_identity == IDENTITY
+                and attempt.status == "cleanup_pending"
+            ),
+        ))
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
+        next_saved = self.ledger.save(
+            newer_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=saved.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        self.assertEqual(next_saved.revision, saved.revision + 1)
+
+    def test_acknowledged_effect_stays_blocking_until_exact_resource_cleanup(self):
+        saved = self.save_attach()
+        operation_id = "b" * 32
+        receipt = None
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            return self.ledger.acknowledge_effect_attempt(
+                operation_id, resource_id="resource-synthetic-1",
+            )
+
+        ran, receipt = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+        )
+        self.assertTrue(ran)
+        self.assertEqual(receipt.status, "active")
+        self.assertEqual(receipt.resource_id, "resource-synthetic-1")
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id, exact_resources_absent=lambda _attempt: False,
+        ))
+        self.assertEqual(len(self.ledger.pending_effect_attempts(CHANNEL)), 1)
 
     def test_deadline_and_fresh_external_validation_gate_side_effect(self):
         saved = self.save_attach()
