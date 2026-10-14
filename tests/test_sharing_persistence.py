@@ -8,6 +8,7 @@ from pathlib import Path
 
 from catchuparr.sharing_persistence import (
     SharingIntentLedger,
+    SharingOperationFenceAcknowledgement,
     StaleSharingIntent,
 )
 from catchuparr.sharing_planner import (
@@ -239,21 +240,29 @@ class SharingPersistenceTests(unittest.TestCase):
         self.assertEqual(0, process.exitcode)
         self.assertEqual("blocked", results.get(timeout=2))
         self.assertFalse(self.ledger.reconcile_effect_attempt(
-            operation_id, exact_resources_absent=lambda attempt: False,
+            operation_id,
+            operation_fence_acknowledged=lambda attempt: attempt.operation_id == operation_id,
+            exact_resources_absent=lambda attempt: False,
         ))
         self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), (pending,))
         self.assertFalse(self.ledger.reconcile_effect_attempt(
             operation_id,
             exact_resources_absent=lambda attempt: True,
         ))
+        def acknowledge_fence(attempt):
+            return SharingOperationFenceAcknowledgement(
+                attempt.operation_id, attempt.revision,
+                f"native-fence-{attempt.operation_id}-{attempt.revision}",
+            )
+
         self.assertTrue(self.ledger.reconcile_effect_attempt(
             operation_id,
-            dispatch_cancel_acknowledged=lambda attempt: (
-                attempt.operation_id == operation_id
-                and attempt.target_identity == IDENTITY
-                and attempt.status == "cleanup_pending"
-            ),
+            operation_fence_acknowledged=acknowledge_fence,
             exact_resources_absent=lambda attempt: True,
+        ))
+        closed = self.ledger.effect_attempt(operation_id)
+        self.assertIsNotNone(self.ledger.operation_fence_acknowledgement(
+            operation_id, closed.revision - 1,
         ))
         self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
         next_saved = self.ledger.save(
@@ -283,9 +292,106 @@ class SharingPersistenceTests(unittest.TestCase):
         self.assertEqual(receipt.status, "active")
         self.assertEqual(receipt.resource_id, "resource-synthetic-1")
         self.assertFalse(self.ledger.reconcile_effect_attempt(
-            operation_id, exact_resources_absent=lambda _attempt: False,
+            operation_id,
+            operation_fence_acknowledged=lambda attempt: attempt.resource_id == "resource-synthetic-1",
+            exact_resources_absent=lambda _attempt: False,
         ))
         self.assertEqual(len(self.ledger.pending_effect_attempts(CHANNEL)), 1)
+
+    def test_acknowledged_resource_requires_persisted_operation_fence_before_absence(self):
+        saved = self.save_attach()
+        operation_id = "f" * 32
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            return self.ledger.acknowledge_effect_attempt(
+                operation_id, resource_id="resource-acknowledged-synthetic",
+            )
+
+        ran, attempt = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+        )
+        self.assertTrue(ran)
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id, exact_resources_absent=lambda _attempt: True,
+        ))
+        self.assertIsNone(self.ledger.operation_fence_acknowledgement(
+            operation_id, attempt.revision,
+        ))
+        callback_attempts = []
+
+        def fence_exact_attempt(current):
+            callback_attempts.append(current)
+            return SharingOperationFenceAcknowledgement(
+                current.operation_id, current.revision,
+                f"native-fence-{current.operation_id}-{current.revision}",
+            )
+
+        self.assertTrue(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=fence_exact_attempt,
+            exact_resources_absent=lambda current: (
+                current.resource_id == "resource-acknowledged-synthetic"
+            ),
+        ))
+        self.assertEqual(len(callback_attempts), 1)
+        self.assertEqual(callback_attempts[0].status, "active")
+        self.assertIsNotNone(self.ledger.operation_fence_acknowledgement(
+            operation_id, attempt.revision,
+        ))
+        reopened = SharingIntentLedger(self.ledger.database_path, clock=lambda: self.now[0])
+        self.assertEqual(
+            reopened.operation_fence_acknowledgement(operation_id, attempt.revision),
+            self.ledger.operation_fence_acknowledgement(operation_id, attempt.revision),
+        )
+
+    def test_stale_or_mismatched_operation_fence_ack_cannot_close_resource(self):
+        saved = self.save_attach()
+        operation_id = "9" * 32
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            return self.ledger.acknowledge_effect_attempt(
+                operation_id, resource_id="resource-fence-stale-synthetic",
+            )
+
+        ran, attempt = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+        )
+        self.assertTrue(ran)
+        absence_probes = []
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=lambda current: SharingOperationFenceAcknowledgement(
+                "different-operation", current.revision, "wrong-fence-synthetic",
+            ),
+            exact_resources_absent=lambda _current: absence_probes.append(True) or True,
+        ))
+        self.assertEqual(absence_probes, [])
+
+        def stale_revision_fence(current):
+            self.ledger.mark_effect_cleanup_pending(current.operation_id)
+            return SharingOperationFenceAcknowledgement(
+                current.operation_id, current.revision,
+                f"stale-fence-{current.operation_id}-{current.revision}",
+            )
+
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=stale_revision_fence,
+            exact_resources_absent=lambda _current: absence_probes.append(True) or True,
+        ))
+        self.assertEqual(absence_probes, [])
+        current = self.ledger.effect_attempt(operation_id)
+        self.assertEqual(current.status, "cleanup_pending")
+        self.assertEqual(current.revision, attempt.revision + 1)
+        self.assertIsNone(self.ledger.operation_fence_acknowledgement(
+            operation_id, current.revision,
+        ))
 
     def test_explicit_stop_can_supersede_pending_effect_without_starting_new_source(self):
         saved = self.save_attach()
@@ -369,11 +475,14 @@ class SharingPersistenceTests(unittest.TestCase):
         def cancel_at_native_boundary(_attempt):
             with cancellation_lock:
                 cancelled["value"] = True
-            return True
+            return SharingOperationFenceAcknowledgement(
+                _attempt.operation_id, _attempt.revision,
+                f"native-fence-{_attempt.operation_id}-{_attempt.revision}",
+            )
 
         self.assertTrue(self.ledger.reconcile_effect_attempt(
             operation_id,
-            dispatch_cancel_acknowledged=cancel_at_native_boundary,
+            operation_fence_acknowledged=cancel_at_native_boundary,
             exact_resources_absent=lambda _attempt: not launched_resources,
         ))
         self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
@@ -382,6 +491,77 @@ class SharingPersistenceTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(launched_resources, [])
         self.assertEqual(failures, ["synthetic native dispatch fence cancelled operation"])
+
+    def test_acknowledged_operation_cannot_reconnect_after_cleanup_pending(self):
+        saved = self.save_attach()
+        operation_id = "8" * 32
+        operation_lock = threading.Lock()
+        cleanup_started = threading.Event()
+        allow_reconnect = threading.Event()
+        operation_fenced = {"value": False}
+        resources = []
+        failures = []
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            resources.append("resource-first-synthetic")
+            acknowledged = self.ledger.acknowledge_effect_attempt(
+                operation_id, resource_id="resource-first-synthetic",
+            )
+            cleanup_started.set()
+            if not allow_reconnect.wait(5):
+                raise RuntimeError("synthetic reconnect barrier timed out")
+            with operation_lock:
+                if operation_fenced["value"]:
+                    raise RuntimeError("synthetic operation fence blocks reconnect")
+                resources.append("resource-reconnected-synthetic")
+            return acknowledged
+
+        def run_dispatch():
+            try:
+                self.ledger.run_if_current(
+                    saved.intent, fresh_validate=lambda _token: True,
+                    side_effect=dispatch,
+                )
+            except RuntimeError as exc:
+                failures.append(str(exc))
+
+        worker = threading.Thread(target=run_dispatch)
+        worker.start()
+        self.assertTrue(cleanup_started.wait(5))
+        pending = self.ledger.mark_effect_cleanup_pending(operation_id)
+        self.assertEqual(pending.status, "cleanup_pending")
+        self.assertEqual(pending.resource_id, "resource-first-synthetic")
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id, exact_resources_absent=lambda _attempt: resources.clear() or True,
+        ))
+
+        def cancel_and_reap(attempt):
+            with operation_lock:
+                operation_fenced["value"] = True
+            return SharingOperationFenceAcknowledgement(
+                attempt.operation_id, attempt.revision,
+                f"native-fence-{attempt.operation_id}-{attempt.revision}",
+            )
+
+        def clean_after_fence(_attempt):
+            with operation_lock:
+                resources.clear()
+                return operation_fenced["value"] and not resources
+
+        self.assertTrue(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=cancel_and_reap,
+            exact_resources_absent=clean_after_fence,
+        ))
+        allow_reconnect.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(resources, [])
+        self.assertEqual(failures, ["synthetic operation fence blocks reconnect"])
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
 
     def test_deadline_and_fresh_external_validation_gate_side_effect(self):
         saved = self.save_attach()

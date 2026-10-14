@@ -14,6 +14,7 @@ from catchuparr.sharing_persistence import (
     SharingEffectReceipt,
     SharingIntentLedger,
     SharingIntentToken,
+    SharingOperationFenceAcknowledgement,
     StaleSharingIntent,
 )
 from catchuparr.sharing_planner import (
@@ -337,14 +338,29 @@ class SharingCoordinatorTests(unittest.TestCase):
                     expected_revision=current.revision, not_before=100.0,
                 )
 
-            def remove_exact_resource(saved):
+            operation_fence = set()
+
+            def fence_operation(saved):
                 self.assertEqual(saved.operation_id, operation.operation_id)
+                self.assertEqual(saved.status, "cleanup_pending")
+                operation_fence.add(saved.operation_id)
+                if saved.operation_id not in operation_fence:
+                    return None
+                return SharingOperationFenceAcknowledgement(
+                    saved.operation_id, saved.revision,
+                    f"native-fence-{saved.operation_id}-{saved.revision}",
+                )
+
+            def remove_exact_resource(saved):
+                self.assertIn(saved.operation_id, operation_fence)
                 self.assertIn((saved.operation_id, "resource-synthetic-lost-ack"), created_resources)
                 created_resources.remove((saved.operation_id, "resource-synthetic-lost-ack"))
                 return True
 
             self.assertTrue(ledger.reconcile_effect_attempt(
-                operation.operation_id, exact_resources_absent=remove_exact_resource,
+                operation.operation_id,
+                operation_fence_acknowledged=fence_operation,
+                exact_resources_absent=remove_exact_resource,
             ))
             self.assertEqual(created_resources, [])
             retry = ledger.save(
