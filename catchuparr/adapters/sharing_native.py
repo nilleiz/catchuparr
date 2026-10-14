@@ -888,6 +888,93 @@ def _recover_registration_ack(redis: Any, episode: BorrowEpisodeSnapshot, *,
         return None
 
 
+_FENCE_UNREGISTERED_OPENING_LUA = """
+if redis.call('TYPE', KEYS[1]).ok ~= 'hash' then return 0 end
+if redis.call('TTL', KEYS[1]) <= 0 then return 0 end
+local version = tonumber(ARGV[2])
+if not version or version < 1 or version > 9007199254740990
+   or version % 1 ~= 0 then return 0 end
+if redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[1]
+   or redis.call('HGET', KEYS[1], 'channel_uuid') ~= ARGV[3]
+   or redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[4]
+   or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[5]
+   or redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[6]
+   or redis.call('HGET', KEYS[1], 'recorder_fence') ~= ARGV[7]
+   or redis.call('HGET', KEYS[1], 'intent_epoch') ~= ARGV[8]
+   or redis.call('HGET', KEYS[1], 'worker_id') ~= ARGV[9]
+   or redis.call('HGET', KEYS[1], 'owner_lock_value') ~= ARGV[10]
+   or redis.call('HGET', KEYS[1], 'metadata_owner') ~= ARGV[11]
+   or redis.call('HGET', KEYS[1], 'stream_id') ~= ARGV[12]
+   or redis.call('HGET', KEYS[1], 'account_id') ~= ARGV[13]
+   or redis.call('HGET', KEYS[1], 'm3u_profile_id') ~= ARGV[14]
+   or redis.call('HGET', KEYS[1], 'input_profile_id') ~= ARGV[15]
+   or redis.call('HGET', KEYS[1], 'lease_digest') ~= ARGV[16] then return 0 end
+local phase = redis.call('HGET', KEYS[1], 'phase')
+if phase == 'closing' then
+  local closed_version = tonumber(redis.call('HGET', KEYS[1], 'version') or '')
+  if closed_version == version + 1 then return 2 end
+  return 0
+end
+if phase ~= 'opening' then return 0 end
+if redis.call('HGET', KEYS[1], 'version') ~= ARGV[2] then return 0 end
+redis.call('HSET', KEYS[1], 'phase', 'closing', 'viewer_left_at', '',
+  'return_deadline', '', 'version', tostring(version + 1))
+return 1
+"""
+
+
+def fence_unregistered_opening(redis: Any, episode: BorrowEpisodeSnapshot, *,
+                               catalog_generation: str) -> bool:
+    """Fence an exact opening before declaring an unknown client absent.
+
+    Registration Lua compares this projection version/phase atomically. After
+    this CAS succeeds, a delayed registration command cannot create a client.
+    """
+    if (not isinstance(episode, BorrowEpisodeSnapshot) or episode.phase != "opening"
+            or not isinstance(catalog_generation, str) or not catalog_generation):
+        return False
+    try:
+        result = redis.eval(
+            _FENCE_UNREGISTERED_OPENING_LUA, 1,
+            episode_projection_key(episode.channel_uuid), episode.episode_id,
+            str(episode.version), episode.channel_uuid, episode.configuration_generation,
+            str(episode.control_generation), catalog_generation,
+            str(episode.recorder_fence), str(episode.intent_epoch), episode.identity[1],
+            episode.identity[2], episode.identity[3], episode.identity[4], episode.identity[5],
+            episode.identity[6], episode.identity[7], episode.lease_digest,
+        )
+    except Exception:
+        return False
+    return type(result) is int and result in {1, 2}
+
+
+def native_registration_is_absent(redis: Any, *, channel_uuid: str, client_id: str) -> bool:
+    """Fail-closed exact hash/marker/membership check after fencing an opening."""
+    if not isinstance(channel_uuid, str) or not channel_uuid or not isinstance(client_id, str) or not client_id:
+        return False
+    client_key = f"live:channel:{channel_uuid}:clients:{client_id}"
+    clients_key = f"live:channel:{channel_uuid}:clients"
+    marker_key = f"catchuparr:sharing:private:{channel_uuid}"
+    try:
+        def kind(key: str) -> str:
+            result = redis.type(key)
+            if isinstance(result, bytes):
+                result = result.decode("ascii", errors="strict")
+            return result
+
+        client_kind, clients_kind, marker_kind = map(kind, (client_key, clients_key, marker_key))
+        if client_kind != "none" or clients_kind not in {"none", "set"}:
+            return False
+        if marker_kind == "hash":
+            if redis.hget(marker_key, client_id) is not None:
+                return False
+        elif marker_kind != "none":
+            return False
+        return clients_kind == "none" or not redis.sismember(clients_key, client_id)
+    except Exception:
+        return False
+
+
 def adopt_registered_client_in_manager(manager: Any, ack: NativeClientRegistrationAck) -> bool:
     """Install only local bookkeeping after Lua atomically registered the client.
 

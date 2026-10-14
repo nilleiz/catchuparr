@@ -25,6 +25,8 @@ from .sharing_native import (
     adopt_registered_client_in_manager,
     check_and_touch_borrowed_client,
     cleanup_borrowed_client,
+    fence_unregistered_opening,
+    native_registration_is_absent,
     observe_native_connection,
     read_native_episode_grant,
     register_borrowed_client,
@@ -130,6 +132,7 @@ class BorrowOpenCleanupPending(BorrowEpisodeRejected):
                  manager: Any, owns_manager: bool, cleanup: Callable[..., bool],
                  ledger: BorrowEpisodeLedger, episode: BorrowEpisodeSnapshot,
                  reconcile: Callable[[], NativeClientRegistrationAck | None] | None = None,
+                 confirm_absent: Callable[[], bool] | None = None,
                  native_removed: bool = False) -> None:
         super().__init__(message)
         self.ack = ack
@@ -139,17 +142,29 @@ class BorrowOpenCleanupPending(BorrowEpisodeRejected):
         self._ledger = ledger
         self._episode = episode
         self._reconcile = reconcile
+        self._confirm_absent = confirm_absent
         self._native_removed = native_removed
+        self._ledger_closed = False
+        self._completed = False
 
     def retry_cleanup(self) -> bool:
         """Retry only a known exact registration; retain ownership on failure."""
+        if self._completed:
+            return True
         if self.ack is None and self._reconcile is not None:
             try:
                 self.ack = self._reconcile()
             except Exception:
                 return False
         if self.ack is None:
-            return False
+            if self._confirm_absent is None:
+                return False
+            try:
+                self._native_removed = self._confirm_absent()
+            except Exception:
+                return False
+            if not self._native_removed:
+                return False
         if not self._native_removed:
             try:
                 removed = self._cleanup(self.ack, self.manager, self.owns_manager)
@@ -158,9 +173,11 @@ class BorrowOpenCleanupPending(BorrowEpisodeRejected):
             if not removed:
                 return False
             self._native_removed = True
+        if not self._ledger_closed:
             BorrowedReaderSession._close_episode_ledger(
                 self._ledger, self._episode.episode_id, self._episode.channel_uuid,
             )
+            self._ledger_closed = True
         if self.owns_manager:
             stop = getattr(self.manager, "stop", None)
             if not callable(stop):
@@ -170,6 +187,7 @@ class BorrowOpenCleanupPending(BorrowEpisodeRejected):
             except Exception:
                 return False
         self.ack = None
+        self._completed = True
         return True
 
 
@@ -597,18 +615,28 @@ class BorrowedReaderSession:
                         ack=ack, manager=manager, owns_manager=owns_manager,
                         cleanup=cleanup, ledger=ledger, episode=episode,
                     ) from exc
-            elif owns_manager and registration_attempted:
+            elif registration_attempted:
                 # A transport failure may have happened after Redis committed
-                # registration. Without an exact ACK, stopping could orphan a
-                # live native client, so preserve the owned manager for recovery.
+                # registration. Without an exact ACK, keep the manager and
+                # require exact ACK recovery or a fenced opening plus verified
+                # absence before cleanup.
                 raise BorrowOpenCleanupPending(
-                    "registration outcome is uncertain; owned manager retained for reconciliation",
-                    ack=None, manager=manager, owns_manager=True,
+                    "registration outcome is uncertain; manager retained for reconciliation",
+                    ack=None, manager=manager, owns_manager=owns_manager,
                     cleanup=cleanup, ledger=ledger, episode=episode,
                     reconcile=lambda: _recover_registration_ack(
                         redis_text, episode, client_id=client_id,
                         local_worker_id=worker_id, user_agent=user_agent, client_ip=client_ip,
                         backend_signature=text_backend,
+                    ),
+                    confirm_absent=lambda: (
+                        fence_unregistered_opening(
+                            redis_text, episode, catalog_generation=catalog_generation,
+                        )
+                        and native_registration_is_absent(
+                            redis_text, channel_uuid=episode.channel_uuid,
+                            client_id=client_id,
+                        )
                     ),
                 ) from exc
             elif owns_manager:

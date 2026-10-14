@@ -192,7 +192,8 @@ class SharingBorrowRouteTests(unittest.TestCase):
             last_viewer_left_at=None, return_deadline=None,
         )
 
-    def _open(self, *, cleanup_reply=True, registration_reply=True, manager_worker=None):
+    def _open(self, *, cleanup_reply=True, registration_reply=True, manager_worker=None,
+              owns_manager=True):
         opening = self._opening_episode()
         active = replace(
             opening, phase="active", client_id="catchuparr-client-route-synthetic",
@@ -213,7 +214,7 @@ class SharingBorrowRouteTests(unittest.TestCase):
             patch("catchuparr.adapters.sharing_borrow_route.redis_backend_signature",
                   return_value="backend-route-synthetic"),
             patch("catchuparr.sharing_episode.select_task_local_client_manager",
-                  return_value=(manager, True)),
+                  return_value=(manager, owns_manager)),
             patch("catchuparr.adapters.sharing_borrow_route.consume_opening_capability",
                   side_effect=lambda *_args, **_kwargs: calls.append("consume") or True),
             patch("catchuparr.adapters.sharing_borrow_route.make_task_local_input_buffer",
@@ -312,7 +313,11 @@ class SharingBorrowRouteTests(unittest.TestCase):
 
     def test_open_failed_cleanup_exposes_retry_handle_and_keeps_manager(self):
         opening, _active, manager, _ack, ledger, _calls, mocks = self._open(cleanup_reply=False)
-        with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4], mocks[5], mocks[6], \
+        cleanup_replies = iter((False, True))
+        with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4], mocks[5], patch(
+            "catchuparr.adapters.sharing_borrow_route.cleanup_borrowed_client",
+            side_effect=lambda *_args, **_kwargs: next(cleanup_replies),
+        ), \
                 patch("catchuparr.adapters.sharing_borrow_route.ReadOnlyTsBufferReader",
                       side_effect=RuntimeError("synthetic reader construction failure")), \
                 patch("catchuparr.adapters.sharing_borrow_route.native_borrow_proof_reader",
@@ -330,10 +335,12 @@ class SharingBorrowRouteTests(unittest.TestCase):
                     client_id="catchuparr-client-route-synthetic", client_ip="192.0.2.60",
                     user_agent="Synthetic Player", ledger=ledger,
                 )
-        self.assertIsNotNone(raised.exception.ack)
-        self.assertEqual(manager.stopped, 0)
-        self.assertFalse(raised.exception.retry_cleanup())
-        self.assertEqual(manager.stopped, 0)
+            self.assertIsNotNone(raised.exception.ack)
+            self.assertEqual(manager.stopped, 0)
+            self.assertTrue(raised.exception.retry_cleanup())
+            self.assertEqual(manager.stopped, 1)
+            self.assertTrue(raised.exception.retry_cleanup())
+            self.assertEqual(manager.stopped, 1)
 
     def test_open_uncertain_registration_without_ack_retains_owned_manager(self):
         opening, _active, manager, _ack, ledger, _calls, mocks = self._open()
@@ -356,6 +363,38 @@ class SharingBorrowRouteTests(unittest.TestCase):
                 )
         self.assertIsNone(raised.exception.ack)
         self.assertFalse(raised.exception.retry_cleanup())
+        self.assertEqual(manager.stopped, 0)
+
+    def test_open_unknown_registration_shared_manager_uses_fenced_absence_retry(self):
+        opening, _active, manager, _ack, ledger, _calls, mocks = self._open(owns_manager=False)
+        with mocks[0], mocks[1], mocks[2], mocks[3], patch(
+            "catchuparr.adapters.sharing_borrow_route.register_borrowed_client",
+            side_effect=RuntimeError("synthetic Redis reply unavailable"),
+        ), mocks[5], mocks[6], patch(
+            "catchuparr.adapters.sharing_borrow_route._recover_registration_ack",
+            return_value=None,
+        ), patch(
+            "catchuparr.adapters.sharing_borrow_route.fence_unregistered_opening",
+            return_value=True,
+        ), patch(
+            "catchuparr.adapters.sharing_borrow_route.native_registration_is_absent",
+            return_value=True,
+        ):
+            with self.assertRaises(BorrowOpenCleanupPending) as raised:
+                BorrowedReaderSession.open(
+                    capability=capability(), capability_secret=SECRET,
+                    authenticated_user_id="user-route-synthetic", now=199,
+                    episode=opening, lease_value="synthetic-route-lease",
+                    catalog_generation="catalog-route-synthetic",
+                    ordinary_viewer_ids=("viewer-route-synthetic",),
+                    redis_text=object(), redis_binary=object(), existing_manager=None,
+                    manager_type=object, worker_id=IDENTITY[1], buffer_type=object,
+                    assigned_sources=(self._assigned_source(),),
+                    client_id="catchuparr-client-route-synthetic", client_ip="192.0.2.60",
+                    user_agent="Synthetic Player", ledger=ledger,
+                )
+            self.assertTrue(raised.exception.retry_cleanup())
+            self.assertTrue(raised.exception.retry_cleanup())
         self.assertEqual(manager.stopped, 0)
 
     def test_stream_failure_runs_exact_cleanup_and_stops_only_owned_manager(self):

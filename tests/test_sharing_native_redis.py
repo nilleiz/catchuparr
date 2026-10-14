@@ -22,6 +22,8 @@ from catchuparr.adapters.sharing_borrow_route import (
 from catchuparr.adapters.sharing_native import (
     check_and_touch_borrowed_client,
     cleanup_borrowed_client,
+    fence_unregistered_opening,
+    native_registration_is_absent,
     project_opening_episode,
     publish_current_authority,
     read_native_episode_grant,
@@ -100,7 +102,19 @@ class RedisCli:
         return values[0] if values else None
 
     def hgetall(self, key: str):
-        values = self.command("HGETALL", key)
+        # JSON preserves empty hash values. `redis-cli --raw` prints an empty
+        # final field as a blank line, which loses output_profile_id=''
+        # during lost-registration-ACK reconciliation.
+        result = subprocess.run(
+            ["sudo", "-n", "docker", "exec", self.container,
+             "redis-cli", "--json", "HGETALL", key],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode:
+            raise RuntimeError("isolated redis-cli command failed")
+        values = json.loads(result.stdout)
+        if not isinstance(values, list) or len(values) % 2:
+            raise AssertionError("Redis returned malformed HGETALL JSON")
         return dict(zip(values[::2], values[1::2]))
 
     def smembers(self, key: str):
@@ -239,6 +253,35 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertFalse(consume_opening_capability(
             self.redis, capability, episode, catalog_generation=CATALOG, now=time.time(),
             secret=CAPABILITY_SECRET, user_id="user-synthetic-lua-060",
+        ))
+
+    def test_fenced_opening_rejects_delayed_registration_before_absence_cleanup(self):
+        episode = self._opening_projection()
+        self.assertTrue(fence_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG,
+        ))
+        self._native_source_and_viewer()
+        self.assertIsNone(register_borrowed_client(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            client_id=CLIENT, local_worker_id=TASK_WORKER,
+            user_agent="Synthetic Player", client_ip="192.0.2.60",
+        ))
+        self.assertTrue(native_registration_is_absent(
+            self.redis, channel_uuid=CHANNEL, client_id=CLIENT,
+        ))
+        self.assertTrue(fence_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG,
+        ))
+
+    def test_fenced_opening_does_not_treat_replacement_resources_as_absent(self):
+        episode = self._opening_projection()
+        self.assertTrue(fence_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG,
+        ))
+        client = f"live:channel:{CHANNEL}:clients:{CLIENT}"
+        self.redis.command("HSET", client, "connected_at", "replacement-synthetic")
+        self.assertFalse(native_registration_is_absent(
+            self.redis, channel_uuid=CHANNEL, client_id=CLIENT,
         ))
 
     def test_signed_opening_capability_rejects_stale_authority_without_nonce_write(self):
