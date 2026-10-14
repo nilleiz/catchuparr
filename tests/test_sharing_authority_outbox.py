@@ -3,7 +3,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from catchuparr.adapters.sharing_native import (
     NativeEpisodeGrant,
@@ -11,6 +11,7 @@ from catchuparr.adapters.sharing_native import (
 )
 from catchuparr.sharing_authority_outbox import (
     SharingAuthorityOutbox,
+    SharingAuthorityPriorObservation,
     SharingAuthorityTarget,
 )
 
@@ -202,7 +203,7 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         self.outbox.commit_activation(event.activation_id)
         calls = []
         first = self.outbox.drain(
-            self.redis, read_prior=lambda *_args: grant,
+            self.redis, read_prior=lambda *_args: SharingAuthorityPriorObservation("exact", grant),
             publish=self.publish,
             invalidate=lambda _redis, prior, _event: calls.append(prior) or False,
             encode_prior=NativeEpisodeInvalidation.from_grant,
@@ -253,6 +254,40 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         self.assertEqual(1, row["prior_observed"])
         self.assertIsNone(row["prior_json"])
 
+    def test_unknown_existing_native_projection_blocks_publication_and_retry_claim(self):
+        event = self.stage()
+        publish = Mock(side_effect=self.publish)
+        result = self.drain(
+            read_prior=lambda *_args: SharingAuthorityPriorObservation("unknown"),
+            publish=publish,
+        )
+        self.assertEqual((event.event_id,), result.pending_event_ids)
+        publish.assert_not_called()
+        with self.outbox._db() as db:
+            row = db.execute(
+                "SELECT prior_observed,prior_json FROM sharing_authority_outbox WHERE event_id=?",
+                (event.event_id,),
+            ).fetchone()
+        self.assertEqual(0, row["prior_observed"])
+        self.assertIsNone(row["prior_json"])
+
+    def test_known_revoked_projection_needs_no_second_invalidation(self):
+        event = self.stage()
+        invalidation = Mock()
+        result = self.drain(
+            read_prior=lambda *_args: SharingAuthorityPriorObservation("known_revoked"),
+            invalidate=invalidation,
+        )
+        self.assertEqual((event.event_id,), result.completed_event_ids)
+        invalidation.assert_not_called()
+        with self.outbox._db() as db:
+            row = db.execute(
+                "SELECT prior_observed,prior_json FROM sharing_authority_outbox WHERE event_id=?",
+                (event.event_id,),
+            ).fetchone()
+        self.assertEqual(1, row["prior_observed"])
+        self.assertIn("known_revoked", row["prior_json"])
+
     def test_configuration_drain_uses_native_codec_for_a_real_empty_prior_target(self):
         from catchuparr.configuration import (
             SHARING_AUTHORITY_OUTBOX_NAME,
@@ -275,8 +310,8 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"core": core, "core.utils": core_utils}),
             patch(
-                "catchuparr.adapters.sharing_native.read_native_episode_grant",
-                return_value=None,
+                "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+                return_value=SharingAuthorityPriorObservation("absent"),
             ),
             patch(
                 "catchuparr.adapters.sharing_native.publish_current_authority",
@@ -290,6 +325,42 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         self.assertEqual(self.target.channel_uuid, published[0][0])
         self.assertEqual(event.authority_revision, published[0][1]["authority_revision"])
         self.assertEqual("complete", outbox.latest_for_channel(self.target.channel_uuid).status)
+
+    def test_configuration_drain_keeps_malformed_projection_pending(self):
+        from catchuparr.configuration import (
+            SHARING_AUTHORITY_OUTBOX_NAME,
+            _drain_sharing_authority_outbox,
+        )
+
+        active_path = self.database.with_name("active-synthetic-malformed-prior.json")
+        outbox = SharingAuthorityOutbox(
+            active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME),
+            clock=lambda: self.now[0],
+        )
+        activation = "activation-config-malformed-prior-synthetic"
+        event = outbox.stage(activation, (self.target,))[0]
+        self.assertTrue(outbox.commit_activation(activation))
+        published = Mock(return_value=True)
+        core = types.ModuleType("core")
+        core.__path__ = []
+        core_utils = types.ModuleType("core.utils")
+        core_utils.RedisClient = types.SimpleNamespace(get_client=lambda: self.redis)
+        with (
+            patch.dict(sys.modules, {"core": core, "core.utils": core_utils}),
+            patch(
+                "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+                return_value=SharingAuthorityPriorObservation("unknown"),
+            ),
+            patch(
+                "catchuparr.adapters.sharing_native.publish_current_authority",
+                side_effect=published,
+            ),
+        ):
+            self.assertFalse(_drain_sharing_authority_outbox(active_path, activation))
+        published.assert_not_called()
+        self.assertEqual(
+            (event.event_id,), tuple(item.event_id for item in outbox.pending(activation)),
+        )
 
 
 if __name__ == "__main__":
