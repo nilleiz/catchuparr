@@ -1,6 +1,7 @@
 import json
 import multiprocessing
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -280,6 +281,97 @@ class SharingPersistenceTests(unittest.TestCase):
             operation_id, exact_resources_absent=lambda _attempt: False,
         ))
         self.assertEqual(len(self.ledger.pending_effect_attempts(CHANNEL)), 1)
+
+    def test_explicit_stop_can_supersede_pending_effect_without_starting_new_source(self):
+        saved = self.save_attach()
+        operation_id = "c" * 32
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+
+        ran, _ = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+        )
+        self.assertTrue(ran)
+        self.ledger.mark_effect_cleanup_pending(operation_id)
+        stopped = replace(
+            saved.state, phase=SharingPhase.STOPPED, pending_action=None,
+            intent_epoch=saved.state.intent_epoch + 1,
+            control_generation=saved.state.control_generation + 1,
+        )
+        stop_intent = self.ledger.save(
+            stopped, action=SharingAction.STOP, expected_revision=saved.revision,
+            not_before=105.0,
+        )
+        self.assertEqual(stop_intent.intent.action, SharingAction.STOP)
+        stop_effects = []
+        ran, _ = self.ledger.run_if_current(
+            stop_intent.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: stop_effects.append("stop"),
+        )
+        self.assertTrue(ran)
+        self.assertEqual(stop_effects, ["stop"])
+
+    def test_dispatching_effect_cannot_close_on_absence_before_delayed_launch(self):
+        saved = self.save_attach()
+        operation_id = "e" * 32
+        dispatch_started = threading.Event()
+        allow_external_effect = threading.Event()
+        cancellation_lock = threading.Lock()
+        cancelled = {"value": False}
+        launched_resources = []
+        failures = []
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            dispatch_started.set()
+            if not allow_external_effect.wait(5):
+                raise RuntimeError("synthetic dispatch barrier timed out")
+            with cancellation_lock:
+                if cancelled["value"]:
+                    raise RuntimeError("synthetic native dispatch fence cancelled operation")
+                launched_resources.append(operation_id)
+            raise RuntimeError("synthetic lost launch ACK")
+
+        def run_dispatch():
+            try:
+                self.ledger.run_if_current(
+                    saved.intent, fresh_validate=lambda _token: True,
+                    side_effect=dispatch,
+                )
+            except RuntimeError as exc:
+                failures.append(str(exc))
+
+        worker = threading.Thread(target=run_dispatch)
+        worker.start()
+        self.assertTrue(dispatch_started.wait(5))
+        absence_probes = []
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            exact_resources_absent=lambda _attempt: absence_probes.append(True) or True,
+        ))
+        self.assertEqual(absence_probes, [])
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL)[0].status, "dispatching")
+        def cancel_at_native_boundary(_attempt):
+            with cancellation_lock:
+                cancelled["value"] = True
+            return True
+
+        self.assertTrue(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            dispatch_cancel_acknowledged=cancel_at_native_boundary,
+            exact_resources_absent=lambda _attempt: not launched_resources,
+        ))
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
+        allow_external_effect.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(launched_resources, [])
+        self.assertEqual(failures, ["synthetic native dispatch fence cancelled operation"])
 
     def test_deadline_and_fresh_external_validation_gate_side_effect(self):
         saved = self.save_attach()
