@@ -639,9 +639,12 @@ class RecorderTaskTests(unittest.TestCase):
             redis = FakeRedis()
             config = SimpleNamespace(channel_uuids=("channel-1",), archive_root=archive_root)
             active = _active_configuration()
+            active["connection_sharing"] = {"channel-1": {"enabled": True}}
             expected_generation = configuration_generation(active)
             attempts = []
             stopped = []
+            lifecycle = []
+            attempt_switches = []
             source_candidates = [
                 {"id": "44", "account_id": "12"},
                 {"id": "45", "account_id": "13"},
@@ -661,6 +664,15 @@ class RecorderTaskTests(unittest.TestCase):
 
                 def revoke(self, redis_client):
                     self.revoked = True
+                    lifecycle.append(f"revoke:{self.stream_id}")
+                    return True
+
+                def operation_needs_switch(self, _redis_client):
+                    return False
+
+                def acknowledge_reaped(self, _redis_client):
+                    lifecycle.append(f"ack:{self.stream_id}")
+                    return True
 
             class FakeRecorder:
                 outcomes = [
@@ -673,7 +685,8 @@ class RecorderTaskTests(unittest.TestCase):
                     self.input_url = input_url
                     self.headers = kwargs["input_headers"]
 
-                def run_candidate(self, _stop_event, **_kwargs):
+                def run_candidate(self, _stop_event, **kwargs):
+                    attempt_switches.append(kwargs.get("attempt_switch"))
                     outcome = self.outcomes.pop(0)
                     if isinstance(outcome, Exception):
                         raise outcome
@@ -712,16 +725,30 @@ class RecorderTaskTests(unittest.TestCase):
                         "catchuparr.configuration.load_applied_state",
                         return_value=(active, SimpleNamespace(paused=False, generation=6)),
                     ),
-                    patch("catchuparr.recorder_proxy.ranked_source_candidates", return_value=source_candidates),
+                    patch(
+                        "catchuparr.recorder_proxy.ranked_source_candidates",
+                        side_effect=lambda _channel, _active, *, all_sources: (
+                            self.assertTrue(all_sources) or source_candidates
+                        ),
+                    ),
+                    patch(
+                        "catchuparr.recorder_proxy.current_sharing_authority_context",
+                        return_value={"authority_revision": 2, "catalog_generation": "catalog-synthetic"},
+                    ),
                     patch(
                         "catchuparr.recorder_proxy.issue_recorder_attempt",
                         side_effect=lambda _redis, _lease, **kwargs: (
-                            attempts.append(Attempt(kwargs["candidate"])) or attempts[-1]
+                            lifecycle.append(f"issue:{kwargs['candidate']['id']}")
+                            or self.assertEqual(2, kwargs["sharing_authority"]["authority_revision"])
+                            or attempts.append(Attempt(kwargs["candidate"])) or attempts[-1]
                         ),
                     ),
                     patch(
                         "catchuparr.recorder_proxy.stop_recorder_attempt",
-                        side_effect=lambda *_args: (stopped.append(True) or True),
+                        side_effect=lambda _redis, attempt, _lease: (
+                            lifecycle.append(f"stop:{attempt.stream_id}")
+                            or stopped.append(True) or True
+                        ),
                     ),
                     patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
                     patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
@@ -734,6 +761,13 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertTrue(all(attempt.revoked for attempt in attempts))
             self.assertEqual(3, len(stopped))
             self.assertTrue(all(attempt.input_url.endswith("/catchuparr/recorder/channel-1") for attempt in attempts))
+            self.assertTrue(all(switch is not None for switch in attempt_switches))
+            self.assertEqual(
+                ["issue:44", "revoke:44", "stop:44", "ack:44",
+                 "issue:45", "revoke:45", "stop:45", "ack:45",
+                 "issue:46", "revoke:46", "stop:46", "ack:46"],
+                lifecycle,
+            )
 
 
 if __name__ == "__main__":

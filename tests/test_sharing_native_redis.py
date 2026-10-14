@@ -11,11 +11,14 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from catchuparr import recorder_proxy
+from catchuparr.adapters.recorder_proxy import worker_id_key
 from catchuparr.adapters.sharing_borrow_route import (
     consume_opening_capability,
     sign_borrow_capability,
@@ -247,6 +250,73 @@ class NativeLuaRedisTests(unittest.TestCase):
             "authority_revision", revision,
         )
         self.redis.command("SET", keys["lease"], LEASE, "EX", 600)
+
+    def test_recorder_operation_issue_open_revoke_and_reap_are_one_fenced_flow(self):
+        channel = "channel-synthetic-operation-060"
+        lease_key = f"catchuparr:recorder:{channel}"
+        current_key = f"catchuparr:sharing:current:{channel}"
+        config_generation = "config-operation-synthetic-060"
+        catalog_generation = "catalog-operation-synthetic-060"
+        self.redis.command(
+            "HSET", current_key,
+            "configuration_generation", config_generation,
+            "control_generation", "7",
+            "catalog_generation", catalog_generation,
+            "authority_revision", "3",
+        )
+        lease_value = "11:lease-owner-synthetic-060"
+        self.redis.command("SET", lease_key, lease_value, "EX", 600)
+        lease = SimpleNamespace(fence=11, _value=lease_value, key=lease_key)
+        django = type(sys)("django")
+        django.__path__ = []
+        django_conf = type(sys)("django.conf")
+        django_conf.settings = SimpleNamespace(SECRET_KEY="synthetic-operation-signing-key")
+        with patch.dict(sys.modules, {"django": django, "django.conf": django_conf}), patch(
+            "catchuparr.configuration._sharing_catalog_generation",
+            return_value=catalog_generation,
+        ):
+            authority = recorder_proxy.current_sharing_authority_context(
+                self.redis, channel, config_generation=config_generation,
+                control_generation=7,
+            )
+            self.assertEqual(3, authority["authority_revision"])
+            attempt = recorder_proxy.issue_recorder_attempt(
+                self.redis, lease, channel_uuid=channel,
+                candidate={"id": "stream-operation-synthetic", "account_id": "account-operation-synthetic"},
+                config_generation=config_generation, control_generation=7,
+                internal_base_url="http://dispatcharr.invalid", sharing_authority=authority,
+            )
+            binding = recorder_proxy.verify_recorder_capability(self.redis, attempt.capability)
+            self.assertIsNotNone(binding)
+            opened = recorder_proxy.begin_sharing_operation_open(self.redis, binding)
+            self.assertIsNotNone(opened)
+            self.assertIsNone(recorder_proxy.begin_sharing_operation_open(self.redis, binding))
+            self.assertTrue(recorder_proxy.end_sharing_operation_open(
+                self.redis, binding, *opened,
+            ))
+            self.assertTrue(attempt.revoke(self.redis))
+            self.redis.command(
+                "HSET", worker_id_key(attempt.worker_id), "state", "released",
+            )
+            self.assertTrue(attempt.acknowledge_reaped(self.redis))
+            self.assertIsNone(self.redis.get(
+                recorder_proxy._sharing_operation_current_key(channel)
+            ))
+            self.assertEqual("closed", self.redis.hget(
+                recorder_proxy._sharing_operation_key(channel, attempt.sharing_operation_id),
+                "status",
+            ))
+
+            # A control change after the authority snapshot cannot issue the next
+            # source attempt with the stale generation.
+            self.redis.command("HSET", current_key, "control_generation", "8")
+            with self.assertRaisesRegex(RuntimeError, "admission was denied"):
+                recorder_proxy.issue_recorder_attempt(
+                    self.redis, lease, channel_uuid=channel,
+                    candidate={"id": "stream-operation-synthetic", "account_id": "account-operation-synthetic"},
+                    config_generation=config_generation, control_generation=7,
+                    internal_base_url="http://dispatcharr.invalid", sharing_authority=authority,
+                )
 
     def _native_source_and_viewer(self):
         keys = _keys()
