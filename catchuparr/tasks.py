@@ -193,7 +193,7 @@ def record_channel(
     stop_event = None
     monitor = None
     attempt_state_lock = threading.Lock()
-    attempt_state = {"attempt": None, "candidate": None, "switch": None}
+    attempt_state = {"attempt": None, "candidate": None, "switch": None, "borrow": None}
     try:
         stop_event = threading.Event()
         sharing = active.get("connection_sharing")
@@ -205,7 +205,7 @@ def record_channel(
         # Sharing-enabled channels use the all-assigned-source ordering even
         # when the user did not add a source filter. The legacy channel route
         # remains unchanged while sharing is disabled.
-        if candidates is not None and not candidates:
+        if candidates is not None and not candidates and not sharing_enabled:
             return {"status": "no_permitted_sources"}
         if candidates is not None and not core_api_supported():
             event("runtime_disabled", level=40, reason="proxy_api")
@@ -224,6 +224,24 @@ def record_channel(
             {RECORDER_CAPABILITY_HEADER: stats_capability}
             if candidates is None else None
         )
+        sharing_coordinator = None
+        if sharing_enabled:
+            from .sharing_runtime import RecorderBorrowCoordinator
+
+            sharing_coordinator = RecorderBorrowCoordinator(
+                redis,
+                config.archive_root,
+                str(channel_uuid),
+                active=active,
+                control_generation=expected_control_generation,
+                recorder_fence=fence,
+                lease_value=str(lease._value),
+                dedicated_source_available=bool(candidates),
+            )
+            # A channel without an allowed dedicated source still needs a live
+            # supervisor so an existing viewer connection can be borrowed.
+            if candidates is None:
+                candidates = []
 
         def supervise():
             while not stop_event.wait(10):
@@ -246,6 +264,22 @@ def record_channel(
 
                         refresh_recorder_markers(redis, stats_capability_digest)
                     current_active = current_admission["active"]
+                    if sharing_coordinator is not None:
+                        prepared = sharing_coordinator.poll(
+                            active=current_active,
+                            control_generation=expected_control_generation,
+                        )
+                        if prepared is not None:
+                            with attempt_state_lock:
+                                if attempt_state["borrow"] is None:
+                                    attempt_state["borrow"] = prepared
+                                else:
+                                    prepared = None
+                            if prepared is not None:
+                                with attempt_state_lock:
+                                    current_switch = attempt_state["switch"]
+                                if current_switch is not None:
+                                    current_switch.request()
                     with attempt_state_lock:
                         current_attempt = attempt_state["attempt"]
                         current_candidate = attempt_state["candidate"]
@@ -289,7 +323,46 @@ def record_channel(
             )
             recorder.run_forever(stop_event)
         else:
-            for index, candidate in enumerate(candidates):
+            def run_prepared_borrow() -> bool:
+                with attempt_state_lock:
+                    prepared = attempt_state["borrow"]
+                    attempt_state["borrow"] = None
+                if prepared is None:
+                    return False
+                current_state = _recorder_admission_state(
+                    channel_uuid, expected_generation, expected_control_generation
+                )
+                if current_state["status"] != "ready":
+                    return False
+                from .adapters.sharing_borrow_route import encode_borrow_capability
+
+                recorder = FFmpegCopyRecorder(
+                    store,
+                    channel_uuid,
+                    f"{proxy_base_url}/catchuparr/sharing/{channel_uuid}",
+                    config.archive_root / "work",
+                    fencing_token=fence,
+                    input_headers={
+                        "X-Catchuparr-Borrow": encode_borrow_capability(prepared.capability),
+                        "X-Catchuparr-Stats-Recorder": stats_capability,
+                    },
+                    require_media_progress=True,
+                )
+                recorder._mark_next_discontinuity = True
+                try:
+                    recorder.run_candidate(
+                        stop_event, startup_timeout=60, media_idle_timeout=120,
+                    )
+                except Exception:
+                    error("borrowed_recorder_worker_stopped")
+                return True
+
+            candidate_index = 0
+            while candidate_index < len(candidates):
+                if run_prepared_borrow():
+                    continue
+                index = candidate_index
+                candidate = candidates[index]
                 if stop_event.is_set():
                     break
                 sharing_authority = None
@@ -392,6 +465,18 @@ def record_channel(
                     return {"status": admission_status}
                 if result is not None and result.status == "stopped":
                     break
+                if run_prepared_borrow():
+                    # The prior attempt was reaped and its sharing operation
+                    # acknowledged before the borrowed reader starts. Return to
+                    # an allowlisted source after that reader closes at grace.
+                    candidate_index = 0
+                    continue
+                candidate_index += 1
+            if not candidates and sharing_coordinator is not None:
+                while not stop_event.is_set():
+                    if run_prepared_borrow():
+                        continue
+                    stop_event.wait(0.5)
     finally:
         try:
             if stop_event is not None:

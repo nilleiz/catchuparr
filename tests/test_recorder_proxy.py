@@ -251,6 +251,43 @@ def _pipeline_connection_pool_module():
 
 
 class RecorderProxyTests(unittest.TestCase):
+    def test_reap_reconciliation_accepts_exact_pending_and_active_slot_states(self):
+        operation = "a" * 32
+        channel = "channel-slot-recovery-synthetic"
+        slots = {
+            f"catchuparr:sharing:attempt:{channel}:open:{operation}:n1":
+                f"pending:{operation}:4:n1",
+            f"catchuparr:sharing:attempt:{channel}:open:{operation}:n2":
+                f"active:{operation}:4:n2",
+            f"catchuparr:sharing:attempt:{channel}:open:{operation}:n3":
+                f"ended:{operation}:4:n3",
+        }
+
+        class SlotRedis:
+            def hgetall(self, _key):
+                return {"open_count": "2"}
+
+            def scan_iter(self, *, match):
+                self.match = match
+                return tuple(slots)
+
+            def get(self, key):
+                return slots.get(key)
+
+        ended = []
+        with patch.object(
+            recorder_proxy, "end_sharing_operation_open",
+            side_effect=lambda _redis, _binding, key, nonce: ended.append((key, nonce)) or True,
+        ):
+            self.assertTrue(recorder_proxy._reconcile_operation_open_slots(
+                SlotRedis(), channel, operation, 4,
+            ))
+        self.assertEqual(
+            [(f"catchuparr:sharing:attempt:{channel}:open:{operation}:n1", "n1"),
+             (f"catchuparr:sharing:attempt:{channel}:open:{operation}:n2", "n2")],
+            ended,
+        )
+
     def test_sharing_operation_open_normalizes_verified_capability_names(self):
         from catchuparr import recorder_proxy
 

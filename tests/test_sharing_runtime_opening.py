@@ -2,6 +2,7 @@ import sys
 import tempfile
 import types
 import unittest
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from catchuparr.sharing_planner import (
     SharingSettings,
     observe,
 )
-from catchuparr.sharing_runtime import prepare_borrow_opening
+from catchuparr.sharing_runtime import acknowledge_opened_borrow, prepare_borrow_opening
 
 CHANNEL = "channel-runtime-opening-synthetic"
 IDENTITY = (
@@ -194,9 +195,10 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             return_value=attempt.backend_signature,
         ), patch(
             "catchuparr.adapters.sharing_native.read_native_episode_grant",
-            return_value=SimpleNamespace(
-                episode_id=opening.episode_id, catalog_generation="catalog-synthetic",
-            ),
+            return_value=None,
+        ), patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_cleanup_binding",
+            return_value=None,
         ), patch(
             "catchuparr.adapters.sharing_native.cleanup_borrowed_client",
             return_value=True,
@@ -286,12 +288,148 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertEqual(1, managers[0].stopped)
         self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
 
+    def test_retained_cleanup_callbacks_keep_each_channel_ack_and_manager(self):
+        from catchuparr.sharing_runtime import (
+            retry_durable_open_cleanups,
+            retry_pending_open_cleanups,
+        )
+
+        channels = (CHANNEL, "channel-runtime-opening-second-synthetic")
+        registrations = []
+        for index, channel in enumerate(channels):
+            identity = (channel, *IDENTITY[1:])
+            state = replace(
+                attach_state(), channel_uuid=channel,
+                candidate_identity=identity,
+                candidate_connection_identity=identity,
+            )
+            saved = (
+                self.saved if channel == CHANNEL else self.intent_ledger.save(
+                    state, action=SharingAction.ATTACH_BORROW,
+                    expected_revision=None, target_identity=identity,
+                    target_admitted=True, not_before=105.0,
+                )
+            )
+            opening = self.episode_ledger.begin_open(
+                saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+                identity=identity,
+                client_id=f"catchuparr-client-retry-{index}-synthetic",
+            )
+            registration = self.episode_ledger.prepare_registration(
+                opening, local_worker_id=f"catchuparr-worker-retry-{index}-synthetic",
+                backend_signature="f" * 64, user_agent="Catchuparr reader",
+                client_ip="127.0.0.1",
+            )
+            ack = SimpleNamespace(
+                episode_id=opening.episode_id, channel_uuid=channel,
+                client_id=registration.client_id,
+                local_worker_id=registration.local_worker_id,
+                redis_backend_signature=registration.backend_signature,
+                connected_at=f"{105 + index}.5",
+                projection_version=opening.version + 1,
+                user_agent=registration.user_agent,
+                client_ip=registration.client_ip,
+            )
+            self.episode_ledger.record_registration_ack(opening.episode_id, ack)
+            self.episode_ledger.revoke(
+                opening.episode_id, expected_version=opening.version,
+                reason="cleanup_pending", cleanup_acknowledged=False,
+            )
+            registrations.append((opening, registration, ack))
+
+        managers = []
+
+        class Manager:
+            def __init__(self, *, channel_id, redis_client, worker_id):
+                self.channel_id = channel_id
+                self.redis_client = redis_client
+                self.worker_id = worker_id
+                self.stopped = 0
+                managers.append(self)
+
+            def stop(self):
+                self.stopped += 1
+
+        client_manager = types.ModuleType("apps.proxy.live_proxy.client_manager")
+        client_manager.ClientManager = Manager
+        modules = {
+            "apps": types.ModuleType("apps"),
+            "apps.proxy": types.ModuleType("apps.proxy"),
+            "apps.proxy.live_proxy": types.ModuleType("apps.proxy.live_proxy"),
+            "apps.proxy.live_proxy.client_manager": client_manager,
+        }
+        redis_text = object()
+        cleanup_calls = []
+
+        def cleanup(_redis, ack, *, episode_id, manager):
+            cleanup_calls.append((ack.client_id, episode_id, manager.worker_id))
+            # Fail the scanner pass, then succeed when retained owners retry.
+            return len(cleanup_calls) > len(registrations)
+
+        def native_grant(_redis, channel):
+            opening, _registration, _ack = next(
+                item for item in registrations if item[0].channel_uuid == channel
+            )
+            return SimpleNamespace(
+                episode_id=opening.episode_id, catalog_generation="catalog-synthetic",
+            )
+
+        with patch.dict(sys.modules, modules), patch(
+            "catchuparr.adapters.sharing_reader.redis_backend_signature",
+            return_value="f" * 64,
+        ), patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_grant",
+            side_effect=native_grant,
+        ), patch(
+            "catchuparr.adapters.sharing_native.cleanup_borrowed_client",
+            side_effect=cleanup,
+        ):
+            self.assertEqual((0, 2), retry_durable_open_cleanups(
+                self.episode_ledger, redis_text, now=300.0,
+            ))
+            self.assertEqual((2, 0), retry_pending_open_cleanups())
+
+        expected = [
+            (registration.client_id, opening.episode_id, registration.local_worker_id)
+            for opening, registration, _ack in registrations
+        ]
+        self.assertEqual(expected, cleanup_calls[2:])
+        self.assertEqual(2, len(managers))
+        self.assertTrue(all(manager.stopped == 1 for manager in managers))
+        self.assertTrue(all(
+            self.episode_ledger.read(channel).phase == "closed"
+            for channel in channels
+        ))
+
     def _episode_exists(self):
         try:
             self.episode_ledger.read(CHANNEL)
         except Exception:
             return False
         return True
+
+
+    def test_native_registration_ack_resolves_attach_and_persists_switch_clock(self):
+        result, _project, _cleanup = self.prepare()
+        claimed, prepared = result
+        self.assertTrue(claimed)
+        self.assertIsNotNone(prepared)
+        opening = self.episode_ledger.read(CHANNEL)
+        self.assertEqual("opening", opening.phase)
+        active = self.episode_ledger.activate(
+            opening.episode_id, expected_version=opening.version,
+            client_id=opening.client_id, connected_at="105.000000",
+            ordinary_viewer_ids=("viewer-runtime-opening-synthetic",),
+        )
+        self.assertEqual("active", active.phase)
+        self.assertTrue(acknowledge_opened_borrow(
+            prepared.capability, self.intent_ledger, self.episode_ledger, target=target(),
+            settings=SharingSettings(True, 5, 30, 60), now=105.0,
+        ))
+        persisted = self.intent_ledger.read(CHANNEL)
+        self.assertIsNone(persisted.intent)
+        self.assertEqual("borrowed", persisted.state.phase.value)
+        self.assertEqual(105.0, persisted.state.last_switch_at)
 
 
 if __name__ == "__main__":

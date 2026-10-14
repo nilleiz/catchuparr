@@ -178,7 +178,7 @@ class BorrowEpisodeLedger:
             db.execute(
                 """CREATE TABLE IF NOT EXISTS sharing_borrow_registration_attempts (
                     episode_id TEXT PRIMARY KEY,
-                    channel_uuid TEXT NOT NULL UNIQUE,
+                    channel_uuid TEXT NOT NULL,
                     client_id TEXT NOT NULL,
                     local_worker_id TEXT NOT NULL,
                     backend_signature TEXT NOT NULL,
@@ -191,6 +191,44 @@ class BorrowEpisodeLedger:
                     updated_at REAL NOT NULL
                 )"""
             )
+            # A channel can have multiple sequential borrow episodes. Retain
+            # each exact client ACK as history for restart reconciliation,
+            # keyed by episode rather than globally reserving the channel.
+            schema_row = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                ("sharing_borrow_registration_attempts",),
+            ).fetchone()
+            if schema_row is not None and "channel_uuid TEXT NOT NULL UNIQUE" in str(schema_row[0]):
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    "ALTER TABLE sharing_borrow_registration_attempts "
+                    "RENAME TO sharing_borrow_registration_attempts_legacy"
+                )
+                db.execute(
+                    """CREATE TABLE sharing_borrow_registration_attempts (
+                        episode_id TEXT PRIMARY KEY,
+                        channel_uuid TEXT NOT NULL,
+                        client_id TEXT NOT NULL,
+                        local_worker_id TEXT NOT NULL,
+                        backend_signature TEXT NOT NULL,
+                        opening_version INTEGER NOT NULL,
+                        user_agent TEXT NOT NULL,
+                        client_ip TEXT NOT NULL,
+                        connected_at TEXT,
+                        projection_version INTEGER,
+                        status TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    )"""
+                )
+                db.execute(
+                    """INSERT INTO sharing_borrow_registration_attempts
+                    SELECT episode_id,channel_uuid,client_id,local_worker_id,
+                    backend_signature,opening_version,user_agent,client_ip,
+                    connected_at,projection_version,status,updated_at
+                    FROM sharing_borrow_registration_attempts_legacy"""
+                )
+                db.execute("DROP TABLE sharing_borrow_registration_attempts_legacy")
+                db.commit()
 
     def _db(self):
         db = sqlite3.connect(self.database_path, timeout=5, isolation_level=None)

@@ -782,6 +782,49 @@ def read_native_episode_grant(redis: Any, channel_uuid: str) -> NativeEpisodeGra
         return None
 
 
+def read_native_episode_cleanup_binding(
+    redis: Any, episode: BorrowEpisodeSnapshot,
+) -> str | None:
+    """Read only the exact projection facts needed for nonauthorizing cleanup.
+
+    Opening/closing/closed projections intentionally do not decode as live
+    grants. This reader cannot authorize a stream; it only returns the catalog
+    fence after matching the durable episode's immutable identity fields.
+    """
+    if not isinstance(episode, BorrowEpisodeSnapshot):
+        return None
+    try:
+        key = episode_projection_key(episode.channel_uuid)
+        if _text(redis.type(key)) != "hash" or int(redis.ttl(key)) <= 0:
+            return None
+        raw = redis.hgetall(key) or {}
+        values = {_text(name): _text(value) for name, value in raw.items()}
+        expected = {
+            "channel_uuid": episode.channel_uuid,
+            "episode_id": episode.episode_id,
+            "configuration_generation": episode.configuration_generation,
+            "control_generation": str(episode.control_generation),
+            "recorder_fence": str(episode.recorder_fence),
+            "intent_epoch": str(episode.intent_epoch),
+            "lease_digest": episode.lease_digest,
+            "worker_id": episode.identity[1],
+            "owner_lock_value": episode.identity[2],
+            "metadata_owner": episode.identity[3],
+            "stream_id": episode.identity[4],
+            "account_id": episode.identity[5],
+            "m3u_profile_id": episode.identity[6],
+            "input_profile_id": episode.identity[7],
+        }
+        if any(values.get(name) != value for name, value in expected.items()):
+            return None
+        if values.get("phase") not in {"opening", "closing", "closed"}:
+            return None
+        catalog = values.get("catalog_generation")
+        return catalog if isinstance(catalog, str) and catalog else None
+    except Exception:
+        return None
+
+
 def observe_native_episode_for_authority_drain(redis: Any, channel_uuid: str):
     """Distinguish truly absent, exact live, already revoked, and malformed state."""
     from ..sharing_authority_outbox import SharingAuthorityPriorObservation

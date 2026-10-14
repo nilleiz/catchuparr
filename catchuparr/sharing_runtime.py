@@ -33,7 +33,13 @@ from .adapters.sharing_native import (
 )
 from .sharing_episode import BorrowEpisodeLedger, BorrowEpisodeRejected
 from .sharing_persistence import SharingIntentLedger, SharingIntentToken
-from .sharing_planner import BorrowTarget, SharingAction
+from .sharing_planner import (
+    BorrowTarget,
+    SharingAction,
+    SharingObservation,
+    SharingSettings,
+    observe,
+)
 
 
 @dataclass(frozen=True)
@@ -46,8 +52,313 @@ class PreparedBorrowOpening:
     capability: SignedBorrowCapability
 
 
+class RecorderBorrowCoordinator:
+    """Poll the real native viewer state and durably issue one borrow opening.
+
+    The recorder task calls ``poll`` from its supervisor thread. The full
+    assigned-source/profile catalog is loaded once when the coordinator is
+    constructed; source policy is used only to decide whether a dedicated
+    fallback exists. An excluded source can therefore be observed for an
+    existing viewer connection, but is never made a new recorder candidate.
+    """
+
+    def __init__(
+        self, redis: Any, archive_root: Path, channel_uuid: str, *,
+        active: dict[str, Any], control_generation: int, recorder_fence: int,
+        lease_value: str, dedicated_source_available: bool,
+    ) -> None:
+        from .configuration import _sharing_catalog_generation
+        from .recorder_proxy import configuration_generation
+
+        if type(dedicated_source_available) is not bool:
+            raise ValueError("dedicated source availability must be boolean")
+        self.redis = redis
+        self.channel_uuid = channel_uuid
+        self.active = active
+        self.control_generation = control_generation
+        self.recorder_fence = recorder_fence
+        self.lease_value = lease_value
+        self.dedicated_source_available = dedicated_source_available
+        self.configuration_generation = configuration_generation(active)
+        self.intent_ledger = SharingIntentLedger(
+            Path(archive_root) / ".catchuparr-sharing.sqlite3",
+        )
+        self.episode_ledger = BorrowEpisodeLedger(
+            Path(archive_root) / ".catchuparr-sharing.sqlite3",
+        )
+        self.assigned_sources, self.catalog_generation = _native_source_catalog(channel_uuid)
+        if _sharing_catalog_generation(channel_uuid) != self.catalog_generation:
+            raise BorrowEpisodeRejected("source catalog changed during preload")
+        from django.db import close_old_connections
+
+        close_old_connections()
+        self.state_record = self.intent_ledger.read(channel_uuid)
+        if (
+            self.state_record is None
+            or self.state_record.state.configuration_generation != self.configuration_generation
+            or self.state_record.state.control_generation != control_generation
+            or self.state_record.state.recorder_fence != recorder_fence
+        ):
+            previous = self.state_record
+            self.state_record = self.intent_ledger.recover(
+                channel_uuid,
+                configuration_generation=self.configuration_generation,
+                control_generation=control_generation,
+                recorder_fence=recorder_fence,
+                now=time.time(),
+                expected_revision=previous.revision if previous is not None else None,
+                recovery_is_current=self._recovery_is_current,
+            )
+
+    def _recovery_is_current(
+        self, channel_uuid: str, _revision: int | None,
+        config_generation: str, control_generation: int, recorder_fence: int,
+    ) -> bool:
+        if channel_uuid != self.channel_uuid or config_generation != self.configuration_generation:
+            return False
+        if control_generation != self.control_generation or recorder_fence != self.recorder_fence:
+            return False
+        try:
+            return (
+                self.redis.get(f"catchuparr:recorder:{channel_uuid}") == self.lease_value
+                and int(self.redis.ttl(f"catchuparr:recorder:{channel_uuid}")) > 0
+            )
+        except Exception:
+            return False
+
+    def poll(self, *, active: dict[str, Any], control_generation: int) -> PreparedBorrowOpening | None:
+        """Persist cooldown observations and claim an ATTACH only at its deadline."""
+        latest = self.intent_ledger.read(self.channel_uuid)
+        if latest is not None and latest.revision > self.state_record.revision:
+            self.state_record = latest
+        try:
+            from .adapters.sharing_native import read_native_episode_grant
+
+            live_episode = read_native_episode_grant(self.redis, self.channel_uuid)
+            if live_episode is not None and live_episode.phase in {"opening", "active", "wait_return", "closing"}:
+                return None
+        except Exception:
+            return None
+        if (
+            self.state_record.intent is not None
+            or control_generation != self.control_generation
+            or active.get("connection_sharing", {}).get(self.channel_uuid, {}).get("enabled") is not True
+        ):
+            return None
+        from .configuration import _sharing_catalog_generation
+        from .recorder_proxy import configuration_generation
+
+        config_generation = configuration_generation(active)
+        if config_generation != self.configuration_generation:
+            return None
+        now = time.time()
+        if not self._recovery_is_current(
+            self.channel_uuid, self.state_record.revision, config_generation,
+            control_generation, self.recorder_fence,
+        ):
+            return None
+        try:
+            if _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation:
+                return None
+            native = observe_native_connection(
+                self.redis, self.channel_uuid,
+                catalog_generation=self.catalog_generation,
+                assigned_sources=self.assigned_sources,
+                observed_at=now,
+            )
+        finally:
+            try:
+                from django.db import close_old_connections
+
+                close_old_connections()
+            except Exception:
+                pass
+        setting = active["connection_sharing"][self.channel_uuid]
+        settings = SharingSettings(
+            enabled=True,
+            live_stability_seconds=setting["live_stability_seconds"],
+            last_viewer_return_seconds=setting["last_viewer_return_seconds"],
+            min_switch_interval_seconds=setting["min_switch_interval_seconds"],
+        )
+        observation = SharingObservation(
+            channel_uuid=self.channel_uuid,
+            now=now,
+            configuration_generation=self.configuration_generation,
+            control_generation=self.control_generation,
+            recorder_fence=self.recorder_fence,
+            lease_is_current=True,
+            settings=settings,
+            target=native.target if native is not None else None,
+            dedicated_source_available=self.dedicated_source_available,
+        )
+        decision = observe(self.state_record.state, observation)
+        if decision.action is SharingAction.NOOP and decision.state == self.state_record.state:
+            return None
+        token_action = decision.action if decision.action not in {SharingAction.WAIT, SharingAction.NOOP} else None
+        target_identity = (
+            decision.state.candidate_connection_identity
+            if token_action is SharingAction.ATTACH_BORROW else None
+        )
+        self.state_record = self.intent_ledger.save(
+            decision.state,
+            action=token_action,
+            expected_revision=self.state_record.revision,
+            target_identity=target_identity,
+            target_admitted=token_action is SharingAction.ATTACH_BORROW,
+            not_before=(decision.deadline if decision.deadline is not None else now)
+            if token_action is not None else None,
+            updated_at=now,
+        )
+        token = self.state_record.intent
+        if token is None or token.action is not SharingAction.ATTACH_BORROW:
+            return None
+        target = native.target if native is not None else None
+        if target is None:
+            return None
+
+        def fresh_validate(exact_token: SharingIntentToken) -> bool:
+            if exact_token != token or not self._recovery_is_current(
+                self.channel_uuid, self.state_record.revision,
+                self.configuration_generation, self.control_generation,
+                self.recorder_fence,
+            ):
+                return False
+            try:
+                catalog = _sharing_catalog_generation(self.channel_uuid)
+                current_sources, current_catalog = _native_source_catalog(self.channel_uuid)
+                if catalog != self.catalog_generation or current_catalog != self.catalog_generation:
+                    return False
+                current = observe_native_connection(
+                    self.redis, self.channel_uuid,
+                    catalog_generation=current_catalog,
+                    assigned_sources=current_sources,
+                    observed_at=time.time(),
+                )
+                return bool(
+                    current is not None
+                    and current.target.connection_identity == exact_token.target_identity
+                    and current.target.eligible_for_new_borrow(self.channel_uuid)
+                )
+            except Exception:
+                return False
+            finally:
+                try:
+                    from django.db import close_old_connections
+
+                    close_old_connections()
+                except Exception:
+                    pass
+
+        claimed, prepared = prepare_borrow_opening(
+            self.redis, self.intent_ledger, self.episode_ledger, token, target,
+            lease_value=self.lease_value,
+            catalog_generation=self.catalog_generation,
+            return_seconds=settings.last_viewer_return_seconds,
+            minimum_switch_seconds=settings.min_switch_interval_seconds,
+            last_switch_at=self.state_record.state.last_switch_at,
+            capability_secret=_django_secret(),
+            fresh_validate=fresh_validate,
+        )
+        self.state_record = self.intent_ledger.read(self.channel_uuid)
+        return prepared if claimed else None
+
+
+def acknowledge_opened_borrow(
+    capability: SignedBorrowCapability,
+    intent_ledger: SharingIntentLedger,
+    episode_ledger: BorrowEpisodeLedger,
+    *,
+    target: BorrowTarget,
+    settings: SharingSettings,
+    now: float,
+) -> bool:
+    """Commit the ATTACH cooldown only after exact native registration ACK."""
+
+    from .sharing_planner import resolve_transition
+
+    if (
+        not isinstance(capability, SignedBorrowCapability)
+        or not isinstance(intent_ledger, SharingIntentLedger)
+        or not isinstance(episode_ledger, BorrowEpisodeLedger)
+        or not isinstance(target, BorrowTarget)
+        or target.connection_identity != capability.connection_identity
+        or not isinstance(settings, SharingSettings)
+        or isinstance(now, bool) or not isinstance(now, (int, float))
+        or not math.isfinite(float(now))
+    ):
+        return False
+    current = intent_ledger.read(capability.channel_uuid)
+    if current is None:
+        return False
+    token = current.intent
+    if (
+        token is None
+        or token.action is not SharingAction.ATTACH_BORROW
+        or token.intent_epoch != capability.intent_epoch
+        or token.configuration_generation != capability.configuration_generation
+        or token.control_generation != capability.control_generation
+        or token.recorder_fence != capability.recorder_fence
+        or token.target_identity != capability.connection_identity
+    ):
+        return False
+    try:
+        episode = episode_ledger.read(capability.channel_uuid)
+    except Exception:
+        return False
+    if (
+        episode.phase != "active"
+        or episode.episode_id != capability.episode_id
+        or episode.version != capability.episode_version + 1
+        or episode.identity != capability.connection_identity
+        or episode.intent_epoch != capability.intent_epoch
+        or episode.recorder_fence != capability.recorder_fence
+    ):
+        return False
+    observation = SharingObservation(
+        channel_uuid=capability.channel_uuid,
+        now=float(now),
+        configuration_generation=capability.configuration_generation,
+        control_generation=capability.control_generation,
+        recorder_fence=capability.recorder_fence,
+        lease_is_current=True,
+        settings=settings,
+        target=target,
+        dedicated_source_available=True,
+    )
+    resolved = resolve_transition(
+        current.state, SharingAction.ATTACH_BORROW, succeeded=True,
+        now=float(now), current_state=current.state,
+        current_observation=observation,
+    )
+    if resolved.pending_action is not None or resolved.last_switch_at != float(now):
+        return False
+    try:
+        intent_ledger.save(
+            resolved, action=None, expected_revision=current.revision,
+            updated_at=float(now),
+        )
+    except Exception:
+        return False
+    return True
+
+
 _pending_open_cleanup_lock = threading.Lock()
 _pending_open_cleanups: dict[str, Any] = {}
+
+
+class _RetainedCleanup:
+    """Keep a task-local manager and exact retry callback alive across requests."""
+
+    def __init__(self, retry: Callable[[], bool]) -> None:
+        self._retry = retry
+
+    def retry_cleanup(self) -> bool:
+        return self._retry() is True
+
+
+def _retain_durable_cleanup(episode_id: str, operation: Any) -> None:
+    with _pending_open_cleanup_lock:
+        _pending_open_cleanups[episode_id] = operation
 
 
 def retain_open_cleanup_pending(error: BaseException) -> None:
@@ -113,6 +424,7 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
         close_fenced_unregistered_opening,
         fence_unregistered_opening,
         native_registration_is_absent,
+        read_native_episode_cleanup_binding,
         read_native_episode_grant,
     )
     from .adapters.sharing_reader import redis_backend_signature
@@ -140,10 +452,25 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
         owns_manager = False
         try:
             grant = read_native_episode_grant(redis_text, snapshot.channel_uuid)
-            if grant is None or grant.episode_id != snapshot.episode_id:
-                pending += 1
-                continue
-            catalog_generation = grant.catalog_generation
+            if grant is not None and grant.episode_id == snapshot.episode_id:
+                catalog_generation = grant.catalog_generation
+            else:
+                # Opening/closing/closed projections are deliberately not
+                # decodable as live authority. Cleanup may use only a strict
+                # immutable identity match and never treats this as a grant.
+                catalog_generation = read_native_episode_cleanup_binding(
+                    redis_text, snapshot,
+                )
+                if catalog_generation is None:
+                    # A durable ACK is enough to remove that exact native
+                    # registration even after the short-lived episode hash
+                    # expires. This does not recover or grant read authority.
+                    # Unknown/prepared registrations still require a live
+                    # projection so a possibly delayed registration can fence.
+                    if registration is None or registration.status != "registered":
+                        pending += 1
+                        continue
+                    catalog_generation = "expired-registration-projection"
             opening_version = (
                 registration.opening_version if registration is not None
                 else snapshot.version - (1 if snapshot.phase == "cleanup_pending" else 0)
@@ -153,6 +480,52 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                 connected_at=None, last_viewer_left_at=None, return_deadline=None,
                 client_id=(registration.client_id if registration is not None else snapshot.client_id),
             )
+
+            def close_sqlite_after_ack(exact_snapshot=snapshot) -> bool:
+                try:
+                    current = ledger.read(exact_snapshot.channel_uuid)
+                    if current.episode_id != exact_snapshot.episode_id:
+                        return False
+                    if current.phase != "closed":
+                        ledger.revoke(
+                            current.episode_id, expected_version=current.version,
+                            reason="closed", cleanup_acknowledged=True,
+                        )
+                    return True
+                except Exception:
+                    return False
+
+            def retain_retry(
+                retry_native: Callable[[], bool], *, exact_manager=None,
+                exact_snapshot=snapshot,
+            ) -> None:
+                nonlocal manager
+                if exact_manager is None:
+                    exact_manager = manager
+                if exact_manager is None:
+                    return
+
+                def retry_owned_cleanup(
+                    exact_retry=retry_native,
+                    exact_manager=exact_manager,
+                    exact_close=close_sqlite_after_ack,
+                ) -> bool:
+                    if exact_retry() is not True:
+                        return False
+                    stop = getattr(exact_manager, "stop", None)
+                    if not callable(stop):
+                        return False
+                    try:
+                        stop()
+                    except Exception:
+                        return False
+                    return exact_close()
+
+                _retain_durable_cleanup(
+                    exact_snapshot.episode_id, _RetainedCleanup(retry_owned_cleanup),
+                )
+                manager = None
+
             if registration is None:
                 if not fence_unregistered_opening(
                     redis_text, opening, catalog_generation=catalog_generation,
@@ -179,6 +552,25 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                 if (getattr(manager, "channel_id", None) != snapshot.channel_uuid
                         or getattr(manager, "worker_id", None) != registration.local_worker_id
                         or redis_backend_signature(manager.redis_client) != registration.backend_signature):
+                    # This manager was constructed by this scanner but does not
+                    # match the persisted worker/backend binding. Never use it
+                    # to clean native state; retain only its own stop operation.
+                    rejected_manager = manager
+                    def stop_rejected_manager(exact_manager=rejected_manager) -> bool:
+                        stop = getattr(exact_manager, "stop", None)
+                        if not callable(stop):
+                            return False
+                        try:
+                            stop()
+                            return True
+                        except Exception:
+                            return False
+                    if not stop_rejected_manager():
+                        _retain_durable_cleanup(
+                            snapshot.episode_id,
+                            _RetainedCleanup(stop_rejected_manager),
+                        )
+                    manager = None
                     pending += 1
                     continue
                 if registration.status == "registered":
@@ -201,25 +593,63 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                         backend_signature=registration.backend_signature,
                     )
                 if ack is None:
-                    fenced = fence_unregistered_opening(
-                        redis_text, opening, catalog_generation=catalog_generation,
-                    )
-                    absent = fenced and native_registration_is_absent(
-                        redis_text, channel_uuid=snapshot.channel_uuid,
-                        client_id=registration.client_id,
-                    )
-                    closed = absent and close_fenced_unregistered_opening(
-                        redis_text, opening, catalog_generation=catalog_generation,
-                        client_id=registration.client_id,
-                    )
+                    def clean_unregistered(
+                        exact_opening=opening,
+                        exact_catalog=catalog_generation,
+                        exact_channel=snapshot.channel_uuid,
+                        exact_client=registration.client_id,
+                    ) -> bool:
+                        fenced = fence_unregistered_opening(
+                            redis_text, exact_opening,
+                            catalog_generation=exact_catalog,
+                        )
+                        absent = fenced and native_registration_is_absent(
+                            redis_text, channel_uuid=exact_channel,
+                            client_id=exact_client,
+                        )
+                        return bool(absent and close_fenced_unregistered_opening(
+                            redis_text, exact_opening,
+                            catalog_generation=exact_catalog,
+                            client_id=exact_client,
+                        ))
+
+                    closed = clean_unregistered()
                     if not closed:
+                        retain_retry(clean_unregistered)
                         pending += 1
                         continue
-                elif not cleanup_borrowed_client(
-                    redis_text, ack, episode_id=snapshot.episode_id, manager=manager,
-                ):
-                    pending += 1
-                    continue
+                else:
+                    def clean_registered(
+                        exact_ack=ack, exact_episode=snapshot.episode_id,
+                        exact_manager=manager,
+                    ) -> bool:
+                        return cleanup_borrowed_client(
+                            redis_text, exact_ack, episode_id=exact_episode,
+                            manager=exact_manager,
+                        )
+
+                    if not clean_registered():
+                        # Preserve the exact local manager and ACK until Redis
+                        # confirms removal; constructing another manager on
+                        # every request would leave heartbeat workers behind.
+                        retained_ack = ack
+                        retained_manager = manager
+                        exact_snapshot = snapshot
+
+                        def retry_registered(
+                            exact_ack=retained_ack,
+                            exact_manager=retained_manager,
+                            exact_episode=exact_snapshot.episode_id,
+                        ) -> bool:
+                            return cleanup_borrowed_client(
+                                redis_text, exact_ack,
+                                episode_id=exact_episode,
+                                manager=exact_manager,
+                            )
+
+                        retain_retry(retry_registered, exact_manager=retained_manager)
+                        pending += 1
+                        continue
             if manager is not None:
                 manager.stop()
                 manager = None
@@ -236,9 +666,82 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
         except Exception:
             pending += 1
             if manager is not None and owns_manager:
-                # The native absence/cleanup ACK may be uncertain. Do not stop
-                # the only local manager handle before a later retry can prove it.
-                pass
+                # Preserve an exact manager across transient scanner failures.
+                # A later scan can recover registration from the durable row;
+                # this process-local owner must not be silently leaked meanwhile.
+                exact_manager = manager
+                exact_snapshot = snapshot
+                exact_registration = registration
+
+                def retry_after_exception(
+                    exact_manager=exact_manager,
+                    exact_snapshot=exact_snapshot,
+                    exact_registration=exact_registration,
+                    exact_opening=opening,
+                    exact_catalog=catalog_generation,
+                    exact_close=close_sqlite_after_ack,
+                ) -> bool:
+                    try:
+                        recovered_ack = _recover_registration_ack(
+                            redis_text,
+                            replace(
+                                exact_snapshot, phase="opening",
+                                version=(exact_registration.opening_version
+                                         if exact_registration is not None
+                                         else exact_snapshot.version),
+                                connected_at=None, last_viewer_left_at=None,
+                                return_deadline=None,
+                                client_id=(exact_registration.client_id
+                                           if exact_registration is not None
+                                           else exact_snapshot.client_id),
+                            ),
+                            client_id=(exact_registration.client_id
+                                       if exact_registration is not None
+                                       else str(exact_snapshot.client_id)),
+                            local_worker_id=(exact_registration.local_worker_id
+                                             if exact_registration is not None else ""),
+                            user_agent=(exact_registration.user_agent
+                                        if exact_registration is not None else None),
+                            client_ip=(exact_registration.client_ip
+                                       if exact_registration is not None else None),
+                            backend_signature=(exact_registration.backend_signature
+                                               if exact_registration is not None else ""),
+                        ) if exact_registration is not None else None
+                        if recovered_ack is not None:
+                            native_done = cleanup_borrowed_client(
+                                redis_text, recovered_ack,
+                                episode_id=exact_snapshot.episode_id,
+                                manager=exact_manager,
+                            )
+                        else:
+                            native_done = (
+                                fence_unregistered_opening(
+                                    redis_text, exact_opening,
+                                    catalog_generation=exact_catalog,
+                                )
+                                and native_registration_is_absent(
+                                    redis_text,
+                                    channel_uuid=exact_snapshot.channel_uuid,
+                                    client_id=str(exact_snapshot.client_id),
+                                )
+                                and close_fenced_unregistered_opening(
+                                    redis_text, exact_opening,
+                                    catalog_generation=exact_catalog,
+                                    client_id=str(exact_snapshot.client_id),
+                                )
+                            )
+                        if not native_done:
+                            return False
+                        exact_manager.stop()
+                        return exact_close()
+                    except Exception:
+                        return False
+
+                _retain_durable_cleanup(
+                    exact_snapshot.episode_id,
+                    _RetainedCleanup(retry_after_exception),
+                )
+                manager = None
     return completed, pending
 
 
@@ -590,7 +1093,7 @@ def open_borrow_session(capability: SignedBorrowCapability) -> BorrowedReaderSes
     # identity, not the native source owner's ID.
     worker_id = f"catchuparr-reader-{uuid.uuid4().hex}"
     secret = _django_secret()
-    return BorrowedReaderSession.open(
+    session = BorrowedReaderSession.open(
         capability=capability,
         capability_secret=secret,
         authenticated_user_id=capability.user_id,
@@ -611,6 +1114,25 @@ def open_borrow_session(capability: SignedBorrowCapability) -> BorrowedReaderSes
         user_agent="Catchuparr read-only sharing reader",
         ledger=ledger,
     )
+    intent_ledger = SharingIntentLedger(Path(config.archive_root) / ".catchuparr-sharing.sqlite3")
+    if not acknowledge_opened_borrow(
+        capability, intent_ledger, ledger, target=observation.target,
+        settings=SharingSettings(
+            enabled=True,
+            live_stability_seconds=setting["live_stability_seconds"],
+            last_viewer_return_seconds=setting["last_viewer_return_seconds"],
+            min_switch_interval_seconds=setting["min_switch_interval_seconds"],
+        ),
+        now=time.time(),
+    ):
+        try:
+            cleaned = session.close() is True
+        except Exception:
+            cleaned = False
+        if not cleaned:
+            retain_session_cleanup_pending(session)
+        raise BorrowEpisodeRejected("borrow activation could not be committed to the recorder planner")
+    return session
 
 
 def _django_secret() -> bytes:
