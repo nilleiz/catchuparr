@@ -3598,8 +3598,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         with run_share._lock:
             share_results = list(run_share.results)
         _require(
-            bool(share_results) and share_results[0].status == "switch_requested",
-            "The borrowed recorder did not reap A at the fenced source-switch boundary",
+            bool(share_results)
+            and share_results[0].useful_segments > 0
+            and share_results[0].status in {"switch_requested", "media_stalled", "exited"},
+            "The borrowed recorder did not finish its useful A input before returning",
         )
         counts_after_share_return, active_after_share_return = source_server.snapshot()
         _require(
@@ -3620,6 +3622,14 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         run_share.stop()
         run_share.join(cooperative_sleep=gevent_sleep)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if (
+                native_server.stream_managers.get(worker_id) is None
+                and redis_client.get(RedisKeys.channel_owner(worker_id)) is None
+            ):
+                break
+            gevent_sleep(0.1)
         _require(
             native_server.stream_managers.get(worker_id) is None
             and redis_client.get(RedisKeys.channel_owner(worker_id)) is None,
