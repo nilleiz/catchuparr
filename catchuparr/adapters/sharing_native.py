@@ -420,7 +420,8 @@ _PROJECT_EPISODE_LUA = """
 local current_type = redis.call('TYPE', KEYS[1]).ok
 local lease_type = redis.call('TYPE', KEYS[2]).ok
 local projection_type = redis.call('TYPE', KEYS[3]).ok
-if current_type ~= 'hash' or lease_type ~= 'string'
+local tombstone_type = redis.call('TYPE', KEYS[4]).ok
+if current_type ~= 'hash' or lease_type ~= 'string' or tombstone_type ~= 'none'
    or (projection_type ~= 'none' and projection_type ~= 'hash') then return 0 end
 local ttl = tonumber(ARGV[18])
 local return_seconds = tonumber(ARGV[14])
@@ -498,10 +499,10 @@ local function private_client(id, channel)
   if cap_channel == channel and cap_lease == lease then return true end
   return nil
 end
-local expected = {'hash', 'hash', 'string', 'string', 'string', 'hash', 'none', 'none', 'none', 'none', 'none', 'string', 'none'}
+local expected = {'hash', 'hash', 'string', 'string', 'string', 'hash', 'none', 'none', 'none', 'none', 'none', 'string', 'none', 'none'}
 local allowed = {{'hash'}, {'hash'}, {'string'}, {'string'}, {'string'}, {'hash'},
   {'none', 'string'}, {'none', 'string'}, {'none', 'hash'}, {'none', 'set'},
-  {'none', 'hash'}, {'string'}, {'none', 'zset'}}
+  {'none', 'hash'}, {'string'}, {'none', 'zset'}, {'none', 'string'}}
 for i = 1, #expected do
   local actual = redis.call('TYPE', KEYS[i]).ok
   local ok = false
@@ -510,6 +511,7 @@ for i = 1, #expected do
 end
 local ttl = tonumber(ARGV[20])
 if not ttl or ttl < 1 or ttl > 720 or ttl % 1 ~= 0 then return 0 end
+if redis.call('EXISTS', KEYS[14]) ~= 0 then return 0 end
 if redis.call('HGET', KEYS[2], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[2], 'control_generation') ~= ARGV[2]
    or redis.call('HGET', KEYS[2], 'catalog_generation') ~= ARGV[3]
@@ -744,6 +746,13 @@ return {1, deadline and string.format('%.6f', deadline) or '', tostring(version)
 
 def episode_projection_key(channel_uuid: str) -> str:
     return f"catchuparr:sharing:episode:{channel_uuid}"
+
+
+def opening_tombstone_key(channel_uuid: str, episode_id: str) -> str:
+    """Permanent, non-authorizing fence for one expired opening attempt."""
+    if not isinstance(channel_uuid, str) or not channel_uuid or not isinstance(episode_id, str) or not episode_id:
+        raise ValueError("channel_uuid and episode_id are required")
+    return f"catchuparr:sharing:opening-tombstone:{channel_uuid}:{episode_id}"
 
 
 def read_native_episode_grant(redis: Any, channel_uuid: str) -> NativeEpisodeGrant | None:
@@ -1028,9 +1037,10 @@ def project_opening_episode(redis: Any, episode: BorrowEpisodeSnapshot, *, lease
         raise ValueError("ttl_seconds must be an integer from 1 to 720")
     current = f"catchuparr:sharing:current:{episode.channel_uuid}"
     status = redis.eval(
-        _PROJECT_EPISODE_LUA, 3,
+        _PROJECT_EPISODE_LUA, 4,
         current, f"catchuparr:recorder:{episode.channel_uuid}",
         episode_projection_key(episode.channel_uuid),
+        opening_tombstone_key(episode.channel_uuid, episode.episode_id),
         episode.configuration_generation, str(episode.control_generation), catalog_generation,
         str(episode.recorder_fence), lease_value, episode.episode_id,
         episode.identity[1], episode.identity[2], episode.identity[3],
@@ -1071,6 +1081,7 @@ def register_borrowed_client(redis: Any, episode: BorrowEpisodeSnapshot, *,
         f"live:channel:{channel}:clients:{client_id}", f"live:channel:{channel}:clients",
         f"catchuparr:sharing:private:{channel}", f"live:channel:{channel}:input:buffer:index",
         f"live:channel:{channel}:input:buffer:chunk_timestamps",
+        opening_tombstone_key(channel, episode.episode_id),
     ]
     try:
         result = redis.eval(
@@ -1251,6 +1262,94 @@ def native_registration_is_absent(redis: Any, *, channel_uuid: str, client_id: s
         elif marker_kind != "none":
             return False
         return clients_kind == "none" or not redis.sismember(clients_key, client_id)
+    except Exception:
+        return False
+
+
+_TOMBSTONE_EXPIRED_OPENING_LUA = """
+local allowed = {
+  {'hash'}, {'none'}, {'none', 'string'}, {'none', 'hash'},
+  {'none', 'set'}, {'none', 'hash'}, {'none', 'string'}
+}
+for i = 1, #allowed do
+  local actual = redis.call('TYPE', KEYS[i]).ok
+  local ok = false
+  for _, value in ipairs(allowed[i]) do if actual == value then ok = true end end
+  if not ok then return 0 end
+end
+if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
+   or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[2]
+   or redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[3]
+   or redis.call('HGET', KEYS[1], 'authority_revision') ~= ARGV[4]
+   or redis.call('TYPE', KEYS[3]).ok ~= ARGV[5]
+   or (ARGV[5] == 'string' and redis.call('GET', KEYS[3]) ~= ARGV[6])
+   or redis.call('EXISTS', KEYS[4]) ~= 0
+   or (redis.call('TYPE', KEYS[5]).ok == 'set'
+       and redis.call('SISMEMBER', KEYS[5], ARGV[7]) ~= 0)
+   or (redis.call('TYPE', KEYS[6]).ok == 'hash'
+       and redis.call('HGET', KEYS[6], ARGV[7]) ~= false) then return 0 end
+local value = ARGV[8]
+local existing = redis.call('GET', KEYS[7])
+if existing then
+  if existing == value then return 2 end
+  return 0
+end
+redis.call('SET', KEYS[7], value)
+return 1
+"""
+
+
+def tombstone_expired_unprojected_opening(
+    redis: Any, episode: BorrowEpisodeSnapshot, *, client_id: str,
+) -> bool:
+    """Atomically prove absence and permanently fence a delayed expired opening.
+
+    The tombstone contains only opaque identifiers and the lease digest. It is
+    intentionally permanent: delayed project/register calls must remain
+    fenced after worker restarts and after the short projection TTL expires.
+    """
+    if (not isinstance(episode, BorrowEpisodeSnapshot)
+            or episode.phase not in {"opening", "cleanup_pending"}
+            or not isinstance(client_id, str)
+            or not client_id.startswith("catchuparr-client-")
+            or episode.client_id != client_id):
+        return False
+    channel = episode.channel_uuid
+    current_key = f"catchuparr:sharing:current:{channel}"
+    try:
+        current = redis.hgetall(current_key) or {}
+        normalized = {_text(key): _text(value) for key, value in current.items()}
+        config = normalized["configuration_generation"]
+        control = normalized["control_generation"]
+        catalog = normalized["catalog_generation"]
+        revision = normalized["authority_revision"]
+        if (not config or not control.isdigit() or not catalog
+                or not revision.isdigit()):
+            return False
+        lease_key = f"catchuparr:recorder:{channel}"
+        lease_kind = redis.type(lease_key)
+        if isinstance(lease_kind, bytes):
+            lease_kind = lease_kind.decode("ascii", errors="strict")
+        if lease_kind not in {"none", "string"}:
+            return False
+        current_lease = redis.get(lease_key) if lease_kind == "string" else None
+        if isinstance(current_lease, bytes):
+            current_lease = current_lease.decode("utf-8", errors="strict")
+        if current_lease is not None and not isinstance(current_lease, str):
+            return False
+        keys = (
+            current_key, episode_projection_key(channel), lease_key,
+            f"live:channel:{channel}:clients:{client_id}",
+            f"live:channel:{channel}:clients", f"catchuparr:sharing:private:{channel}",
+            opening_tombstone_key(channel, episode.episode_id),
+        )
+        value = "|".join((channel, episode.episode_id, client_id, episode.lease_digest))
+        result = redis.eval(
+            _TOMBSTONE_EXPIRED_OPENING_LUA, len(keys), *keys,
+            config, control, catalog, revision, lease_kind, current_lease or "",
+            client_id, value,
+        )
+        return type(result) is int and result in {1, 2}
     except Exception:
         return False
 

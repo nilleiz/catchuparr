@@ -294,11 +294,12 @@ class NativeSharingTests(unittest.TestCase):
         ))
         script, numkeys, args = redis.calls[0]
         self.assertIs(script, _PROJECT_EPISODE_LUA)
-        self.assertEqual(numkeys, 3)
+        self.assertEqual(numkeys, 4)
         self.assertEqual(args[:numkeys], (
             f"catchuparr:sharing:current:{CHANNEL}",
             f"catchuparr:recorder:{CHANNEL}",
             f"catchuparr:sharing:episode:{CHANNEL}",
+            f"catchuparr:sharing:opening-tombstone:{CHANNEL}:{snap.episode_id}",
         ))
         values = args[numkeys:]
         self.assertEqual(values[:3], (
@@ -340,7 +341,7 @@ class NativeSharingTests(unittest.TestCase):
         self.assertIn("current ~= expected", script)
         self.assertIn("next_revision <= expected", script)
 
-    def test_register_uses_thirteen_native_keys_and_exact_generation_identity(self):
+    def test_register_uses_fourteen_native_keys_and_exact_generation_identity(self):
         redis = CaptureRedis([1, "100.250000", "2"])
         snap = episode()
         ack = register_borrowed_client(
@@ -353,7 +354,7 @@ class NativeSharingTests(unittest.TestCase):
         script, numkeys, args = redis.calls[0]
         self.assertIs(script, _REGISTER_BORROWED_CLIENT_LUA)
         keys, values = args[:numkeys], args[numkeys:]
-        self.assertEqual(numkeys, 13)
+        self.assertEqual(numkeys, 14)
         self.assertEqual(keys, (
             f"catchuparr:sharing:episode:{CHANNEL}",
             f"catchuparr:sharing:current:{CHANNEL}",
@@ -368,6 +369,7 @@ class NativeSharingTests(unittest.TestCase):
             f"catchuparr:sharing:private:{CHANNEL}",
             f"live:channel:{CHANNEL}:input:buffer:index",
             f"live:channel:{CHANNEL}:input:buffer:chunk_timestamps",
+            f"catchuparr:sharing:opening-tombstone:{CHANNEL}:{snap.episode_id}",
         ))
         self.assertEqual(values, (
             "config-synthetic-3", "7", "catalog-synthetic-4", "11", "1", LEASE,

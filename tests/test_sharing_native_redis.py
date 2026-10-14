@@ -34,6 +34,7 @@ from catchuparr.adapters.sharing_native import (
     publish_current_authority,
     read_native_episode_grant,
     register_borrowed_client,
+    tombstone_expired_unprojected_opening,
 )
 from catchuparr.sharing_episode import BorrowEpisodeSnapshot
 
@@ -869,6 +870,39 @@ class NativeLuaRedisTests(unittest.TestCase):
         grant = read_native_episode_grant(self.redis, CHANNEL)
         self.assertIsNotNone(grant)
         self.assertEqual(grant.version, episode.version + 1)
+
+    def test_expired_opening_tombstone_blocks_delayed_project_and_registration(self):
+        episode = self._opening_projection()
+        keys = _keys()
+        original_projection = self.redis.hgetall(keys["episode"])
+        self.redis.command("DEL", keys["episode"])
+        self.assertTrue(tombstone_expired_unprojected_opening(
+            self.redis, episode, client_id=CLIENT,
+        ))
+        tombstone = f"catchuparr:sharing:opening-tombstone:{CHANNEL}:{episode.episode_id}"
+        self.assertEqual(
+            self.redis.get(tombstone),
+            "|".join((CHANNEL, episode.episode_id, CLIENT, episode.lease_digest)),
+        )
+        self.assertFalse(project_opening_episode(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            return_seconds=30, minimum_switch_seconds=60, last_switch_at=95,
+        ))
+        # Model a delayed command that already captured the old projection.
+        # Registration must still reject before writing its client hash/set or
+        # private marker, even if that projection key reappears.
+        self.redis.command("HSET", keys["episode"], *sum(
+            ([field, value] for field, value in original_projection.items()), []
+        ))
+        self._native_source_and_viewer()
+        self.assertIsNone(register_borrowed_client(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            client_id=CLIENT, local_worker_id=TASK_WORKER,
+            user_agent="Synthetic Player", client_ip="192.0.2.60",
+        ))
+        self.assertEqual(self.redis.type(keys["client"]), "none")
+        self.assertFalse(self.redis.sismember(keys["clients"], CLIENT))
+        self.assertIsNone(self.redis.hget(keys["private"], CLIENT))
 
     def test_registration_rejects_client_id_different_from_persisted_attempt(self):
         episode = self._opening_projection()
