@@ -125,6 +125,23 @@ class SharingEffectReceipt:
 
 
 @dataclass(frozen=True)
+class SharingOperationFenceAcknowledgement:
+    """Durable proof that the exact operation cannot create future resources."""
+
+    operation_id: str
+    operation_revision: int
+    fence_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation_id, str) or not self.operation_id:
+            raise ValueError("operation_id is required")
+        if type(self.operation_revision) is not int or self.operation_revision < 1:
+            raise ValueError("operation_revision must be positive")
+        if not isinstance(self.fence_id, str) or not self.fence_id or len(self.fence_id) > 256:
+            raise ValueError("fence_id must be a bounded opaque identifier")
+
+
+@dataclass(frozen=True)
 class SharingEffectDispatch:
     status: str
     operation: SharingEffectAttempt | None
@@ -233,6 +250,15 @@ class SharingIntentLedger:
                     revision INTEGER NOT NULL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS sharing_effect_fences (
+                    operation_id TEXT NOT NULL,
+                    operation_revision INTEGER NOT NULL,
+                    fence_id TEXT NOT NULL,
+                    acknowledged_at REAL NOT NULL,
+                    PRIMARY KEY (operation_id, operation_revision)
                 )"""
             )
             db.execute(
@@ -1007,19 +1033,39 @@ class SharingIntentLedger:
             ).fetchall()
         return tuple(self._effect_attempt_from_row(row) for row in rows)
 
+    def operation_fence_acknowledgement(
+        self, operation_id: str, operation_revision: int,
+    ) -> SharingOperationFenceAcknowledgement | None:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id is required")
+        if type(operation_revision) is not int or operation_revision < 1:
+            raise ValueError("operation_revision must be positive")
+        with self._database() as db:
+            row = db.execute(
+                "SELECT * FROM sharing_effect_fences WHERE operation_id=? AND operation_revision=?",
+                (operation_id, operation_revision),
+            ).fetchone()
+        if row is None:
+            return None
+        return SharingOperationFenceAcknowledgement(
+            row["operation_id"], row["operation_revision"], row["fence_id"],
+        )
+
     def reconcile_effect_attempt(
         self,
         operation_id: str,
         *,
         exact_resources_absent: Callable[[SharingEffectAttempt], bool],
-        dispatch_cancel_acknowledged: Callable[[SharingEffectAttempt], bool] | None = None,
+        operation_fence_acknowledged: Callable[
+            [SharingEffectAttempt], SharingOperationFenceAcknowledgement | None
+        ] | None = None,
     ) -> bool:
-        """Close an operation only after cancellation and exact absence ACKs.
+        """Close only after operation-fence and exact-resource absence ACKs.
 
-        A dispatching operation may still create a resource after a point-in-
-        time absence check. Such a row requires an exact executor/native fence
-        callback which first makes that operation incapable of dispatching,
-        then the ordinary exact-resource absence proof.
+        Every nonclosed operation may reconnect, finish a delayed dispatch, or
+        otherwise create another resource. The callback must fence the exact
+        operation at the executor/native boundary, including future mutation,
+        before the ordinary exact-resource absence proof can close its row.
         """
         if not callable(exact_resources_absent):
             raise ValueError("exact resource absence callback is required")
@@ -1028,17 +1074,49 @@ class SharingIntentLedger:
             return False
         if attempt.status == "closed":
             return True
-        dispatch_outcome_unknown = (
-            attempt.status == "dispatching"
-            or (attempt.status == "cleanup_pending" and attempt.resource_id is None)
+        stored_fence = self.operation_fence_acknowledgement(
+            attempt.operation_id, attempt.revision,
         )
-        if dispatch_outcome_unknown:
-            if not callable(dispatch_cancel_acknowledged):
+        if stored_fence is None:
+            if not callable(operation_fence_acknowledged):
                 return False
             try:
-                if dispatch_cancel_acknowledged(attempt) is not True:
-                    return False
+                fence_ack = operation_fence_acknowledged(attempt)
             except Exception:
+                return False
+            if (not isinstance(fence_ack, SharingOperationFenceAcknowledgement)
+                    or fence_ack.operation_id != attempt.operation_id
+                    or fence_ack.operation_revision != attempt.revision):
+                return False
+            now = self._finite_time(self.clock(), "clock")
+            with self._database() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT * FROM sharing_effect_attempts WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                current = self._effect_attempt_from_row(row) if row is not None else None
+                if (current is None or current.revision != attempt.revision
+                        or current.status != attempt.status):
+                    db.rollback()
+                    return False
+                existing = db.execute(
+                    "SELECT fence_id FROM sharing_effect_fences WHERE operation_id=? AND operation_revision=?",
+                    (operation_id, attempt.revision),
+                ).fetchone()
+                if existing is not None and existing["fence_id"] != fence_ack.fence_id:
+                    db.rollback()
+                    return False
+                db.execute(
+                    """INSERT OR IGNORE INTO sharing_effect_fences
+                    (operation_id,operation_revision,fence_id,acknowledged_at) VALUES (?,?,?,?)""",
+                    (operation_id, attempt.revision, fence_ack.fence_id, now),
+                )
+                db.commit()
+            stored_fence = self.operation_fence_acknowledgement(
+                attempt.operation_id, attempt.revision,
+            )
+            if stored_fence != fence_ack:
                 return False
         try:
             if exact_resources_absent(attempt) is not True:
@@ -1054,6 +1132,13 @@ class SharingIntentLedger:
             current = self._effect_attempt_from_row(row) if row is not None else None
             if (current is None or current.revision != attempt.revision
                     or current.status != attempt.status):
+                db.rollback()
+                return False
+            fence_row = db.execute(
+                "SELECT 1 FROM sharing_effect_fences WHERE operation_id=? AND operation_revision=?",
+                (operation_id, attempt.revision),
+            ).fetchone()
+            if fence_row is None:
                 db.rollback()
                 return False
             cur = db.execute(
