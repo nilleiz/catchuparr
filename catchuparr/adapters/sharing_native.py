@@ -852,10 +852,10 @@ def observe_native_episode_for_authority_drain(redis: Any, channel_uuid: str):
             return SharingAuthorityPriorObservation("exact", grant)
         if phase in {"closing", "closed"}:
             required = (
-                "episode_id", "configuration_generation", "catalog_generation",
+                "channel_uuid", "episode_id", "configuration_generation", "catalog_generation",
                 "worker_id", "owner_lock_value", "metadata_owner", "stream_id",
                 "account_id", "m3u_profile_id", "input_profile_id", "client_id",
-                "client_worker_id", "connected_at", "lease_value", "lease_digest",
+                "lease_value", "lease_digest",
             )
             if any(not values.get(name) for name in required):
                 return SharingAuthorityPriorObservation("unknown")
@@ -867,8 +867,23 @@ def observe_native_episode_for_authority_drain(redis: Any, channel_uuid: str):
                 value = values.get(name, "")
                 if not value.isdecimal():
                     return SharingAuthorityPriorObservation("unknown")
-            if int(values["version"]) < 2:
+            if (int(values["control_generation"]) < 0
+                    or int(values["recorder_fence"]) < 1
+                    or int(values["intent_epoch"]) < 0
+                    or int(values["version"]) < 2):
                 return SharingAuthorityPriorObservation("unknown")
+            connected_at = values.get("connected_at", "")
+            client_worker_id = values.get("client_worker_id", "")
+            if phase == "closing" and (not connected_at or not client_worker_id):
+                return SharingAuthorityPriorObservation("unknown")
+            if bool(connected_at) != bool(client_worker_id):
+                return SharingAuthorityPriorObservation("unknown")
+            if connected_at:
+                try:
+                    if not math.isfinite(float(connected_at)):
+                        return SharingAuthorityPriorObservation("unknown")
+                except (TypeError, ValueError, OverflowError):
+                    return SharingAuthorityPriorObservation("unknown")
             return SharingAuthorityPriorObservation("known_revoked")
     except Exception:
         return SharingAuthorityPriorObservation("unknown")
@@ -894,9 +909,10 @@ def publish_current_authority(redis: Any, channel_uuid: str, *, configuration_ge
 
 
 _INVALIDATE_NATIVE_EPISODE_LUA = """
+local lease_type = redis.call('TYPE', KEYS[3]).ok
 if redis.call('TYPE', KEYS[1]).ok ~= 'hash'
    or redis.call('TYPE', KEYS[2]).ok ~= 'hash'
-   or redis.call('TYPE', KEYS[3]).ok ~= 'string' then return 0 end
+   or (lease_type ~= 'string' and lease_type ~= 'none') then return 0 end
 local version = tonumber(ARGV[9])
 if not version or version < 2 or version > 9007199254740990
    or version % 1 ~= 0 or redis.call('TTL', KEYS[2]) <= 0 then return 0 end
@@ -921,9 +937,6 @@ if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[2], 'owner_lock_value') ~= ARGV[21]
    or redis.call('HGET', KEYS[2], 'metadata_owner') ~= ARGV[22]
    or redis.call('HGET', KEYS[2], 'client_worker_id') ~= ARGV[23]
-   or redis.call('HGET', KEYS[2], 'lease_digest') ~= ARGV[20]
-   or redis.call('HGET', KEYS[2], 'lease_value') ~= redis.call('GET', KEYS[3])
-   or redis.call('TTL', KEYS[3]) <= 0
    or (ARGV[10] ~= 'active' and ARGV[10] ~= 'wait_return') then return 0 end
 local current_version = tonumber(redis.call('HGET', KEYS[2], 'version') or '')
 local current_phase = redis.call('HGET', KEYS[2], 'phase')
@@ -945,7 +958,11 @@ if current_phase == 'closing'
    and redis.call('HGET', KEYS[2], 'revocation_catalog_generation') == target_catalog then
   return 1
 end
-if redis.call('TTL', KEYS[2]) <= 0 then return 0 end
+if current_phase ~= 'active' and current_phase ~= 'wait_return'
+   or lease_type ~= 'string'
+   or redis.call('HGET', KEYS[2], 'lease_value') ~= redis.call('GET', KEYS[3])
+   or redis.call('TTL', KEYS[3]) <= 0
+   or redis.call('TTL', KEYS[2]) <= 0 then return 0 end
 redis.call('HSET', KEYS[2], 'phase', 'closing', 'viewer_left_at', '',
   'return_deadline', '', 'version', tostring(current_version + 1),
   'revocation_authority_revision', target_revision,

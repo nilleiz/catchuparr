@@ -230,6 +230,25 @@ class RedisCliJsonTests(unittest.TestCase):
         self.assertEqual(
             "known_revoked", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
         )
+        unregistered = {
+            **values, "phase": "closed", "connected_at": "", "client_worker_id": "",
+        }
+        redis.values = unregistered
+        self.assertEqual(
+            "known_revoked", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
+        )
+        for field, value in (
+            ("lease_digest", "0" * 64),
+            ("configuration_generation", ""),
+            ("owner_lock_value", ""),
+            ("client_worker_id", "worker-only-without-connected-at"),
+            ("version", "not-a-number"),
+        ):
+            with self.subTest(revoked_field=field):
+                redis.values = {**unregistered, field: value}
+                self.assertEqual(
+                    "unknown", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
+                )
         redis.values = {**values, "phase": "active", "lease_digest": "0" * 64}
         self.assertEqual(
             "unknown", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
@@ -624,6 +643,41 @@ class NativeLuaRedisTests(unittest.TestCase):
                 ))
                 self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closed")
 
+    def test_closed_unregistered_projection_is_typed_revoked_only_with_full_identity(self):
+        from catchuparr.adapters.sharing_native import observe_native_episode_for_authority_drain
+
+        episode = self._opening_projection()
+        self.assertTrue(fence_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG,
+        ))
+        self.assertTrue(native_registration_is_absent(
+            self.redis, channel_uuid=CHANNEL, client_id=CLIENT,
+        ))
+        self.assertTrue(close_fenced_unregistered_opening(
+            self.redis, episode, catalog_generation=CATALOG, client_id=CLIENT,
+        ))
+        self.assertEqual(
+            "known_revoked",
+            observe_native_episode_for_authority_drain(self.redis, CHANNEL).state,
+        )
+        for field, value in (
+            ("lease_digest", "0" * 64),
+            ("catalog_generation", ""),
+            ("account_id", ""),
+            ("intent_epoch", "NaN"),
+        ):
+            with self.subTest(revoked_field=field):
+                self.redis.command("HSET", _keys()["episode"], field, value)
+                self.assertEqual(
+                    "unknown",
+                    observe_native_episode_for_authority_drain(self.redis, CHANNEL).state,
+                )
+                self.redis.command("HSET", _keys()["episode"], field,
+                                   {"lease_digest": hashlib.sha256(LEASE.encode()).hexdigest(),
+                                    "catalog_generation": CATALOG,
+                                    "account_id": ACCOUNT,
+                                    "intent_epoch": str(episode.intent_epoch)}[field])
+
     def test_signed_opening_capability_rejects_stale_authority_without_nonce_write(self):
         episode = self._opening_projection()
         capability = self._capability(episode)
@@ -693,7 +747,9 @@ class NativeLuaRedisTests(unittest.TestCase):
         ))
         self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closing")
         self.assertEqual(self.redis.hget(_keys()["episode"], "version"), str(grant.version + 1))
-        # A lost response after the exact closing CAS is safely idempotent.
+        # A lost response remains acknowledgeable even after the previous
+        # recorder releases its lease; the exact projection stamp is enough.
+        self.redis.command("DEL", _keys()["lease"])
         self.assertTrue(invalidate_native_episode(
             self.redis, grant, configuration_generation="config-next",
             control_generation=8, catalog_generation="catalog-next",
