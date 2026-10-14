@@ -171,6 +171,70 @@ def _decode_hgetall_json(payload: str) -> dict[str, str]:
 
 
 class RedisCliJsonTests(unittest.TestCase):
+    def test_prior_observation_distinguishes_absent_exact_revoked_and_unknown(self):
+        from dataclasses import asdict
+
+        from catchuparr.adapters.sharing_native import (
+            NativeEpisodeGrant,
+            observe_native_episode_for_authority_drain,
+        )
+
+        lease_value = "synthetic-outbox-observation-lease"
+        grant = NativeEpisodeGrant(
+            channel_uuid=CHANNEL, episode_id="episode-observation-synthetic",
+            phase="active", configuration_generation=CONFIG,
+            control_generation=7, catalog_generation=CATALOG,
+            recorder_fence=11, intent_epoch=4, version=2,
+            lease_value=lease_value, worker_id=WORKER,
+            owner_lock_value="owner-observation-synthetic",
+            metadata_owner="owner-observation-synthetic", stream_id=STREAM,
+            account_id=ACCOUNT, m3u_profile_id=M3U_PROFILE,
+            input_profile_id=INPUT_PROFILE, client_id=CLIENT,
+            client_worker_id=TASK_WORKER, connected_at="100.5",
+            return_seconds=30, minimum_switch_seconds=60, last_switch_at=95.0,
+            last_viewer_left_at=None, return_deadline=None,
+        )
+        class Redis:
+            kind = "none"
+            values = {}
+
+            def type(self, _key):
+                return self.kind
+
+            def hgetall(self, _key):
+                return dict(self.values)
+
+        redis = Redis()
+        self.assertEqual(
+            "absent", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
+        )
+        redis.kind = "string"
+        self.assertEqual(
+            "unknown", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
+        )
+        redis.kind = "hash"
+        redis.values = {"channel_uuid": CHANNEL}
+        self.assertEqual(
+            "unknown", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
+        )
+        raw_grant = asdict(grant)
+        raw_grant["last_viewer_left_at"] = ""
+        raw_grant["return_deadline"] = ""
+        values = {name: str(value) for name, value in raw_grant.items()}
+        values["lease_digest"] = hashlib.sha256(lease_value.encode()).hexdigest()
+        redis.values = values
+        exact = observe_native_episode_for_authority_drain(redis, CHANNEL)
+        self.assertEqual("exact", exact.state)
+        self.assertEqual(grant.episode_id, exact.value.episode_id)
+        redis.values = {**values, "phase": "closing"}
+        self.assertEqual(
+            "known_revoked", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
+        )
+        redis.values = {**values, "phase": "active", "lease_digest": "0" * 64}
+        self.assertEqual(
+            "unknown", observe_native_episode_for_authority_drain(redis, CHANNEL).state,
+        )
+
     def test_type_facade_matches_redis_py_value_shape(self):
         cli = RedisCli("synthetic-test-container")
         with patch(

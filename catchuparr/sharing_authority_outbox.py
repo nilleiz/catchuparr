@@ -57,6 +57,22 @@ class SharingAuthorityDrain:
     pending_event_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SharingAuthorityPriorObservation:
+    """Typed distinction between absent, revoked, exact, and unsafe prior state."""
+
+    state: str
+    value: Any = None
+
+    def __post_init__(self) -> None:
+        if self.state not in {"absent", "known_revoked", "exact", "unknown"}:
+            raise ValueError("prior observation state is invalid")
+        if self.state == "exact" and self.value is None:
+            raise ValueError("exact prior observation requires a value")
+        if self.state != "exact" and self.value is not None:
+            raise ValueError("only an exact prior observation may carry a value")
+
+
 class SharingAuthorityOutbox:
     """SQLite source of revisions and pending Redis CAS publications."""
 
@@ -289,18 +305,52 @@ class SharingAuthorityOutbox:
                 observed, stored = record
                 if not observed:
                     prior = read_prior(redis, event.channel_uuid)
-                    encoded = (
-                        encode_prior(prior)
-                        if prior is not None and encode_prior is not None
-                        else prior
-                    )
+                    prior_state = "exact"
+                    if isinstance(prior, SharingAuthorityPriorObservation):
+                        prior_state = prior.state
+                        if prior_state == "unknown":
+                            pending.append(event.event_id)
+                            continue
+                        prior = prior.value if prior_state == "exact" else None
+                        encoded = (
+                            encode_prior(prior)
+                            if prior_state == "exact" and encode_prior is not None
+                            else prior
+                        )
+                        encoded = {
+                            "__sharing_authority_prior__": prior_state,
+                            "value": encoded,
+                        }
+                    else:
+                        encoded = (
+                            encode_prior(prior)
+                            if prior is not None and encode_prior is not None
+                            else prior
+                        )
                     stored = self._json_dump(self._json_safe(encoded))
                     if not self._store_prior(event, stored):
                         pending.append(event.event_id)
                         continue
-                prior = None if stored is None else self._json_load(stored)
-                if prior is not None and decode_prior is not None:
-                    prior = decode_prior(prior)
+                    stored_state = prior_state
+                else:
+                    stored_state = None
+                stored_value = None if stored is None else self._json_load(stored)
+                if (isinstance(stored_value, dict)
+                        and set(stored_value) == {"__sharing_authority_prior__", "value"}):
+                    stored_state = stored_value["__sharing_authority_prior__"]
+                    prior = stored_value["value"]
+                    if (stored_state not in {"absent", "known_revoked", "exact"}
+                            or (stored_state == "exact") != (prior is not None)):
+                        pending.append(event.event_id)
+                        continue
+                    if stored_state == "exact" and prior is not None and decode_prior is not None:
+                        prior = decode_prior(prior)
+                    elif stored_state != "exact":
+                        prior = None
+                else:
+                    prior = stored_value
+                    if prior is not None and decode_prior is not None:
+                        prior = decode_prior(prior)
                 published = publish(redis, event)
                 if published is not True:
                     # A lost Lua reply is accepted only when the exact target
@@ -308,7 +358,8 @@ class SharingAuthorityOutbox:
                     if not self._target_is_current(redis, event):
                         pending.append(event.event_id)
                         continue
-                if prior is not None and invalidate(redis, prior, event) is not True:
+                if ((stored_state in {None, "exact"} and prior is not None)
+                        and invalidate(redis, prior, event) is not True):
                     pending.append(event.event_id)
                     continue
                 self._acknowledge(event)

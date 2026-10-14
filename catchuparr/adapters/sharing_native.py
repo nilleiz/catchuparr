@@ -782,6 +782,56 @@ def read_native_episode_grant(redis: Any, channel_uuid: str) -> NativeEpisodeGra
         return None
 
 
+def observe_native_episode_for_authority_drain(redis: Any, channel_uuid: str):
+    """Distinguish truly absent, exact live, already revoked, and malformed state."""
+    from ..sharing_authority_outbox import SharingAuthorityPriorObservation
+
+    if not isinstance(channel_uuid, str) or not channel_uuid:
+        return SharingAuthorityPriorObservation("unknown")
+    key = episode_projection_key(channel_uuid)
+    try:
+        key_type = _text(redis.type(key))
+        if key_type == "none":
+            return SharingAuthorityPriorObservation("absent")
+        if key_type != "hash":
+            return SharingAuthorityPriorObservation("unknown")
+        raw = redis.hgetall(key) or {}
+        values = {_text(name): _text(value) for name, value in raw.items()}
+        if not values or values.get("channel_uuid") != channel_uuid:
+            return SharingAuthorityPriorObservation("unknown")
+        phase = values.get("phase")
+        if phase in {"active", "wait_return"}:
+            grant = read_native_episode_grant(redis, channel_uuid)
+            if (grant is None or grant.phase != phase
+                    or grant.episode_id != values.get("episode_id")
+                    or grant.lease_value != values.get("lease_value")):
+                return SharingAuthorityPriorObservation("unknown")
+            return SharingAuthorityPriorObservation("exact", grant)
+        if phase in {"closing", "closed"}:
+            required = (
+                "episode_id", "configuration_generation", "catalog_generation",
+                "worker_id", "owner_lock_value", "metadata_owner", "stream_id",
+                "account_id", "m3u_profile_id", "input_profile_id", "client_id",
+                "client_worker_id", "connected_at", "lease_value", "lease_digest",
+            )
+            if any(not values.get(name) for name in required):
+                return SharingAuthorityPriorObservation("unknown")
+            if (not re.fullmatch(r"[0-9a-f]{64}", values["lease_digest"])
+                    or hashlib.sha256(values["lease_value"].encode("utf-8")).hexdigest()
+                    != values["lease_digest"]):
+                return SharingAuthorityPriorObservation("unknown")
+            for name in ("control_generation", "recorder_fence", "intent_epoch", "version"):
+                value = values.get(name, "")
+                if not value.isdecimal():
+                    return SharingAuthorityPriorObservation("unknown")
+            if int(values["version"]) < 2:
+                return SharingAuthorityPriorObservation("unknown")
+            return SharingAuthorityPriorObservation("known_revoked")
+    except Exception:
+        return SharingAuthorityPriorObservation("unknown")
+    return SharingAuthorityPriorObservation("unknown")
+
+
 def publish_current_authority(redis: Any, channel_uuid: str, *, configuration_generation: str,
                               control_generation: int, catalog_generation: str,
                               expected_revision: int, authority_revision: int) -> bool:
@@ -802,7 +852,8 @@ def publish_current_authority(redis: Any, channel_uuid: str, *, configuration_ge
 
 _INVALIDATE_NATIVE_EPISODE_LUA = """
 if redis.call('TYPE', KEYS[1]).ok ~= 'hash'
-   or redis.call('TYPE', KEYS[2]).ok ~= 'hash' then return 0 end
+   or redis.call('TYPE', KEYS[2]).ok ~= 'hash'
+   or redis.call('TYPE', KEYS[3]).ok ~= 'string' then return 0 end
 local version = tonumber(ARGV[9])
 if not version or version < 2 or version > 9007199254740990
    or version % 1 ~= 0 or redis.call('TTL', KEYS[2]) <= 0 then return 0 end
@@ -827,6 +878,9 @@ if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[2], 'owner_lock_value') ~= ARGV[21]
    or redis.call('HGET', KEYS[2], 'metadata_owner') ~= ARGV[22]
    or redis.call('HGET', KEYS[2], 'client_worker_id') ~= ARGV[23]
+   or redis.call('HGET', KEYS[2], 'lease_digest') ~= ARGV[20]
+   or redis.call('HGET', KEYS[2], 'lease_value') ~= redis.call('GET', KEYS[3])
+   or redis.call('TTL', KEYS[3]) <= 0
    or (ARGV[10] ~= 'active' and ARGV[10] ~= 'wait_return') then return 0 end
 local current_version = tonumber(redis.call('HGET', KEYS[2], 'version') or '')
 local current_phase = redis.call('HGET', KEYS[2], 'phase')

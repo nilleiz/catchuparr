@@ -828,9 +828,10 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
         from .adapters.sharing_native import (
             NativeEpisodeInvalidation,
             invalidate_native_episode,
+            observe_native_episode_for_authority_drain,
             publish_current_authority,
-            read_native_episode_grant,
         )
+        from .sharing_authority_outbox import SharingAuthorityPriorObservation
 
         redis = RedisClient.get_client()
         if redis is None:
@@ -857,10 +858,16 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
                 authority_revision=event.authority_revision,
             )
 
+        def read_prior(client, channel_uuid):
+            observation = observe_native_episode_for_authority_drain(client, channel_uuid)
+            if not isinstance(observation, SharingAuthorityPriorObservation):
+                return SharingAuthorityPriorObservation("unknown")
+            return observation
+
         result = outbox.drain(
             redis,
             activation_id=activation_id,
-            read_prior=read_native_episode_grant,
+            read_prior=read_prior,
             publish=publish,
             invalidate=invalidate,
             encode_prior=NativeEpisodeInvalidation.from_grant,
