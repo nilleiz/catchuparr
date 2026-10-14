@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -166,6 +167,68 @@ class NativeEpisodeGrant:
                 and self.last_viewer_left_at is not None
                 and self.return_deadline < self.last_viewer_left_at):
             raise ValueError("return deadline cannot precede viewer departure")
+
+
+@dataclass(frozen=True)
+class NativeEpisodeInvalidation:
+    """Persistable exact revocation identity without the raw recorder lease."""
+
+    channel_uuid: str
+    episode_id: str
+    phase: str
+    configuration_generation: str
+    control_generation: int
+    catalog_generation: str
+    recorder_fence: int
+    intent_epoch: int
+    version: int
+    lease_digest: str
+    worker_id: str
+    owner_lock_value: str
+    metadata_owner: str
+    stream_id: str
+    account_id: str
+    m3u_profile_id: str
+    input_profile_id: str
+    client_id: str
+    client_worker_id: str
+    connected_at: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "channel_uuid", "episode_id", "configuration_generation", "catalog_generation",
+            "worker_id", "owner_lock_value", "metadata_owner", "stream_id", "account_id",
+            "m3u_profile_id", "input_profile_id", "client_id", "client_worker_id", "connected_at",
+        ):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"{name} must be a non-empty string")
+        if self.phase not in {"active", "wait_return"}:
+            raise ValueError("only an active prior episode may be invalidated")
+        for name in ("control_generation", "recorder_fence", "intent_epoch"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if type(self.version) is not int or self.version < 2:
+            raise ValueError("version must be an active projection version")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.lease_digest):
+            raise ValueError("lease_digest must be a SHA-256 hex digest")
+
+    @classmethod
+    def from_grant(cls, grant: NativeEpisodeGrant) -> "NativeEpisodeInvalidation":
+        if not isinstance(grant, NativeEpisodeGrant):
+            raise ValueError("native episode grant is required")
+        return cls(
+            channel_uuid=grant.channel_uuid, episode_id=grant.episode_id, phase=grant.phase,
+            configuration_generation=grant.configuration_generation,
+            control_generation=grant.control_generation, catalog_generation=grant.catalog_generation,
+            recorder_fence=grant.recorder_fence, intent_epoch=grant.intent_epoch,
+            version=grant.version,
+            lease_digest=hashlib.sha256(grant.lease_value.encode("utf-8")).hexdigest(),
+            worker_id=grant.worker_id, owner_lock_value=grant.owner_lock_value,
+            metadata_owner=grant.metadata_owner, stream_id=grant.stream_id,
+            account_id=grant.account_id, m3u_profile_id=grant.m3u_profile_id,
+            input_profile_id=grant.input_profile_id, client_id=grant.client_id,
+            client_worker_id=grant.client_worker_id, connected_at=grant.connected_at,
+        )
 
 
 def _private_client(redis: Any, channel_uuid: str, client_id: str) -> bool | None:
@@ -748,8 +811,6 @@ if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[3]
    or redis.call('HGET', KEYS[1], 'authority_revision') ~= ARGV[4]
    or redis.call('HGET', KEYS[2], 'episode_id') ~= ARGV[5]
-   or redis.call('HGET', KEYS[2], 'version') ~= ARGV[9]
-   or redis.call('HGET', KEYS[2], 'phase') ~= ARGV[10]
    or redis.call('HGET', KEYS[2], 'configuration_generation') ~= ARGV[11]
    or redis.call('HGET', KEYS[2], 'control_generation') ~= ARGV[12]
    or redis.call('HGET', KEYS[2], 'catalog_generation') ~= ARGV[13]
@@ -766,19 +827,31 @@ if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[2], 'owner_lock_value') ~= ARGV[21]
    or redis.call('HGET', KEYS[2], 'metadata_owner') ~= ARGV[22]
    or redis.call('HGET', KEYS[2], 'client_worker_id') ~= ARGV[23]
-   or redis.call('HGET', KEYS[2], 'lease_value') ~= ARGV[24]
    or (ARGV[10] ~= 'active' and ARGV[10] ~= 'wait_return') then return 0 end
+local current_version = tonumber(redis.call('HGET', KEYS[2], 'version') or '')
+local current_phase = redis.call('HGET', KEYS[2], 'phase')
+if not current_version or current_version % 1 ~= 0 then return 0 end
+-- A previous invalidation may have committed while its reply was lost. Accept
+-- only the exact one-step closing transition for this stored prior snapshot.
+if current_phase == 'closing' and current_version == version + 1 then return 1 end
+if current_version ~= version or current_phase ~= ARGV[10] then return 0 end
+if current_phase ~= 'active' and current_phase ~= 'wait_return' then return 0 end
+if redis.call('TTL', KEYS[2]) <= 0 or redis.call('TTL', KEYS[3]) <= 0
+   or redis.call('TYPE', KEYS[3]).ok ~= 'string'
+   or redis.call('GET', KEYS[3]) ~= redis.call('HGET', KEYS[2], 'lease_value') then return 0 end
 redis.call('HSET', KEYS[2], 'phase', 'closing', 'viewer_left_at', '',
   'return_deadline', '', 'version', tostring(version + 1))
 return 1
 """
 
 
-def invalidate_native_episode(redis: Any, grant: NativeEpisodeGrant, *,
+def invalidate_native_episode(redis: Any, grant: NativeEpisodeGrant | NativeEpisodeInvalidation, *,
                               configuration_generation: str, control_generation: int,
                               catalog_generation: str, authority_revision: int) -> bool:
     """Fence one exact old borrowed episode after a durable authority change."""
-    if (not isinstance(grant, NativeEpisodeGrant)
+    if isinstance(grant, NativeEpisodeGrant):
+        grant = NativeEpisodeInvalidation.from_grant(grant)
+    if (not isinstance(grant, NativeEpisodeInvalidation)
             or not isinstance(configuration_generation, str) or not configuration_generation
             or type(control_generation) is not int or control_generation < 0
             or not isinstance(catalog_generation, str) or not catalog_generation
@@ -787,6 +860,7 @@ def invalidate_native_episode(redis: Any, grant: NativeEpisodeGrant, *,
     channel = grant.channel_uuid
     keys = (
         f"catchuparr:sharing:current:{channel}", episode_projection_key(channel),
+        f"catchuparr:recorder:{channel}",
     )
     result = redis.eval(
         _INVALIDATE_NATIVE_EPISODE_LUA, len(keys), *keys,
@@ -796,9 +870,8 @@ def invalidate_native_episode(redis: Any, grant: NativeEpisodeGrant, *,
         grant.configuration_generation, str(grant.control_generation),
         grant.catalog_generation, str(grant.recorder_fence), str(grant.intent_epoch),
         grant.stream_id, grant.account_id, grant.m3u_profile_id, grant.input_profile_id,
-        hashlib.sha256(grant.lease_value.encode("utf-8")).hexdigest(),
+        grant.lease_digest,
         grant.owner_lock_value, grant.metadata_owner, grant.client_worker_id,
-        grant.lease_value,
     )
     return type(result) is int and result == 1
 

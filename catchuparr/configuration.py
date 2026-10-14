@@ -478,6 +478,10 @@ class _PreparedActivation:
             self.activation_outcome_unknown_warning = True
             self.recording_paused_warning = True
             return
+        if not _commit_sharing_authority_activation(self.active_path, self.activation_id):
+            self.activation_pending_warning = True
+            self.recording_paused_warning = True
+            return
         if not _drain_sharing_authority_outbox(self.active_path, self.activation_id):
             # Keep both the activation journal and deny marker until every
             # Redis authority CAS and prior-episode invalidation is confirmed.
@@ -532,6 +536,17 @@ class _PreparedActivation:
         restored = active_restored and control_restored
         if restored:
             try:
+                outbox_path = self.active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME)
+                if outbox_path.exists():
+                    from .sharing_authority_outbox import SharingAuthorityOutbox
+
+                    outbox = SharingAuthorityOutbox(outbox_path)
+                    if not outbox.cancel_activation(self.activation_id):
+                        restored = False
+            except Exception:
+                restored = False
+        if restored:
+            try:
                 _restore_control_deny_marker(self.sidecar, self.marker_was_present)
             except Exception:
                 restored = False
@@ -539,16 +554,6 @@ class _PreparedActivation:
             try:
                 _remove_activation_state_locked(self.active_path)
                 _remove_activation_backup_locked(self.active_path)
-            except Exception:
-                restored = False
-        if restored:
-            try:
-                outbox_path = self.active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME)
-                if outbox_path.exists():
-                    from .sharing_authority_outbox import SharingAuthorityOutbox
-
-                    outbox = SharingAuthorityOutbox(outbox_path)
-                    outbox.cancel_activation(self.activation_id)
             except Exception:
                 restored = False
         self.finished = restored
@@ -623,6 +628,16 @@ def _sharing_authority_outbox(path: Path):
     from .sharing_authority_outbox import SharingAuthorityOutbox
 
     return SharingAuthorityOutbox(path.with_name(SHARING_AUTHORITY_OUTBOX_NAME))
+
+
+def _commit_sharing_authority_activation(path: Path, activation_id: str) -> bool:
+    outbox_path = path.with_name(SHARING_AUTHORITY_OUTBOX_NAME)
+    if not outbox_path.exists():
+        return True
+    try:
+        return _sharing_authority_outbox(path).commit_activation(activation_id)
+    except Exception:
+        return False
 
 
 def _stage_sharing_authority_activation(
@@ -753,7 +768,11 @@ def _reconcile_control_authority_outbox(path: Path, active: dict[str, Any] | Non
             ):
                 # Control publication follows the sidecar replace, so a staged
                 # event that does not match disk never reached Redis.
-                outbox.cancel_event(event.event_id)
+                if not outbox.cancel_event(event.event_id):
+                    ok = False
+                continue
+            if not outbox.commit_activation(event.activation_id):
+                ok = False
                 continue
             if not _drain_sharing_authority_outbox(path, event.activation_id):
                 ok = False
@@ -779,6 +798,8 @@ def _reconcile_control_authority_outbox(path: Path, active: dict[str, Any] | Non
         if needs_stage:
             activation_id = f"control-recovery-{uuid.uuid4().hex}"
             outbox.stage(activation_id, targets)
+            if not outbox.commit_activation(activation_id):
+                return False
             if not _drain_sharing_authority_outbox(path, activation_id):
                 return False
         return all(
@@ -805,7 +826,7 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
         from core.utils import RedisClient
 
         from .adapters.sharing_native import (
-            NativeEpisodeGrant,
+            NativeEpisodeInvalidation,
             invalidate_native_episode,
             publish_current_authority,
             read_native_episode_grant,
@@ -827,7 +848,7 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
 
         def invalidate(client, prior, event):
             if isinstance(prior, dict):
-                prior = NativeEpisodeGrant(**prior)
+                prior = NativeEpisodeInvalidation(**prior)
             return invalidate_native_episode(
                 client, prior,
                 configuration_generation=event.configuration_generation,
@@ -842,8 +863,8 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
             read_prior=read_native_episode_grant,
             publish=publish,
             invalidate=invalidate,
-            encode_prior=lambda prior: prior,
-            decode_prior=lambda prior: NativeEpisodeGrant(**prior),
+            encode_prior=NativeEpisodeInvalidation.from_grant,
+            decode_prior=lambda prior: NativeEpisodeInvalidation(**prior),
         )
         return not result.pending_event_ids
     except Exception:
@@ -1187,6 +1208,8 @@ def _recover_interrupted_activation_locked(path: Path) -> None:
             _confirm_committed_bundle_durability(path)
         except OSError:
             raise ValueError("Committed configuration durability could not be confirmed") from None
+        if not _commit_sharing_authority_activation(path, activation_id):
+            raise ValueError("Committed sharing authority activation could not be authorized")
         if not _drain_sharing_authority_outbox(path, activation_id):
             raise ValueError(
                 "Committed sharing authority publication is pending; recorder admission remains denied"
@@ -1212,7 +1235,8 @@ def _recover_interrupted_activation_locked(path: Path) -> None:
             if outbox_path.exists():
                 from .sharing_authority_outbox import SharingAuthorityOutbox
 
-                SharingAuthorityOutbox(outbox_path).cancel_activation(activation_id)
+                if not SharingAuthorityOutbox(outbox_path).cancel_activation(activation_id):
+                    raise ValueError("activation has an in-flight authority publication")
         except Exception:
             raise ValueError("Interrupted sharing authority activation could not be cancelled") from None
     if not committed_candidate_valid and uncertain_id is not None:

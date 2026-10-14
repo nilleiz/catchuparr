@@ -2,6 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from catchuparr.adapters.sharing_native import (
+    NativeEpisodeGrant,
+    NativeEpisodeInvalidation,
+)
 from catchuparr.sharing_authority_outbox import (
     SharingAuthorityOutbox,
     SharingAuthorityTarget,
@@ -52,6 +56,7 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         return True
 
     def drain(self, **kwargs):
+        self.outbox.commit_activation(kwargs.get("activation_id", "activation-outbox-synthetic"))
         return self.outbox.drain(
             self.redis,
             read_prior=kwargs.get("read_prior", lambda _redis, _channel: None),
@@ -150,15 +155,76 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         self.assertEqual([False], cancel_results)
         self.assertEqual((event.event_id,), result.completed_event_ids)
         self.assertEqual("complete", self.outbox.latest_for_channel(self.target.channel_uuid).status)
+        self.assertFalse(self.outbox.cancel_activation(event.activation_id))
 
     def test_latest_channel_event_uses_revision_when_wall_clock_moves_back(self):
         first = self.stage("first-clock-event")
-        self.assertEqual((first.event_id,), self.drain().completed_event_ids)
+        self.assertEqual(
+            (first.event_id,),
+            self.drain(activation_id="first-clock-event").completed_event_ids,
+        )
         self.now[0] = 90.0
         second = self.outbox.stage("second-clock-event", (self.target,))[0]
         latest = self.outbox.latest_for_channel(self.target.channel_uuid)
         self.assertEqual(second, latest.event)
         self.assertEqual(2, latest.event.authority_revision)
+
+    def test_uncommitted_event_cannot_publish_and_can_be_cancelled(self):
+        event = self.stage()
+        result = self.outbox.drain(
+            self.redis, read_prior=lambda *_args: None,
+            publish=self.publish, invalidate=lambda *_args: True,
+        )
+        self.assertEqual((), result.completed_event_ids)
+        self.assertEqual((event.event_id,), result.pending_event_ids)
+        self.assertEqual({}, self.redis.hashes)
+        self.assertTrue(self.outbox.cancel_activation(event.activation_id))
+        self.assertEqual((), self.outbox.pending())
+
+    def test_native_prior_snapshot_is_durable_without_raw_lease_and_retryable(self):
+        event = self.stage()
+        grant = NativeEpisodeGrant(
+            channel_uuid=self.target.channel_uuid, episode_id="episode-outbox-synthetic",
+            phase="active", configuration_generation="old-config-synthetic",
+            control_generation=3, catalog_generation="old-catalog-synthetic",
+            recorder_fence=12, intent_epoch=8, version=2,
+            lease_value="synthetic-secret-lease-value", worker_id="worker-outbox-synthetic",
+            owner_lock_value="owner-outbox-synthetic", metadata_owner="owner-outbox-synthetic",
+            stream_id="stream-outbox-synthetic", account_id="account-outbox-synthetic",
+            m3u_profile_id="m3u-outbox-synthetic", input_profile_id="input-outbox-synthetic",
+            client_id="catchuparr-client-outbox-synthetic", client_worker_id="worker-outbox-synthetic",
+            connected_at="12.5", return_seconds=30, minimum_switch_seconds=60,
+            last_switch_at=10.0, last_viewer_left_at=None, return_deadline=None,
+        )
+        self.outbox.commit_activation(event.activation_id)
+        calls = []
+        first = self.outbox.drain(
+            self.redis, read_prior=lambda *_args: grant,
+            publish=self.publish,
+            invalidate=lambda _redis, prior, _event: calls.append(prior) or False,
+            encode_prior=NativeEpisodeInvalidation.from_grant,
+            decode_prior=lambda value: NativeEpisodeInvalidation(**value),
+        )
+        self.assertEqual((event.event_id,), first.pending_event_ids)
+        with self.outbox._db() as db:
+            stored = db.execute(
+                "SELECT prior_json,prior_observed FROM sharing_authority_outbox WHERE event_id=?",
+                (event.event_id,),
+            ).fetchone()
+        self.assertEqual(1, stored["prior_observed"])
+        self.assertNotIn("synthetic-secret-lease-value", stored["prior_json"])
+        self.assertNotIn("lease_value", stored["prior_json"])
+        retry = self.outbox.drain(
+            self.redis,
+            read_prior=lambda *_args: self.fail("stored prior episode must be reused"),
+            publish=self.publish,
+            invalidate=lambda _redis, prior, _event: calls.append(prior) or True,
+            encode_prior=NativeEpisodeInvalidation.from_grant,
+            decode_prior=lambda value: NativeEpisodeInvalidation(**value),
+        )
+        self.assertEqual((event.event_id,), retry.completed_event_ids)
+        self.assertEqual(2, len(calls))
+        self.assertTrue(all(isinstance(call, NativeEpisodeInvalidation) for call in calls))
 
 
 if __name__ == "__main__":

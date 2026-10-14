@@ -481,7 +481,8 @@ class NativeLuaRedisTests(unittest.TestCase):
         ))
         self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closing")
         self.assertEqual(self.redis.hget(_keys()["episode"], "version"), str(grant.version + 1))
-        self.assertFalse(invalidate_native_episode(
+        # A lost response after the exact closing CAS is safely idempotent.
+        self.assertTrue(invalidate_native_episode(
             self.redis, grant, configuration_generation="config-next",
             control_generation=8, catalog_generation="catalog-next",
             authority_revision=2,
