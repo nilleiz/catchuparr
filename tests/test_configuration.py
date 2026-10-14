@@ -386,6 +386,27 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertNotEqual(original_control.generation, updated_control.generation)
 
+    def test_pause_authority_staging_does_not_require_provider_catalog(self):
+        from types import SimpleNamespace
+
+        active = {"connection_sharing": {CHANNEL_A: {"enabled": True}}}
+        control = SimpleNamespace(paused=True, generation=9)
+        with (
+            patch.object(configuration, "_load_active_configuration_locked", return_value=active),
+            patch.object(configuration, "active_configuration_generation", return_value="config-stop-synthetic"),
+            patch.object(configuration, "_sharing_catalog_generation", side_effect=AssertionError("catalog unavailable")),
+        ):
+            self.assertTrue(configuration._stage_sharing_authority_control(
+                self.active_path, "control-stop-no-catalog", control,
+            ))
+        outbox = SharingAuthorityOutbox(
+            self.active_path.with_name(configuration.SHARING_AUTHORITY_OUTBOX_NAME)
+        )
+        event = outbox.pending("control-stop-no-catalog")[0]
+        self.assertEqual("config-stop-synthetic", event.configuration_generation)
+        self.assertEqual(9, event.control_generation)
+        self.assertNotEqual("", event.catalog_generation)
+
     def test_committed_sharing_apply_keeps_admission_denied_until_outbox_recovery(self):
         settings = dict(
             self.settings,

@@ -696,6 +696,18 @@ def _stage_sharing_authority_control(
     from .sharing_authority_outbox import SharingAuthorityTarget
 
     config_generation = active_configuration_generation(active)
+    if control.paused:
+        # A control Stop is a retirement target. It must remain available even
+        # when provider catalog inspection is currently unavailable.
+        catalog_generation = _paused_sharing_catalog_generation(
+            config_generation, control.generation,
+        )
+        targets = [
+            SharingAuthorityTarget(channel, config_generation, control.generation, catalog_generation)
+            for channel in enabled
+        ]
+        _sharing_authority_outbox(path).stage(activation_id, targets)
+        return True
     targets = [
         SharingAuthorityTarget(
             channel, config_generation, control.generation,
@@ -705,6 +717,13 @@ def _stage_sharing_authority_control(
     ]
     _sharing_authority_outbox(path).stage(activation_id, targets)
     return True
+
+
+def _paused_sharing_catalog_generation(config_generation: str, control_generation: int) -> str:
+    retired = json.dumps(
+        ["paused-sharing", config_generation, control_generation], separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(retired).hexdigest()
 
 
 def _reconcile_control_authority_outbox(path: Path, active: dict[str, Any] | None, control: Any) -> bool:
@@ -744,7 +763,8 @@ def _reconcile_control_authority_outbox(path: Path, active: dict[str, Any] | Non
         for channel in enabled:
             targets.append(SharingAuthorityTarget(
                 channel, config_generation, control.generation,
-                _sharing_catalog_generation(channel),
+                _paused_sharing_catalog_generation(config_generation, control.generation)
+                if control.paused else _sharing_catalog_generation(channel),
             ))
         needs_stage = False
         for target in targets:
@@ -785,6 +805,7 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
         from core.utils import RedisClient
 
         from .adapters.sharing_native import (
+            NativeEpisodeGrant,
             invalidate_native_episode,
             publish_current_authority,
             read_native_episode_grant,
@@ -805,6 +826,8 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
             )
 
         def invalidate(client, prior, event):
+            if isinstance(prior, dict):
+                prior = NativeEpisodeGrant(**prior)
             return invalidate_native_episode(
                 client, prior,
                 configuration_generation=event.configuration_generation,
@@ -819,6 +842,8 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
             read_prior=read_native_episode_grant,
             publish=publish,
             invalidate=invalidate,
+            encode_prior=lambda prior: prior,
+            decode_prior=lambda prior: NativeEpisodeGrant(**prior),
         )
         return not result.pending_event_ids
     except Exception:
