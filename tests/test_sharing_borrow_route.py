@@ -1,6 +1,8 @@
+import tempfile
 import unittest
 from dataclasses import replace
 from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,7 +25,13 @@ from catchuparr.adapters.sharing_reader import (
     BorrowReaderUnavailable,
     validate_borrow_read_proof,
 )
-from catchuparr.sharing_episode import BorrowEpisodeRejected, BorrowEpisodeSnapshot
+from catchuparr.sharing_episode import (
+    BorrowEpisodeLedger,
+    BorrowEpisodeRejected,
+    BorrowEpisodeSnapshot,
+)
+from catchuparr.sharing_persistence import SharingIntentToken
+from catchuparr.sharing_planner import SharingAction
 
 SECRET = b"synthetic-route-secret-060-with-at-least-32-bytes"
 IDENTITY = (
@@ -59,6 +67,21 @@ def capability():
 
 
 class SharingBorrowRouteTests(unittest.TestCase):
+    def test_invalid_signature_is_rejected_before_backend_or_state_reads(self):
+        from catchuparr import sharing_runtime
+
+        invalid = replace(capability(), signature="0" * 64)
+        with (
+            patch.object(sharing_runtime, "_django_secret", return_value=SECRET),
+            patch.object(
+                sharing_runtime, "retry_pending_open_cleanups",
+                side_effect=AssertionError("backend or recovery access happened before signature validation"),
+            ) as retry,
+            self.assertRaises(BorrowEpisodeRejected),
+        ):
+            sharing_runtime.open_borrow_session(invalid)
+        retry.assert_not_called()
+
     def test_capability_url_codec_roundtrips_and_rejects_modified_or_ambiguous_fields(self):
         original = capability()
         encoded = encode_borrow_capability(original)
@@ -224,7 +247,30 @@ class SharingBorrowRouteTests(unittest.TestCase):
             redis_backend_signature="backend-route-synthetic", connected_at="123.5",
             projection_version=2, user_agent="Synthetic Player", client_ip="192.0.2.60",
         )
-        ledger = SimpleNamespace(activate=lambda *_args, **_kwargs: active)
+        class Ledger:
+            def __init__(self):
+                self.current = opening
+
+            def activate(self, *_args, **_kwargs):
+                self.current = active
+                return active
+
+            def read(self, channel_uuid):
+                if channel_uuid != IDENTITY[0]:
+                    raise BorrowEpisodeRejected("wrong synthetic channel")
+                return self.current
+
+            def revoke(self, episode_id, *, expected_version, cleanup_acknowledged=False, **_kwargs):
+                if episode_id != self.current.episode_id or expected_version != self.current.version:
+                    raise BorrowEpisodeRejected("stale synthetic ledger transition")
+                phase = "closed" if cleanup_acknowledged else "cleanup_pending"
+                self.current = replace(
+                    self.current, phase=phase, version=expected_version + 1,
+                    return_deadline=None,
+                )
+                return self.current
+
+        ledger = Ledger()
         calls = []
         mocks = (
             patch("catchuparr.adapters.sharing_borrow_route.redis_backend_signature",
@@ -353,8 +399,10 @@ class SharingBorrowRouteTests(unittest.TestCase):
                 )
             self.assertIsNotNone(raised.exception.ack)
             self.assertEqual(manager.stopped, 0)
+            self.assertEqual(ledger.current.phase, "cleanup_pending")
             self.assertTrue(raised.exception.retry_cleanup())
             self.assertEqual(manager.stopped, 1)
+            self.assertEqual(ledger.current.phase, "closed")
             self.assertTrue(raised.exception.retry_cleanup())
             self.assertEqual(manager.stopped, 1)
 
@@ -380,6 +428,71 @@ class SharingBorrowRouteTests(unittest.TestCase):
         self.assertIsNone(raised.exception.ack)
         self.assertFalse(raised.exception.retry_cleanup())
         self.assertEqual(manager.stopped, 0)
+        self.assertEqual(ledger.current.phase, "cleanup_pending")
+
+    def test_failed_open_persists_cleanup_pending_in_episode_ledger(self):
+        identity = IDENTITY
+        token = SharingIntentToken(
+            channel_uuid=identity[0], revision=1, intent_epoch=7,
+            action=SharingAction.ATTACH_BORROW,
+            configuration_generation="config-route-synthetic", control_generation=3,
+            recorder_fence=9, target_identity=identity, target_admitted=True,
+            not_before=100.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = BorrowEpisodeLedger(Path(directory) / "episode.sqlite3", clock=lambda: 123.0)
+            opening = ledger.begin_open(
+                token, lease_digest=sha256(b"synthetic-route-lease").hexdigest(),
+                identity=identity, client_id="catchuparr-client-route-synthetic",
+            )
+            signed_opening = sign_borrow_capability(
+                secret=SECRET, channel_uuid=identity[0], episode_id=opening.episode_id,
+                user_id="user-route-synthetic",
+                configuration_generation=opening.configuration_generation,
+                catalog_generation="catalog-route-synthetic",
+                control_generation=opening.control_generation,
+                recorder_fence=opening.recorder_fence, intent_epoch=opening.intent_epoch,
+                connection_identity=opening.identity, episode_version=opening.version,
+                expires_at=200.0, nonce="nonce-route-synthetic",
+            )
+            manager = FakeManager()
+            manager.worker_id = IDENTITY[1]
+            manager.redis_client = object()
+            ack = NativeClientRegistrationAck(
+                channel_uuid=IDENTITY[0], episode_id=opening.episode_id,
+                client_id="catchuparr-client-route-synthetic", local_worker_id=IDENTITY[1],
+                redis_backend_signature="backend-route-synthetic", connected_at="123.5",
+                projection_version=2, user_agent="Synthetic Player", client_ip="192.0.2.60",
+            )
+            with (
+                patch("catchuparr.adapters.sharing_borrow_route.redis_backend_signature", return_value="backend-route-synthetic"),
+                patch("catchuparr.sharing_episode.select_task_local_client_manager", return_value=(manager, True)),
+                patch("catchuparr.adapters.sharing_borrow_route.consume_opening_capability", return_value=True),
+                patch("catchuparr.adapters.sharing_borrow_route.make_task_local_input_buffer", return_value=object()),
+                patch("catchuparr.adapters.sharing_borrow_route.register_borrowed_client", return_value=ack),
+                patch("catchuparr.adapters.sharing_borrow_route.adopt_registered_client_in_manager", return_value=True),
+                patch("catchuparr.adapters.sharing_borrow_route.cleanup_borrowed_client", return_value=False),
+                patch("catchuparr.adapters.sharing_borrow_route.native_borrow_proof_reader", return_value=lambda: None),
+                patch("catchuparr.adapters.sharing_borrow_route.ReadOnlyTsBufferReader", side_effect=RuntimeError("synthetic reader setup failure")),
+            ):
+                with self.assertRaises(BorrowOpenCleanupPending) as raised:
+                    BorrowedReaderSession.open(
+                        capability=signed_opening, capability_secret=SECRET,
+                        authenticated_user_id="user-route-synthetic", now=199,
+                        episode=opening, lease_value="synthetic-route-lease",
+                        catalog_generation="catalog-route-synthetic",
+                        ordinary_viewer_ids=("viewer-route-synthetic",),
+                        redis_text=object(), redis_binary=object(), existing_manager=None,
+                        manager_type=object, worker_id=IDENTITY[1], buffer_type=object,
+                        assigned_sources=(self._assigned_source(),),
+                        client_id="catchuparr-client-route-synthetic", client_ip="192.0.2.60",
+                        user_agent="Synthetic Player", ledger=ledger,
+                    )
+            self.assertTrue(raised.exception.cleanup_pending_persisted)
+            persisted = ledger.read(IDENTITY[0])
+            self.assertEqual("cleanup_pending", persisted.phase)
+            self.assertEqual("catchuparr-client-route-synthetic", persisted.client_id)
+            self.assertEqual((persisted,), ledger.pending_cleanup())
 
     def test_open_unknown_registration_shared_manager_uses_fenced_absence_retry(self):
         opening, _active, manager, _ack, ledger, _calls, mocks = self._open(owns_manager=False)

@@ -179,7 +179,11 @@ def sharing_borrow_view(request, channel_uuid: str):
         return _no_cache(response)
     try:
         from .adapters.sharing_borrow_route import decode_borrow_capability
-        from .sharing_runtime import open_borrow_session
+        from .sharing_runtime import (
+            BorrowedSessionStream,
+            open_borrow_session,
+            retain_open_cleanup_pending,
+        )
 
         token = getattr(request, "headers", {}).get("X-Catchuparr-Borrow", "")
         signed = decode_borrow_capability(token)
@@ -187,6 +191,20 @@ def sharing_borrow_view(request, channel_uuid: str):
             raise ValueError("borrow route channel mismatch")
         session = open_borrow_session(signed)
     except Exception as exc:
+        from .adapters.sharing_borrow_route import BorrowOpenCleanupPending
+
+        if isinstance(exc, BorrowOpenCleanupPending):
+            # Keep the exact manager/ACK/reconciliation handle reachable until
+            # its durable non-authorizing episode and cleanup are acknowledged.
+            retain_open_cleanup_pending(exc)
+            try:
+                cleanup_complete = exc.retry_cleanup() is True
+            except Exception:
+                cleanup_complete = False
+            if not cleanup_complete and not exc.cleanup_pending_persisted:
+                # Do not discard the only cleanup owner as an ordinary stale
+                # ticket when SQLite could not record the pending operation.
+                return _no_cache(HttpResponse("Unavailable", status=503))
         # Do not log a bearer capability, lease value, client address, or native
         # identity. The caller sees one generic denial for all stale bindings.
         logger.info(
@@ -194,9 +212,14 @@ def sharing_borrow_view(request, channel_uuid: str):
             extra={"reason": type(exc).__name__, "dependency": getattr(exc, "name", "")},
         )
         return _no_cache(HttpResponse("Not found", status=404))
-    return _no_cache(StreamingHttpResponse(
-        session.iter_chunks(), content_type="video/mp2t", status=200,
-    ))
+    stream = BorrowedSessionStream(session)
+    try:
+        return _no_cache(StreamingHttpResponse(
+            stream, content_type="video/mp2t", status=200,
+        ))
+    except Exception:
+        stream.close()
+        raise
 
 
 def _trace_component(value: str) -> str:
