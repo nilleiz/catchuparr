@@ -15,8 +15,13 @@ import time
 import unittest
 from types import SimpleNamespace
 
+from catchuparr.adapters.sharing_borrow_route import (
+    consume_opening_capability,
+    sign_borrow_capability,
+)
 from catchuparr.adapters.sharing_native import (
     check_and_touch_borrowed_client,
+    cleanup_borrowed_client,
     project_opening_episode,
     publish_current_authority,
     read_native_episode_grant,
@@ -37,6 +42,7 @@ TASK_WORKER = "task-worker-synthetic-lua-060"
 CATALOG = "catalog-synthetic-lua-060"
 CONFIG = "config-synthetic-lua-060"
 EPISODE_ID = "episode-synthetic-lua-060"
+CAPABILITY_SECRET = b"synthetic-capability-secret-060-at-least-32-bytes"
 
 
 class Connection:
@@ -206,6 +212,71 @@ class NativeLuaRedisTests(unittest.TestCase):
         )
         return episode, ack
 
+    def _capability(self, episode, *, expires_at=None):
+        identity = (
+            CHANNEL, WORKER, WORKER, WORKER, STREAM, ACCOUNT,
+            M3U_PROFILE, INPUT_PROFILE,
+        )
+        return sign_borrow_capability(
+            secret=CAPABILITY_SECRET, channel_uuid=CHANNEL, episode_id=episode.episode_id,
+            user_id="user-synthetic-lua-060",
+            configuration_generation=episode.configuration_generation,
+            catalog_generation=CATALOG, control_generation=episode.control_generation,
+            recorder_fence=episode.recorder_fence, intent_epoch=episode.intent_epoch,
+            connection_identity=identity, episode_version=episode.version,
+            expires_at=time.time() + 60 if expires_at is None else expires_at,
+            nonce="nonce-synthetic-lua-060",
+        )
+
+    def test_signed_opening_capability_is_current_and_single_use(self):
+        episode = self._opening_projection()
+        capability = self._capability(episode)
+        self.assertTrue(consume_opening_capability(
+            self.redis, capability, episode, catalog_generation=CATALOG, now=time.time(),
+            secret=CAPABILITY_SECRET, user_id="user-synthetic-lua-060",
+        ))
+        self.assertFalse(consume_opening_capability(
+            self.redis, capability, episode, catalog_generation=CATALOG, now=time.time(),
+            secret=CAPABILITY_SECRET, user_id="user-synthetic-lua-060",
+        ))
+
+    def test_signed_opening_capability_rejects_stale_authority_without_nonce_write(self):
+        episode = self._opening_projection()
+        capability = self._capability(episode)
+        self.redis.command("HSET", _keys()["current"], "catalog_generation", "catalog-new-synthetic")
+        self.assertFalse(consume_opening_capability(
+            self.redis, capability, episode, catalog_generation=CATALOG, now=time.time(),
+            secret=CAPABILITY_SECRET, user_id="user-synthetic-lua-060",
+        ))
+        nonce_key = "catchuparr:sharing:consumed:" + CHANNEL + ":" + hashlib.sha256(
+            capability.nonce.encode()
+        ).hexdigest()
+        self.assertFalse(self.redis.exists(nonce_key))
+
+    def test_exact_cleanup_keeps_marker_until_registration_and_handles_replacement(self):
+        episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        keys = _keys()
+        manager = SimpleNamespace(
+            channel_id=CHANNEL, worker_id=TASK_WORKER, redis_client=self.redis,
+            lock=__import__("threading").RLock(), clients={CLIENT},
+            _registered_clients={CLIENT}, last_heartbeat_time={CLIENT: 100.0},
+        )
+        self.redis.command("HSET", keys["client"], "connected_at", "replacement-time-synthetic")
+        self.assertFalse(cleanup_borrowed_client(
+            self.redis, ack, episode_id=episode.episode_id, manager=manager,
+        ))
+        self.assertEqual(self.redis.hget(keys["private"], CLIENT), EPISODE_ID)
+        self.assertIn(CLIENT, self.redis.smembers(keys["clients"]))
+        self.redis.command("HSET", keys["client"], "connected_at", ack.connected_at)
+        self.assertTrue(cleanup_borrowed_client(
+            self.redis, ack, episode_id=episode.episode_id, manager=manager,
+        ))
+        self.assertFalse(self.redis.exists(keys["client"]))
+        self.assertIsNone(self.redis.hget(keys["private"], CLIENT))
+        self.assertNotIn(CLIENT, self.redis.smembers(keys["clients"]))
+        self.assertNotIn(CLIENT, manager.clients)
+
     def test_current_authority_revision_cas_prevents_stale_overwrite(self):
         self._base_authority(revision=4)
         self.assertTrue(publish_current_authority(
@@ -247,6 +318,38 @@ class NativeLuaRedisTests(unittest.TestCase):
         grant = read_native_episode_grant(self.redis, CHANNEL)
         self.assertIsNotNone(grant)
         self.assertEqual(grant.version, episode.version + 1)
+
+    def test_registration_lost_reply_recovers_exact_committed_ack(self):
+        episode = self._opening_projection()
+        self._native_source_and_viewer()
+
+        class LostReplyRedis:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.connection_pool = delegate.connection_pool
+                self.lost = False
+
+            def __getattr__(self, name):
+                return getattr(self.delegate, name)
+
+            def eval(self, *args):
+                result = self.delegate.eval(*args)
+                if not self.lost and result and result[0] == 1:
+                    self.lost = True
+                    raise RuntimeError("synthetic reply lost after Lua commit")
+                return result
+
+        wrapped = LostReplyRedis(self.redis)
+        ack = register_borrowed_client(
+            wrapped, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            client_id=CLIENT, local_worker_id=TASK_WORKER,
+            user_agent="Synthetic Player", client_ip="192.0.2.60",
+            client_record_ttl=60,
+        )
+        self.assertIsNotNone(ack)
+        self.assertEqual(ack.episode_id, episode.episode_id)
+        self.assertEqual(ack.client_id, CLIENT)
+        self.assertEqual(self.redis.hget(_keys()["private"], CLIENT), EPISODE_ID)
 
     def test_registration_rejects_stale_authority_and_has_no_partial_writes(self):
         episode = self._opening_projection()

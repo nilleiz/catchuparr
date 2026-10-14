@@ -341,7 +341,7 @@ class NativeSharingTests(unittest.TestCase):
             channel_uuid=CHANNEL, episode_id="episode-synthetic-7",
             client_id="catchuparr-client-synthetic-7", local_worker_id="task-worker-synthetic",
             redis_backend_signature=redis_backend_signature(redis), connected_at="100.0",
-            projection_version=2,
+            projection_version=2, user_agent="Synthetic Player", client_ip="192.0.2.7",
         )
         self.assertTrue(adopt_registered_client_in_manager(manager, ack))
         self.assertIn(ack.client_id, manager.clients)
