@@ -763,6 +763,10 @@ if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[2], 'm3u_profile_id') ~= ARGV[18]
    or redis.call('HGET', KEYS[2], 'input_profile_id') ~= ARGV[19]
    or redis.call('HGET', KEYS[2], 'lease_digest') ~= ARGV[20]
+   or redis.call('HGET', KEYS[2], 'owner_lock_value') ~= ARGV[21]
+   or redis.call('HGET', KEYS[2], 'metadata_owner') ~= ARGV[22]
+   or redis.call('HGET', KEYS[2], 'client_worker_id') ~= ARGV[23]
+   or redis.call('HGET', KEYS[2], 'lease_value') ~= ARGV[24]
    or (ARGV[10] ~= 'active' and ARGV[10] ~= 'wait_return') then return 0 end
 redis.call('HSET', KEYS[2], 'phase', 'closing', 'viewer_left_at', '',
   'return_deadline', '', 'version', tostring(version + 1))
@@ -793,6 +797,8 @@ def invalidate_native_episode(redis: Any, grant: NativeEpisodeGrant, *,
         grant.catalog_generation, str(grant.recorder_fence), str(grant.intent_epoch),
         grant.stream_id, grant.account_id, grant.m3u_profile_id, grant.input_profile_id,
         hashlib.sha256(grant.lease_value.encode("utf-8")).hexdigest(),
+        grant.owner_lock_value, grant.metadata_owner, grant.client_worker_id,
+        grant.lease_value,
     )
     return type(result) is int and result == 1
 
