@@ -558,6 +558,60 @@ class NativeLuaRedisTests(unittest.TestCase):
             authority_revision=2,
         ))
 
+    def test_invalidation_survives_viewer_leave_and_return_after_prior_snapshot(self):
+        _episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        prior = read_native_episode_grant(self.redis, CHANNEL)
+        self.assertIsNotNone(prior)
+        keys = _keys()
+
+        # Interleave valid native lease/grace transitions between the durable
+        # prior snapshot and the authority publication/invalidation callback.
+        self.redis.command("SREM", keys["clients"], VIEWER)
+        self.redis.command("DEL", keys["viewer"])
+        current = read_native_episode_grant(self.redis, CHANNEL)
+        ok, deadline, departed_version = check_and_touch_borrowed_client(self.redis, current)
+        self.assertTrue(ok)
+        self.assertIsNotNone(deadline)
+        self.assertEqual("wait_return", self.redis.hget(keys["episode"], "phase"))
+
+        self.redis.command("SADD", keys["clients"], VIEWER)
+        self.redis.command(
+            "HSET", keys["viewer"], "connected_at", "200",
+            "worker_id", "viewer-worker-synthetic-lua-060", "user_id", "7",
+            "output_format", "mpegts", "output_profile_id", "",
+        )
+        current = read_native_episode_grant(self.redis, CHANNEL)
+        ok, deadline, returned_version = check_and_touch_borrowed_client(self.redis, current)
+        self.assertTrue(ok)
+        self.assertIsNone(deadline)
+        self.assertEqual(departed_version + 1, returned_version)
+        self.assertEqual("active", self.redis.hget(keys["episode"], "phase"))
+        self.assertGreater(returned_version, prior.version)
+
+        self.assertTrue(publish_current_authority(
+            self.redis, CHANNEL, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            expected_revision=1, authority_revision=2,
+        ))
+        self.assertTrue(invalidate_native_episode(
+            self.redis, prior, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            authority_revision=2,
+        ))
+        self.assertEqual("closing", self.redis.hget(keys["episode"], "phase"))
+        self.assertEqual(str(returned_version + 1), self.redis.hget(keys["episode"], "version"))
+        self.assertEqual("2", self.redis.hget(
+            keys["episode"], "revocation_authority_revision",
+        ))
+        # The exact committed operation stamp, not the stale prior version, is
+        # the retry acknowledgement after a lost Lua response.
+        self.assertTrue(invalidate_native_episode(
+            self.redis, prior, configuration_generation="config-next",
+            control_generation=8, catalog_generation="catalog-next",
+            authority_revision=2,
+        ))
+
     def test_current_authority_invalidation_rejects_stale_revision_and_projection(self):
         changed_fields = (
             ("client_id", "replacement-client-synthetic"),
