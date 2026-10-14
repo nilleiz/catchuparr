@@ -289,7 +289,11 @@ class SharingAuthorityOutbox:
                 observed, stored = record
                 if not observed:
                     prior = read_prior(redis, event.channel_uuid)
-                    encoded = encode_prior(prior) if encode_prior is not None else prior
+                    encoded = (
+                        encode_prior(prior)
+                        if prior is not None and encode_prior is not None
+                        else prior
+                    )
                     stored = self._json_dump(self._json_safe(encoded))
                     if not self._store_prior(event, stored):
                         pending.append(event.event_id)
