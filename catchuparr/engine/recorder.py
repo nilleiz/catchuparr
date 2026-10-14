@@ -212,7 +212,7 @@ class FFmpegCopyRecorder:
         media_idle_timeout: float = 120.0,
         poll_interval: float = 0.5,
         attempt_switch: RecorderAttemptSwitch | None = None,
-        on_first_media: Callable[[float], None] | None = None,
+        on_first_media: Callable[[float], bool] | None = None,
     ) -> RecorderAttemptResult:
         """Run a single source until it stops or useful media stalls.
 
