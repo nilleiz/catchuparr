@@ -7,6 +7,8 @@ from unittest.mock import patch
 from catchuparr.adapters.sharing_borrow_route import (
     BorrowedReaderSession,
     BorrowOpenCleanupPending,
+    decode_borrow_capability,
+    encode_borrow_capability,
     native_borrow_proof_reader,
     sign_borrow_capability,
 )
@@ -57,6 +59,20 @@ def capability():
 
 
 class SharingBorrowRouteTests(unittest.TestCase):
+    def test_capability_url_codec_roundtrips_and_rejects_modified_or_ambiguous_fields(self):
+        original = capability()
+        encoded = encode_borrow_capability(original)
+        decoded = decode_borrow_capability(encoded)
+        self.assertEqual(original, decoded)
+        self.assertTrue(decoded.verify(SECRET, user_id="user-route-synthetic", now=199))
+        tampered = encoded[:-1] + ("A" if encoded[-1] != "A" else "B")
+        with self.assertRaises(ValueError):
+            decode_borrow_capability(tampered)
+        with self.assertRaises(ValueError):
+            decode_borrow_capability("e30")
+        with self.assertRaises(ValueError):
+            decode_borrow_capability("a" * 4097)
+
     def test_signed_capability_binds_user_expiry_and_exact_episode(self):
         grant = capability()
         self.assertTrue(grant.verify(SECRET, user_id="user-route-synthetic", now=199))
