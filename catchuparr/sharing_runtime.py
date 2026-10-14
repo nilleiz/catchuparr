@@ -10,16 +10,184 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from .adapters.sharing_borrow_route import (
     BorrowedReaderSession,
     SignedBorrowCapability,
+    sign_borrow_capability,
 )
-from .adapters.sharing_native import NativeAssignedSource, observe_native_connection
+from .adapters.sharing_native import (
+    NativeAssignedSource,
+    close_fenced_unregistered_opening,
+    fence_unregistered_opening,
+    native_registration_is_absent,
+    observe_native_connection,
+    project_opening_episode,
+)
 from .sharing_episode import BorrowEpisodeLedger, BorrowEpisodeRejected
+from .sharing_persistence import SharingIntentLedger, SharingIntentToken
+from .sharing_planner import BorrowTarget, SharingAction
+
+
+@dataclass(frozen=True)
+class PreparedBorrowOpening:
+    """A durably claimed and Redis-projected one-use reader opening."""
+
+    episode_id: str
+    episode_version: int
+    client_id: str
+    capability: SignedBorrowCapability
+
+
+def prepare_borrow_opening(
+    redis: Any,
+    intent_ledger: SharingIntentLedger,
+    episode_ledger: BorrowEpisodeLedger,
+    token: SharingIntentToken,
+    target: BorrowTarget,
+    *,
+    lease_value: str,
+    catalog_generation: str,
+    return_seconds: int,
+    minimum_switch_seconds: int,
+    last_switch_at: float | None,
+    capability_secret: bytes,
+    capability_ttl_seconds: int = 90,
+    fresh_validate: Callable[[SharingIntentToken], bool],
+    clock: Callable[[], float] = time.time,
+) -> tuple[bool, PreparedBorrowOpening | None]:
+    """Claim an exact ATTACH intent, project its opening, and sign one route ticket.
+
+    The caller still must consume the ticket through the recorder's private HTTP
+    route and wait for the native registration/episode activation ACK before it
+    treats the borrow as active. No URL resolution or manager-map mutation is
+    performed here.
+    """
+    if (
+        not isinstance(intent_ledger, SharingIntentLedger)
+        or not isinstance(episode_ledger, BorrowEpisodeLedger)
+        or not isinstance(token, SharingIntentToken)
+        or token.action is not SharingAction.ATTACH_BORROW
+        or not isinstance(target, BorrowTarget)
+        or target.connection_identity != token.target_identity
+        or not target.eligible_for_new_borrow(token.channel_uuid)
+        or not isinstance(lease_value, str) or not lease_value
+        or not isinstance(catalog_generation, str) or not catalog_generation
+        or type(return_seconds) is not int or not 0 <= return_seconds <= 3600
+        or type(minimum_switch_seconds) is not int
+        or not 0 <= minimum_switch_seconds <= 3600
+        or type(capability_ttl_seconds) is not int
+        or not 1 <= capability_ttl_seconds <= 120
+        or not isinstance(capability_secret, bytes) or len(capability_secret) < 32
+        or not callable(fresh_validate) or not callable(clock)
+    ):
+        return False, None
+
+    def dispatch(exact_token: SharingIntentToken) -> PreparedBorrowOpening:
+        now = clock()
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(float(now))
+        ):
+            raise BorrowEpisodeRejected("sharing clock is invalid")
+        if exact_token.target_identity != target.connection_identity:
+            raise BorrowEpisodeRejected("borrow target changed before opening")
+        previous = None
+        try:
+            previous = episode_ledger.read(exact_token.channel_uuid)
+        except BorrowEpisodeRejected:
+            pass
+        episode = episode_ledger.begin_open(
+            exact_token,
+            lease_digest=hashlib.sha256(lease_value.encode("utf-8")).hexdigest(),
+            identity=target.connection_identity,
+            client_id=f"catchuparr-client-{uuid.uuid4().hex}",
+            expected_version=previous.version if previous is not None else None,
+        )
+        projected = False
+        try:
+            projected = project_opening_episode(
+                redis,
+                episode,
+                lease_value=lease_value,
+                catalog_generation=catalog_generation,
+                return_seconds=return_seconds,
+                minimum_switch_seconds=minimum_switch_seconds,
+                last_switch_at=last_switch_at,
+            )
+            if not projected:
+                raise BorrowEpisodeRejected("native opening projection was not acknowledged")
+            capability = sign_borrow_capability(
+                secret=capability_secret,
+                channel_uuid=episode.channel_uuid,
+                episode_id=episode.episode_id,
+                user_id="0",
+                configuration_generation=episode.configuration_generation,
+                catalog_generation=catalog_generation,
+                control_generation=episode.control_generation,
+                recorder_fence=episode.recorder_fence,
+                intent_epoch=episode.intent_epoch,
+                connection_identity=episode.identity,
+                episode_version=episode.version,
+                expires_at=float(now) + capability_ttl_seconds,
+                nonce=episode.client_id.removeprefix("catchuparr-client-"),
+            )
+            # A final coordinator proof closes the gap between token claim and
+            # ticket return. The route performs its own stricter Redis CAS.
+            if fresh_validate(exact_token) is not True:
+                raise BorrowEpisodeRejected("borrow intent became stale during opening")
+            return PreparedBorrowOpening(
+                episode.episode_id, episode.version, episode.client_id, capability,
+            )
+        except Exception:
+            # The opening is not retried. Close only after exact native evidence
+            # says the projection and client resources are absent.
+            closed = False
+            if projected or episode.phase == "opening":
+                try:
+                    fenced = fence_unregistered_opening(
+                        redis, episode, catalog_generation=catalog_generation,
+                    )
+                    absent = fenced and native_registration_is_absent(
+                        redis,
+                        channel_uuid=episode.channel_uuid,
+                        client_id=episode.client_id or "",
+                    )
+                    closed = bool(
+                        absent and close_fenced_unregistered_opening(
+                            redis, episode,
+                            catalog_generation=catalog_generation,
+                            client_id=episode.client_id or "",
+                        )
+                    )
+                except Exception:
+                    closed = False
+            try:
+                episode_ledger.revoke(
+                    episode.episode_id,
+                    expected_version=episode.version,
+                    reason="closed" if closed else "cleanup_pending",
+                    cleanup_acknowledged=closed,
+                )
+            except Exception:
+                pass
+            raise
+
+    claimed, prepared = intent_ledger.run_if_current(
+        token,
+        fresh_validate=fresh_validate,
+        side_effect=dispatch,
+    )
+    if not claimed or not isinstance(prepared, PreparedBorrowOpening):
+        return False, None
+    return True, prepared
 
 
 def _native_source_catalog(channel_uuid: str) -> tuple[tuple[NativeAssignedSource, ...], str]:
