@@ -155,10 +155,12 @@ def record_channel(
     from .engine.store import ArchiveStore
     from .logging_utils import error, event
     from .recorder_proxy import (
+        RecorderAttemptAdmissionUncertain,
         candidate_is_current,
         current_sharing_authority_context,
         issue_recorder_attempt,
         ranked_source_candidates,
+        reconcile_unlaunched_sharing_operation,
         stop_recorder_attempt,
     )
     from .runtime import require_supported_version
@@ -302,16 +304,37 @@ def record_channel(
                     from .engine.recorder import RecorderAttemptSwitch
 
                     attempt_switch = RecorderAttemptSwitch()
-                attempt = issue_recorder_attempt(
-                    redis,
-                    lease,
-                    channel_uuid=channel_uuid,
-                    candidate=candidate,
-                    config_generation=generation,
-                    control_generation=expected_control_generation,
-                    internal_base_url=proxy_base_url,
-                    sharing_authority=sharing_authority,
-                )
+                try:
+                    attempt = issue_recorder_attempt(
+                        redis,
+                        lease,
+                        channel_uuid=channel_uuid,
+                        candidate=candidate,
+                        config_generation=generation,
+                        control_generation=expected_control_generation,
+                        internal_base_url=proxy_base_url,
+                        sharing_authority=sharing_authority,
+                    )
+                except RecorderAttemptAdmissionUncertain as exc:
+                    uncertain = exc.attempt
+                    digest = uncertain.capability_key.removeprefix(
+                        "catchuparr:recorder-proxy:capability:"
+                    )
+                    if not reconcile_unlaunched_sharing_operation(
+                        redis, channel_uuid=str(channel_uuid),
+                        operation_id=str(uncertain.sharing_operation_id),
+                        operation_revision=int(uncertain.sharing_operation_revision),
+                        worker_id=uncertain.worker_id,
+                        capability_digest=digest,
+                        current_lease_value=str(lease._value),
+                        current_lease_fence=int(lease.fence),
+                        unreturned_capability=True,
+                    ):
+                        error("sharing_attempt_cleanup_pending")
+                        stop_event.set()
+                        return {"status": "sharing_cleanup_pending"}
+                    error("sharing_attempt_reconciled")
+                    return {"status": "sharing_admission_uncertain"}
                 with attempt_state_lock:
                     attempt_state["attempt"] = attempt
                     attempt_state["candidate"] = candidate

@@ -255,6 +255,12 @@ class SharingBorrowRouteTests(unittest.TestCase):
                 self.current = active
                 return active
 
+            def prepare_registration(self, *_args, **_kwargs):
+                return None
+
+            def record_registration_ack(self, *_args, **_kwargs):
+                return None
+
             def read(self, channel_uuid):
                 if channel_uuid != IDENTITY[0]:
                     raise BorrowEpisodeRejected("wrong synthetic channel")
@@ -461,11 +467,11 @@ class SharingBorrowRouteTests(unittest.TestCase):
             ack = NativeClientRegistrationAck(
                 channel_uuid=IDENTITY[0], episode_id=opening.episode_id,
                 client_id="catchuparr-client-route-synthetic", local_worker_id=IDENTITY[1],
-                redis_backend_signature="backend-route-synthetic", connected_at="123.5",
+                redis_backend_signature="b" * 64, connected_at="123.5",
                 projection_version=2, user_agent="Synthetic Player", client_ip="192.0.2.60",
             )
             with (
-                patch("catchuparr.adapters.sharing_borrow_route.redis_backend_signature", return_value="backend-route-synthetic"),
+                patch("catchuparr.adapters.sharing_borrow_route.redis_backend_signature", return_value="b" * 64),
                 patch("catchuparr.sharing_episode.select_task_local_client_manager", return_value=(manager, True)),
                 patch("catchuparr.adapters.sharing_borrow_route.consume_opening_capability", return_value=True),
                 patch("catchuparr.adapters.sharing_borrow_route.make_task_local_input_buffer", return_value=object()),

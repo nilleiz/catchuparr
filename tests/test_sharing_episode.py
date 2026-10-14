@@ -120,6 +120,59 @@ class BorrowEpisodeTests(unittest.TestCase):
         self.assertEqual(pending.phase, "cleanup_pending")
         self.assertEqual(self.ledger.pending_cleanup(), (pending,))
 
+    def test_native_registration_attempt_and_ack_survive_ledger_reopen(self):
+        opening = self.ledger.begin_open(
+            attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY,
+            client_id="catchuparr-client-restart-synthetic",
+        )
+        attempt = self.ledger.prepare_registration(
+            opening, local_worker_id="catchuparr-reader-restart-synthetic",
+            backend_signature="b" * 64, user_agent="Catchuparr reader",
+            client_ip="127.0.0.1",
+        )
+        self.assertEqual("prepared", attempt.status)
+        self.assertEqual((), self.ledger.registration_recovery_candidates(
+            stale_opening_before=99.0,
+        ))
+        stale = self.ledger.registration_recovery_candidates(stale_opening_before=101.0)
+        self.assertEqual((opening, attempt), stale[0])
+
+        ack = SimpleNamespace(
+            channel_uuid=opening.channel_uuid, episode_id=opening.episode_id,
+            client_id=attempt.client_id, local_worker_id=attempt.local_worker_id,
+            redis_backend_signature=attempt.backend_signature,
+            connected_at="100.5", projection_version=opening.version + 1,
+            user_agent=attempt.user_agent, client_ip=attempt.client_ip,
+        )
+        registered = self.ledger.record_registration_ack(opening.episode_id, ack)
+        reopened = BorrowEpisodeLedger(Path(self.temp.name) / "episodes.sqlite", clock=self.clock)
+        persisted = reopened.registration_attempt(opening.episode_id)
+        self.assertEqual("registered", persisted.status)
+        self.assertEqual(registered, persisted)
+        self.assertEqual("100.5", persisted.connected_at)
+        self.assertEqual(opening.version + 1, persisted.projection_version)
+
+    def test_registration_ack_cannot_rebind_persisted_worker_or_backend(self):
+        opening = self.ledger.begin_open(
+            attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY,
+            client_id="catchuparr-client-ack-binding-synthetic",
+        )
+        attempt = self.ledger.prepare_registration(
+            opening, local_worker_id="reader-worker-exact-synthetic",
+            backend_signature="c" * 64, user_agent="Catchuparr reader",
+            client_ip="127.0.0.1",
+        )
+        bad_ack = SimpleNamespace(
+            channel_uuid=opening.channel_uuid, episode_id=opening.episode_id,
+            client_id=attempt.client_id, local_worker_id="replacement-worker-synthetic",
+            redis_backend_signature=attempt.backend_signature,
+            connected_at="100.5", projection_version=2,
+            user_agent=attempt.user_agent, client_ip=attempt.client_ip,
+        )
+        with self.assertRaises(BorrowEpisodeRejected):
+            self.ledger.record_registration_ack(opening.episode_id, bad_ack)
+        self.assertEqual("prepared", self.ledger.registration_attempt(opening.episode_id).status)
+
     def test_registration_ack_cannot_replace_persisted_client_attempt(self):
         opening = self.ledger.begin_open(
             attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY,

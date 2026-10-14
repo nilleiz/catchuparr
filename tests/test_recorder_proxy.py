@@ -251,6 +251,146 @@ def _pipeline_connection_pool_module():
 
 
 class RecorderProxyTests(unittest.TestCase):
+    def test_sharing_operation_open_normalizes_verified_capability_names(self):
+        from catchuparr import recorder_proxy
+
+        binding = {
+            "account_id": "account-synthetic-open",
+            "channel_uuid": "channel-synthetic-open",
+            "config_generation": "config-synthetic-open",
+            "control_generation": "4",
+            "lease_fence": "9",
+            "lease_key": "catchuparr:recorder:channel-synthetic-open",
+            "lease_value": "9:synthetic-owner",
+            "stream_id": "stream-synthetic-open",
+            "worker_id": "worker-synthetic-open",
+            "sharing_operation_id": "operation-synthetic-open",
+            "sharing_operation_revision": "2",
+            "sharing_authority_revision": "6",
+            "sharing_catalog_generation": "catalog-synthetic-open",
+            "capability_digest": "digest-synthetic-open",
+        }
+
+        class CaptureRedis:
+            def eval(self, script, numkeys, *args):
+                self.invocation = (script, numkeys, args)
+                return 1
+
+        redis = CaptureRedis()
+        opened = recorder_proxy.begin_sharing_operation_open(redis, binding)
+        self.assertIsNotNone(opened)
+        _script, numkeys, args = redis.invocation
+        self.assertEqual(7, numkeys)
+        self.assertEqual("operation-synthetic-open", args[7])
+        self.assertEqual("2", args[8])
+        self.assertEqual("6", args[9])
+        self.assertEqual("catalog-synthetic-open", args[12])
+        self.assertEqual("digest-synthetic-open", args[15])
+        self.assertEqual(
+            json.dumps(binding, sort_keys=True, separators=(",", ":")),
+            args[18],
+        )
+
+    def test_operation_slot_closer_retries_until_end_acknowledged(self):
+        from catchuparr import recorder_proxy
+
+        outcomes = iter((False, True))
+        calls = []
+
+        def end(_redis, binding, open_key, nonce):
+            calls.append((binding, open_key, nonce))
+            return next(outcomes)
+
+        binding = {"channel_uuid": "channel-close-synthetic"}
+        with patch.object(recorder_proxy, "end_sharing_operation_open", side_effect=end):
+            close = recorder_proxy._operation_slot_closer(
+                object(), binding, "open-key-synthetic", "nonce-synthetic",
+            )
+            self.assertFalse(close())
+            self.assertTrue(close())
+            self.assertTrue(close())
+        self.assertEqual(2, len(calls))
+        self.assertTrue(all(call[1:] == ("open-key-synthetic", "nonce-synthetic") for call in calls))
+
+    def test_begin_open_lost_reply_attempts_exact_nonce_cleanup(self):
+        from catchuparr import recorder_proxy
+
+        binding = {
+            "channel_uuid": "channel-lost-open-synthetic",
+            "worker_id": "worker-lost-open-synthetic",
+            "sharing_operation_id": "operation-lost-open-synthetic",
+            "sharing_operation_revision": "3",
+            "sharing_authority_revision": "5",
+            "config_generation": "config-lost-open-synthetic",
+            "control_generation": "2",
+            "sharing_catalog_generation": "catalog-lost-open-synthetic",
+            "lease_fence": "10",
+            "lease_key": "catchuparr:recorder:channel-lost-open-synthetic",
+            "lease_value": "10:synthetic-owner",
+            "capability_digest": "a" * 64,
+        }
+
+        class LostReplyRedis:
+            def __init__(self):
+                self.calls = []
+
+            def eval(self, script, numkeys, *args):
+                self.calls.append((script, numkeys, args))
+                if len(self.calls) == 1:
+                    raise TimeoutError("synthetic lost BEGIN reply")
+                return 1
+
+        redis = LostReplyRedis()
+        with patch("catchuparr.recorder_proxy.uuid.uuid4", return_value=SimpleNamespace(hex="n" * 32)):
+            self.assertIsNone(recorder_proxy.begin_sharing_operation_open(redis, binding))
+        self.assertEqual(2, len(redis.calls))
+        _script, numkeys, args = redis.calls[1]
+        self.assertEqual(2, numkeys)
+        self.assertEqual(binding["sharing_operation_id"], args[2])
+        self.assertEqual("3", args[3])
+        self.assertEqual("n" * 32, args[4])
+
+    def test_uncertain_issue_retains_exact_attempt_for_restart_reconciliation(self):
+        from catchuparr import recorder_proxy
+
+        class UncertainRedis(FakeRedis):
+            def eval(self, *_args):
+                raise TimeoutError("synthetic issue reply lost")
+
+        redis = UncertainRedis()
+        channel = "channel-uncertain-issue-synthetic"
+        lease_value = "12:synthetic-owner"
+        redis.set(f"catchuparr:recorder:{channel}", lease_value)
+        redis.hset(
+            f"catchuparr:sharing:current:{channel}", mapping={
+                "configuration_generation": "config-uncertain",
+                "control_generation": "3",
+                "catalog_generation": "catalog-uncertain",
+                "authority_revision": "5",
+            },
+        )
+        lease = SimpleNamespace(fence=12, _value=lease_value, key=f"catchuparr:recorder:{channel}")
+        django = types.ModuleType("django")
+        django.__path__ = []
+        django_conf = types.ModuleType("django.conf")
+        django_conf.settings = SimpleNamespace(SECRET_KEY="synthetic-signing-key")
+        with patch.dict(sys.modules, {"django": django, "django.conf": django_conf}), patch(
+            "catchuparr.configuration._sharing_catalog_generation",
+            return_value="catalog-uncertain",
+        ), patch.object(recorder_proxy, "reconcile_unlaunched_sharing_operation", return_value=False):
+            with self.assertRaises(recorder_proxy.RecorderAttemptAdmissionUncertain) as raised:
+                recorder_proxy.issue_recorder_attempt(
+                    redis, lease, channel_uuid=channel,
+                    candidate={"id": "stream-uncertain", "account_id": "account-uncertain"},
+                    config_generation="config-uncertain", control_generation=3,
+                    internal_base_url="http://dispatcharr.invalid",
+                    sharing_authority={"catalog_generation": "catalog-uncertain", "authority_revision": 5},
+                )
+        attempt = raised.exception.attempt
+        self.assertEqual(channel, attempt.channel_uuid)
+        self.assertEqual(1, attempt.sharing_operation_revision)
+        self.assertNotIn(attempt.capability, repr(raised.exception))
+
     def test_configuration_generation_includes_applied_schedule(self):
         active = {
             "channel_uuids": "00000000-0000-0000-0000-000000000001",
