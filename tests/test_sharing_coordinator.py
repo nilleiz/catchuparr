@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,7 +10,12 @@ from catchuparr import sharing_coordinator as coordinator
 from catchuparr.adapters.sharing_native import NativeEpisodeGrant
 from catchuparr.engine.recorder import RecorderAttemptResult, RecorderAttemptSwitch
 from catchuparr.sharing_episode import BorrowEpisodeLedger
-from catchuparr.sharing_persistence import SharingIntentLedger, SharingIntentToken
+from catchuparr.sharing_persistence import (
+    SharingEffectReceipt,
+    SharingIntentLedger,
+    SharingIntentToken,
+    StaleSharingIntent,
+)
 from catchuparr.sharing_planner import (
     SharingAction,
     SharingObservation,
@@ -178,9 +184,11 @@ class SharingCoordinatorTests(unittest.TestCase):
                 attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: False,
-                candidate={"identity": "synthetic"},
+                source_identity=IDENTITY,
+                source_client_id="catchuparr-client-source-synthetic",
+                candidate={"identity": IDENTITY},
                 candidate_is_currently_allowed=lambda _candidate: True,
-                launch_allowed_candidate=lambda *_args: launched.append("launch"),
+                launch_allowed_candidate=lambda *_args: self.fail("launch before cleanup ACK"),
             )
             self.assertEqual(result, ("cleanup_pending", None))
             self.assertEqual(launched, [])
@@ -200,11 +208,18 @@ class SharingCoordinatorTests(unittest.TestCase):
                 ledger=ledger,
                 fresh_validate=lambda _token: events.append("validate") or True,
                 exact_cleanup_acknowledged=lambda: events.append("cleanup") or True,
-                candidate={"identity": "synthetic"},
+                source_identity=IDENTITY,
+                source_client_id="catchuparr-client-source-synthetic",
+                candidate={"identity": IDENTITY},
                 candidate_is_currently_allowed=lambda _candidate: True,
-                launch_allowed_candidate=lambda _token, _candidate: events.append("launch") or "started",
+                launch_allowed_candidate=lambda _token, _candidate, op_id: (
+                    events.append("launch")
+                    or SharingEffectReceipt(op_id, "resource-synthetic-1")
+                ),
             )
-            self.assertEqual(result, ("launched", "started"))
+            self.assertEqual(result[0], "launched")
+            self.assertEqual(result[1].status, "active")
+            self.assertEqual(result[1].receipt.resource_id, "resource-synthetic-1")
             # The ledger validates once before and once inside the cross-process
             # claim boundary, then performs exactly one fallback side effect.
             self.assertEqual(events, ["cleanup", "validate", "validate", "launch"])
@@ -217,7 +232,9 @@ class SharingCoordinatorTests(unittest.TestCase):
                 attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: True,
-                candidate={"identity": "synthetic"},
+                source_identity=IDENTITY,
+                source_client_id="catchuparr-client-source-synthetic",
+                candidate={"identity": IDENTITY},
                 candidate_is_currently_allowed=lambda _candidate: True,
                 launch_allowed_candidate=lambda *_args: self.fail("duplicate fallback launch"),
             )
@@ -236,11 +253,105 @@ class SharingCoordinatorTests(unittest.TestCase):
                 attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: True,
-                candidate={"identity": "synthetic"},
+                source_identity=IDENTITY,
+                source_client_id="catchuparr-client-source-synthetic",
+                candidate={"identity": IDENTITY},
                 candidate_is_currently_allowed=lambda _candidate: False,
                 launch_allowed_candidate=lambda *_args: self.fail("unallowed fallback launch"),
             )
             self.assertEqual(outcome, ("stale", None))
+
+    def test_fallback_lost_ack_keeps_durable_cleanup_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite"
+            ledger = SharingIntentLedger(database_path, clock=lambda: 100.0)
+            switch_intent, token, attempt_switch = _switch_and_fallback_tokens(ledger)
+            created_resources = []
+            calls = []
+
+            def launch(_token, _candidate, operation_id):
+                calls.append(operation_id)
+                created_resources.append((operation_id, "resource-synthetic-lost-ack"))
+                raise RuntimeError("synthetic lost launch ACK")
+
+            outcome = coordinator.return_to_allowed_after_reap(
+                RecorderAttemptResult(
+                    "switch_requested", 2, 0,
+                    attempt_switch_id=attempt_switch.attempt_id,
+                ), token,
+                switch_intent=switch_intent,
+                attempt_switch=attempt_switch,
+                ledger=ledger,
+                fresh_validate=lambda _token: True,
+                exact_cleanup_acknowledged=lambda: True,
+                source_identity=IDENTITY,
+                source_client_id="catchuparr-client-source-synthetic",
+                candidate={"identity": IDENTITY},
+                candidate_is_currently_allowed=lambda _candidate: True,
+                launch_allowed_candidate=launch,
+            )
+            self.assertEqual(outcome[0], "cleanup_pending")
+            dispatch = outcome[1]
+            self.assertEqual(dispatch.status, "cleanup_pending")
+            operation = dispatch.operation
+            self.assertEqual(operation.status, "cleanup_pending")
+            self.assertEqual(operation.target_identity, IDENTITY)
+            self.assertEqual(operation.source_identity, IDENTITY)
+            self.assertEqual(operation.source_attempt_id, attempt_switch.attempt_id)
+            self.assertEqual(operation.source_client_id, "catchuparr-client-source-synthetic")
+            self.assertEqual(created_resources, [(operation.operation_id, "resource-synthetic-lost-ack")])
+
+            # The consumed operation is never replayed, and a later epoch
+            # cannot start until the exact unknown resource has been removed.
+            repeated = coordinator.return_to_allowed_after_reap(
+                RecorderAttemptResult(
+                    "switch_requested", 2, 0,
+                    attempt_switch_id=attempt_switch.attempt_id,
+                ), token,
+                switch_intent=switch_intent,
+                attempt_switch=attempt_switch,
+                ledger=ledger,
+                fresh_validate=lambda _token: True,
+                exact_cleanup_acknowledged=lambda: True,
+                source_identity=IDENTITY,
+                source_client_id="catchuparr-client-source-synthetic",
+                candidate={"identity": IDENTITY},
+                candidate_is_currently_allowed=lambda _candidate: True,
+                launch_allowed_candidate=launch,
+            )
+            self.assertEqual(repeated, ("stale", None))
+            self.assertEqual(calls, [operation.operation_id])
+
+            # A fresh process-facing ledger sees the unresolved operation and
+            # still cannot admit the next epoch until its exact absence ACK.
+            ledger = SharingIntentLedger(database_path, clock=lambda: 100.0)
+            current = ledger.read(CHANNEL)
+            self.assertEqual(
+                tuple(item.operation_id for item in ledger.pending_effect_attempts(CHANNEL)),
+                (operation.operation_id,),
+            )
+            retry_state = replace(current.state, intent_epoch=current.state.intent_epoch + 1)
+            with self.assertRaisesRegex(StaleSharingIntent, "exact cleanup ACK"):
+                ledger.save(
+                    retry_state, action=SharingAction.RETURN_TO_ALLOWED,
+                    expected_revision=current.revision, not_before=100.0,
+                )
+
+            def remove_exact_resource(saved):
+                self.assertEqual(saved.operation_id, operation.operation_id)
+                self.assertIn((saved.operation_id, "resource-synthetic-lost-ack"), created_resources)
+                created_resources.remove((saved.operation_id, "resource-synthetic-lost-ack"))
+                return True
+
+            self.assertTrue(ledger.reconcile_effect_attempt(
+                operation.operation_id, exact_resources_absent=remove_exact_resource,
+            ))
+            self.assertEqual(created_resources, [])
+            retry = ledger.save(
+                retry_state, action=SharingAction.RETURN_TO_ALLOWED,
+                expected_revision=current.revision, not_before=100.0,
+            )
+            self.assertEqual(retry.intent.intent_epoch, token.intent_epoch + 1)
 
     def test_old_attempt_switch_result_cannot_launch_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -256,7 +367,9 @@ class SharingCoordinatorTests(unittest.TestCase):
                 attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: self.fail("stale cleanup check"),
-                candidate={"identity": "synthetic"},
+                source_identity=IDENTITY,
+                source_client_id="catchuparr-client-source-synthetic",
+                candidate={"identity": IDENTITY},
                 candidate_is_currently_allowed=lambda _candidate: True,
                 launch_allowed_candidate=lambda *_args: self.fail("stale fallback launch"),
             )
@@ -272,7 +385,9 @@ class SharingCoordinatorTests(unittest.TestCase):
                 attempt_switch=attempt_switch,
                 ledger=ledger, fresh_validate=lambda _token: True,
                 exact_cleanup_acknowledged=lambda: True,
-                candidate={"identity": "synthetic"},
+                source_identity=IDENTITY,
+                source_client_id="catchuparr-client-source-synthetic",
+                candidate={"identity": IDENTITY},
                 candidate_is_currently_allowed=lambda _candidate: True,
                 launch_allowed_candidate=lambda *_args: self.fail("fallback after global stop"),
             )

@@ -7,6 +7,7 @@ observations loaded outside the TS body hot path.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -17,7 +18,12 @@ from .adapters.sharing_native import (
     publish_current_authority,
 )
 from .engine.recorder import RecorderAttemptResult, RecorderAttemptSwitch
-from .sharing_persistence import SharingIntentLedger, SharingIntentToken
+from .sharing_persistence import (
+    SharingEffectDispatch,
+    SharingEffectReceipt,
+    SharingIntentLedger,
+    SharingIntentToken,
+)
 from .sharing_planner import SharingAction
 
 
@@ -232,16 +238,20 @@ def return_to_allowed_after_reap(
     ledger: SharingIntentLedger,
     fresh_validate: Callable[[SharingIntentToken], bool],
     exact_cleanup_acknowledged: Callable[[], bool],
+    source_identity: tuple[str, ...],
+    source_client_id: str,
     candidate: Mapping[str, Any] | None,
     candidate_is_currently_allowed: Callable[[Mapping[str, Any]], bool],
-    launch_allowed_candidate: Callable[[SharingIntentToken, Mapping[str, Any]], Any],
-) -> tuple[str, Any | None]:
+    launch_allowed_candidate: Callable[[SharingIntentToken, Mapping[str, Any], str], SharingEffectReceipt],
+) -> tuple[str, SharingEffectDispatch | None]:
     """Launch fallback only after FFmpeg returned and old input cleanup ACKs.
 
     ``run_candidate`` returns its result after waiting for the FFmpeg process
     to exit. The cleanup callback must confirm the exact previous attempt and
     reservation are gone. Launch uses a single logical intent claim and a
-    second fresh validation; no source URL is resolved here.
+    second fresh validation; no source URL is resolved here. The launcher must
+    use the supplied durable operation id as its idempotency and reconciliation
+    key, including when its response is lost.
     """
     if (not isinstance(result, RecorderAttemptResult)
             or result.status != "switch_requested"
@@ -267,7 +277,19 @@ def return_to_allowed_after_reap(
         return "cleanup_pending", None
     if candidate is None:
         return "no_allowed_candidate", None
+    if (not isinstance(source_identity, tuple) or len(source_identity) != 8
+            or any(not isinstance(part, str) or not part for part in source_identity)
+            or source_identity[0] != token.channel_uuid):
+        return "stale", None
+    if (not isinstance(source_client_id, str) or not source_client_id
+            or len(source_client_id) > 256):
+        return "stale", None
     if not isinstance(candidate, Mapping) or not callable(candidate_is_currently_allowed):
+        return "stale", None
+    target_identity = candidate.get("identity")
+    if (not isinstance(target_identity, tuple) or len(target_identity) != 8
+            or any(not isinstance(part, str) or not part for part in target_identity)
+            or target_identity[0] != token.channel_uuid):
         return "stale", None
 
     def validate_current(exact_token: SharingIntentToken) -> bool:
@@ -279,12 +301,63 @@ def return_to_allowed_after_reap(
         except Exception:
             return False
 
+    operation_id = uuid.uuid4().hex
+
+    def dispatch(exact_token: SharingIntentToken) -> SharingEffectReceipt:
+        ledger.begin_effect_attempt(
+            exact_token, operation_id=operation_id, target_identity=target_identity,
+            source_attempt_id=attempt_switch.attempt_id,
+            source_identity=source_identity,
+            source_client_id=source_client_id,
+        )
+        try:
+            receipt = launch_allowed_candidate(exact_token, candidate, operation_id)
+            if (not isinstance(receipt, SharingEffectReceipt)
+                    or receipt.operation_id != operation_id):
+                raise ValueError("candidate launcher did not acknowledge this exact operation")
+            ledger.acknowledge_effect_attempt(operation_id, resource_id=receipt.resource_id)
+            return receipt
+        except Exception:
+            try:
+                ledger.mark_effect_cleanup_pending(operation_id)
+            except Exception:
+                # The pre-dispatch row remains dispatching and still blocks
+                # another effect until exact startup reconciliation.
+                pass
+            raise
+
     try:
-        committed, effect = ledger.run_if_current(
+        committed, receipt = ledger.run_if_current(
             token,
             fresh_validate=validate_current,
-            side_effect=lambda exact_token: launch_allowed_candidate(exact_token, candidate),
+            side_effect=dispatch,
         )
     except Exception:
+        try:
+            pending = ledger.effect_attempt(operation_id)
+            if pending is not None:
+                if pending.status != "cleanup_pending":
+                    pending = ledger.mark_effect_cleanup_pending(operation_id)
+                return "cleanup_pending", SharingEffectDispatch("cleanup_pending", pending)
+        except Exception:
+            # Dispatch may have been persisted even though its reply was
+            # lost. Report unresolved ownership; startup reconciliation scans
+            # the durable per-channel operation row.
+            return "cleanup_pending", SharingEffectDispatch("cleanup_pending", None)
         return "stale", None
-    return ("launched", effect) if committed else ("stale", None)
+    if not committed:
+        return "stale", None
+    try:
+        operation = ledger.effect_attempt(operation_id)
+    except Exception:
+        return "cleanup_pending", SharingEffectDispatch("cleanup_pending", None)
+    if (not isinstance(receipt, SharingEffectReceipt) or operation is None
+            or operation.status != "active" or operation.resource_id != receipt.resource_id):
+        if operation is not None:
+            try:
+                operation = ledger.mark_effect_cleanup_pending(operation_id)
+            except Exception:
+                pass
+            return "cleanup_pending", SharingEffectDispatch("cleanup_pending", operation)
+        return "cleanup_pending", None
+    return "launched", SharingEffectDispatch("active", operation, receipt)

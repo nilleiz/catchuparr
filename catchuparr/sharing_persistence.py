@@ -103,6 +103,34 @@ class PersistedSharingState:
     intent: SharingIntentToken | None
 
 
+@dataclass(frozen=True)
+class SharingEffectAttempt:
+    operation_id: str
+    token: SharingIntentToken
+    target_identity: tuple[str, ...]
+    source_identity: tuple[str, ...] | None
+    source_attempt_id: str | None
+    source_client_id: str | None
+    status: str
+    resource_id: str | None
+    revision: int
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class SharingEffectReceipt:
+    operation_id: str
+    resource_id: str
+
+
+@dataclass(frozen=True)
+class SharingEffectDispatch:
+    status: str
+    operation: SharingEffectAttempt | None
+    receipt: SharingEffectReceipt | None = None
+
+
 class SharingIntentLedger:
     """SQLite ledger with local cooperative locks and durable cross-process CAS."""
 
@@ -184,6 +212,27 @@ class SharingIntentLedger:
                     intent_epoch INTEGER NOT NULL,
                     action TEXT NOT NULL,
                     PRIMARY KEY (channel_uuid, intent_epoch, action)
+                )"""
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS sharing_effect_attempts (
+                    operation_id TEXT PRIMARY KEY,
+                    channel_uuid TEXT NOT NULL,
+                    intent_revision INTEGER NOT NULL,
+                    intent_epoch INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    configuration_generation TEXT NOT NULL,
+                    control_generation INTEGER NOT NULL,
+                    recorder_fence INTEGER NOT NULL,
+                    target_identity_json TEXT NOT NULL,
+                    source_identity_json TEXT,
+                    source_attempt_id TEXT,
+                    source_client_id TEXT,
+                    status TEXT NOT NULL,
+                    resource_id TEXT,
+                    revision INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
                 )"""
             )
             db.execute(
@@ -355,6 +404,12 @@ class SharingIntentLedger:
             if row is not None and int(row["revision"]) != expected_revision:
                 db.rollback()
                 raise StaleSharingIntent("sharing state revision changed")
+            if action is not None and db.execute(
+                "SELECT 1 FROM sharing_effect_attempts WHERE channel_uuid=? AND status!='closed' LIMIT 1",
+                (channel,),
+            ).fetchone() is not None:
+                db.rollback()
+                raise StaleSharingIntent("an earlier external effect still needs exact cleanup ACK")
             if row is not None:
                 current = self._decode(row)
                 if state.intent_epoch < current.state.intent_epoch:
@@ -789,4 +844,276 @@ class SharingIntentLedger:
                 return False, None
             if self._finite_time(self.clock(), "clock") < float(token.not_before):
                 return False, None
-            return True, side_effect(token)
+        # The durable claim is already consumed. Do not retain a cooperative
+        # lock while calling a launcher or native boundary; the operation
+        # callback must establish its own persisted cleanup ownership first.
+        return True, side_effect(token)
+
+    def begin_effect_attempt(
+        self,
+        token: SharingIntentToken,
+        *,
+        operation_id: str,
+        target_identity: tuple[str, ...],
+        source_attempt_id: str | None = None,
+        source_identity: tuple[str, ...] | None = None,
+        source_client_id: str | None = None,
+    ) -> SharingEffectAttempt:
+        """Persist exact operation ownership after intent claim, before dispatch."""
+        if not isinstance(token, SharingIntentToken):
+            raise ValueError("token must be SharingIntentToken")
+        if not isinstance(operation_id, str) or len(operation_id) != 32 or any(
+            char not in "0123456789abcdef" for char in operation_id
+        ):
+            raise ValueError("operation_id must be a lowercase UUID hex value")
+        if (not isinstance(target_identity, tuple) or len(target_identity) != 8
+                or any(not isinstance(part, str) or not part for part in target_identity)
+                or target_identity[0] != token.channel_uuid):
+            raise ValueError("target_identity must be the exact eight-field channel binding")
+        if source_attempt_id is not None and (
+            not isinstance(source_attempt_id, str) or len(source_attempt_id) != 32
+            or any(char not in "0123456789abcdef" for char in source_attempt_id)
+        ):
+            raise ValueError("source_attempt_id must be a lowercase UUID hex value")
+        if source_identity is not None and (
+            not isinstance(source_identity, tuple) or len(source_identity) != 8
+            or any(not isinstance(part, str) or not part for part in source_identity)
+            or source_identity[0] != token.channel_uuid
+        ):
+            raise ValueError("source_identity must be the exact eight-field channel binding")
+        if source_client_id is not None and (
+            not isinstance(source_client_id, str) or not source_client_id
+            or len(source_client_id) > 256
+        ):
+            raise ValueError("source_client_id must be a bounded opaque identifier")
+        now = self._finite_time(self.clock(), "clock")
+        with self.action_lock(token.channel_uuid), self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM sharing_runtime WHERE channel_uuid=?", (token.channel_uuid,)
+            ).fetchone()
+            claim = db.execute(
+                "SELECT 1 FROM sharing_intent_claims WHERE channel_uuid=? AND revision=? AND action=?",
+                (token.channel_uuid, token.revision, token.action.value),
+            ).fetchone()
+            persisted = self._decode(row) if row is not None else None
+            if persisted is None or persisted.intent != token or claim is None:
+                db.rollback()
+                raise StaleSharingIntent("effect operation lacks the exact current consumed intent")
+            persisted_source_identity = persisted.state.borrowed_identity
+            if (persisted_source_identity is not None and source_identity is not None
+                    and persisted_source_identity != source_identity):
+                db.rollback()
+                raise StaleSharingIntent("source identity changed before effect ownership was recorded")
+            if source_identity is None:
+                source_identity = persisted_source_identity
+            if source_identity is not None and (
+                not isinstance(source_identity, tuple) or len(source_identity) != 8
+                or any(not isinstance(part, str) or not part for part in source_identity)
+                or source_identity[0] != token.channel_uuid
+            ):
+                db.rollback()
+                raise ValueError("persisted source identity is malformed")
+            if db.execute(
+                "SELECT 1 FROM sharing_effect_attempts WHERE channel_uuid=? AND status!='closed' LIMIT 1",
+                (token.channel_uuid,),
+            ).fetchone() is not None:
+                db.rollback()
+                raise StaleSharingIntent("another external effect still needs cleanup ACK")
+            db.execute(
+                """INSERT INTO sharing_effect_attempts (
+                    operation_id,channel_uuid,intent_revision,intent_epoch,action,
+                    configuration_generation,control_generation,recorder_fence,
+                    target_identity_json,source_identity_json,source_attempt_id,source_client_id,
+                    status,resource_id,revision,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'dispatching',NULL,1,?,?)""",
+                (operation_id, token.channel_uuid, token.revision, token.intent_epoch,
+                 token.action.value, token.configuration_generation, token.control_generation,
+                 token.recorder_fence, json.dumps(target_identity, separators=(",", ":")),
+                 (json.dumps(source_identity, separators=(",", ":"))
+                  if source_identity is not None else None), source_attempt_id,
+                 source_client_id, now, now),
+            )
+            db.commit()
+        operation = self.effect_attempt(operation_id)
+        assert operation is not None
+        return operation
+
+    def acknowledge_effect_attempt(self, operation_id: str, *, resource_id: str) -> SharingEffectAttempt:
+        """Record the exact external resource ACK; never infer success from callback return alone."""
+        if not isinstance(resource_id, str) or not resource_id or len(resource_id) > 256:
+            raise ValueError("resource_id must be a bounded opaque identifier")
+        now = self._finite_time(self.clock(), "clock")
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM sharing_effect_attempts WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            attempt = self._effect_attempt_from_row(row) if row is not None else None
+            if attempt is None or attempt.status != "dispatching":
+                db.rollback()
+                raise StaleSharingIntent("effect operation is not awaiting its first ACK")
+            cur = db.execute(
+                """UPDATE sharing_effect_attempts SET status='active',resource_id=?,
+                revision=revision+1,updated_at=? WHERE operation_id=? AND revision=? AND status='dispatching'""",
+                (resource_id, now, operation_id, attempt.revision),
+            )
+            if cur.rowcount != 1:
+                db.rollback()
+                raise StaleSharingIntent("effect operation changed before ACK")
+            db.commit()
+        result = self.effect_attempt(operation_id)
+        assert result is not None
+        return result
+
+    def mark_effect_cleanup_pending(self, operation_id: str) -> SharingEffectAttempt:
+        """Keep unknown dispatch outcomes fenced until exact absence is proven."""
+        now = self._finite_time(self.clock(), "clock")
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM sharing_effect_attempts WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            attempt = self._effect_attempt_from_row(row) if row is not None else None
+            if attempt is None or attempt.status not in {"dispatching", "active", "cleanup_pending"}:
+                db.rollback()
+                raise StaleSharingIntent("effect operation cannot enter cleanup pending")
+            if attempt.status != "cleanup_pending":
+                db.execute(
+                    """UPDATE sharing_effect_attempts SET status='cleanup_pending',
+                    revision=revision+1,updated_at=? WHERE operation_id=? AND revision=?""",
+                    (now, operation_id, attempt.revision),
+                )
+            db.commit()
+        result = self.effect_attempt(operation_id)
+        assert result is not None
+        return result
+
+    def effect_attempt(self, operation_id: str) -> SharingEffectAttempt | None:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id is required")
+        with self._database() as db:
+            row = db.execute(
+                "SELECT * FROM sharing_effect_attempts WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+        return None if row is None else self._effect_attempt_from_row(row)
+
+    def pending_effect_attempts(self, channel_uuid: str) -> tuple[SharingEffectAttempt, ...]:
+        channel = self._channel(channel_uuid)
+        with self._database() as db:
+            rows = db.execute(
+                "SELECT * FROM sharing_effect_attempts WHERE channel_uuid=? AND status!='closed' ORDER BY created_at",
+                (channel,),
+            ).fetchall()
+        return tuple(self._effect_attempt_from_row(row) for row in rows)
+
+    def reconcile_effect_attempt(
+        self,
+        operation_id: str,
+        *,
+        exact_resources_absent: Callable[[SharingEffectAttempt], bool],
+    ) -> bool:
+        """Close an operation only after its exact resource absence callback ACKs."""
+        if not callable(exact_resources_absent):
+            raise ValueError("exact resource absence callback is required")
+        attempt = self.effect_attempt(operation_id)
+        if attempt is None:
+            return False
+        if attempt.status == "closed":
+            return True
+        try:
+            if exact_resources_absent(attempt) is not True:
+                return False
+        except Exception:
+            return False
+        now = self._finite_time(self.clock(), "clock")
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM sharing_effect_attempts WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            current = self._effect_attempt_from_row(row) if row is not None else None
+            if (current is None or current.revision != attempt.revision
+                    or current.status != attempt.status):
+                db.rollback()
+                return False
+            cur = db.execute(
+                """UPDATE sharing_effect_attempts SET status='closed',revision=revision+1,
+                updated_at=? WHERE operation_id=? AND revision=? AND status=?""",
+                (now, operation_id, attempt.revision, attempt.status),
+            )
+            if cur.rowcount != 1:
+                db.rollback()
+                return False
+            db.commit()
+        return True
+
+    @staticmethod
+    def _effect_attempt_from_row(row: sqlite3.Row) -> SharingEffectAttempt:
+        try:
+            identity = SharingIntentLedger._strict_json_loads(row["target_identity_json"])
+            if (not isinstance(identity, list) or len(identity) != 8
+                    or any(not isinstance(part, str) or not part for part in identity)
+                    or identity[0] != row["channel_uuid"]):
+                raise ValueError("effect target identity is malformed")
+            source_identity_json = row["source_identity_json"]
+            source_identity = None
+            if source_identity_json is not None:
+                decoded_source = SharingIntentLedger._strict_json_loads(source_identity_json)
+                if (not isinstance(decoded_source, list) or len(decoded_source) != 8
+                        or any(not isinstance(part, str) or not part for part in decoded_source)
+                        or decoded_source[0] != row["channel_uuid"]):
+                    raise ValueError("effect source identity is malformed")
+                source_identity = tuple(decoded_source)
+            source_attempt_id = row["source_attempt_id"]
+            if source_attempt_id is not None and (
+                not isinstance(source_attempt_id, str) or len(source_attempt_id) != 32
+                or any(char not in "0123456789abcdef" for char in source_attempt_id)
+            ):
+                raise ValueError("effect source attempt id is malformed")
+            source_client_id = row["source_client_id"]
+            if source_client_id is not None and (
+                not isinstance(source_client_id, str) or not source_client_id
+                or len(source_client_id) > 256
+            ):
+                raise ValueError("effect source client id is malformed")
+            token_action = SharingAction(row["action"])
+            if token_action not in _INTENT_ACTIONS:
+                raise ValueError("effect action is unsupported")
+            status = row["status"]
+            if status not in {"dispatching", "active", "cleanup_pending", "closed"}:
+                raise ValueError("effect status is unsupported")
+            operation_id = row["operation_id"]
+            if (not isinstance(operation_id, str) or len(operation_id) != 32
+                    or any(char not in "0123456789abcdef" for char in operation_id)):
+                raise ValueError("operation id is malformed")
+            resource_id = row["resource_id"]
+            if resource_id is not None and (
+                not isinstance(resource_id, str) or not resource_id or len(resource_id) > 256
+            ):
+                raise ValueError("resource id is malformed")
+            if status == "active" and resource_id is None:
+                raise ValueError("active effect lacks resource acknowledgement")
+            token = SharingIntentToken(
+                channel_uuid=row["channel_uuid"], revision=row["intent_revision"],
+                intent_epoch=row["intent_epoch"], action=token_action,
+                configuration_generation=row["configuration_generation"],
+                control_generation=row["control_generation"], recorder_fence=row["recorder_fence"],
+                target_identity=tuple(identity) if token_action == SharingAction.ATTACH_BORROW else None,
+                target_admitted=token_action == SharingAction.ATTACH_BORROW,
+                not_before=0.0,
+            )
+            created_at = SharingIntentLedger._finite_time(row["created_at"], "created_at")
+            updated_at = SharingIntentLedger._finite_time(row["updated_at"], "updated_at")
+            revision = row["revision"]
+            if type(revision) is not int or revision < 1:
+                raise ValueError("effect revision is malformed")
+            return SharingEffectAttempt(
+                operation_id=operation_id, token=token, target_identity=tuple(identity),
+                source_identity=source_identity, source_attempt_id=source_attempt_id,
+                source_client_id=source_client_id,
+                status=status, resource_id=resource_id, revision=revision,
+                created_at=created_at, updated_at=updated_at,
+            )
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise ValueError("persisted effect operation is malformed") from exc
