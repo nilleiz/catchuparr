@@ -106,6 +106,20 @@ class BorrowEpisodeTests(unittest.TestCase):
             lease_digest=LEASE_DIGEST, ordinary_viewer_ids=("viewer-1",), checked_at=101,
         ))
 
+    def test_opening_persists_exact_client_attempt_for_restart_cleanup_reconciliation(self):
+        opening = self.ledger.begin_open(
+            attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY,
+            client_id="catchuparr-client-episode-recovery-synthetic",
+        )
+        self.assertEqual(opening.client_id, "catchuparr-client-episode-recovery-synthetic")
+        self.assertEqual(self.ledger.pending_cleanup(), (opening,))
+        pending = self.ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        self.assertEqual(pending.phase, "cleanup_pending")
+        self.assertEqual(self.ledger.pending_cleanup(), (pending,))
+
     def test_grace_is_episode_bound_dynamic_and_canceled_on_viewer_return(self):
         opening = self.ledger.begin_open(attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY)
         active = self.ledger.activate(

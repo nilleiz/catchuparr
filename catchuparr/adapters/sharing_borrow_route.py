@@ -491,6 +491,7 @@ class BorrowedReaderSession:
             or capability.intent_epoch != episode.intent_epoch
             or capability.episode_version != episode.version
             or capability.connection_identity != episode.identity
+            or episode.client_id != client_id
             or not ordinary_viewer_ids
         ):
             raise BorrowEpisodeRejected("opening snapshot has no matching live viewer authority")
