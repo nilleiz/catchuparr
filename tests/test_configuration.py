@@ -33,6 +33,7 @@ from catchuparr.native_output_security import (
     load_native_key,
 )
 from catchuparr.runtime import load_runtime_settings
+from catchuparr.sharing_authority_outbox import SharingAuthorityOutbox
 
 CHANNEL_A = "00000000-0000-0000-0000-000000000001"
 CHANNEL_B = "00000000-0000-0000-0000-000000000002"
@@ -208,7 +209,14 @@ class ConfigurationTests(unittest.TestCase):
             ),
         )
         validated = validate_configuration(settings, self.catalog)
-        applied = apply_configuration(settings, self.catalog, self.active_path)
+        # These assertions cover validation and serialization. The native
+        # Dispatcharr catalog and Redis authority CAS are exercised in their
+        # adapter tests, so keep this configuration unit test self-contained.
+        with patch.object(
+            configuration, "_sharing_catalog_generation",
+            return_value="synthetic-sharing-catalog-generation",
+        ), patch.object(configuration, "_drain_sharing_authority_outbox", return_value=True):
+            applied = apply_configuration(settings, self.catalog, self.active_path)
         active = load_active_configuration(self.active_path)
         expected = {
             CHANNEL_A: {
@@ -252,6 +260,20 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(before, self.active_path.read_bytes())
             self.assertEqual(control_before, control_path.read_bytes())
         self.assertTrue(initial["applied"])
+
+    def test_default_off_control_recovery_does_not_create_or_need_sharing_outbox(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        deny = self.active_path.with_name(".catchuparr-recorder-control-deny")
+        deny.touch()
+
+        active, control = load_applied_state(self.active_path)
+
+        self.assertIsNotNone(active)
+        self.assertFalse(control.paused)
+        self.assertFalse(deny.exists())
+        self.assertFalse(
+            self.active_path.with_name(configuration.SHARING_AUTHORITY_OUTBOX_NAME).exists()
+        )
 
     def test_legacy_v5_snapshot_reads_sharing_as_disabled_defaults(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
@@ -338,16 +360,20 @@ class ConfigurationTests(unittest.TestCase):
     def test_v6_sharing_values_rotate_applied_generation(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         original, original_control = load_applied_state(self.active_path)
-        result = apply_configuration(
-            dict(
-                self.settings,
-                connection_sharing_config=(
-                    "version: 1\ndefault:\n  enabled: true\n"
+        with patch.object(
+            configuration, "_sharing_catalog_generation",
+            return_value="synthetic-sharing-catalog-generation",
+        ), patch.object(configuration, "_drain_sharing_authority_outbox", return_value=True):
+            result = apply_configuration(
+                dict(
+                    self.settings,
+                    connection_sharing_config=(
+                        "version: 1\ndefault:\n  enabled: true\n"
+                    ),
                 ),
-            ),
-            self.catalog,
-            self.active_path,
-        )
+                self.catalog,
+                self.active_path,
+            )
         updated, updated_control = load_applied_state(self.active_path)
         self.assertTrue(result["applied"])
         self.assertNotEqual(
@@ -359,6 +385,107 @@ class ConfigurationTests(unittest.TestCase):
             updated_control.configuration_generation,
         )
         self.assertNotEqual(original_control.generation, updated_control.generation)
+
+    def test_committed_sharing_apply_keeps_admission_denied_until_outbox_recovery(self):
+        settings = dict(
+            self.settings,
+            connection_sharing_config="version: 1\ndefault:\n  enabled: true\n",
+        )
+        redis_hashes = {}
+
+        class Redis:
+            def hgetall(self, key):
+                return dict(redis_hashes.get(key, {}))
+
+        def drain_real_outbox(path, activation_id=None):
+            outbox = SharingAuthorityOutbox(
+                Path(path).with_name(configuration.SHARING_AUTHORITY_OUTBOX_NAME)
+            )
+
+            def publish(_redis, event):
+                key = f"catchuparr:sharing:current:{event.channel_uuid}"
+                current = redis_hashes.get(key, {})
+                if int(current.get("authority_revision", "0")) != event.expected_revision:
+                    return False
+                redis_hashes[key] = {
+                    "authority_revision": str(event.authority_revision),
+                    "configuration_generation": event.configuration_generation,
+                    "control_generation": str(event.control_generation),
+                    "catalog_generation": event.catalog_generation,
+                }
+                return True
+
+            result = outbox.drain(
+                Redis(),
+                activation_id=activation_id,
+                read_prior=lambda *_args: None,
+                publish=publish,
+                invalidate=lambda *_args: True,
+            )
+            if result.pending_event_ids:
+                raise AssertionError((result, redis_hashes))
+            return not result.pending_event_ids
+
+        with patch.object(
+            configuration, "_sharing_catalog_generation",
+            return_value="synthetic-sharing-catalog-generation",
+        ), patch.object(
+            configuration,
+            "_drain_sharing_authority_outbox",
+            side_effect=[False, drain_real_outbox],
+        ):
+            result = apply_configuration(settings, self.catalog, self.active_path)
+
+        self.assertTrue(result["activation_cleanup_pending"])
+        self.assertTrue(configuration._activation_uncertain_path(self.active_path).exists())
+        self.assertTrue((self.active_path.parent / ".catchuparr-recorder-control-deny").exists())
+        outbox = SharingAuthorityOutbox(
+            self.active_path.with_name(configuration.SHARING_AUTHORITY_OUTBOX_NAME)
+        )
+        self.assertEqual(2, len(outbox.pending()))
+
+        with patch.object(
+            configuration, "_drain_sharing_authority_outbox", side_effect=drain_real_outbox,
+        ) as recovery_drain:
+            configuration.recover_interrupted_activation(self.active_path)
+        self.assertEqual(1, recovery_drain.call_count)
+        active, control = load_applied_state(self.active_path)
+        self.assertTrue(all(item["enabled"] for item in active["connection_sharing"].values()))
+        self.assertEqual(
+            configuration.active_configuration_generation(active),
+            control.configuration_generation,
+        )
+        self.assertEqual((), outbox.pending())
+        self.assertFalse(configuration._activation_uncertain_path(self.active_path).exists())
+        self.assertFalse((self.active_path.parent / ".catchuparr-recorder-control-deny").exists())
+
+    def test_precommit_rollback_cancels_staged_sharing_authority(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        settings = dict(
+            self.settings,
+            connection_sharing_config="version: 1\ndefault:\n  enabled: true\n",
+        )
+        with patch.object(
+            configuration, "_sharing_catalog_generation",
+            return_value="synthetic-sharing-catalog-generation",
+        ), patch.object(
+            configuration,
+            "_write_activation_commit_locked",
+            side_effect=OSError("synthetic commit marker failure"),
+        ), self.assertRaisesRegex(Exception, "previous settings were restored"):
+            apply_configuration(settings, self.catalog, self.active_path)
+
+        active = load_active_configuration(self.active_path)
+        self.assertTrue(all(not item["enabled"] for item in active["connection_sharing"].values()))
+        outbox = SharingAuthorityOutbox(
+            self.active_path.with_name(configuration.SHARING_AUTHORITY_OUTBOX_NAME)
+        )
+        self.assertEqual((), outbox.pending())
+        self.assertTrue(all(
+            record.status == "cancelled"
+            for channel in (CHANNEL_A, CHANNEL_B)
+            if (record := outbox.latest_for_channel(channel)) is not None
+        ))
 
     def test_v4_snapshot_without_origins_remains_readable(self):
         apply_configuration(self.settings, self.catalog, self.active_path)

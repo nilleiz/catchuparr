@@ -33,6 +33,7 @@ ACTIVATION_BACKUP_NAME = ".catchuparr-configuration-activation-previous.json"
 ACTIVATION_COMMIT_NAME = ".catchuparr-configuration-activation-commit.json"
 ACTIVATION_UNCERTAIN_NAME = ".catchuparr-configuration-activation-uncertain.json"
 ACTIVATION_STATE_VERSION = 1
+SHARING_AUTHORITY_OUTBOX_NAME = ".catchuparr-sharing-authority.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -477,6 +478,12 @@ class _PreparedActivation:
             self.activation_outcome_unknown_warning = True
             self.recording_paused_warning = True
             return
+        if not _drain_sharing_authority_outbox(self.active_path, self.activation_id):
+            # Keep both the activation journal and deny marker until every
+            # Redis authority CAS and prior-episode invalidation is confirmed.
+            self.recording_paused_warning = True
+            self.activation_cleanup_warning = True
+            return
         try:
             _remove_activation_uncertain_locked(self.active_path)
         except Exception:
@@ -534,6 +541,16 @@ class _PreparedActivation:
                 _remove_activation_backup_locked(self.active_path)
             except Exception:
                 restored = False
+        if restored:
+            try:
+                outbox_path = self.active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME)
+                if outbox_path.exists():
+                    from .sharing_authority_outbox import SharingAuthorityOutbox
+
+                    outbox = SharingAuthorityOutbox(outbox_path)
+                    outbox.cancel_activation(self.activation_id)
+            except Exception:
+                restored = False
         self.finished = restored
         return restored
 
@@ -581,11 +598,14 @@ def _prepare_document_with_control_locked(
     )
     try:
         _atomic_json_replace_locked(path, document)
-        _configuration_control_state_locked(
+        new_control = _configuration_control_state_locked(
             sidecar,
             recording_enabled=document["settings"]["recording_enabled"],
             configuration_generation=generation,
             recovering_pending=marker_was_present,
+        )
+        _stage_sharing_authority_activation(
+            path, activation_id, previous_active, active, new_control,
         )
     except Exception:
         restored = prepared.rollback()
@@ -597,6 +617,212 @@ def _prepare_document_with_control_locked(
             "configuration activation failed; recorder admission remains denied"
         ) from None
     return prepared
+
+
+def _sharing_authority_outbox(path: Path):
+    from .sharing_authority_outbox import SharingAuthorityOutbox
+
+    return SharingAuthorityOutbox(path.with_name(SHARING_AUTHORITY_OUTBOX_NAME))
+
+
+def _stage_sharing_authority_activation(
+    path: Path,
+    activation_id: str,
+    previous_active_bytes: bytes | None,
+    new_active: dict[str, Any],
+    new_control: Any,
+) -> None:
+    """Persist authority revisions before the activation commit marker."""
+    previous_active = _active_configuration_from_bytes(previous_active_bytes)
+    old_enabled = _enabled_sharing_channels(previous_active)
+    new_enabled = _enabled_sharing_channels(new_active)
+    affected = sorted(old_enabled | new_enabled)
+    if not affected:
+        return
+    from .sharing_authority_outbox import SharingAuthorityTarget
+
+    config_generation = active_configuration_generation(new_active)
+    targets = []
+    for channel in affected:
+        if channel in new_enabled:
+            # Borrow eligibility depends on these exact assigned profile facts;
+            # fail Apply closed if the catalog cannot be described completely.
+            catalog_generation = _sharing_catalog_generation(channel)
+        else:
+            # A deselected/disabled channel is revoked by config/control CAS.
+            # Its retired catalog value is deliberately never read as authority.
+            retired = json.dumps(
+                ["disabled-sharing", channel, config_generation], separators=(",", ":"),
+            ).encode("ascii")
+            catalog_generation = hashlib.sha256(retired).hexdigest()
+        targets.append(SharingAuthorityTarget(
+            channel_uuid=channel,
+            configuration_generation=config_generation,
+            control_generation=new_control.generation,
+            catalog_generation=catalog_generation,
+        ))
+    _sharing_authority_outbox(path).stage(activation_id, targets)
+
+
+def _enabled_sharing_channels(active: dict[str, Any] | None) -> set[str]:
+    if not isinstance(active, dict):
+        return set()
+    sharing = active.get("connection_sharing")
+    if not isinstance(sharing, dict):
+        return set()
+    return {
+        str(channel) for channel, setting in sharing.items()
+        if isinstance(setting, dict) and setting.get("enabled") is True
+    }
+
+
+def _sharing_catalog_generation(channel_uuid: str) -> str:
+    from .sharing_runtime import _native_source_catalog
+
+    _sources, catalog_generation = _native_source_catalog(channel_uuid)
+    return catalog_generation
+
+
+def _stage_sharing_authority_control(
+    path: Path,
+    activation_id: str,
+    control: Any,
+) -> bool:
+    """Stage control-generation revocations while its deny marker is held."""
+    active = _load_active_configuration_locked(path)
+    enabled = sorted(_enabled_sharing_channels(active))
+    if not enabled or active is None:
+        return False
+    from .sharing_authority_outbox import SharingAuthorityTarget
+
+    config_generation = active_configuration_generation(active)
+    targets = [
+        SharingAuthorityTarget(
+            channel, config_generation, control.generation,
+            _sharing_catalog_generation(channel),
+        )
+        for channel in enabled
+    ]
+    _sharing_authority_outbox(path).stage(activation_id, targets)
+    return True
+
+
+def _reconcile_control_authority_outbox(path: Path, active: dict[str, Any] | None, control: Any) -> bool:
+    """Drain only control events whose exact target is durably on disk."""
+    enabled = sorted(_enabled_sharing_channels(active))
+    if not enabled:
+        # No channel can hold a borrowed grant under the committed snapshot.
+        # A surviving control deny marker still protects recording until this
+        # validated sidecar is read; there is no sharing authority to publish.
+        return True
+    try:
+        from .sharing_authority_outbox import SharingAuthorityTarget
+
+        outbox = _sharing_authority_outbox(path)
+        pending = outbox.pending()
+        config_generation = (
+            active_configuration_generation(active) if active is not None else ""
+        )
+        ok = True
+        for event in pending:
+            if not event.activation_id.startswith("control-"):
+                ok = False
+                continue
+            if (
+                event.configuration_generation != config_generation
+                or event.control_generation != control.generation
+            ):
+                # Control publication follows the sidecar replace, so a staged
+                # event that does not match disk never reached Redis.
+                outbox.cancel_event(event.event_id)
+                continue
+            if not _drain_sharing_authority_outbox(path, event.activation_id):
+                ok = False
+        if not ok:
+            return False
+        targets = []
+        for channel in enabled:
+            targets.append(SharingAuthorityTarget(
+                channel, config_generation, control.generation,
+                _sharing_catalog_generation(channel),
+            ))
+        needs_stage = False
+        for target in targets:
+            latest = outbox.latest_for_channel(target.channel_uuid)
+            if latest is None or latest.status != "complete" or (
+                latest.event.configuration_generation != target.configuration_generation
+                or latest.event.control_generation != target.control_generation
+                or latest.event.catalog_generation != target.catalog_generation
+            ):
+                needs_stage = True
+                break
+        if needs_stage:
+            activation_id = f"control-recovery-{uuid.uuid4().hex}"
+            outbox.stage(activation_id, targets)
+            if not _drain_sharing_authority_outbox(path, activation_id):
+                return False
+        return all(
+            (latest := outbox.latest_for_channel(target.channel_uuid)) is not None
+            and latest.status == "complete"
+            and latest.event.configuration_generation == target.configuration_generation
+            and latest.event.control_generation == target.control_generation
+            and latest.event.catalog_generation == target.catalog_generation
+            for target in targets
+        )
+    except Exception:
+        return False
+
+
+def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None) -> bool:
+    """Publish and revoke pending targets before local admission is reopened."""
+    outbox_path = path.with_name(SHARING_AUTHORITY_OUTBOX_NAME)
+    if not outbox_path.exists():
+        return True
+    try:
+        outbox = _sharing_authority_outbox(path)
+        if not outbox.pending(activation_id):
+            return True
+        from core.utils import RedisClient
+
+        from .adapters.sharing_native import (
+            invalidate_native_episode,
+            publish_current_authority,
+            read_native_episode_grant,
+        )
+
+        redis = RedisClient.get_client()
+        if redis is None:
+            return False
+
+        def publish(client, event):
+            return publish_current_authority(
+                client, event.channel_uuid,
+                configuration_generation=event.configuration_generation,
+                control_generation=event.control_generation,
+                catalog_generation=event.catalog_generation,
+                expected_revision=event.expected_revision,
+                authority_revision=event.authority_revision,
+            )
+
+        def invalidate(client, prior, event):
+            return invalidate_native_episode(
+                client, prior,
+                configuration_generation=event.configuration_generation,
+                control_generation=event.control_generation,
+                catalog_generation=event.catalog_generation,
+                authority_revision=event.authority_revision,
+            )
+
+        result = outbox.drain(
+            redis,
+            activation_id=activation_id,
+            read_prior=read_native_episode_grant,
+            publish=publish,
+            invalidate=invalidate,
+        )
+        return not result.pending_event_ids
+    except Exception:
+        return False
 
 
 def _read_file_bytes(path: Path) -> bytes | None:
@@ -930,11 +1156,16 @@ def _recover_interrupted_activation_locked(path: Path) -> None:
     if uncertain_id is not None and uncertain_id != activation_id:
         raise ValueError("Configuration activation guard does not match its journal")
     committed = _activation_commit_matches(path, state)
-    if committed and _committed_bundle_valid(path, activation_id):
+    committed_candidate_valid = committed and _committed_bundle_valid(path, activation_id)
+    if committed_candidate_valid:
         try:
             _confirm_committed_bundle_durability(path)
         except OSError:
             raise ValueError("Committed configuration durability could not be confirmed") from None
+        if not _drain_sharing_authority_outbox(path, activation_id):
+            raise ValueError(
+                "Committed sharing authority publication is pending; recorder admission remains denied"
+            )
         try:
             from .recorder_control import _clear_deny_marker_durably, control_state_path
 
@@ -950,7 +1181,16 @@ def _recover_interrupted_activation_locked(path: Path) -> None:
                 raise ValueError("Configuration activation outcome remains unresolved")
     elif not _restore_activation_backup_locked(path, backup):
         raise ValueError("Interrupted configuration activation could not be restored")
-    elif uncertain_id is not None:
+    else:
+        try:
+            outbox_path = path.with_name(SHARING_AUTHORITY_OUTBOX_NAME)
+            if outbox_path.exists():
+                from .sharing_authority_outbox import SharingAuthorityOutbox
+
+                SharingAuthorityOutbox(outbox_path).cancel_activation(activation_id)
+        except Exception:
+            raise ValueError("Interrupted sharing authority activation could not be cancelled") from None
+    if not committed_candidate_valid and uncertain_id is not None:
         try:
             _remove_activation_uncertain_locked(path)
         except Exception:
@@ -1175,7 +1415,25 @@ def load_applied_state(
             _deny_marker_exists(control_deny_path(path))
             if not sidecar.exists():
                 raise RecorderControlError("applied recorder control state is missing")
-        control = _load_or_initialize_locked(sidecar)
+        control = _load_or_initialize_locked(sidecar, allow_pending=True)
+        if _deny_marker_exists(control_deny_path(path)):
+            if not _reconcile_control_authority_outbox(path, active, control):
+                raise RecorderControlError(
+                    "sharing authority recovery is pending; recorder admission remains denied"
+                )
+            try:
+                from .recorder_control import _clear_deny_marker_durably
+
+                _clear_deny_marker_durably(control_deny_path(path))
+            except Exception:
+                raise RecorderControlError(
+                    "recorder control deny marker could not be cleared"
+                ) from None
+            if _deny_marker_exists(control_deny_path(path)):
+                raise RecorderControlError(
+                    "recorder control transition remains denied"
+                )
+            control = _load_or_initialize_locked(sidecar)
         if active is not None and active.get("version", 0) >= 4:
             active_generation = active_configuration_generation(active)
             if control.configuration_generation != active_generation:
