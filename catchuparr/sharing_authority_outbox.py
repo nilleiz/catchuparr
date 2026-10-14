@@ -89,6 +89,7 @@ class SharingAuthorityOutbox:
                     prior_json TEXT,
                     prior_observed INTEGER NOT NULL DEFAULT 0 CHECK(prior_observed IN (0,1)),
                     claimed_at REAL,
+                    committed INTEGER NOT NULL DEFAULT 0 CHECK(committed IN (0,1)),
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(activation_id, channel_uuid)
@@ -105,6 +106,11 @@ class SharingAuthorityOutbox:
                 )
             if "claimed_at" not in columns:
                 db.execute("ALTER TABLE sharing_authority_outbox ADD COLUMN claimed_at REAL")
+            if "committed" not in columns:
+                db.execute(
+                    "ALTER TABLE sharing_authority_outbox ADD COLUMN committed "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(committed IN (0,1))"
+                )
             db.execute(
                 "CREATE INDEX IF NOT EXISTS sharing_authority_pending "
                 "ON sharing_authority_outbox(status, activation_id, channel_uuid)"
@@ -171,6 +177,14 @@ class SharingAuthorityOutbox:
         now = self._time(self.clock())
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
+            claimed = db.execute(
+                "SELECT 1 FROM sharing_authority_outbox WHERE activation_id=? "
+                "AND (status='complete' OR (status='pending' AND claimed_at IS NOT NULL)) LIMIT 1",
+                (activation_id,),
+            ).fetchone()
+            if claimed is not None:
+                db.rollback()
+                return False
             changed = db.execute(
                 "UPDATE sharing_authority_outbox SET status='cancelled',updated_at=? "
                 "WHERE activation_id=? AND status='pending' AND claimed_at IS NULL",
@@ -192,6 +206,29 @@ class SharingAuthorityOutbox:
             ).rowcount
             db.commit()
         return changed == 1
+
+    def commit_activation(self, activation_id: str) -> bool:
+        """Authorize draining only after the caller's external state is durable."""
+        if not isinstance(activation_id, str) or not activation_id:
+            return False
+        now = self._time(self.clock())
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            claimed_staged = db.execute(
+                "SELECT 1 FROM sharing_authority_outbox WHERE activation_id=? "
+                "AND status='pending' AND claimed_at IS NOT NULL AND committed=0 LIMIT 1",
+                (activation_id,),
+            ).fetchone()
+            if claimed_staged is not None:
+                db.rollback()
+                return False
+            db.execute(
+                "UPDATE sharing_authority_outbox SET committed=1,updated_at=? "
+                "WHERE activation_id=? AND status='pending'",
+                (now, activation_id),
+            )
+            db.commit()
+        return True
 
     def pending(self, activation_id: str | None = None) -> tuple[SharingAuthorityOutboxEvent, ...]:
         with self._db() as db:
@@ -247,12 +284,13 @@ class SharingAuthorityOutbox:
             try:
                 record = self._claim(event)
                 if record is None:
+                    pending.append(event.event_id)
                     continue
                 observed, stored = record
                 if not observed:
                     prior = read_prior(redis, event.channel_uuid)
-                    encoded = encode_prior(prior) if encode_prior is not None else self._json_safe(prior)
-                    stored = self._json_dump(encoded)
+                    encoded = encode_prior(prior) if encode_prior is not None else prior
+                    stored = self._json_dump(self._json_safe(encoded))
                     if not self._store_prior(event, stored):
                         pending.append(event.event_id)
                         continue
@@ -281,10 +319,10 @@ class SharingAuthorityOutbox:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT status,prior_observed,prior_json,claimed_at FROM sharing_authority_outbox WHERE event_id=?",
+                "SELECT status,prior_observed,prior_json,claimed_at,committed FROM sharing_authority_outbox WHERE event_id=?",
                 (event.event_id,),
             ).fetchone()
-            if row is None or row["status"] != "pending":
+            if row is None or row["status"] != "pending" or row["committed"] != 1:
                 db.rollback()
                 return None
             if row["claimed_at"] is None:
@@ -337,7 +375,8 @@ class SharingAuthorityOutbox:
                 db.rollback()
                 raise RuntimeError("authority event disappeared")
             current = self._event(row)
-            if current != event or row["status"] != "pending" or row["claimed_at"] is None:
+            if (current != event or row["status"] != "pending" or row["claimed_at"] is None
+                    or row["committed"] != 1):
                 db.rollback()
                 raise RuntimeError("authority event changed before acknowledgment")
             revision = db.execute(

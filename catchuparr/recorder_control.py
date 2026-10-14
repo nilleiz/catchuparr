@@ -286,9 +286,13 @@ def _transition_locked(
                 pass
         raise RecorderControlError("recorder control transition failed; admission remains denied") from None
     if staged:
-        from .configuration import _drain_sharing_authority_outbox
+        from .configuration import (
+            _commit_sharing_authority_activation,
+            _drain_sharing_authority_outbox,
+        )
 
-        if not _drain_sharing_authority_outbox(path, outbox_id):
+        if (not _commit_sharing_authority_activation(path, outbox_id)
+                or not _drain_sharing_authority_outbox(path, outbox_id)):
             raise RecorderControlError(
                 "sharing authority publication is pending; recorder admission remains denied"
             )
@@ -328,12 +332,14 @@ def _force_paused_locked(
     outbox_id = f"control-{uuid.uuid4().hex}"
     try:
         from .configuration import (
+            _commit_sharing_authority_activation,
             _drain_sharing_authority_outbox,
             _stage_sharing_authority_control,
         )
 
         if _stage_sharing_authority_control(path, outbox_id, paused):
-            if not _drain_sharing_authority_outbox(path, outbox_id):
+            if (not _commit_sharing_authority_activation(path, outbox_id)
+                    or not _drain_sharing_authority_outbox(path, outbox_id)):
                 raise RecorderControlError(
                     "sharing authority publication is pending; admission remains denied"
                 )
