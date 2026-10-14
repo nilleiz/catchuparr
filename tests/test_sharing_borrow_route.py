@@ -6,16 +6,22 @@ from unittest.mock import patch
 
 from catchuparr.adapters.sharing_borrow_route import (
     BorrowedReaderSession,
+    BorrowOpenCleanupPending,
     native_borrow_proof_reader,
     sign_borrow_capability,
 )
-from catchuparr.adapters.sharing_native import NativeClientRegistrationAck, NativeEpisodeGrant
+from catchuparr.adapters.sharing_native import (
+    NativeAssignedSource,
+    NativeClientRegistrationAck,
+    NativeEpisodeGrant,
+)
 from catchuparr.adapters.sharing_reader import (
     BorrowBindingLost,
     BorrowReadBinding,
+    BorrowReaderUnavailable,
     validate_borrow_read_proof,
 )
-from catchuparr.sharing_episode import BorrowEpisodeSnapshot
+from catchuparr.sharing_episode import BorrowEpisodeRejected, BorrowEpisodeSnapshot
 
 SECRET = b"synthetic-route-secret-060-with-at-least-32-bytes"
 IDENTITY = (
@@ -111,7 +117,8 @@ class SharingBorrowRouteTests(unittest.TestCase):
         ):
             reader = native_borrow_proof_reader(
                 redis=object(), episode=episode, ack=ack,
-                assigned_sources=(object(),), clock=lambda: 120.0,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
             )
             proof = reader()
         binding = BorrowReadBinding(
@@ -146,10 +153,210 @@ class SharingBorrowRouteTests(unittest.TestCase):
                 ):
                     reader = native_borrow_proof_reader(
                         redis=object(), episode=episode, ack=ack,
-                        assigned_sources=(object(),), clock=lambda: 120.0,
+                        assigned_sources=(self._assigned_source(),),
+                        catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
                     )
                     with self.assertRaises(BorrowBindingLost):
                         reader()
+
+    def test_dynamic_grace_rejects_catalog_epoch_change_before_native_cas(self):
+        episode, ack, grant, _target = self._current_proof_inputs()
+        with patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant",
+                   return_value=replace(grant, catalog_generation="catalog-replaced-synthetic")), \
+                patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client") as touch:
+            reader = native_borrow_proof_reader(
+                redis=object(), episode=episode, ack=ack,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+            )
+            with self.assertRaises(BorrowBindingLost):
+                reader()
+        touch.assert_not_called()
+
+    @staticmethod
+    def _assigned_source():
+        return NativeAssignedSource(
+            channel_uuid=IDENTITY[0], stream_id=IDENTITY[4], account_id=IDENTITY[5],
+            m3u_profile_id=IDENTITY[6], input_profile_id=IDENTITY[7],
+            assigned=True, account_active=True, profile_active=True, media_compatible=True,
+        )
+
+    @staticmethod
+    def _opening_episode():
+        return BorrowEpisodeSnapshot(
+            episode_id="episode-route-synthetic", channel_uuid=IDENTITY[0],
+            phase="opening", configuration_generation="config-route-synthetic",
+            control_generation=3, recorder_fence=9, intent_epoch=7,
+            identity=IDENTITY, lease_digest=sha256(b"synthetic-route-lease").hexdigest(),
+            client_id=None, connected_at=None, version=1,
+            last_viewer_left_at=None, return_deadline=None,
+        )
+
+    def _open(self, *, cleanup_reply=True, registration_reply=True, manager_worker=None):
+        opening = self._opening_episode()
+        active = replace(
+            opening, phase="active", client_id="catchuparr-client-route-synthetic",
+            connected_at="123.5", version=2,
+        )
+        manager = FakeManager()
+        manager.worker_id = manager_worker or IDENTITY[1]
+        manager.redis_client = object()
+        ack = NativeClientRegistrationAck(
+            channel_uuid=IDENTITY[0], episode_id=opening.episode_id,
+            client_id="catchuparr-client-route-synthetic", local_worker_id=IDENTITY[1],
+            redis_backend_signature="backend-route-synthetic", connected_at="123.5",
+            projection_version=2, user_agent="Synthetic Player", client_ip="192.0.2.60",
+        )
+        ledger = SimpleNamespace(activate=lambda *_args, **_kwargs: active)
+        calls = []
+        mocks = (
+            patch("catchuparr.adapters.sharing_borrow_route.redis_backend_signature",
+                  return_value="backend-route-synthetic"),
+            patch("catchuparr.sharing_episode.select_task_local_client_manager",
+                  return_value=(manager, True)),
+            patch("catchuparr.adapters.sharing_borrow_route.consume_opening_capability",
+                  side_effect=lambda *_args, **_kwargs: calls.append("consume") or True),
+            patch("catchuparr.adapters.sharing_borrow_route.make_task_local_input_buffer",
+                  side_effect=lambda *_args, **_kwargs: calls.append("buffer") or object()),
+            patch("catchuparr.adapters.sharing_borrow_route.register_borrowed_client",
+                  side_effect=lambda *_args, **_kwargs: calls.append("register") or
+                  (ack if registration_reply else None)),
+            patch("catchuparr.adapters.sharing_borrow_route.adopt_registered_client_in_manager",
+                  side_effect=lambda *_args: calls.append("adopt") or True),
+            patch("catchuparr.adapters.sharing_borrow_route.cleanup_borrowed_client",
+                  side_effect=lambda *_args, **_kwargs: calls.append("cleanup") or cleanup_reply),
+            patch("catchuparr.adapters.sharing_borrow_route.ReadOnlyTsBufferReader",
+                  side_effect=lambda *_args: calls.append("reader") or FakeReader()),
+        )
+        return opening, active, manager, ack, ledger, calls, mocks
+
+    def test_open_orders_capability_registration_activation_and_reader(self):
+        opening, _active, manager, ack, ledger, calls, mocks = self._open()
+        with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4], mocks[5], mocks[6], mocks[7], \
+                patch("catchuparr.adapters.sharing_borrow_route.native_borrow_proof_reader",
+                      return_value=lambda: None):
+            session = BorrowedReaderSession.open(
+                capability=capability(), capability_secret=SECRET,
+                authenticated_user_id="user-route-synthetic", now=199,
+                episode=opening, lease_value="synthetic-route-lease",
+                catalog_generation="catalog-route-synthetic",
+                ordinary_viewer_ids=("viewer-route-synthetic",),
+                redis_text=object(), redis_binary=object(), existing_manager=None,
+                manager_type=object, worker_id=IDENTITY[1], buffer_type=object,
+                assigned_sources=(self._assigned_source(),), client_id=ack.client_id,
+                client_ip="192.0.2.60", user_agent="Synthetic Player", ledger=ledger,
+            )
+        self.assertEqual(calls, ["consume", "buffer", "register", "adopt", "reader"])
+        self.assertIs(session.client_manager, manager)
+        self.assertTrue(session.owns_client_manager)
+
+    def test_open_replay_does_not_construct_or_register(self):
+        opening, _active, _manager, _ack, _ledger, calls, mocks = self._open()
+        with mocks[0], mocks[1], patch(
+            "catchuparr.adapters.sharing_borrow_route.consume_opening_capability", return_value=False,
+        ), mocks[3], mocks[4]:
+            with self.assertRaises(BorrowEpisodeRejected):
+                BorrowedReaderSession.open(
+                    capability=capability(), capability_secret=SECRET,
+                    authenticated_user_id="user-route-synthetic", now=199,
+                    episode=opening, lease_value="synthetic-route-lease",
+                    catalog_generation="catalog-route-synthetic",
+                    ordinary_viewer_ids=("viewer-route-synthetic",),
+                    redis_text=object(), redis_binary=object(), existing_manager=None,
+                    manager_type=object, worker_id=IDENTITY[1], buffer_type=object,
+                    assigned_sources=(self._assigned_source(),),
+                    client_id="catchuparr-client-route-synthetic", client_ip="192.0.2.60",
+                    user_agent="Synthetic Player", ledger=_ledger,
+                )
+        self.assertEqual(calls, [])
+
+    def test_open_backend_mismatch_precedes_nonce_and_registration(self):
+        opening, _active, _manager, _ack, ledger, calls, mocks = self._open()
+        with patch("catchuparr.adapters.sharing_borrow_route.redis_backend_signature",
+                   side_effect=("text-backend", "binary-backend")), mocks[2], mocks[4]:
+            with self.assertRaises(BorrowReaderUnavailable):
+                BorrowedReaderSession.open(
+                    capability=capability(), capability_secret=SECRET,
+                    authenticated_user_id="user-route-synthetic", now=199,
+                    episode=opening, lease_value="synthetic-route-lease",
+                    catalog_generation="catalog-route-synthetic",
+                    ordinary_viewer_ids=("viewer-route-synthetic",),
+                    redis_text=object(), redis_binary=object(), existing_manager=None,
+                    manager_type=object, worker_id=IDENTITY[1], buffer_type=object,
+                    assigned_sources=(self._assigned_source(),),
+                    client_id="catchuparr-client-route-synthetic", client_ip="192.0.2.60",
+                    user_agent="Synthetic Player", ledger=ledger,
+                )
+        self.assertEqual(calls, [])
+
+    def test_open_manager_security_backend_mismatch_precedes_nonce(self):
+        opening, _active, manager, _ack, ledger, calls, mocks = self._open()
+        with patch("catchuparr.adapters.sharing_borrow_route.redis_backend_signature",
+                   side_effect=("secure-backend", "secure-backend", "different-security-backend")), \
+                mocks[1], mocks[2]:
+            with self.assertRaises(BorrowReaderUnavailable):
+                BorrowedReaderSession.open(
+                    capability=capability(), capability_secret=SECRET,
+                    authenticated_user_id="user-route-synthetic", now=199,
+                    episode=opening, lease_value="synthetic-route-lease",
+                    catalog_generation="catalog-route-synthetic",
+                    ordinary_viewer_ids=("viewer-route-synthetic",),
+                    redis_text=object(), redis_binary=object(), existing_manager=None,
+                    manager_type=object, worker_id=IDENTITY[1], buffer_type=object,
+                    assigned_sources=(self._assigned_source(),),
+                    client_id="catchuparr-client-route-synthetic", client_ip="192.0.2.60",
+                    user_agent="Synthetic Player", ledger=ledger,
+                )
+        self.assertEqual(calls, [])
+        self.assertEqual(manager.stopped, 1)
+
+    def test_open_failed_cleanup_exposes_retry_handle_and_keeps_manager(self):
+        opening, _active, manager, _ack, ledger, _calls, mocks = self._open(cleanup_reply=False)
+        with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4], mocks[5], mocks[6], \
+                patch("catchuparr.adapters.sharing_borrow_route.ReadOnlyTsBufferReader",
+                      side_effect=RuntimeError("synthetic reader construction failure")), \
+                patch("catchuparr.adapters.sharing_borrow_route.native_borrow_proof_reader",
+                      return_value=lambda: None):
+            with self.assertRaises(BorrowOpenCleanupPending) as raised:
+                BorrowedReaderSession.open(
+                    capability=capability(), capability_secret=SECRET,
+                    authenticated_user_id="user-route-synthetic", now=199,
+                    episode=opening, lease_value="synthetic-route-lease",
+                    catalog_generation="catalog-route-synthetic",
+                    ordinary_viewer_ids=("viewer-route-synthetic",),
+                    redis_text=object(), redis_binary=object(), existing_manager=None,
+                    manager_type=object, worker_id=IDENTITY[1], buffer_type=object,
+                    assigned_sources=(self._assigned_source(),),
+                    client_id="catchuparr-client-route-synthetic", client_ip="192.0.2.60",
+                    user_agent="Synthetic Player", ledger=ledger,
+                )
+        self.assertIsNotNone(raised.exception.ack)
+        self.assertEqual(manager.stopped, 0)
+        self.assertFalse(raised.exception.retry_cleanup())
+        self.assertEqual(manager.stopped, 0)
+
+    def test_open_uncertain_registration_without_ack_retains_owned_manager(self):
+        opening, _active, manager, _ack, ledger, _calls, mocks = self._open()
+        with mocks[0], mocks[1], mocks[2], mocks[3], patch(
+            "catchuparr.adapters.sharing_borrow_route.register_borrowed_client",
+            side_effect=RuntimeError("synthetic Redis reply unavailable"),
+        ), mocks[5], mocks[6]:
+            with self.assertRaises(BorrowOpenCleanupPending) as raised:
+                BorrowedReaderSession.open(
+                    capability=capability(), capability_secret=SECRET,
+                    authenticated_user_id="user-route-synthetic", now=199,
+                    episode=opening, lease_value="synthetic-route-lease",
+                    catalog_generation="catalog-route-synthetic",
+                    ordinary_viewer_ids=("viewer-route-synthetic",),
+                    redis_text=object(), redis_binary=object(), existing_manager=None,
+                    manager_type=object, worker_id=IDENTITY[1], buffer_type=object,
+                    assigned_sources=(self._assigned_source(),),
+                    client_id="catchuparr-client-route-synthetic", client_ip="192.0.2.60",
+                    user_agent="Synthetic Player", ledger=ledger,
+                )
+        self.assertIsNone(raised.exception.ack)
+        self.assertFalse(raised.exception.retry_cleanup())
+        self.assertEqual(manager.stopped, 0)
 
     def test_stream_failure_runs_exact_cleanup_and_stops_only_owned_manager(self):
         manager = FakeManager()

@@ -21,6 +21,7 @@ from ..sharing_episode import BorrowEpisodeLedger, BorrowEpisodeRejected, Borrow
 from .sharing_native import (
     NativeAssignedSource,
     NativeClientRegistrationAck,
+    _recover_registration_ack,
     adopt_registered_client_in_manager,
     check_and_touch_borrowed_client,
     cleanup_borrowed_client,
@@ -35,6 +36,7 @@ from .sharing_reader import (
     BorrowReadProof,
     ReadOnlyTsBufferReader,
     make_task_local_input_buffer,
+    redis_backend_signature,
 )
 
 
@@ -114,6 +116,61 @@ class SignedBorrowCapability:
             return False
         expected = hmac.new(secret, self.payload(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, self.signature)
+
+
+class BorrowOpenCleanupPending(BorrowEpisodeRejected):
+    """An exact registration could not be confirmed absent during failed open.
+
+    The manager and acknowledgment remain reachable so a caller can retry the
+    exact Redis cleanup. An uncertain registration with no acknowledgment is
+    deliberately not cleaned by client ID alone and never stops its manager.
+    """
+
+    def __init__(self, message: str, *, ack: NativeClientRegistrationAck | None,
+                 manager: Any, owns_manager: bool, cleanup: Callable[..., bool],
+                 ledger: BorrowEpisodeLedger, episode: BorrowEpisodeSnapshot,
+                 reconcile: Callable[[], NativeClientRegistrationAck | None] | None = None,
+                 native_removed: bool = False) -> None:
+        super().__init__(message)
+        self.ack = ack
+        self.manager = manager
+        self.owns_manager = owns_manager
+        self._cleanup = cleanup
+        self._ledger = ledger
+        self._episode = episode
+        self._reconcile = reconcile
+        self._native_removed = native_removed
+
+    def retry_cleanup(self) -> bool:
+        """Retry only a known exact registration; retain ownership on failure."""
+        if self.ack is None and self._reconcile is not None:
+            try:
+                self.ack = self._reconcile()
+            except Exception:
+                return False
+        if self.ack is None:
+            return False
+        if not self._native_removed:
+            try:
+                removed = self._cleanup(self.ack, self.manager, self.owns_manager)
+            except Exception:
+                return False
+            if not removed:
+                return False
+            self._native_removed = True
+            BorrowedReaderSession._close_episode_ledger(
+                self._ledger, self._episode.episode_id, self._episode.channel_uuid,
+            )
+        if self.owns_manager:
+            stop = getattr(self.manager, "stop", None)
+            if not callable(stop):
+                return False
+            try:
+                stop()
+            except Exception:
+                return False
+        self.ack = None
+        return True
 
 
 def sign_borrow_capability(
@@ -249,6 +306,7 @@ def native_borrow_proof_reader(
     episode: BorrowEpisodeSnapshot,
     ack: NativeClientRegistrationAck,
     assigned_sources: tuple[NativeAssignedSource, ...],
+    catalog_generation: str,
     clock: Callable[[], float] = time.time,
     client_record_ttl: int = 60,
 ) -> Callable[[], BorrowReadProof]:
@@ -258,6 +316,8 @@ def native_borrow_proof_reader(
         or not isinstance(ack, NativeClientRegistrationAck)
         or not isinstance(assigned_sources, tuple)
         or not assigned_sources
+        or any(not isinstance(source, NativeAssignedSource) for source in assigned_sources)
+        or not isinstance(catalog_generation, str) or not catalog_generation
         or not callable(clock)
     ):
         raise BorrowReaderUnavailable("native borrowed proof inputs are incomplete")
@@ -274,6 +334,7 @@ def native_borrow_proof_reader(
         if grant is None or not (
             grant.episode_id == episode.episode_id
             and grant.phase in {"active", "wait_return"}
+            and grant.catalog_generation == catalog_generation
             and grant.configuration_generation == episode.configuration_generation
             and grant.control_generation == episode.control_generation
             and grant.recorder_fence == episode.recorder_fence
@@ -296,6 +357,7 @@ def native_borrow_proof_reader(
             current_grant.episode_id == episode.episode_id
             and current_grant.configuration_generation == episode.configuration_generation
             and current_grant.control_generation == episode.control_generation
+            and current_grant.catalog_generation == catalog_generation
             and current_grant.recorder_fence == episode.recorder_fence
             and current_grant.intent_epoch == episode.intent_epoch
             and hashlib.sha256(current_grant.lease_value.encode()).hexdigest() == episode.lease_digest
@@ -414,36 +476,62 @@ class BorrowedReaderSession:
             or not ordinary_viewer_ids
         ):
             raise BorrowEpisodeRejected("opening snapshot has no matching live viewer authority")
-        if not isinstance(assigned_sources, tuple) or not assigned_sources:
+        try:
+            text_backend = redis_backend_signature(redis_text)
+            binary_backend = redis_backend_signature(redis_binary)
+        except BorrowReaderUnavailable:
+            raise
+        if text_backend != binary_backend:
+            raise BorrowReaderUnavailable("native metadata and TS buffer use different Redis backends")
+        if (not isinstance(assigned_sources, tuple) or not assigned_sources
+                or any(not isinstance(source, NativeAssignedSource) for source in assigned_sources)):
             raise BorrowReaderUnavailable("preloaded assigned-source catalog is required")
-        if not consume_opening_capability(
-            redis_text, capability, episode, catalog_generation=catalog_generation, now=now,
-            secret=capability_secret, user_id=authenticated_user_id,
-        ):
-            raise BorrowEpisodeRejected("signed route capability was already consumed")
 
-        # The viewer proof and source catalog are supplied from a fresh
-        # coordinator snapshot before any native registration side effect.
+        # Resolve and validate the task-local manager before consuming the
+        # capability. Its backend must share the exact authority/reader backend
+        # including TLS and authentication configuration.
         from ..sharing_episode import select_task_local_client_manager
 
         manager, owns_manager = select_task_local_client_manager(
             existing_manager, manager_type, channel_uuid=episode.channel_uuid,
             redis_client=redis_text, worker_id=worker_id,
         )
-        if getattr(manager, "worker_id", None) != worker_id:
+        try:
+            manager_backend = redis_backend_signature(manager.redis_client)
+        except (AttributeError, BorrowReaderUnavailable):
             if owns_manager:
                 manager.stop()
-            raise BorrowReaderUnavailable("task-local client manager belongs to another worker")
+            raise BorrowReaderUnavailable("task-local manager Redis backend is unavailable")
+        if manager_backend != text_backend or getattr(manager, "worker_id", None) != worker_id:
+            if owns_manager:
+                manager.stop()
+            raise BorrowReaderUnavailable("task-local manager backend or worker does not match")
+        if not consume_opening_capability(
+            redis_text, capability, episode, catalog_generation=catalog_generation, now=now,
+            secret=capability_secret, user_id=authenticated_user_id,
+        ):
+            if owns_manager:
+                manager.stop()
+            raise BorrowEpisodeRejected("signed route capability was already consumed")
+
+        # The viewer proof and source catalog are supplied from a fresh
+        # coordinator snapshot before any native registration side effect.
         ack = None
+        registration_attempted = False
         try:
             buffer = make_task_local_input_buffer(buffer_type, episode.channel_uuid, redis_binary)
+            registration_attempted = True
             ack = register_borrowed_client(
                 redis_text, episode, lease_value=lease_value,
                 catalog_generation=catalog_generation, client_id=client_id,
                 local_worker_id=worker_id, user_agent=user_agent, client_ip=client_ip,
                 client_record_ttl=client_record_ttl,
             )
-            if ack is None or not adopt_registered_client_in_manager(manager, ack):
+            if ack is None:
+                raise BorrowEpisodeRejected("native client registration was not acknowledged locally")
+            if ack.redis_backend_signature != text_backend:
+                raise BorrowReaderUnavailable("registration ACK belongs to another Redis backend")
+            if not adopt_registered_client_in_manager(manager, ack):
                 raise BorrowEpisodeRejected("native client registration was not acknowledged locally")
             active = ledger.activate(
                 episode.episode_id, expected_version=episode.version,
@@ -457,7 +545,8 @@ class BorrowedReaderSession:
             )
             proof_reader = native_borrow_proof_reader(
                 redis=redis_text, episode=active, ack=ack,
-                assigned_sources=assigned_sources, clock=clock,
+                assigned_sources=assigned_sources, catalog_generation=catalog_generation,
+                clock=clock,
                 client_record_ttl=client_record_ttl,
             )
             reader = ReadOnlyTsBufferReader(buffer, binding, proof_reader)
@@ -470,20 +559,58 @@ class BorrowedReaderSession:
                     manager=exact_manager,
                 ),
             )
-        except Exception:
+        except Exception as exc:
+            def cleanup(exact_ack: NativeClientRegistrationAck, exact_manager: Any,
+                        _owned: bool) -> bool:
+                return cleanup_borrowed_client(
+                    redis_text, exact_ack, episode_id=exact_ack.episode_id,
+                    manager=exact_manager,
+                )
             if ack is not None:
                 try:
-                    removed = cleanup_borrowed_client(
-                        redis_text, ack, episode_id=ack.episode_id, manager=manager,
-                    )
+                    removed = cleanup(ack, manager, owns_manager)
                 except Exception:
                     removed = False
                 if removed:
                     cls._close_episode_ledger(ledger, episode.episode_id, episode.channel_uuid)
                 if owns_manager and removed:
                     stop = getattr(manager, "stop", None)
-                    if callable(stop):
+                    if not callable(stop):
+                        raise BorrowOpenCleanupPending(
+                            "native client is absent but owned manager shutdown is pending",
+                            ack=ack, manager=manager, owns_manager=owns_manager,
+                            cleanup=cleanup, ledger=ledger, episode=episode,
+                            native_removed=True,
+                        ) from exc
+                    try:
                         stop()
+                    except Exception as stop_error:
+                        raise BorrowOpenCleanupPending(
+                            "native client is absent but owned manager shutdown is pending",
+                            ack=ack, manager=manager, owns_manager=owns_manager,
+                            cleanup=cleanup, ledger=ledger, episode=episode,
+                            native_removed=True,
+                        ) from stop_error
+                else:
+                    raise BorrowOpenCleanupPending(
+                        "borrowed registration cleanup is pending; retain its exact handle",
+                        ack=ack, manager=manager, owns_manager=owns_manager,
+                        cleanup=cleanup, ledger=ledger, episode=episode,
+                    ) from exc
+            elif owns_manager and registration_attempted:
+                # A transport failure may have happened after Redis committed
+                # registration. Without an exact ACK, stopping could orphan a
+                # live native client, so preserve the owned manager for recovery.
+                raise BorrowOpenCleanupPending(
+                    "registration outcome is uncertain; owned manager retained for reconciliation",
+                    ack=None, manager=manager, owns_manager=True,
+                    cleanup=cleanup, ledger=ledger, episode=episode,
+                    reconcile=lambda: _recover_registration_ack(
+                        redis_text, episode, client_id=client_id,
+                        local_worker_id=worker_id, user_agent=user_agent, client_ip=client_ip,
+                        backend_signature=text_backend,
+                    ),
+                ) from exc
             elif owns_manager:
                 stop = getattr(manager, "stop", None)
                 if callable(stop):

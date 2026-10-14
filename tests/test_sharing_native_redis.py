@@ -230,6 +230,7 @@ class NativeLuaRedisTests(unittest.TestCase):
 
     def test_signed_opening_capability_is_current_and_single_use(self):
         episode = self._opening_projection()
+        self._native_source_and_viewer()
         capability = self._capability(episode)
         self.assertTrue(consume_opening_capability(
             self.redis, capability, episode, catalog_generation=CATALOG, now=time.time(),
