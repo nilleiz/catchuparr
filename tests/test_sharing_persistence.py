@@ -931,6 +931,60 @@ class SharingPersistenceTests(unittest.TestCase):
         self.assertGreater(recovered.state.intent_epoch, borrowed_state.intent_epoch)
         self.assertEqual(borrowed_state.last_switch_at, recovered.state.last_switch_at)
         self.assertNotEqual(IDENTITY, persisted.get("borrowed_identity"))
+
+    def test_recovery_rebinds_only_pending_return_intent_after_worker_restart(self):
+        saved = self.save_attach()
+        pending_state = replace(
+            saved.state,
+            phase=SharingPhase.WAIT_RETURN,
+            candidate_identity=None,
+            candidate_connection_identity=None,
+            candidate_since=None,
+            borrowed_identity=None,
+            last_viewer_left_at=100.0,
+            last_switch_at=95.0,
+            pending_action=SharingAction.RETURN_TO_ALLOWED,
+            intent_epoch=saved.state.intent_epoch + 1,
+        )
+        pending = self.ledger.save(
+            pending_state, action=SharingAction.RETURN_TO_ALLOWED,
+            expected_revision=saved.revision, not_before=155.0,
+        )
+        recovered = self.ledger.recover(
+            CHANNEL, configuration_generation="config-a", control_generation=3,
+            recorder_fence=12, now=110.0, expected_revision=pending.revision,
+            recovery_is_current=lambda *_args: True,
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, recovered.intent.action)
+        self.assertEqual(SharingPhase.WAIT_RETURN, recovered.state.phase)
+        self.assertIsNone(recovered.state.borrowed_identity)
+        self.assertEqual(100.0, recovered.state.last_viewer_left_at)
+        self.assertEqual(95.0, recovered.state.last_switch_at)
+        self.assertEqual(155.0, recovered.intent.not_before)
+        self.assertGreater(recovered.intent.intent_epoch, pending.intent.intent_epoch)
+        self.assertEqual(12, recovered.state.recorder_fence)
+
+    def test_recovery_cancels_return_intent_after_control_change(self):
+        saved = self.save_attach()
+        pending_state = replace(
+            saved.state, phase=SharingPhase.WAIT_RETURN,
+            candidate_identity=None, candidate_connection_identity=None,
+            candidate_since=None, last_viewer_left_at=100.0,
+            pending_action=SharingAction.RETURN_TO_ALLOWED,
+            intent_epoch=saved.state.intent_epoch + 1,
+        )
+        pending = self.ledger.save(
+            pending_state, action=SharingAction.RETURN_TO_ALLOWED,
+            expected_revision=saved.revision, not_before=130.0,
+        )
+        recovered = self.ledger.recover(
+            CHANNEL, configuration_generation="config-a", control_generation=4,
+            recorder_fence=12, now=110.0, expected_revision=pending.revision,
+            recovery_is_current=lambda *_args: True,
+        )
+        self.assertIsNone(recovered.intent)
+        self.assertEqual(SharingPhase.DEDICATED, recovered.state.phase)
+        self.assertIsNone(recovered.state.borrowed_identity)
         ran, _ = self.ledger.run_if_current(
             saved.intent,
             fresh_validate=lambda _token: True,

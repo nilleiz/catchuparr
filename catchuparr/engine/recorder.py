@@ -241,14 +241,16 @@ class FFmpegCopyRecorder:
         def notify_first_media(committed: int) -> None:
             nonlocal first_media_notified
             if committed and not first_media_notified:
-                first_media_notified = True
-                if on_first_media is not None:
-                    try:
-                        on_first_media(time.time())
-                    except Exception:
-                        # Media publication is already committed; admission
-                        # bookkeeping can fail closed without invalidating it.
-                        pass
+                if on_first_media is None:
+                    first_media_notified = True
+                    return
+                try:
+                    # The callback commits the sharing return authority. A
+                    # transient denial must be retried on a later committed
+                    # segment; publishing media alone is not its ACK.
+                    first_media_notified = on_first_media(time.time()) is True
+                except Exception:
+                    first_media_notified = False
 
         try:
             process = subprocess.Popen(

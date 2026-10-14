@@ -242,6 +242,14 @@ def record_channel(
                 lease_value=str(lease._value),
                 dedicated_source_available=bool(candidates),
             )
+            pending_return_reader = getattr(sharing_coordinator, "pending_return_intent", None)
+            pending_return = pending_return_reader() if callable(pending_return_reader) else None
+            if pending_return is not None:
+                return_receipt = sharing_coordinator.recovered_return_receipt()
+                if return_receipt is None:
+                    error("sharing_return_recovery_pending")
+                    return {"status": "sharing_return_recovery_pending"}
+                attempt_state["return_prepared"] = return_receipt
             # A channel without an allowed dedicated source still needs a live
             # supervisor so an existing viewer connection can be borrowed.
             if candidates is None:
@@ -391,19 +399,28 @@ def record_channel(
                         error("borrow_cleanup_pending")
                     stop_event.set()
                     return True
+                borrow_outcome = "failure"
                 try:
-                    recorder.run_candidate(
+                    borrow_result = recorder.run_candidate(
                         stop_event, startup_timeout=60, media_idle_timeout=120,
                     )
                 except Exception:
                     error("borrowed_recorder_worker_stopped")
+                else:
+                    if stop_event.is_set():
+                        borrow_outcome = "stop"
+                    elif (sharing_coordinator is not None
+                            and sharing_coordinator.viewer_return_deadline_reached(now=time.time())):
+                        borrow_outcome = "return"
+                    elif borrow_result.status == "stopped":
+                        borrow_outcome = "stop"
                 # run_candidate has reaped FFmpeg, so exact reader cleanup may
                 # now be retried. Never switch inputs while its native client
                 # or episode projection can still be live.
                 cleanup_acknowledged = cleanup_prepared_borrow(prepared)
                 if cleanup_acknowledged and sharing_coordinator is not None:
                     cleanup_acknowledged = sharing_coordinator.record_return_after_cleanup(
-                        prepared, now=time.time(),
+                        prepared, now=time.time(), outcome=borrow_outcome,
                     )
                     if cleanup_acknowledged:
                         return_token = sharing_coordinator.pending_return_intent()
@@ -426,8 +443,13 @@ def record_channel(
                     return_prepared = attempt_state["return_prepared"]
                 if return_prepared is not None and sharing_coordinator is not None:
                     return_token = sharing_coordinator.pending_return_intent()
+                    return_origin_epoch = (
+                        return_prepared.capability.intent_epoch
+                        if hasattr(return_prepared, "capability")
+                        else return_prepared.intent_epoch
+                    )
                     if (return_token is None
-                            or return_token.intent_epoch <= return_prepared.capability.intent_epoch):
+                            or return_token.intent_epoch <= return_origin_epoch):
                         # The dedicated source is not authorized until the
                         # exact post-borrow RETURN intent exists.
                         if stop_event.wait(0.5):
@@ -517,13 +539,24 @@ def record_channel(
                         if (return_token is not None and return_prepared is not None
                                 and sharing_coordinator is not None):
                             def acknowledge_return_media(media_at):
-                                if sharing_coordinator.acknowledge_return_media(
+                                acknowledged = sharing_coordinator.acknowledge_return_media(
                                     return_prepared, return_token, attempt, candidate,
                                     media_at=media_at,
-                                ):
+                                )
+                                if acknowledged:
                                     with attempt_state_lock:
                                         if attempt_state.get("return_prepared") is return_prepared:
                                             attempt_state["return_prepared"] = None
+                                elif not sharing_coordinator.return_ack_retryable(
+                                    return_prepared, return_token, attempt, candidate,
+                                ):
+                                    # A failed fresh completion proof means the
+                                    # old attempt is no longer authorized. Stop
+                                    # instead of keeping media flowing under an
+                                    # uncommitted RETURN intent. A transient SQL
+                                    # commit failure is retried on later media.
+                                    stop_event.set()
+                                return acknowledged
 
                             first_media_callback = acknowledge_return_media
                         try:

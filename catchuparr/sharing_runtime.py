@@ -52,6 +52,20 @@ class PreparedBorrowOpening:
     capability: SignedBorrowCapability
 
 
+@dataclass(frozen=True)
+class PreparedBorrowReturn:
+    """Non-authorizing durable receipt for a closed borrow awaiting return media."""
+
+    channel_uuid: str
+    episode_id: str
+    client_id: str
+    intent_epoch: int
+    configuration_generation: str
+    control_generation: int
+    recorder_fence: int
+    connection_identity: tuple[str, ...]
+
+
 class RecorderBorrowCoordinator:
     """Poll the real native viewer state and durably issue one borrow opening.
 
@@ -109,6 +123,39 @@ class RecorderBorrowCoordinator:
                 expected_revision=previous.revision if previous is not None else None,
                 recovery_is_current=self._recovery_is_current,
             )
+        self._recovered_return_receipt = self._read_return_receipt()
+
+    def _read_return_receipt(self) -> PreparedBorrowReturn | None:
+        """Rebuild cleanup evidence only; this never restores a borrowed grant."""
+        try:
+            current = self.intent_ledger.read(self.channel_uuid)
+            token = current.intent if current is not None else None
+            if (token is None or token.action is not SharingAction.RETURN_TO_ALLOWED
+                    or current.state.phase.value != "wait_return"):
+                return None
+            episode = self.episode_ledger.read(self.channel_uuid)
+            if (episode.phase != "closed" or not episode.client_id
+                    or episode.configuration_generation != self.configuration_generation
+                    or episode.control_generation != self.control_generation
+                    or episode.recorder_fence >= self.recorder_fence
+                    or episode.intent_epoch >= token.intent_epoch
+                    or episode.identity is None):
+                return None
+            return PreparedBorrowReturn(
+                channel_uuid=self.channel_uuid,
+                episode_id=episode.episode_id,
+                client_id=episode.client_id,
+                intent_epoch=episode.intent_epoch,
+                configuration_generation=episode.configuration_generation,
+                control_generation=episode.control_generation,
+                recorder_fence=episode.recorder_fence,
+                connection_identity=episode.identity,
+            )
+        except Exception:
+            return None
+
+    def recovered_return_receipt(self) -> PreparedBorrowReturn | None:
+        return self._recovered_return_receipt
 
     def _recovery_is_current(
         self, channel_uuid: str, _revision: int | None,
@@ -174,13 +221,15 @@ class RecorderBorrowCoordinator:
 
     def record_return_after_cleanup(
         self, prepared: PreparedBorrowOpening, *, now: float,
+        outcome: str = "return",
     ) -> bool:
         """Create a fenced return intent after the exact borrowed reader is gone.
 
         Cleanup is not a successful source switch. The return cooldown is
         committed later, after the allowlisted recorder publishes useful media.
         """
-        if (not isinstance(prepared, PreparedBorrowOpening)
+        if (outcome not in {"return", "failure", "stop"}
+                or not isinstance(prepared, PreparedBorrowOpening)
                 or isinstance(now, bool) or not isinstance(now, (int, float))
                 or not math.isfinite(float(now))
                 or not borrow_cleanup_acknowledged(self.redis, self.episode_ledger, prepared)):
@@ -200,6 +249,10 @@ class RecorderBorrowCoordinator:
                     and self._recover_closed_attach()
                 )
             state = current.state
+            if outcome == "stop":
+                # Exact cleanup was checked above. A control/Stop path must
+                # not require the revoked lease or create a fallback intent.
+                return True
             if (
                 state.phase.value not in {"borrowed", "wait_return", "failed"}
                 or state.intent_epoch != prepared.capability.intent_epoch
@@ -248,11 +301,16 @@ class RecorderBorrowCoordinator:
             left_at = state.last_viewer_left_at
             if left_at is None:
                 left_at = float(now)
-            deadline = max(
-                float(left_at) + return_seconds,
-                (float(state.last_switch_at) + minimum_switch)
-                if state.last_switch_at is not None else float(left_at),
-            )
+            if outcome == "failure":
+                # Recorder failure bypasses ordinary viewer-return and switch
+                # cooldowns after the borrowed process has been reaped.
+                deadline = float(now)
+            else:
+                deadline = max(
+                    float(left_at) + return_seconds,
+                    (float(state.last_switch_at) + minimum_switch)
+                    if state.last_switch_at is not None else float(left_at),
+                )
             next_state = replace(
                 state, phase=type(state.phase).WAIT_RETURN,
                 candidate_identity=None, candidate_connection_identity=None,
@@ -284,12 +342,40 @@ class RecorderBorrowCoordinator:
             return None
         return None
 
+    def viewer_return_deadline_reached(self, *, now: float) -> bool:
+        """Use the first native zero-viewer observation, not reader teardown time."""
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(float(now)):
+            return False
+        try:
+            current = self.intent_ledger.read(self.channel_uuid)
+            if current is None:
+                return False
+            state = current.state
+            left_at = state.last_viewer_left_at
+            if state.phase.value != "wait_return" or left_at is None:
+                return False
+            settings = self.active.get("connection_sharing", {}).get(self.channel_uuid, {})
+            return_seconds = settings.get("last_viewer_return_seconds")
+            minimum_switch = settings.get("min_switch_interval_seconds")
+            if (type(return_seconds) is not int or not 0 <= return_seconds <= 3600
+                    or type(minimum_switch) is not int or not 0 <= minimum_switch <= 3600):
+                return False
+            deadline = max(
+                float(left_at) + return_seconds,
+                (float(state.last_switch_at) + minimum_switch)
+                if state.last_switch_at is not None else float(left_at),
+            )
+            self.state_record = current
+            return float(now) >= deadline
+        except Exception:
+            return False
+
     def acknowledge_return_media(
-        self, prepared: PreparedBorrowOpening, token: SharingIntentToken,
+        self, prepared: PreparedBorrowOpening | PreparedBorrowReturn, token: SharingIntentToken,
         attempt: Any, candidate: dict[str, Any], *, media_at: float,
     ) -> bool:
         """Commit the return clock only after a current allowed source writes media."""
-        if (not isinstance(prepared, PreparedBorrowOpening)
+        if (not isinstance(prepared, (PreparedBorrowOpening, PreparedBorrowReturn))
                 or not isinstance(token, SharingIntentToken)
                 or token.action is not SharingAction.RETURN_TO_ALLOWED
                 or not isinstance(candidate, dict)
@@ -306,18 +392,35 @@ class RecorderBorrowCoordinator:
         from .sharing_planner import resolve_transition
 
         try:
+            if isinstance(prepared, PreparedBorrowOpening):
+                origin_epoch = prepared.capability.intent_epoch
+                origin_configuration = prepared.capability.configuration_generation
+                origin_control = prepared.capability.control_generation
+                origin_fence = prepared.capability.recorder_fence
+                cleanup_ok = borrow_cleanup_acknowledged(
+                    self.redis, self.episode_ledger, prepared,
+                )
+            else:
+                origin_epoch = prepared.intent_epoch
+                origin_configuration = prepared.configuration_generation
+                origin_control = prepared.control_generation
+                origin_fence = prepared.recorder_fence
+                cleanup_ok = borrow_return_cleanup_acknowledged(
+                    self.redis, self.episode_ledger, prepared,
+                )
             current = self.intent_ledger.read(self.channel_uuid)
             if current is None or current.intent != token:
                 return False
             if (token.channel_uuid != self.channel_uuid
-                    or token.intent_epoch <= prepared.capability.intent_epoch
-                    or token.configuration_generation != prepared.capability.configuration_generation
-                    or token.control_generation != prepared.capability.control_generation
-                    or token.recorder_fence != prepared.capability.recorder_fence
+                    or token.intent_epoch <= origin_epoch
+                    or token.configuration_generation != origin_configuration
+                    or token.control_generation != origin_control
+                    or (isinstance(prepared, PreparedBorrowOpening)
+                        and token.recorder_fence != origin_fence)
                     or current.state.phase.value != "wait_return"
                     or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED):
                 return False
-            if not borrow_cleanup_acknowledged(self.redis, self.episode_ledger, prepared):
+            if not cleanup_ok:
                 return False
             if (getattr(attempt, "channel_uuid", None) != self.channel_uuid
                     or getattr(attempt, "config_generation", None) != self.configuration_generation
@@ -382,6 +485,64 @@ class RecorderBorrowCoordinator:
         except Exception:
             return False
 
+    def return_ack_retryable(
+        self, prepared: PreparedBorrowOpening | PreparedBorrowReturn, token: SharingIntentToken,
+        attempt: Any, candidate: dict[str, Any],
+    ) -> bool:
+        """Retry a transient commit failure only while the same source is current."""
+        from .configuration import _sharing_catalog_generation
+        from .recorder_proxy import (
+            candidate_is_current,
+            current_sharing_authority_context,
+            sharing_operation_is_current,
+        )
+
+        try:
+            origin_epoch = (
+                prepared.capability.intent_epoch
+                if isinstance(prepared, PreparedBorrowOpening)
+                else prepared.intent_epoch
+            )
+            cleanup_ok = (
+                borrow_cleanup_acknowledged(self.redis, self.episode_ledger, prepared)
+                if isinstance(prepared, PreparedBorrowOpening)
+                else borrow_return_cleanup_acknowledged(self.redis, self.episode_ledger, prepared)
+            )
+            if not cleanup_ok:
+                return False
+            current = self.intent_ledger.read(self.channel_uuid)
+            if (current is None or current.intent != token
+                    or token.action is not SharingAction.RETURN_TO_ALLOWED
+                    or token.intent_epoch <= origin_epoch
+                    or not self._recovery_is_current(
+                        self.channel_uuid, current.revision, self.configuration_generation,
+                        self.control_generation, self.recorder_fence,
+                    )
+                    or _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation
+                    or getattr(attempt, "channel_uuid", None) != self.channel_uuid
+                    or getattr(attempt, "config_generation", None) != self.configuration_generation
+                    or getattr(attempt, "control_generation", None) != self.control_generation
+                    or getattr(attempt, "sharing_catalog_generation", None) != self.catalog_generation
+                    or str(candidate.get("id") or candidate.get("stream_id") or "") != getattr(attempt, "stream_id", None)
+                    or str(candidate.get("account_id") or "") != getattr(attempt, "account_id", None)
+                    or not candidate_is_current(
+                        self.channel_uuid, attempt.stream_id, attempt.account_id, self.active,
+                    )
+                    or not sharing_operation_is_current(self.redis, attempt)):
+                return False
+            authority = current_sharing_authority_context(
+                self.redis, self.channel_uuid,
+                config_generation=self.configuration_generation,
+                control_generation=self.control_generation,
+            )
+            return bool(
+                authority is not None
+                and authority.get("authority_revision") == getattr(attempt, "sharing_authority_revision", None)
+                and authority.get("catalog_generation") == self.catalog_generation
+            )
+        except Exception:
+            return False
+
     def poll(self, *, active: dict[str, Any], control_generation: int) -> PreparedBorrowOpening | None:
         """Persist cooldown observations and claim an ATTACH only at its deadline."""
         latest = self.intent_ledger.read(self.channel_uuid)
@@ -392,6 +553,8 @@ class RecorderBorrowCoordinator:
 
             live_episode = read_native_episode_grant(self.redis, self.channel_uuid)
             if live_episode is not None and live_episode.phase in {"opening", "active", "wait_return", "closing"}:
+                if live_episode.phase in {"active", "wait_return"}:
+                    self._sync_viewer_grace(live_episode)
                 return None
         except Exception:
             return None
@@ -524,6 +687,44 @@ class RecorderBorrowCoordinator:
         self.state_record = self.intent_ledger.read(self.channel_uuid)
         return prepared if claimed else None
 
+    def _sync_viewer_grace(self, grant: Any) -> None:
+        """Persist the native episode's first zero-viewer time without SQL on reads."""
+        from dataclasses import replace
+
+        try:
+            current = self.intent_ledger.read(self.channel_uuid)
+            if current is None or current.intent is not None:
+                return
+            state = current.state
+            if (grant.configuration_generation != self.configuration_generation
+                    or grant.control_generation != self.control_generation
+                    or grant.recorder_fence != self.recorder_fence
+                    or grant.intent_epoch != state.intent_epoch):
+                return
+            if grant.phase == "active":
+                phase = type(state.phase).BORROWED
+                left_at = None
+            else:
+                phase = type(state.phase).WAIT_RETURN
+                left_at = float(grant.last_viewer_left_at)
+            if state.phase == phase and state.last_viewer_left_at == left_at:
+                self.state_record = current
+                return
+            updated = replace(
+                state, phase=phase, last_viewer_left_at=left_at,
+                candidate_identity=None, candidate_connection_identity=None,
+                candidate_since=None, borrowed_identity=None,
+                pending_action=None,
+            )
+            self.state_record = self.intent_ledger.save(
+                updated, action=None, expected_revision=current.revision,
+                updated_at=time.time(),
+            )
+        except Exception:
+            # The native grant remains the authoritative reader gate. A failed
+            # advisory persistence update cannot broaden its deadline.
+            return
+
 
 def borrow_cleanup_acknowledged(
     redis: Any, ledger: BorrowEpisodeLedger, prepared: PreparedBorrowOpening,
@@ -560,6 +761,38 @@ def borrow_cleanup_acknowledged(
             redis,
             channel_uuid=prepared.capability.channel_uuid,
             client_id=prepared.client_id,
+        )
+    except Exception:
+        return False
+
+
+def borrow_return_cleanup_acknowledged(
+    redis: Any, ledger: BorrowEpisodeLedger, receipt: PreparedBorrowReturn,
+) -> bool:
+    """Validate persisted close evidence without reauthorizing the old borrow."""
+    if not isinstance(ledger, BorrowEpisodeLedger) or not isinstance(receipt, PreparedBorrowReturn):
+        return False
+    try:
+        episode = ledger.read(receipt.channel_uuid)
+        if (episode.phase != "closed"
+                or episode.episode_id != receipt.episode_id
+                or episode.client_id != receipt.client_id
+                or episode.identity != receipt.connection_identity
+                or episode.intent_epoch != receipt.intent_epoch
+                or episode.configuration_generation != receipt.configuration_generation
+                or episode.control_generation != receipt.control_generation
+                or episode.recorder_fence != receipt.recorder_fence):
+            return False
+        from .adapters.sharing_native import (
+            native_registration_is_absent,
+            observe_native_episode_for_authority_drain,
+        )
+
+        projection = observe_native_episode_for_authority_drain(redis, receipt.channel_uuid)
+        if getattr(projection, "state", None) not in {"absent", "known_revoked"}:
+            return False
+        return native_registration_is_absent(
+            redis, channel_uuid=receipt.channel_uuid, client_id=receipt.client_id,
         )
     except Exception:
         return False

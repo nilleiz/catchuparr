@@ -1281,8 +1281,6 @@ if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[2]
    or redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[3]
    or redis.call('HGET', KEYS[1], 'authority_revision') ~= ARGV[4]
-   or redis.call('TYPE', KEYS[3]).ok ~= ARGV[5]
-   or (ARGV[5] == 'string' and redis.call('GET', KEYS[3]) ~= ARGV[6])
    or redis.call('EXISTS', KEYS[4]) ~= 0
    or (redis.call('TYPE', KEYS[5]).ok == 'set'
        and redis.call('SISMEMBER', KEYS[5], ARGV[7]) ~= 0)
@@ -1292,6 +1290,14 @@ local value = ARGV[8]
 local existing = redis.call('GET', KEYS[7])
 if existing then
   if existing == value then return 2 end
+  return 0
+end
+-- A permanent exact tombstone is safe to acknowledge after the old lease has
+-- been replaced: it cannot reopen authority, and the current authority CAS
+-- plus exact resource-absence checks above still apply. A first tombstone,
+-- however, must be fenced by the original lease observation.
+if redis.call('TYPE', KEYS[3]).ok ~= ARGV[5]
+   or (ARGV[5] == 'string' and redis.call('GET', KEYS[3]) ~= ARGV[6]) then
   return 0
 end
 redis.call('SET', KEYS[7], value)
@@ -1336,12 +1342,6 @@ def tombstone_expired_unprojected_opening(
         if isinstance(current_lease, bytes):
             current_lease = current_lease.decode("utf-8", errors="strict")
         if current_lease is not None and not isinstance(current_lease, str):
-            return False
-        if (current_lease is not None
-                and hashlib.sha256(current_lease.encode("utf-8")).hexdigest()
-                != episode.lease_digest):
-            # A replacement recorder lease is a newer owner, not evidence that
-            # this expired opening can safely be closed.
             return False
         keys = (
             current_key, episode_projection_key(channel), lease_key,
