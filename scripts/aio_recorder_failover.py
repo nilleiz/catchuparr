@@ -896,6 +896,9 @@ class _RecorderTaskRun:
         self.result: dict | None = None
         self.failures: list[str] = []
         self.processes: list[object] = []
+        # Keep synthetic route credentials in memory solely for replay-denial
+        # checks. They are never printed, serialized, or included in receipts.
+        self.input_headers: list[dict[str, str]] = []
         self._lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self._patchers = []
@@ -944,7 +947,11 @@ class _RecorderTaskRun:
                 self.processes.append(process)
             return process
 
-        def bounded_run_candidate(recorder, stop_event, **_native_timeouts):
+        def bounded_run_candidate(recorder, stop_event, **native_timeouts):
+            headers = getattr(recorder, "input_headers", None)
+            if isinstance(headers, dict):
+                with self._lock:
+                    self.input_headers.append(dict(headers))
             try:
                 result = original_run_candidate(
                     recorder,
@@ -952,6 +959,11 @@ class _RecorderTaskRun:
                     startup_timeout=self.startup_timeout,
                     media_idle_timeout=self.media_idle_timeout,
                     poll_interval=POLL_INTERVAL,
+                    **{
+                        key: native_timeouts[key]
+                        for key in ("attempt_switch", "on_first_media")
+                        if key in native_timeouts
+                    },
                 )
             except Exception as exc:
                 with self._lock:

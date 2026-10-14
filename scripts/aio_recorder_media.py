@@ -2588,6 +2588,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     live_response = None
     live_reader = None
     live_session = None
+    churn_session = None
     native_server = None
     native_diagnostic = None
     native_diagnostic_report = None
@@ -3409,10 +3410,227 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Native live A after archive B cleanup",
         )
 
+        # Exercise the real opt-in connection-sharing path with the only
+        # allowed archive source set to B while the existing native viewer is
+        # on A. The first recorder input must borrow A's published TS buffer;
+        # after the final ordinary viewer leaves, it must return to B only
+        # after the applied switch cooldown.
+        from aio_stats_probe import stats_options_draft
+
+        sharing_settings = stats_options_draft(settings_b, hide_recorders=True)
+        sharing_settings["connection_sharing_config"] = (
+            "version: 1\n"
+            "default:\n"
+            "  enabled: true\n"
+            "  live_stability_seconds: 0\n"
+            "  last_viewer_return_seconds: 2\n"
+            "  min_switch_interval_seconds: 30\n"
+            "rules:\n"
+            "  - channels: {profile: all}\n"
+        )
+        current_plugin_config = PluginConfig.objects.get(key="catchuparr")
+        current_plugin_config.settings = dict(sharing_settings)
+        current_plugin_config.save(update_fields=("settings",))
+        applied_sharing = catchuparr_runtime.apply_configuration(sharing_settings)
+        _require(
+            applied_sharing.get("applied") is True,
+            "Unified Apply rejected the synthetic sharing-enabled B policy",
+        )
+        active_sharing = load_active_configuration(active_path)
+        _require(active_sharing is not None, "Applied sharing configuration was not readable")
+        _require(
+            active_sharing["connection_sharing"][worker_id]["enabled"] is True
+            and [str(item.get("id")) for item in ranked_source_candidates(
+                worker_id, active_sharing,
+            )] == [str(stream_b.id)],
+            "Sharing did not retain the B-only fallback policy",
+        )
+        share_source_baseline, share_active_baseline = source_server.snapshot()
+        _require(
+            share_active_baseline["source-a.ts"] == 1
+            and share_active_baseline["source-b.ts"] == 0,
+            "Sharing fixture did not start with only the existing live A connection",
+        )
+        run_share = _RecorderTaskRun(
+            worker_id, startup_timeout=45, media_idle_timeout=25,
+        )
+        run_share.start()
+        harnesses.append(run_share)
+
+        borrow_headers = None
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            with run_share._lock:
+                borrow_headers = next(
+                    (dict(headers) for headers in run_share.input_headers
+                     if "X-Catchuparr-Borrow" in headers),
+                    None,
+                )
+            if borrow_headers is not None:
+                break
+            if run_share.failures:
+                raise RuntimeError("Sharing recorder failed before opening a native borrow")
+            time.sleep(0.1)
+        _require(borrow_headers is not None,
+                 "Sharing recorder did not request the signed native-buffer route")
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2, timeout=30,
+        )
+        from catchuparr import stats as catchuparr_stats
+        from catchuparr.adapters.sharing_borrow_route import decode_borrow_capability
+
+        capability_token = borrow_headers["X-Catchuparr-Borrow"]
+        borrow_capability = decode_borrow_capability(capability_token)
+        borrow_client_id = f"catchuparr-client-{borrow_capability.nonce}"
+        _require(
+            catchuparr_stats._is_recorder_client(worker_id, borrow_client_id),
+            "The borrowed native reader was not tagged as a server-verified recorder",
+        )
+        _require(
+            native_server.stream_managers.get(worker_id) is native_manager
+            and native_manager.running
+            and _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner
+            and _native_source_metadata(redis_client, metadata_key) == source_metadata
+            and {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot,
+            "Borrowing changed native A ownership, source metadata, or assignments",
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id],
+            "Borrowing reserved a duplicate provider profile slot",
+        )
+        counts_borrowing, active_borrowing = source_server.snapshot()
+        _require(
+            counts_borrowing["source-a.ts"] == share_source_baseline["source-a.ts"]
+            and counts_borrowing["source-b.ts"] == share_source_baseline["source-b.ts"]
+            and active_borrowing["source-a.ts"] == 1
+            and active_borrowing["source-b.ts"] == 0,
+            "Borrowing opened another provider source instead of reusing native A",
+        )
+        borrowed_ids = {segment.id for segment in store.segments(worker_id)}
+        borrowed_segments = _wait_for_indexed_tone(
+            run_share, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=borrowed_ids, minimum=1, timeout=45,
+            cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(borrowed_segments), "Borrowed live A did not reach the archive")
+
+        # A consumed opening capability cannot be replayed into a second
+        # reader, even while its first reader remains active.
+        replay = client.get(
+            f"/catchuparr/sharing/{channel.uuid}",
+            HTTP_HOST="localhost",
+            HTTP_X_CATCHUPARR_BORROW=capability_token,
+        )
+        _require(replay.status_code == 404,
+                 "A consumed native-borrow capability opened a second reader")
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2, timeout=10,
+        )
+
+        # Hide=true must hide only the signed borrow client from native Stats.
+        from aio_stats_probe import probe_actual_recorder_stats
+
+        probe_actual_recorder_stats(
+            channel_id=worker_id,
+            redis_client=redis_client,
+            native_server=native_server,
+            profile_a=profile_a,
+            profile_b=profile_b,
+            profile_connections_key=profile_connections_key,
+            assignment_snapshot=assignment_snapshot,
+            metadata_key=metadata_key,
+        )
+
+        # Add a second ordinary viewer, then remove the original. The borrow
+        # must continue while that second viewer remains, so return is based on
+        # actual ordinary membership rather than viewer count snapshots.
+        churn_response = client.get(
+            f"/proxy/ts/stream/{channel.uuid}",
+            HTTP_HOST="localhost",
+            HTTP_USER_AGENT="Synthetic sharing churn viewer",
+        )
+        _require(churn_response.status_code == 200,
+                 "A second synthetic native viewer could not join the borrowed source")
+        churn_session, _churn_buffer = _create_native_live_reader_session(
+            churn_response, native_server, worker_id,
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 3, timeout=20,
+        )
         live_session.close()
-        live_response = None
-        live_reader = None
         live_session = None
+        live_reader = None
+        live_response = None
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2, timeout=15,
+        )
+        gevent_sleep(3)
+        counts_with_churn, active_with_churn = source_server.snapshot()
+        _require(
+            counts_with_churn["source-b.ts"] == share_source_baseline["source-b.ts"]
+            and active_with_churn["source-a.ts"] == 1,
+            "The borrow returned while another ordinary native viewer remained",
+        )
+        churn_session.close()
+        churn_session = None
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1, timeout=15,
+        )
+        gevent_sleep(3)
+        counts_during_return_cooldown, _active_during_return_cooldown = source_server.snapshot()
+        _require(
+            counts_during_return_cooldown["source-b.ts"]
+            == share_source_baseline["source-b.ts"],
+            "The allowed B source opened before the minimum switch interval",
+        )
+
+        b_before_share = {segment.id for segment in store.segments(worker_id)}
+        returned_segments = _wait_for_indexed_tone(
+            run_share, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=880, existing_ids=b_before_share, minimum=1, timeout=150,
+            cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(returned_segments), "Recorder did not return to allowed source B")
+        with run_share._lock:
+            share_results = list(run_share.results)
+        _require(
+            bool(share_results) and share_results[0].status == "switch_requested",
+            "The borrowed recorder did not reap A at the fenced source-switch boundary",
+        )
+        counts_after_share_return, active_after_share_return = source_server.snapshot()
+        _require(
+            counts_after_share_return["source-b.ts"]
+            == share_source_baseline["source-b.ts"] + 1
+            and active_after_share_return["source-b.ts"] == 1
+            and counts_after_share_return["source-a.ts"]
+            == share_source_baseline["source-a.ts"]
+            and active_after_share_return["source-a.ts"] == 0,
+            "Return did not use one allowed B connection after releasing borrowed A",
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id]
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + 1,
+            "Borrow return did not release A and reserve only the allowed B profile",
+        )
+        run_share.stop()
+        run_share.join(cooperative_sleep=gevent_sleep)
+        _require(
+            native_server.stream_managers.get(worker_id) is None
+            and redis_client.get(RedisKeys.channel_owner(worker_id)) is None,
+            "Stopping after borrow return left the native A owner running without viewers",
+        )
+
+        if live_session is not None:
+            live_session.close()
+            live_response = None
+            live_reader = None
+            live_session = None
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             owner = redis_client.get(RedisKeys.channel_owner(worker_id))
@@ -3508,6 +3726,12 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 live_response.close()
             except Exception:
                 cleanup_errors.append("native-live-response")
+        if churn_session is not None:
+            try:
+                churn_session.close()
+                churn_session = None
+            except Exception:
+                cleanup_errors.append("native-churn-response")
         try:
             from catchuparr.adapters.recorder_proxy import stop_managed_workers
 
