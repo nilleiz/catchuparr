@@ -404,7 +404,7 @@ class SharingIntentLedger:
             if row is not None and int(row["revision"]) != expected_revision:
                 db.rollback()
                 raise StaleSharingIntent("sharing state revision changed")
-            if action is not None and db.execute(
+            if action not in {None, SharingAction.STOP} and db.execute(
                 "SELECT 1 FROM sharing_effect_attempts WHERE channel_uuid=? AND status!='closed' LIMIT 1",
                 (channel,),
             ).fetchone() is not None:
@@ -1012,8 +1012,15 @@ class SharingIntentLedger:
         operation_id: str,
         *,
         exact_resources_absent: Callable[[SharingEffectAttempt], bool],
+        dispatch_cancel_acknowledged: Callable[[SharingEffectAttempt], bool] | None = None,
     ) -> bool:
-        """Close an operation only after its exact resource absence callback ACKs."""
+        """Close an operation only after cancellation and exact absence ACKs.
+
+        A dispatching operation may still create a resource after a point-in-
+        time absence check. Such a row requires an exact executor/native fence
+        callback which first makes that operation incapable of dispatching,
+        then the ordinary exact-resource absence proof.
+        """
         if not callable(exact_resources_absent):
             raise ValueError("exact resource absence callback is required")
         attempt = self.effect_attempt(operation_id)
@@ -1021,6 +1028,14 @@ class SharingIntentLedger:
             return False
         if attempt.status == "closed":
             return True
+        if attempt.status == "dispatching":
+            if not callable(dispatch_cancel_acknowledged):
+                return False
+            try:
+                if dispatch_cancel_acknowledged(attempt) is not True:
+                    return False
+            except Exception:
+                return False
         try:
             if exact_resources_absent(attempt) is not True:
                 return False
