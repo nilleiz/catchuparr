@@ -488,27 +488,37 @@ class NativeLuaRedisTests(unittest.TestCase):
         ))
 
     def test_current_authority_invalidation_rejects_stale_revision_and_projection(self):
-        _episode, ack = self._register()
-        self.assertIsNotNone(ack)
-        grant = read_native_episode_grant(self.redis, CHANNEL)
-        self.assertIsNotNone(grant)
-        self.assertTrue(publish_current_authority(
-            self.redis, CHANNEL, configuration_generation="config-next",
-            control_generation=8, catalog_generation="catalog-next",
-            expected_revision=1, authority_revision=2,
-        ))
-        self.assertFalse(invalidate_native_episode(
-            self.redis, grant, configuration_generation="config-next",
-            control_generation=8, catalog_generation="catalog-next",
-            authority_revision=3,
-        ))
-        self.redis.command("HSET", _keys()["episode"], "client_id", "replacement-client-synthetic")
-        self.assertFalse(invalidate_native_episode(
-            self.redis, grant, configuration_generation="config-next",
-            control_generation=8, catalog_generation="catalog-next",
-            authority_revision=2,
-        ))
-        self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "active")
+        changed_fields = (
+            ("client_id", "replacement-client-synthetic"),
+            ("owner_lock_value", "replacement-owner-lock-synthetic"),
+            ("metadata_owner", "replacement-metadata-owner-synthetic"),
+            ("client_worker_id", "replacement-client-worker-synthetic"),
+            ("lease_value", "replacement-lease-synthetic"),
+        )
+        for field, replacement in changed_fields:
+            with self.subTest(field=field):
+                self.redis.command("FLUSHDB")
+                _episode, ack = self._register()
+                self.assertIsNotNone(ack)
+                grant = read_native_episode_grant(self.redis, CHANNEL)
+                self.assertIsNotNone(grant)
+                self.assertTrue(publish_current_authority(
+                    self.redis, CHANNEL, configuration_generation="config-next",
+                    control_generation=8, catalog_generation="catalog-next",
+                    expected_revision=1, authority_revision=2,
+                ))
+                self.assertFalse(invalidate_native_episode(
+                    self.redis, grant, configuration_generation="config-next",
+                    control_generation=8, catalog_generation="catalog-next",
+                    authority_revision=3,
+                ))
+                self.redis.command("HSET", _keys()["episode"], field, replacement)
+                self.assertFalse(invalidate_native_episode(
+                    self.redis, grant, configuration_generation="config-next",
+                    control_generation=8, catalog_generation="catalog-next",
+                    authority_revision=2,
+                ))
+                self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "active")
 
     def test_project_rejects_wrong_projection_type_without_replacing_key(self):
         self._base_authority()
