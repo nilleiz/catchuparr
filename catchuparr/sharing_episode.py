@@ -87,6 +87,43 @@ class BorrowEpisodeSnapshot:
             raise ValueError("revoked episode cannot retain return grace")
 
 
+@dataclass(frozen=True)
+class BorrowRegistrationAttempt:
+    """Durable exact native-client identity for crash cleanup reconciliation."""
+
+    episode_id: str
+    channel_uuid: str
+    client_id: str
+    local_worker_id: str
+    backend_signature: str
+    opening_version: int
+    user_agent: str
+    client_ip: str
+    connected_at: str | None
+    projection_version: int | None
+    status: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "episode_id", "channel_uuid", "client_id", "local_worker_id",
+            "backend_signature", "user_agent", "client_ip",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string")
+        if type(self.opening_version) is not int or self.opening_version < 1:
+            raise ValueError("opening_version is invalid")
+        if self.status not in {"prepared", "registered"}:
+            raise ValueError("registration attempt status is invalid")
+        if self.status == "registered":
+            if (not isinstance(self.connected_at, str) or not self.connected_at
+                    or type(self.projection_version) is not int
+                    or self.projection_version != self.opening_version + 1):
+                raise ValueError("registered attempt ACK is incomplete")
+        elif self.connected_at is not None or self.projection_version is not None:
+            raise ValueError("prepared attempt cannot contain a registration ACK")
+
+
 def _finite_time(value: float, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(float(value)):
         raise ValueError(f"{name} must be a finite wall-clock timestamp")
@@ -138,12 +175,160 @@ class BorrowEpisodeLedger:
                                  control_generation, recorder_fence, intent_epoch, action)
                 )"""
             )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS sharing_borrow_registration_attempts (
+                    episode_id TEXT PRIMARY KEY,
+                    channel_uuid TEXT NOT NULL UNIQUE,
+                    client_id TEXT NOT NULL,
+                    local_worker_id TEXT NOT NULL,
+                    backend_signature TEXT NOT NULL,
+                    opening_version INTEGER NOT NULL,
+                    user_agent TEXT NOT NULL,
+                    client_ip TEXT NOT NULL,
+                    connected_at TEXT,
+                    projection_version INTEGER,
+                    status TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )"""
+            )
 
     def _db(self):
         db = sqlite3.connect(self.database_path, timeout=5, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA busy_timeout=5000")
         return db
+
+    def prepare_registration(self, episode: BorrowEpisodeSnapshot, *,
+                             local_worker_id: str, backend_signature: str,
+                             user_agent: str, client_ip: str) -> BorrowRegistrationAttempt:
+        """Persist exact manager/backend/client identity before native Lua writes."""
+        if not isinstance(episode, BorrowEpisodeSnapshot) or episode.phase != "opening":
+            raise BorrowEpisodeRejected("registration requires the exact opening episode")
+        planned = episode.client_id
+        values = (local_worker_id, backend_signature, user_agent, client_ip)
+        if (not isinstance(planned, str) or not planned.startswith("catchuparr-client-")
+                or any(not isinstance(value, str) or not value for value in values)
+                or len(backend_signature) != 64
+                or any(char not in "0123456789abcdef" for char in backend_signature)):
+            raise ValueError("registration identity is invalid")
+        now = _finite_time(self.clock(), "clock")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM sharing_borrow_episodes WHERE episode_id=?",
+                (episode.episode_id,),
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                raise BorrowEpisodeRejected("opening episode disappeared before registration")
+            current = self._snapshot_from_row(row)
+            if (current.phase != "opening" or current.version != episode.version
+                    or current.client_id != planned or current.identity != episode.identity):
+                db.rollback()
+                raise BorrowEpisodeRejected("opening changed before registration attempt")
+            existing = db.execute(
+                "SELECT * FROM sharing_borrow_registration_attempts WHERE episode_id=?",
+                (episode.episode_id,),
+            ).fetchone()
+            if existing is not None:
+                attempt = self._registration_from_row(existing)
+                if (attempt.channel_uuid, attempt.client_id, attempt.local_worker_id,
+                    attempt.backend_signature, attempt.opening_version, attempt.user_agent,
+                    attempt.client_ip) != (
+                    episode.channel_uuid, planned, local_worker_id, backend_signature,
+                    episode.version, user_agent, client_ip,
+                ):
+                    db.rollback()
+                    raise BorrowEpisodeRejected("registration retry changed its exact identity")
+                db.commit()
+                return attempt
+            db.execute(
+                """INSERT INTO sharing_borrow_registration_attempts
+                (episode_id,channel_uuid,client_id,local_worker_id,backend_signature,
+                 opening_version,user_agent,client_ip,connected_at,projection_version,status,updated_at)
+                VALUES (?,?,?,?,?,?,?, ?,NULL,NULL,'prepared',?)""",
+                (episode.episode_id, episode.channel_uuid, planned, local_worker_id,
+                 backend_signature, episode.version, user_agent, client_ip, now),
+            )
+            db.commit()
+        return self.registration_attempt(episode.episode_id)
+
+    def record_registration_ack(self, episode_id: str, ack) -> BorrowRegistrationAttempt:
+        """Durably bind the Lua ACK before adoption or episode activation."""
+        fields = (
+            "channel_uuid", "episode_id", "client_id", "local_worker_id",
+            "redis_backend_signature", "connected_at", "projection_version",
+            "user_agent", "client_ip",
+        )
+        if any(not hasattr(ack, name) for name in fields):
+            raise ValueError("native registration ACK is incomplete")
+        now = _finite_time(self.clock(), "clock")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM sharing_borrow_registration_attempts WHERE episode_id=?",
+                (episode_id,),
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                raise BorrowEpisodeRejected("registration ACK has no durable attempt")
+            attempt = self._registration_from_row(row)
+            if (ack.episode_id, ack.channel_uuid, ack.client_id, ack.local_worker_id,
+                ack.redis_backend_signature, ack.user_agent, ack.client_ip) != (
+                attempt.episode_id, attempt.channel_uuid, attempt.client_id,
+                attempt.local_worker_id, attempt.backend_signature,
+                attempt.user_agent, attempt.client_ip,
+            ) or type(ack.projection_version) is not int or not isinstance(ack.connected_at, str):
+                db.rollback()
+                raise BorrowEpisodeRejected("registration ACK differs from durable attempt")
+            try:
+                connected = float(ack.connected_at)
+            except (TypeError, ValueError, OverflowError):
+                db.rollback()
+                raise BorrowEpisodeRejected("registration ACK clock is malformed") from None
+            if (not math.isfinite(connected)
+                    or ack.projection_version != attempt.opening_version + 1):
+                db.rollback()
+                raise BorrowEpisodeRejected("registration ACK version or clock is invalid")
+            if attempt.status == "registered":
+                if (attempt.connected_at != ack.connected_at
+                        or attempt.projection_version != ack.projection_version):
+                    db.rollback()
+                    raise BorrowEpisodeRejected("registration ACK changed after persistence")
+                db.commit()
+                return attempt
+            db.execute(
+                """UPDATE sharing_borrow_registration_attempts
+                SET connected_at=?,projection_version=?,status='registered',updated_at=?
+                WHERE episode_id=? AND status='prepared'""",
+                (ack.connected_at, ack.projection_version, now, episode_id),
+            )
+            db.commit()
+        return self.registration_attempt(episode_id)
+
+    def registration_attempt(self, episode_id: str) -> BorrowRegistrationAttempt:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM sharing_borrow_registration_attempts WHERE episode_id=?",
+                (episode_id,),
+            ).fetchone()
+        if row is None:
+            raise BorrowEpisodeRejected("registration attempt is not persisted")
+        return self._registration_from_row(row)
+
+    @staticmethod
+    def _registration_from_row(row: sqlite3.Row) -> BorrowRegistrationAttempt:
+        try:
+            return BorrowRegistrationAttempt(
+                episode_id=row["episode_id"], channel_uuid=row["channel_uuid"],
+                client_id=row["client_id"], local_worker_id=row["local_worker_id"],
+                backend_signature=row["backend_signature"], opening_version=row["opening_version"],
+                user_agent=row["user_agent"], client_ip=row["client_ip"],
+                connected_at=row["connected_at"], projection_version=row["projection_version"],
+                status=row["status"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise BorrowEpisodeRejected("persisted registration attempt is malformed") from exc
 
     @staticmethod
     def _valid_identity(identity: tuple[str, ...], channel: str) -> None:
@@ -324,6 +509,47 @@ class BorrowEpisodeLedger:
         # A malformed row aborts the snapshot; callers must fail closed instead
         # of skipping an operation whose native resources might still exist.
         return tuple(self._snapshot_from_row(row) for row in rows)
+
+    def registration_recovery_candidates(
+        self, *, stale_opening_before: float,
+    ) -> tuple[tuple[BorrowEpisodeSnapshot, BorrowRegistrationAttempt | None], ...]:
+        """Find pending or expired opening state for restart-safe exact cleanup."""
+        cutoff = _finite_time(stale_opening_before, "stale_opening_before")
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT e.*, r.episode_id AS r_episode_id, r.channel_uuid AS r_channel_uuid,
+                r.client_id AS r_client_id, r.local_worker_id AS r_local_worker_id,
+                r.backend_signature AS r_backend_signature, r.opening_version AS r_opening_version,
+                r.user_agent AS r_user_agent, r.client_ip AS r_client_ip,
+                r.connected_at AS r_connected_at, r.projection_version AS r_projection_version,
+                r.status AS r_status
+                FROM sharing_borrow_episodes e
+                LEFT JOIN sharing_borrow_registration_attempts r ON r.episode_id=e.episode_id
+                WHERE e.phase='cleanup_pending'
+                   OR (e.phase='opening' AND e.updated_at<=?)
+                ORDER BY e.updated_at""",
+                (cutoff,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            snapshot = self._snapshot_from_row(row)
+            registration = None
+            if row["r_episode_id"] is not None:
+                registration = self._registration_from_row({
+                    "episode_id": row["r_episode_id"],
+                    "channel_uuid": row["r_channel_uuid"],
+                    "client_id": row["r_client_id"],
+                    "local_worker_id": row["r_local_worker_id"],
+                    "backend_signature": row["r_backend_signature"],
+                    "opening_version": row["r_opening_version"],
+                    "user_agent": row["r_user_agent"],
+                    "client_ip": row["r_client_ip"],
+                    "connected_at": row["r_connected_at"],
+                    "projection_version": row["r_projection_version"],
+                    "status": row["r_status"],
+                })
+            result.append((snapshot, registration))
+        return tuple(result)
 
     @staticmethod
     def _snapshot_from_row(row: sqlite3.Row) -> BorrowEpisodeSnapshot:

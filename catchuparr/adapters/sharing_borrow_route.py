@@ -652,6 +652,11 @@ class BorrowedReaderSession:
         registration_attempted = False
         try:
             buffer = make_task_local_input_buffer(buffer_type, episode.channel_uuid, redis_binary)
+            ledger.prepare_registration(
+                episode, local_worker_id=worker_id,
+                backend_signature=text_backend, user_agent=user_agent,
+                client_ip=client_ip,
+            )
             registration_attempted = True
             ack = register_borrowed_client(
                 redis_text, episode, lease_value=lease_value,
@@ -661,6 +666,7 @@ class BorrowedReaderSession:
             )
             if ack is None:
                 raise BorrowEpisodeRejected("native client registration was not acknowledged locally")
+            ledger.record_registration_ack(episode.episode_id, ack)
             if ack.redis_backend_signature != text_backend:
                 raise BorrowReaderUnavailable("registration ACK belongs to another Redis backend")
             if not adopt_registered_client_in_manager(manager, ack):

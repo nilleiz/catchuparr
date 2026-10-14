@@ -96,6 +96,152 @@ def retry_pending_open_cleanups() -> tuple[int, int]:
     return completed, pending
 
 
+def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
+                                now: float | None = None, stale_after: float = 120.0) -> tuple[int, int]:
+    """Rebuild exact cleanup ownership from SQLite after a web worker restart.
+
+    This runs only at route setup, never in the TS byte loop. Stale opening
+    tickets have expired before they are fenced; active episodes are not
+    selected unless a prior failure durably marked cleanup_pending.
+    """
+    from dataclasses import replace
+
+    from .adapters.sharing_borrow_route import _recover_registration_ack
+    from .adapters.sharing_native import (
+        NativeClientRegistrationAck,
+        cleanup_borrowed_client,
+        close_fenced_unregistered_opening,
+        fence_unregistered_opening,
+        native_registration_is_absent,
+        read_native_episode_grant,
+    )
+    from .adapters.sharing_reader import redis_backend_signature
+
+    observed_at = time.time() if now is None else now
+    if (isinstance(observed_at, bool) or not isinstance(observed_at, (int, float))
+            or not math.isfinite(float(observed_at))
+            or isinstance(stale_after, bool) or not isinstance(stale_after, (int, float))
+            or not math.isfinite(float(stale_after)) or stale_after < 0):
+        return 0, 0
+    try:
+        candidates = ledger.registration_recovery_candidates(
+            stale_opening_before=float(observed_at) - float(stale_after),
+        )
+        text_backend = redis_backend_signature(redis_text)
+    except Exception:
+        return 0, 1
+    with _pending_open_cleanup_lock:
+        retained_ids = set(_pending_open_cleanups)
+    completed = pending = 0
+    for snapshot, registration in candidates:
+        if snapshot.episode_id in retained_ids:
+            continue
+        manager = None
+        owns_manager = False
+        try:
+            grant = read_native_episode_grant(redis_text, snapshot.channel_uuid)
+            if grant is None or grant.episode_id != snapshot.episode_id:
+                pending += 1
+                continue
+            catalog_generation = grant.catalog_generation
+            opening_version = (
+                registration.opening_version if registration is not None
+                else snapshot.version - (1 if snapshot.phase == "cleanup_pending" else 0)
+            )
+            opening = replace(
+                snapshot, phase="opening", version=opening_version,
+                connected_at=None, last_viewer_left_at=None, return_deadline=None,
+                client_id=(registration.client_id if registration is not None else snapshot.client_id),
+            )
+            if registration is None:
+                if not fence_unregistered_opening(
+                    redis_text, opening, catalog_generation=catalog_generation,
+                ) or not native_registration_is_absent(
+                    redis_text, channel_uuid=snapshot.channel_uuid,
+                    client_id=str(opening.client_id),
+                ) or not close_fenced_unregistered_opening(
+                    redis_text, opening, catalog_generation=catalog_generation,
+                    client_id=str(opening.client_id),
+                ):
+                    pending += 1
+                    continue
+            else:
+                if registration.backend_signature != text_backend:
+                    pending += 1
+                    continue
+                from apps.proxy.live_proxy.client_manager import ClientManager
+
+                manager = ClientManager(
+                    channel_id=snapshot.channel_uuid, redis_client=redis_text,
+                    worker_id=registration.local_worker_id,
+                )
+                owns_manager = True
+                if (getattr(manager, "channel_id", None) != snapshot.channel_uuid
+                        or getattr(manager, "worker_id", None) != registration.local_worker_id
+                        or redis_backend_signature(manager.redis_client) != registration.backend_signature):
+                    pending += 1
+                    continue
+                if registration.status == "registered":
+                    ack = NativeClientRegistrationAck(
+                        channel_uuid=registration.channel_uuid,
+                        episode_id=registration.episode_id,
+                        client_id=registration.client_id,
+                        local_worker_id=registration.local_worker_id,
+                        redis_backend_signature=registration.backend_signature,
+                        connected_at=registration.connected_at,
+                        projection_version=registration.projection_version,
+                        user_agent=registration.user_agent,
+                        client_ip=registration.client_ip,
+                    )
+                else:
+                    ack = _recover_registration_ack(
+                        redis_text, opening, client_id=registration.client_id,
+                        local_worker_id=registration.local_worker_id,
+                        user_agent=registration.user_agent, client_ip=registration.client_ip,
+                        backend_signature=registration.backend_signature,
+                    )
+                if ack is None:
+                    fenced = fence_unregistered_opening(
+                        redis_text, opening, catalog_generation=catalog_generation,
+                    )
+                    absent = fenced and native_registration_is_absent(
+                        redis_text, channel_uuid=snapshot.channel_uuid,
+                        client_id=registration.client_id,
+                    )
+                    closed = absent and close_fenced_unregistered_opening(
+                        redis_text, opening, catalog_generation=catalog_generation,
+                        client_id=registration.client_id,
+                    )
+                    if not closed:
+                        pending += 1
+                        continue
+                elif not cleanup_borrowed_client(
+                    redis_text, ack, episode_id=snapshot.episode_id, manager=manager,
+                ):
+                    pending += 1
+                    continue
+            if manager is not None:
+                manager.stop()
+                manager = None
+            current = ledger.read(snapshot.channel_uuid)
+            if current.episode_id != snapshot.episode_id:
+                pending += 1
+                continue
+            if current.phase != "closed":
+                ledger.revoke(
+                    current.episode_id, expected_version=current.version,
+                    reason="closed", cleanup_acknowledged=True,
+                )
+            completed += 1
+        except Exception:
+            pending += 1
+            if manager is not None and owns_manager:
+                # The native absence/cleanup ACK may be uncertain. Do not stop
+                # the only local manager handle before a later retry can prove it.
+                pass
+    return completed, pending
+
+
 class BorrowedSessionStream:
     """Ensure a response closed before its first iteration still releases ownership."""
 
@@ -383,6 +529,7 @@ def open_borrow_session(capability: SignedBorrowCapability) -> BorrowedReaderSes
     if config is None:
         raise BorrowEpisodeRejected("sharing archive configuration is unavailable")
     ledger = BorrowEpisodeLedger(Path(config.archive_root) / ".catchuparr-sharing.sqlite3")
+    retry_durable_open_cleanups(ledger, redis_text, now=time.time())
     episode = ledger.read(capability.channel_uuid)
     if (
         episode.phase != "opening"

@@ -109,20 +109,58 @@ if redis.call('HGET', KEYS[4], 'status') ~= 'active'
    or redis.call('HGET', KEYS[6], 'state') == 'failed'
    or redis.call('GET', KEYS[5]) ~= ARGV[12]
    or ARGV[11] == '' or ARGV[12] == '' then return 0 end
-redis.call('SET', KEYS[7], ARGV[1] .. ':' .. ARGV[2] .. ':' .. ARGV[11])
+redis.call('SET', KEYS[7], 'pending:' .. ARGV[1] .. ':' .. ARGV[2] .. ':' .. ARGV[11])
 redis.call('HINCRBY', KEYS[4], 'open_count', 1)
+return 1
+"""
+
+_ACTIVATE_SHARING_OPERATION_OPEN_LUA = """
+local function kind(key) return redis.call('TYPE', key).ok end
+if kind(KEYS[1]) ~= 'hash' or kind(KEYS[2]) ~= 'string'
+   or kind(KEYS[3]) ~= 'string' or kind(KEYS[4]) ~= 'hash'
+   or kind(KEYS[5]) ~= 'string' or kind(KEYS[6]) ~= 'hash'
+   or kind(KEYS[7]) ~= 'string' then return 0 end
+local pending = 'pending:' .. ARGV[1] .. ':' .. ARGV[2] .. ':' .. ARGV[11]
+local active = 'active:' .. ARGV[1] .. ':' .. ARGV[2] .. ':' .. ARGV[11]
+local state = redis.call('GET', KEYS[7])
+if state ~= pending and state ~= active
+   or redis.call('HGET', KEYS[4], 'status') ~= 'active'
+   or redis.call('GET', KEYS[3]) ~= ARGV[1] .. ':' .. ARGV[2]
+   or redis.call('HGET', KEYS[4], 'operation_id') ~= ARGV[1]
+   or redis.call('HGET', KEYS[4], 'operation_revision') ~= ARGV[2]
+   or redis.call('HGET', KEYS[4], 'worker_id') ~= ARGV[8]
+   or redis.call('HGET', KEYS[4], 'capability_digest') ~= ARGV[9]
+   or redis.call('HGET', KEYS[1], 'authority_revision') ~= ARGV[3]
+   or redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[4]
+   or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[5]
+   or redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[6]
+   or redis.call('GET', KEYS[2]) ~= ARGV[10]
+   or redis.call('TTL', KEYS[2]) <= 0
+   or redis.call('EXISTS', KEYS[5]) ~= 1
+   or redis.call('GET', KEYS[5]) ~= ARGV[12]
+   or redis.call('HGET', KEYS[6], 'state') == 'released'
+   or redis.call('HGET', KEYS[6], 'state') == 'failed' then return 0 end
+if state == active then return 1 end
+redis.call('SET', KEYS[7], active)
 return 1
 """
 
 _END_SHARING_OPERATION_OPEN_LUA = """
 local function kind(key) return redis.call('TYPE', key).ok end
-if kind(KEYS[1]) ~= 'hash' or kind(KEYS[2]) ~= 'string' then return 0 end
+if kind(KEYS[1]) ~= 'hash' or (kind(KEYS[2]) ~= 'string' and kind(KEYS[2]) ~= 'none') then return 0 end
+local open_value = ARGV[1] .. ':' .. ARGV[2] .. ':' .. ARGV[3]
+local pending_value = 'pending:' .. open_value
+local active_value = 'active:' .. open_value
+local ended_value = 'ended:' .. open_value
 if redis.call('HGET', KEYS[1], 'operation_id') ~= ARGV[1]
-   or redis.call('HGET', KEYS[1], 'operation_revision') ~= ARGV[2]
-   or redis.call('GET', KEYS[2]) ~= ARGV[1] .. ':' .. ARGV[2] .. ':' .. ARGV[3] then return 0 end
+   or redis.call('HGET', KEYS[1], 'operation_revision') ~= ARGV[2] then return 0 end
+if kind(KEYS[2]) == 'string' and redis.call('GET', KEYS[2]) == ended_value then return 1 end
+if kind(KEYS[2]) ~= 'string' then return 0 end
+local existing = redis.call('GET', KEYS[2])
+if existing ~= pending_value and existing ~= active_value then return 0 end
 local count = tonumber(redis.call('HGET', KEYS[1], 'open_count') or '')
 if not count or count < 1 or count % 1 ~= 0 then return 0 end
-redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[2], ended_value, 'EX', ARGV[4])
 redis.call('HINCRBY', KEYS[1], 'open_count', -1)
 return 1
 """
@@ -176,6 +214,50 @@ redis.call('EXPIRE', KEYS[2], ARGV[6])
 redis.call('DEL', KEYS[1])
 return 1
 """
+
+_RECONCILE_UNLAUNCHED_SHARING_OPERATION_LUA = """
+local function kind(key) return redis.call('TYPE', key).ok end
+if (kind(KEYS[1]) ~= 'string' and kind(KEYS[1]) ~= 'none')
+   or kind(KEYS[2]) ~= 'hash'
+   or (kind(KEYS[3]) ~= 'string' and kind(KEYS[3]) ~= 'none')
+   or kind(KEYS[4]) ~= 'hash' or kind(KEYS[5]) ~= 'string' then return 0 end
+local old_fence = tonumber(redis.call('HGET', KEYS[2], 'recorder_fence') or '')
+local current_fence = tonumber(ARGV[6])
+local count = tonumber(redis.call('HGET', KEYS[2], 'open_count') or '')
+if redis.call('GET', KEYS[5]) ~= ARGV[5]
+   or redis.call('HGET', KEYS[2], 'operation_id') ~= ARGV[1]
+   or redis.call('HGET', KEYS[2], 'operation_revision') ~= ARGV[2]
+   or redis.call('HGET', KEYS[2], 'worker_id') ~= ARGV[3]
+   or redis.call('HGET', KEYS[2], 'capability_digest') ~= ARGV[4]
+   or redis.call('HGET', KEYS[4], 'sharing_operation_id') ~= ARGV[1]
+   or redis.call('HGET', KEYS[4], 'sharing_operation_revision') ~= ARGV[2]
+   or redis.call('HGET', KEYS[4], 'worker_id') ~= ARGV[3]
+   or redis.call('HGET', KEYS[4], 'capability_digest') ~= ARGV[4]
+   or redis.call('HGET', KEYS[4], 'state') ~= 'issued'
+   or not old_fence or not current_fence or current_fence < old_fence
+   or (current_fence == old_fence and ARGV[7] ~= 'unreturned')
+   or not count or count ~= 0 then return 0 end
+local state = redis.call('HGET', KEYS[2], 'status')
+if state ~= 'active' and state ~= 'closing' then
+  if state == 'closed' and kind(KEYS[1]) == 'none' and kind(KEYS[3]) == 'none' then return 1 end
+  return 0
+end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] .. ':' .. ARGV[2]
+   or redis.call('EXISTS', KEYS[3]) ~= 1 then return 0 end
+redis.call('HSET', KEYS[2], 'status', 'closed', 'closed_at', ARGV[8])
+redis.call('EXPIRE', KEYS[2], ARGV[9])
+redis.call('HSET', KEYS[4], 'state', 'failed')
+redis.call('DEL', KEYS[1], KEYS[3])
+return 1
+"""
+
+
+class RecorderAttemptAdmissionUncertain(RuntimeError):
+    """An issue write may have committed; exact attempt identity is retained."""
+
+    def __init__(self, attempt: "RecorderProxyAttempt"):
+        super().__init__("sharing recorder admission outcome is uncertain")
+        self.attempt = attempt
 
 
 @dataclass(frozen=True)
@@ -238,6 +320,10 @@ def _sharing_operation_open_key(channel_uuid: str, operation_id: str, nonce: str
     return f"{SHARING_OPERATION_PREFIX}{channel_uuid}:open:{operation_id}:{nonce}"
 
 
+def _sharing_operation_open_pattern(channel_uuid: str, operation_id: str) -> str:
+    return f"{SHARING_OPERATION_PREFIX}{channel_uuid}:open:{operation_id}:*"
+
+
 def close_sharing_operation_admission(redis_client, attempt: RecorderProxyAttempt) -> bool:
     """Atomically tombstone one attempt before its native process is stopped."""
     if (not isinstance(attempt, RecorderProxyAttempt)
@@ -283,14 +369,190 @@ def close_sharing_operation_after_reap(redis_client, attempt: RecorderProxyAttem
         or attempt.capability_key != CAPABILITY_PREFIX + token_digest
     ):
         return False
+    if not reconcile_operation_open_slots_after_reap(redis_client, attempt):
+        return False
+    return close_sharing_operation_after_reap_exact(
+        redis_client, channel_uuid=channel_uuid,
+        operation_id=attempt.sharing_operation_id,
+        operation_revision=attempt.sharing_operation_revision,
+        worker_id=attempt.worker_id, capability_digest=token_digest,
+    )
+
+
+def reconcile_operation_open_slots_after_reap(
+    redis_client, attempt: RecorderProxyAttempt,
+) -> bool:
+    """Close persisted HTTP reservations after the exact recorder was reaped."""
+    try:
+        channel_uuid = _channel_from_attempt(attempt)
+        operation_id = attempt.sharing_operation_id
+        revision = attempt.sharing_operation_revision
+    except Exception:
+        return False
+    return _reconcile_operation_open_slots(
+        redis_client, channel_uuid, operation_id, revision,
+    )
+
+
+def _reconcile_operation_open_slots(
+    redis_client, channel_uuid: str, operation_id: str, revision: int,
+) -> bool:
+    try:
+        operation = redis_client.hgetall(
+            _sharing_operation_key(channel_uuid, operation_id),
+        ) or {}
+        operation = {_decode(key): _decode(value) for key, value in operation.items()}
+        if operation.get("open_count") == "0":
+            return True
+        scan_iter = getattr(redis_client, "scan_iter", None)
+        if not callable(scan_iter):
+            return False
+        keys = scan_iter(
+            match=_sharing_operation_open_pattern(channel_uuid, operation_id),
+        )
+    except Exception:
+        return False
+    binding = {
+        "channel_uuid": channel_uuid,
+        "sharing_operation_id": operation_id,
+        "sharing_operation_revision": revision,
+    }
+    try:
+        for raw_key in keys:
+            key = _decode(raw_key)
+            value = _decode(redis_client.get(key))
+            if value is None:
+                continue
+            prefix = f"{operation_id}:{revision}:"
+            if value.startswith("ended:" + prefix):
+                continue
+            if not value.startswith(prefix):
+                return False
+            nonce = value[len(prefix):]
+            if not nonce or not end_sharing_operation_open(
+                redis_client, binding, key, nonce,
+            ):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def reconcile_prior_sharing_operation(
+    redis_client, *, channel_uuid: str, current_lease_value: str,
+    current_lease_fence: int,
+) -> bool:
+    """Startup recovery for exact prior attempts after a newer lease is held."""
+    if (not isinstance(channel_uuid, str) or not channel_uuid
+            or not isinstance(current_lease_value, str) or not current_lease_value
+            or type(current_lease_fence) is not int or current_lease_fence < 1):
+        return False
+    try:
+        pointer = _decode(redis_client.get(_sharing_operation_current_key(channel_uuid)))
+        if pointer is None:
+            return True
+        operation_id, separator, revision_text = str(pointer).rpartition(":")
+        if not separator or not operation_id or not revision_text.isdecimal():
+            return False
+        revision = int(revision_text)
+        operation = redis_client.hgetall(
+            _sharing_operation_key(channel_uuid, operation_id),
+        ) or {}
+        operation = {_decode(key): _decode(value) for key, value in operation.items()}
+        if (operation.get("operation_id") != operation_id
+                or operation.get("operation_revision") != str(revision)):
+            return False
+        old_fence = int(operation.get("recorder_fence", "0"))
+        if old_fence < 1 or old_fence >= current_lease_fence:
+            return False
+        worker_id = operation.get("worker_id")
+        digest = operation.get("capability_digest")
+        worker = redis_client.hgetall(_worker_record_key(str(worker_id))) or {}
+        worker = {_decode(key): _decode(value) for key, value in worker.items()}
+        if (worker.get("sharing_operation_id") != operation_id
+                or worker.get("sharing_operation_revision") != str(revision)
+                or worker.get("worker_id") != worker_id
+                or worker.get("capability_digest") != digest):
+            return False
+        if worker.get("state") == "issued" and operation.get("open_count") == "0":
+            return reconcile_unlaunched_sharing_operation(
+                redis_client, channel_uuid=channel_uuid, operation_id=operation_id,
+                operation_revision=revision, worker_id=str(worker_id),
+                capability_digest=str(digest), current_lease_value=current_lease_value,
+                current_lease_fence=current_lease_fence,
+            )
+        if (worker.get("state") not in {"released", "failed"}
+                or operation.get("status") not in {"active", "closing"}):
+            return False
+        if not _reconcile_operation_open_slots(
+            redis_client, channel_uuid, operation_id, revision,
+        ):
+            return False
+        return close_sharing_operation_after_reap_exact(
+            redis_client, channel_uuid=channel_uuid, operation_id=operation_id,
+            operation_revision=revision, worker_id=str(worker_id),
+            capability_digest=str(digest),
+        )
+    except Exception:
+        return False
+
+
+def close_sharing_operation_after_reap_exact(
+    redis_client, *, channel_uuid: str, operation_id: str,
+    operation_revision: int, worker_id: str, capability_digest: str,
+) -> bool:
+    """Idempotently release exact operation admission after native reap ACK."""
     try:
         result = redis_client.eval(
             _CLOSE_SHARING_OPERATION_LUA, 4,
             _sharing_operation_current_key(channel_uuid),
-            _sharing_operation_key(channel_uuid, attempt.sharing_operation_id),
-            _worker_record_key(attempt.worker_id), attempt.capability_key,
-            attempt.sharing_operation_id, str(attempt.sharing_operation_revision),
-            attempt.worker_id, token_digest,
+            _sharing_operation_key(channel_uuid, operation_id),
+            _worker_record_key(worker_id),
+            CAPABILITY_PREFIX + capability_digest,
+            operation_id, str(operation_revision),
+            worker_id, capability_digest,
+            str(time.time()), str(24 * 60 * 60),
+        )
+    except Exception:
+        return False
+    return type(result) is int and result == 1
+
+
+def reconcile_unlaunched_sharing_operation(
+    redis_client, *, channel_uuid: str, operation_id: str,
+    operation_revision: int, worker_id: str, capability_digest: str,
+    current_lease_value: str, current_lease_fence: int,
+    unreturned_capability: bool = False,
+) -> bool:
+    """Close only an exact issued attempt that has no open HTTP reservation.
+
+    A same-fence reconciliation is allowed only in the issue call that never
+    returned the bearer capability to its caller. Restart recovery requires a
+    strictly newer lease fence, proving the old task cannot open the route.
+    """
+    if (
+        not isinstance(channel_uuid, str) or not channel_uuid
+        or not isinstance(operation_id, str) or not operation_id
+        or type(operation_revision) is not int or operation_revision < 1
+        or not isinstance(worker_id, str) or not worker_id
+        or not isinstance(capability_digest, str) or len(capability_digest) != 64
+        or any(c not in "0123456789abcdef" for c in capability_digest)
+        or not isinstance(current_lease_value, str) or not current_lease_value
+        or type(current_lease_fence) is not int or current_lease_fence < 1
+        or type(unreturned_capability) is not bool
+    ):
+        return False
+    try:
+        result = redis_client.eval(
+            _RECONCILE_UNLAUNCHED_SHARING_OPERATION_LUA, 5,
+            _sharing_operation_current_key(channel_uuid),
+            _sharing_operation_key(channel_uuid, operation_id),
+            CAPABILITY_PREFIX + capability_digest,
+            _worker_record_key(worker_id),
+            f"catchuparr:recorder:{channel_uuid}",
+            operation_id, str(operation_revision), worker_id, capability_digest,
+            current_lease_value, str(current_lease_fence),
+            "unreturned" if unreturned_capability else "reaped",
             str(time.time()), str(24 * 60 * 60),
         )
     except Exception:
@@ -335,48 +597,109 @@ def sharing_operation_is_current(redis_client, attempt: RecorderProxyAttempt) ->
         return False
 
 
-def begin_sharing_operation_open(redis_client, binding: Mapping[str, Any]) -> tuple[str, str] | None:
-    """Reserve one response slot before native worker initialization/reservation."""
+def _normalized_sharing_operation_binding(binding: Mapping[str, Any]) -> dict[str, Any] | None:
+    # Recorder capabilities use the namespaced sharing_* fields in the signed
+    # payload. Normalize those exact fields for the Lua argument interface,
+    # while preserving the original map when comparing the stored capability.
+    aliases = {
+        "operation_id": "sharing_operation_id",
+        "operation_revision": "sharing_operation_revision",
+        "authority_revision": "sharing_authority_revision",
+        "catalog_generation": "sharing_catalog_generation",
+    }
+    normalized = dict(binding) if isinstance(binding, Mapping) else {}
+    for name, signed_name in aliases.items():
+        signed_value = normalized.get(signed_name)
+        direct_value = normalized.get(name)
+        if signed_value is not None and direct_value is not None and str(signed_value) != str(direct_value):
+            return None
+        value = direct_value if direct_value is not None else signed_value
+        if value is not None:
+            normalized[name] = str(value)
     required = (
         "channel_uuid", "worker_id", "operation_id", "operation_revision",
         "authority_revision", "config_generation", "control_generation",
         "catalog_generation", "lease_fence", "lease_key", "lease_value",
         "capability_digest",
     )
-    if any(not isinstance(binding.get(name), str) or not binding[name] for name in required):
+    if any(not isinstance(normalized.get(name), str) or not normalized[name] for name in required):
         return None
-    channel_uuid = binding["channel_uuid"]
-    operation_id = binding["operation_id"]
-    nonce = uuid.uuid4().hex
-    open_key = _sharing_operation_open_key(channel_uuid, operation_id, nonce)
-    keys = (
+    return normalized
+
+
+def _sharing_operation_open_keys(normalized: Mapping[str, Any], open_key: str) -> tuple[str, ...]:
+    channel_uuid = normalized["channel_uuid"]
+    operation_id = normalized["operation_id"]
+    return (
         f"catchuparr:sharing:current:{channel_uuid}",
-        binding["lease_key"],
+        normalized["lease_key"],
         _sharing_operation_current_key(channel_uuid),
         _sharing_operation_key(channel_uuid, operation_id),
-        CAPABILITY_PREFIX + binding["capability_digest"],
-        _worker_record_key(binding["worker_id"]),
+        CAPABILITY_PREFIX + normalized["capability_digest"],
+        _worker_record_key(normalized["worker_id"]),
         open_key,
     )
-    args = (
-        operation_id, binding["operation_revision"], binding["authority_revision"],
-        binding["config_generation"], binding["control_generation"],
-        binding["catalog_generation"], binding["lease_fence"], binding["worker_id"],
-        binding["capability_digest"], binding["lease_value"], nonce,
-        json.dumps(
-            {**{key: str(value) for key, value in binding.items()
-                 if key != "capability_digest"},
-             "capability_digest": binding["capability_digest"]},
-            sort_keys=True, separators=(",", ":"),
-        ),
+
+
+def _sharing_operation_open_args(normalized: Mapping[str, Any], binding: Mapping[str, Any],
+                                 nonce: str) -> tuple[str, ...]:
+    return (
+        normalized["operation_id"], normalized["operation_revision"],
+        normalized["authority_revision"], normalized["config_generation"],
+        normalized["control_generation"], normalized["catalog_generation"],
+        normalized["lease_fence"], normalized["worker_id"],
+        normalized["capability_digest"], normalized["lease_value"], nonce,
+        json.dumps({key: str(value) for key, value in binding.items()},
+                   sort_keys=True, separators=(",", ":")),
     )
+
+
+def begin_sharing_operation_open(redis_client, binding: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Reserve one response slot before native worker initialization/reservation."""
+    normalized = _normalized_sharing_operation_binding(binding)
+    if normalized is None:
+        return None
+    channel_uuid = normalized["channel_uuid"]
+    operation_id = normalized["operation_id"]
+    nonce = uuid.uuid4().hex
+    open_key = _sharing_operation_open_key(channel_uuid, operation_id, nonce)
+    keys = _sharing_operation_open_keys(normalized, open_key)
+    args = _sharing_operation_open_args(normalized, binding, nonce)
     try:
         result = redis_client.eval(_BEGIN_SHARING_OPERATION_OPEN_LUA, len(keys), *keys, *args)
     except Exception:
+        # The nonce and exact Redis key are known before EVAL. If Redis applied
+        # BEGIN but its reply was lost, release that exact slot now. END is
+        # idempotent, so a lost cleanup reply remains safely retryable.
+        end_sharing_operation_open(redis_client, binding, open_key, nonce)
         return None
     if type(result) is not int or result != 1:
+        # A malformed/lost response must not strand a slot created by a
+        # successful script. A denied script has no matching key, so this is
+        # harmless in that case.
+        end_sharing_operation_open(redis_client, binding, open_key, nonce)
         return None
     return open_key, nonce
+
+
+def activate_sharing_operation_open(redis_client, binding: Mapping[str, Any],
+                                    open_key: str, nonce: str) -> bool:
+    """Mark a reserved request active only after source response setup succeeds."""
+    normalized = _normalized_sharing_operation_binding(binding)
+    if (normalized is None or not isinstance(open_key, str) or not isinstance(nonce, str)
+            or not nonce or open_key != _sharing_operation_open_key(
+                normalized["channel_uuid"], normalized["operation_id"], nonce,
+            )):
+        return False
+    try:
+        result = redis_client.eval(
+            _ACTIVATE_SHARING_OPERATION_OPEN_LUA, 7,
+            *_sharing_operation_open_keys(normalized, open_key),
+            *_sharing_operation_open_args(normalized, binding, nonce),
+        )
+    except Exception:
+        return False
+    return type(result) is int and result == 1
 
 
 def end_sharing_operation_open(redis_client, attempt: RecorderProxyAttempt,
@@ -405,7 +728,7 @@ def end_sharing_operation_open(redis_client, attempt: RecorderProxyAttempt,
         result = redis_client.eval(
             _END_SHARING_OPERATION_OPEN_LUA, 2,
             _sharing_operation_key(channel_uuid, operation_id),
-            open_key, operation_id, str(operation_revision), nonce,
+            open_key, operation_id, str(operation_revision), nonce, str(30 * 24 * 60 * 60),
         )
     except Exception:
         return False
@@ -418,6 +741,24 @@ def _attach_response_closer(response: Any, closer) -> bool:
         return False
     closers.append(closer)
     return True
+
+
+def _operation_slot_closer(redis_client, binding: Mapping[str, Any], open_key: str, nonce: str):
+    """Return a retryable exact Redis slot closer for a streaming response."""
+    lock = threading.Lock()
+    acknowledged = False
+
+    def close() -> bool:
+        nonlocal acknowledged
+        with lock:
+            if acknowledged:
+                return True
+            acknowledged = end_sharing_operation_open(
+                redis_client, binding, open_key, nonce,
+            )
+            return acknowledged
+
+    return close
 
 
 def configuration_generation(active_configuration: Mapping[str, Any]) -> str:
@@ -714,6 +1055,11 @@ def issue_recorder_attempt(
         operation_current_key = _sharing_operation_current_key(str(channel_uuid))
         operation_sequence_key = _sharing_operation_sequence_key(str(channel_uuid))
         operation_key = _sharing_operation_key(str(channel_uuid), attempt_id)
+        if not reconcile_prior_sharing_operation(
+            redis_client, channel_uuid=str(channel_uuid),
+            current_lease_value=str(lease_value), current_lease_fence=int(fence),
+        ):
+            raise RuntimeError("previous sharing operation still requires exact cleanup")
         raw_sequence = redis_client.get(operation_sequence_key)
         if raw_sequence is None:
             sequence = 0
@@ -738,6 +1084,21 @@ def issue_recorder_attempt(
     record = {**binding, "capability_digest": digest}
     reservation_id = uuid.uuid4().hex
     created_at = str(time.time())
+    attempt = RecorderProxyAttempt(
+        worker_id=worker_id,
+        stream_id=stream_id,
+        account_id=account_id,
+        config_generation=str(config_generation),
+        control_generation=control_generation,
+        capability_key=key,
+        input_url=f"{internal_base_url.rstrip('/')}/catchuparr/recorder/{channel_uuid}",
+        capability=token,
+        channel_uuid=str(channel_uuid),
+        sharing_operation_id=attempt_id if sharing_authority is not None else None,
+        sharing_operation_revision=operation_revision,
+        sharing_authority_revision=authority_revision,
+        sharing_catalog_generation=catalog_generation,
+    )
     if sharing_authority is None:
         if not redis_client.set(
             key,
@@ -782,24 +1143,26 @@ def issue_recorder_attempt(
                 _ISSUE_SHARING_ATTEMPT_LUA, len(keys), *keys, *args,
             )
         except Exception as exc:
-            raise RuntimeError("sharing recorder operation admission failed") from exc
+            reconciled = reconcile_unlaunched_sharing_operation(
+                redis_client, channel_uuid=str(channel_uuid), operation_id=attempt_id,
+                operation_revision=operation_revision, worker_id=worker_id,
+                capability_digest=digest, current_lease_value=str(lease_value),
+                current_lease_fence=int(fence), unreturned_capability=True,
+            )
+            if not reconciled:
+                raise RecorderAttemptAdmissionUncertain(attempt) from exc
+            raise RuntimeError("sharing recorder admission failed and was reconciled") from exc
         if type(result) is not int or result != operation_revision:
+            if type(result) is not int:
+                if not reconcile_unlaunched_sharing_operation(
+                    redis_client, channel_uuid=str(channel_uuid), operation_id=attempt_id,
+                    operation_revision=operation_revision, worker_id=worker_id,
+                    capability_digest=digest, current_lease_value=str(lease_value),
+                    current_lease_fence=int(fence), unreturned_capability=True,
+                ):
+                    raise RecorderAttemptAdmissionUncertain(attempt)
             raise RuntimeError("sharing recorder operation admission was denied")
-    return RecorderProxyAttempt(
-        worker_id=worker_id,
-        stream_id=stream_id,
-        account_id=account_id,
-        config_generation=str(config_generation),
-        control_generation=control_generation,
-        capability_key=key,
-        input_url=f"{internal_base_url.rstrip('/')}/catchuparr/recorder/{channel_uuid}",
-        capability=token,
-        channel_uuid=str(channel_uuid),
-        sharing_operation_id=attempt_id if sharing_authority is not None else None,
-        sharing_operation_revision=operation_revision,
-        sharing_authority_revision=authority_revision,
-        sharing_catalog_generation=catalog_generation,
-    )
+    return attempt
 
 
 def verify_recorder_capability(redis_client, token: str) -> dict[str, str] | None:
@@ -946,17 +1309,20 @@ def stream_recorder_view(request, channel_uuid: str):
             return HttpResponse("Recorder source proxy cannot redirect", status=502)
         if operation_open is not None:
             open_key, nonce = operation_open
-            closed = False
-            close_lock = threading.Lock()
-
-            def close_operation_slot() -> None:
-                nonlocal closed
-                with close_lock:
-                    if closed:
-                        return
-                    closed = True
+            if not activate_sharing_operation_open(
+                redis_client, binding, open_key, nonce,
+            ):
+                close_response = getattr(response, "close", None)
+                if callable(close_response):
+                    try:
+                        close_response()
+                    except Exception:
+                        logger.exception("Could not close a denied recorder response")
                 end_sharing_operation_open(redis_client, binding, open_key, nonce)
-
+                return HttpResponse("Recorder attempt is no longer admitted", status=502)
+            close_operation_slot = _operation_slot_closer(
+                redis_client, binding, open_key, nonce,
+            )
             if not _attach_response_closer(response, close_operation_slot):
                 close_operation_slot()
                 return HttpResponse("Recorder stream lifecycle is unavailable", status=502)

@@ -142,6 +142,17 @@ class RedisCli:
     def ttl(self, key: str):
         return int(self.command("TTL", key)[0])
 
+    def scan_iter(self, *, match: str):
+        cursor = "0"
+        while True:
+            values = self.command("SCAN", cursor, "MATCH", match, "COUNT", "100")
+            if not values:
+                raise AssertionError("Redis SCAN returned no cursor")
+            cursor = values[0]
+            yield from values[1:]
+            if cursor == "0":
+                return
+
 
 def _decode_hgetall_json(payload: str) -> dict[str, str]:
     """Decode Redis 7 JSON objects without losing empty hash values."""
@@ -291,14 +302,28 @@ class NativeLuaRedisTests(unittest.TestCase):
             opened = recorder_proxy.begin_sharing_operation_open(self.redis, binding)
             self.assertIsNotNone(opened)
             self.assertIsNone(recorder_proxy.begin_sharing_operation_open(self.redis, binding))
+            self.assertTrue(recorder_proxy.activate_sharing_operation_open(
+                self.redis, binding, *opened,
+            ))
             self.assertTrue(recorder_proxy.end_sharing_operation_open(
                 self.redis, binding, *opened,
+            ))
+            # Leave a second exact slot active to exercise restart/reaper
+            # reconciliation after its HTTP close acknowledgment is lost.
+            second_open = recorder_proxy.begin_sharing_operation_open(self.redis, binding)
+            self.assertIsNotNone(second_open)
+            self.assertTrue(recorder_proxy.activate_sharing_operation_open(
+                self.redis, binding, *second_open,
             ))
             self.assertTrue(attempt.revoke(self.redis))
             self.redis.command(
                 "HSET", worker_id_key(attempt.worker_id), "state", "released",
             )
             self.assertTrue(attempt.acknowledge_reaped(self.redis))
+            self.assertEqual("0", self.redis.hget(
+                recorder_proxy._sharing_operation_key(channel, attempt.sharing_operation_id),
+                "open_count",
+            ))
             self.assertIsNone(self.redis.get(
                 recorder_proxy._sharing_operation_current_key(channel)
             ))

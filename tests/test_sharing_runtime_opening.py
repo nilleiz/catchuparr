@@ -1,6 +1,10 @@
+import sys
 import tempfile
+import types
 import unittest
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.sharing_episode import BorrowEpisodeLedger
@@ -134,6 +138,153 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             self.prepare(project=False, close=False)
         episode = self.episode_ledger.read(CHANNEL)
         self.assertEqual("cleanup_pending", episode.phase)
+
+    def test_durable_cleanup_scanner_rebuilds_ack_and_manager_after_restart(self):
+        from catchuparr.sharing_runtime import retry_durable_open_cleanups
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-runtime-recovery-synthetic",
+        )
+        attempt = self.episode_ledger.prepare_registration(
+            opening, local_worker_id="catchuparr-reader-runtime-recovery-synthetic",
+            backend_signature="d" * 64, user_agent="Catchuparr reader",
+            client_ip="127.0.0.1",
+        )
+        ack = SimpleNamespace(
+            episode_id=opening.episode_id, channel_uuid=opening.channel_uuid,
+            client_id=attempt.client_id, local_worker_id=attempt.local_worker_id,
+            redis_backend_signature=attempt.backend_signature,
+            connected_at="105.5", projection_version=opening.version + 1,
+            user_agent=attempt.user_agent, client_ip=attempt.client_ip,
+        )
+        self.episode_ledger.record_registration_ack(opening.episode_id, ack)
+        self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        managers = []
+
+        class Manager:
+            def __init__(self, *, channel_id, redis_client, worker_id):
+                self.channel_id = channel_id
+                self.redis_client = redis_client
+                self.worker_id = worker_id
+                self.stopped = 0
+                managers.append(self)
+
+            def stop(self):
+                self.stopped += 1
+
+        live_proxy = types.ModuleType("apps.proxy.live_proxy")
+        live_proxy.__path__ = []
+        client_manager = types.ModuleType("apps.proxy.live_proxy.client_manager")
+        client_manager.ClientManager = Manager
+        redis_text = object()
+        redis_keys = {
+            "apps": types.ModuleType("apps"),
+            "apps.proxy": types.ModuleType("apps.proxy"),
+            "apps.proxy.live_proxy": live_proxy,
+            "apps.proxy.live_proxy.client_manager": client_manager,
+        }
+        with patch.dict(sys.modules, redis_keys), patch(
+            "catchuparr.adapters.sharing_reader.redis_backend_signature",
+            return_value=attempt.backend_signature,
+        ), patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_grant",
+            return_value=SimpleNamespace(
+                episode_id=opening.episode_id, catalog_generation="catalog-synthetic",
+            ),
+        ), patch(
+            "catchuparr.adapters.sharing_native.cleanup_borrowed_client",
+            return_value=True,
+        ) as cleanup:
+            self.assertEqual((1, 0), retry_durable_open_cleanups(
+                self.episode_ledger, redis_text, now=300.0,
+            ))
+        self.assertEqual(1, managers[0].stopped)
+        self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
+        cleanup.assert_called_once()
+        rebuilt_ack = cleanup.call_args.args[1]
+        self.assertEqual(ack.client_id, rebuilt_ack.client_id)
+        self.assertEqual(ack.connected_at, rebuilt_ack.connected_at)
+
+    def test_durable_cleanup_scanner_fences_uncertain_registration_before_stop(self):
+        from catchuparr.sharing_runtime import retry_durable_open_cleanups
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-unknown-recovery-synthetic",
+        )
+        self.episode_ledger.prepare_registration(
+            opening, local_worker_id="catchuparr-reader-unknown-recovery-synthetic",
+            backend_signature="e" * 64, user_agent="Catchuparr reader",
+            client_ip="127.0.0.1",
+        )
+        self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        managers = []
+
+        class Manager:
+            def __init__(self, *, channel_id, redis_client, worker_id):
+                self.channel_id = channel_id
+                self.redis_client = redis_client
+                self.worker_id = worker_id
+                self.stopped = 0
+                managers.append(self)
+
+            def stop(self):
+                self.stopped += 1
+
+        live_proxy = types.ModuleType("apps.proxy.live_proxy")
+        live_proxy.__path__ = []
+        client_manager = types.ModuleType("apps.proxy.live_proxy.client_manager")
+        client_manager.ClientManager = Manager
+        modules = {
+            "apps": types.ModuleType("apps"),
+            "apps.proxy": types.ModuleType("apps.proxy"),
+            "apps.proxy.live_proxy": live_proxy,
+            "apps.proxy.live_proxy.client_manager": client_manager,
+        }
+        redis_text = object()
+        with patch.dict(sys.modules, modules), patch(
+            "catchuparr.adapters.sharing_reader.redis_backend_signature",
+            return_value="e" * 64,
+        ), patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_grant",
+            return_value=SimpleNamespace(
+                episode_id=opening.episode_id, catalog_generation="catalog-synthetic",
+            ),
+        ), patch(
+            "catchuparr.adapters.sharing_borrow_route._recover_registration_ack",
+            return_value=None,
+        ), patch(
+            "catchuparr.adapters.sharing_native.fence_unregistered_opening",
+            return_value=True,
+        ) as fence, patch(
+            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            return_value=True,
+        ) as absent, patch(
+            "catchuparr.adapters.sharing_native.close_fenced_unregistered_opening",
+            return_value=True,
+        ) as close:
+            self.assertEqual((1, 0), retry_durable_open_cleanups(
+                self.episode_ledger, redis_text, now=300.0,
+            ))
+        fence.assert_called_once()
+        absent.assert_called_once_with(
+            redis_text, channel_uuid=CHANNEL,
+            client_id="catchuparr-client-unknown-recovery-synthetic",
+        )
+        close.assert_called_once()
+        self.assertEqual(1, managers[0].stopped)
+        self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
 
     def _episode_exists(self):
         try:
