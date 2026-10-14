@@ -172,6 +172,67 @@ class RecorderBorrowCoordinator:
         except Exception:
             return False
 
+    def record_return_after_cleanup(
+        self, prepared: PreparedBorrowOpening, *, now: float,
+    ) -> bool:
+        """Commit the return cooldown only after this exact borrow is gone."""
+        if (not isinstance(prepared, PreparedBorrowOpening)
+                or isinstance(now, bool) or not isinstance(now, (int, float))
+                or not math.isfinite(float(now))
+                or not borrow_cleanup_acknowledged(self.redis, self.episode_ledger, prepared)):
+            return False
+        try:
+            current = self.intent_ledger.read(self.channel_uuid)
+            if current is None:
+                return False
+            self.state_record = current
+            token = current.intent
+            if token is not None:
+                # A route that failed before activation consumes ATTACH, but it
+                # is not a successful source switch and earns no cooldown.
+                return bool(
+                    token.action is SharingAction.ATTACH_BORROW
+                    and token.intent_epoch == prepared.capability.intent_epoch
+                    and self._recover_closed_attach()
+                )
+            state = current.state
+            if (
+                state.phase.value not in {"borrowed", "wait_return"}
+                or state.intent_epoch != prepared.capability.intent_epoch
+                or state.configuration_generation != prepared.capability.configuration_generation
+                or state.control_generation != prepared.capability.control_generation
+                or state.recorder_fence != prepared.capability.recorder_fence
+            ):
+                return False
+            from dataclasses import replace
+
+            next_state = replace(
+                state,
+                phase=(
+                    type(state.phase).DEDICATED
+                    if self.dedicated_source_available
+                    else type(state.phase).PAUSED
+                ),
+                candidate_identity=None,
+                candidate_connection_identity=None,
+                candidate_since=None,
+                borrowed_identity=None,
+                last_viewer_left_at=None,
+                last_switch_at=max(
+                    float(now),
+                    float(state.last_switch_at)
+                    if state.last_switch_at is not None else float(now),
+                ),
+                pending_action=None,
+            )
+            self.state_record = self.intent_ledger.save(
+                next_state, action=None, expected_revision=current.revision,
+                updated_at=float(now),
+            )
+            return True
+        except Exception:
+            return False
+
     def poll(self, *, active: dict[str, Any], control_generation: int) -> PreparedBorrowOpening | None:
         """Persist cooldown observations and claim an ATTACH only at its deadline."""
         latest = self.intent_ledger.read(self.channel_uuid)
@@ -500,7 +561,8 @@ def retry_pending_open_cleanups() -> tuple[int, int]:
 
 
 def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
-                                now: float | None = None, stale_after: float = 120.0) -> tuple[int, int]:
+                                now: float | None = None, stale_after: float = 120.0,
+                                episode_id: str | None = None) -> tuple[int, int]:
     """Rebuild exact cleanup ownership from SQLite after a web worker restart.
 
     This runs only at route setup, never in the TS byte loop. Stale opening
@@ -514,6 +576,7 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
         NativeClientRegistrationAck,
         cleanup_borrowed_client,
         close_fenced_unregistered_opening,
+        episode_projection_key,
         fence_unregistered_opening,
         native_registration_is_absent,
         read_native_episode_cleanup_binding,
@@ -530,6 +593,7 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
     try:
         candidates = ledger.registration_recovery_candidates(
             stale_opening_before=float(observed_at) - float(stale_after),
+            episode_id=episode_id,
         )
         text_backend = redis_backend_signature(redis_text)
     except Exception:
@@ -542,6 +606,7 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
             continue
         manager = None
         owns_manager = False
+        cleanup_progress = {"native_done": False, "manager_stopped": False}
         try:
             grant = read_native_episode_grant(redis_text, snapshot.channel_uuid)
             if grant is not None and grant.episode_id == snapshot.episode_id:
@@ -560,6 +625,42 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                     # Unknown/prepared registrations still require a live
                     # projection so a possibly delayed registration can fence.
                     if registration is None or registration.status != "registered":
+                        # Once the exact projection TTL has elapsed, the
+                        # registration Lua can no longer authorize a delayed
+                        # HTTP request. Require the full opening lifetime,
+                        # an actually absent projection key, and absence of
+                        # every exact private-client resource before closing
+                        # an unknown/prepared attempt.
+                        client_id = registration.client_id if registration is not None else snapshot.client_id
+                        cutoff = float(observed_at) - max(120.0, float(stale_after))
+                        try:
+                            projection_type = redis_text.type(
+                                episode_projection_key(snapshot.channel_uuid),
+                            )
+                            if isinstance(projection_type, bytes):
+                                projection_type = projection_type.decode("ascii", errors="strict")
+                        except Exception:
+                            projection_type = None
+                        if (
+                            isinstance(client_id, str)
+                            and client_id.startswith("catchuparr-client-")
+                            and projection_type == "none"
+                            and ledger.registration_attempt_is_stale(snapshot, before=cutoff)
+                            and native_registration_is_absent(
+                                redis_text, channel_uuid=snapshot.channel_uuid,
+                                client_id=client_id,
+                            )
+                        ):
+                            current = ledger.read(snapshot.channel_uuid)
+                            if (current.episode_id == snapshot.episode_id
+                                    and current.version == snapshot.version
+                                    and current.phase in {"opening", "cleanup_pending"}):
+                                ledger.revoke(
+                                    current.episode_id, expected_version=current.version,
+                                    reason="closed", cleanup_acknowledged=True,
+                                )
+                                completed += 1
+                                continue
                         pending += 1
                         continue
                     catalog_generation = "expired-registration-projection"
@@ -596,21 +697,26 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                     exact_manager = manager
                 if exact_manager is None:
                     return
+                progress = {"native_done": False, "manager_stopped": False}
 
                 def retry_owned_cleanup(
                     exact_retry=retry_native,
                     exact_manager=exact_manager,
                     exact_close=close_sqlite_after_ack,
                 ) -> bool:
-                    if exact_retry() is not True:
-                        return False
-                    stop = getattr(exact_manager, "stop", None)
-                    if not callable(stop):
-                        return False
-                    try:
-                        stop()
-                    except Exception:
-                        return False
+                    if not progress["native_done"]:
+                        if exact_retry() is not True:
+                            return False
+                        progress["native_done"] = True
+                    if not progress["manager_stopped"]:
+                        stop = getattr(exact_manager, "stop", None)
+                        if not callable(stop):
+                            return False
+                        try:
+                            stop()
+                        except Exception:
+                            return False
+                        progress["manager_stopped"] = True
                     return exact_close()
 
                 _retain_durable_cleanup(
@@ -630,6 +736,7 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                 ):
                     pending += 1
                     continue
+                cleanup_progress["native_done"] = True
             else:
                 if registration.backend_signature != text_backend:
                     pending += 1
@@ -742,9 +849,10 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                         retain_retry(retry_registered, exact_manager=retained_manager)
                         pending += 1
                         continue
+                    cleanup_progress["native_done"] = True
             if manager is not None:
                 manager.stop()
-                manager = None
+                cleanup_progress["manager_stopped"] = True
             current = ledger.read(snapshot.channel_uuid)
             if current.episode_id != snapshot.episode_id:
                 pending += 1
@@ -755,6 +863,7 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                     reason="closed", cleanup_acknowledged=True,
                 )
             completed += 1
+            manager = None
         except Exception:
             pending += 1
             if manager is not None and owns_manager:
@@ -772,59 +881,64 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                     exact_opening=opening,
                     exact_catalog=catalog_generation,
                     exact_close=close_sqlite_after_ack,
+                    exact_progress=cleanup_progress,
                 ) -> bool:
                     try:
-                        recovered_ack = _recover_registration_ack(
-                            redis_text,
-                            replace(
-                                exact_snapshot, phase="opening",
-                                version=(exact_registration.opening_version
-                                         if exact_registration is not None
-                                         else exact_snapshot.version),
-                                connected_at=None, last_viewer_left_at=None,
-                                return_deadline=None,
+                        if not exact_progress["native_done"]:
+                            recovered_ack = _recover_registration_ack(
+                                redis_text,
+                                replace(
+                                    exact_snapshot, phase="opening",
+                                    version=(exact_registration.opening_version
+                                             if exact_registration is not None
+                                             else exact_snapshot.version),
+                                    connected_at=None, last_viewer_left_at=None,
+                                    return_deadline=None,
+                                    client_id=(exact_registration.client_id
+                                               if exact_registration is not None
+                                               else exact_snapshot.client_id),
+                                ),
                                 client_id=(exact_registration.client_id
                                            if exact_registration is not None
-                                           else exact_snapshot.client_id),
-                            ),
-                            client_id=(exact_registration.client_id
-                                       if exact_registration is not None
-                                       else str(exact_snapshot.client_id)),
-                            local_worker_id=(exact_registration.local_worker_id
-                                             if exact_registration is not None else ""),
-                            user_agent=(exact_registration.user_agent
-                                        if exact_registration is not None else None),
-                            client_ip=(exact_registration.client_ip
-                                       if exact_registration is not None else None),
-                            backend_signature=(exact_registration.backend_signature
-                                               if exact_registration is not None else ""),
-                        ) if exact_registration is not None else None
-                        if recovered_ack is not None:
-                            native_done = cleanup_borrowed_client(
-                                redis_text, recovered_ack,
-                                episode_id=exact_snapshot.episode_id,
-                                manager=exact_manager,
-                            )
-                        else:
-                            native_done = (
-                                fence_unregistered_opening(
-                                    redis_text, exact_opening,
-                                    catalog_generation=exact_catalog,
+                                           else str(exact_snapshot.client_id)),
+                                local_worker_id=(exact_registration.local_worker_id
+                                                 if exact_registration is not None else ""),
+                                user_agent=(exact_registration.user_agent
+                                            if exact_registration is not None else None),
+                                client_ip=(exact_registration.client_ip
+                                           if exact_registration is not None else None),
+                                backend_signature=(exact_registration.backend_signature
+                                                   if exact_registration is not None else ""),
+                            ) if exact_registration is not None else None
+                            if recovered_ack is not None:
+                                native_done = cleanup_borrowed_client(
+                                    redis_text, recovered_ack,
+                                    episode_id=exact_snapshot.episode_id,
+                                    manager=exact_manager,
                                 )
-                                and native_registration_is_absent(
-                                    redis_text,
-                                    channel_uuid=exact_snapshot.channel_uuid,
-                                    client_id=str(exact_snapshot.client_id),
+                            else:
+                                native_done = (
+                                    fence_unregistered_opening(
+                                        redis_text, exact_opening,
+                                        catalog_generation=exact_catalog,
+                                    )
+                                    and native_registration_is_absent(
+                                        redis_text,
+                                        channel_uuid=exact_snapshot.channel_uuid,
+                                        client_id=str(exact_snapshot.client_id),
+                                    )
+                                    and close_fenced_unregistered_opening(
+                                        redis_text, exact_opening,
+                                        catalog_generation=exact_catalog,
+                                        client_id=str(exact_snapshot.client_id),
+                                    )
                                 )
-                                and close_fenced_unregistered_opening(
-                                    redis_text, exact_opening,
-                                    catalog_generation=exact_catalog,
-                                    client_id=str(exact_snapshot.client_id),
-                                )
-                            )
-                        if not native_done:
-                            return False
-                        exact_manager.stop()
+                            if not native_done:
+                                return False
+                            exact_progress["native_done"] = True
+                        if not exact_progress["manager_stopped"]:
+                            exact_manager.stop()
+                            exact_progress["manager_stopped"] = True
                         return exact_close()
                     except Exception:
                         return False

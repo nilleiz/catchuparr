@@ -324,6 +324,30 @@ def record_channel(
             )
             recorder.run_forever(stop_event)
         else:
+            def cleanup_prepared_borrow(prepared) -> bool:
+                try:
+                    from .sharing_episode import BorrowEpisodeLedger
+                    from .sharing_runtime import (
+                        borrow_cleanup_acknowledged,
+                        retry_durable_open_cleanups,
+                        retry_pending_open_cleanups,
+                    )
+
+                    episode_ledger = BorrowEpisodeLedger(
+                        config.archive_root / ".catchuparr-sharing.sqlite3",
+                    )
+                    # Restrict reconciliation to this episode. The SQLite
+                    # file is shared by channels, and an unrelated opening
+                    # may still have a live signed capability.
+                    retry_durable_open_cleanups(
+                        episode_ledger, redis, now=time.time(),
+                        stale_after=0, episode_id=prepared.episode_id,
+                    )
+                    retry_pending_open_cleanups()
+                    return borrow_cleanup_acknowledged(redis, episode_ledger, prepared)
+                except Exception:
+                    return False
+
             def run_prepared_borrow() -> bool:
                 with attempt_state_lock:
                     prepared = attempt_state["borrow"]
@@ -333,10 +357,12 @@ def record_channel(
                 current_state = _recorder_admission_state(
                     channel_uuid, expected_generation, expected_control_generation
                 )
-                if current_state["status"] != "ready":
+                if stop_event.is_set() or current_state["status"] != "ready":
                     # The opening claim has been consumed. Do not fall through
                     # to an allowlisted recorder while its native registration
                     # may still be present.
+                    if not cleanup_prepared_borrow(prepared):
+                        error("borrow_cleanup_pending")
                     stop_event.set()
                     return True
                 from .adapters.sharing_borrow_route import encode_borrow_capability
@@ -354,37 +380,28 @@ def record_channel(
                     require_media_progress=True,
                 )
                 recorder._mark_next_discontinuity = True
+                current_state = _recorder_admission_state(
+                    channel_uuid, expected_generation, expected_control_generation
+                )
+                if stop_event.is_set() or current_state["status"] != "ready":
+                    if not cleanup_prepared_borrow(prepared):
+                        error("borrow_cleanup_pending")
+                    stop_event.set()
+                    return True
                 try:
                     recorder.run_candidate(
                         stop_event, startup_timeout=60, media_idle_timeout=120,
                     )
                 except Exception:
                     error("borrowed_recorder_worker_stopped")
-                cleanup_acknowledged = False
-                try:
-                    from .sharing_episode import BorrowEpisodeLedger
-                    from .sharing_runtime import (
-                        borrow_cleanup_acknowledged,
-                        retry_durable_open_cleanups,
-                        retry_pending_open_cleanups,
+                # run_candidate has reaped FFmpeg, so exact reader cleanup may
+                # now be retried. Never switch inputs while its native client
+                # or episode projection can still be live.
+                cleanup_acknowledged = cleanup_prepared_borrow(prepared)
+                if cleanup_acknowledged and sharing_coordinator is not None:
+                    cleanup_acknowledged = sharing_coordinator.record_return_after_cleanup(
+                        prepared, now=time.time(),
                     )
-
-                    episode_ledger = BorrowEpisodeLedger(
-                        config.archive_root / ".catchuparr-sharing.sqlite3",
-                    )
-                    # run_candidate has reaped FFmpeg, so exact reader cleanup
-                    # may now be retried. Never switch inputs while its native
-                    # client or episode projection can still be live.
-                    retry_durable_open_cleanups(
-                        episode_ledger, redis, now=time.time(),
-                        stale_after=0,
-                    )
-                    retry_pending_open_cleanups()
-                    cleanup_acknowledged = borrow_cleanup_acknowledged(
-                        redis, episode_ledger, prepared,
-                    )
-                except Exception:
-                    cleanup_acknowledged = False
                 if not cleanup_acknowledged:
                     error("borrow_cleanup_pending")
                     stop_event.set()

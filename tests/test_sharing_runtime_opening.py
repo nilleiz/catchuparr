@@ -16,6 +16,7 @@ from catchuparr.sharing_planner import (
     SharingObservation,
     SharingSettings,
     observe,
+    resolve_transition,
 )
 from catchuparr.sharing_runtime import (
     PreparedBorrowOpening,
@@ -230,6 +231,77 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             redis, channel_uuid=CHANNEL, client_id=opening.client_id,
         )
 
+    def test_exact_borrow_return_commits_minimum_switch_clock(self):
+        waiting = attach_state()
+        opening_observation = SharingObservation(
+            channel_uuid=CHANNEL, now=105.0,
+            configuration_generation="config-synthetic", control_generation=2,
+            recorder_fence=7, lease_is_current=True,
+            settings=SharingSettings(True, 5, 30, 60), target=target(),
+        )
+        borrowed = resolve_transition(
+            waiting, SharingAction.ATTACH_BORROW, succeeded=True, now=105.0,
+            current_state=waiting, current_observation=opening_observation,
+        )
+        saved_borrowed = self.intent_ledger.save(
+            borrowed, action=None, expected_revision=self.saved.revision,
+            updated_at=105.0,
+        )
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-runtime-return-synthetic",
+        )
+        self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        from catchuparr.adapters.sharing_borrow_route import sign_borrow_capability
+
+        capability = sign_borrow_capability(
+            secret=b"runtime-return-synthetic-secret-000000",
+            channel_uuid=CHANNEL,
+            episode_id=opening.episode_id,
+            user_id="0",
+            configuration_generation=opening.configuration_generation,
+            catalog_generation="catalog-synthetic",
+            control_generation=opening.control_generation,
+            recorder_fence=opening.recorder_fence,
+            intent_epoch=opening.intent_epoch,
+            connection_identity=IDENTITY,
+            episode_version=opening.version,
+            expires_at=300.0,
+            nonce="b" * 32,
+        )
+        prepared = PreparedBorrowOpening(
+            opening.episode_id, opening.version, opening.client_id, capability,
+        )
+        coordinator = object.__new__(RecorderBorrowCoordinator)
+        coordinator.channel_uuid = CHANNEL
+        coordinator.redis = object()
+        coordinator.intent_ledger = self.intent_ledger
+        coordinator.episode_ledger = self.episode_ledger
+        coordinator.state_record = saved_borrowed
+        coordinator.dedicated_source_available = True
+        with patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True):
+            self.assertTrue(RecorderBorrowCoordinator.record_return_after_cleanup(
+                coordinator, prepared, now=200.0,
+            ))
+        self.assertEqual(200.0, coordinator.state_record.state.last_switch_at)
+        self.assertEqual("dedicated", coordinator.state_record.state.phase.value)
+        reloaded = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(200.0, reloaded.state.last_switch_at)
+        next_observation = SharingObservation(
+            channel_uuid=CHANNEL, now=205.0,
+            configuration_generation="config-synthetic", control_generation=2,
+            recorder_fence=7, lease_is_current=True,
+            settings=SharingSettings(True, 5, 30, 60), target=target(),
+        )
+        decision = observe(reloaded.state, next_observation)
+        self.assertEqual(SharingAction.WAIT, decision.action)
+        self.assertEqual(260.0, decision.deadline)
+
     def test_stale_claim_never_creates_episode_or_projects(self):
         result, projector, cleanup = self.prepare(validate=lambda _token: False)
         self.assertEqual((False, None), result)
@@ -245,7 +317,10 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertEqual("cleanup_pending", episode.phase)
 
     def test_durable_cleanup_scanner_rebuilds_ack_and_manager_after_restart(self):
-        from catchuparr.sharing_runtime import retry_durable_open_cleanups
+        from catchuparr.sharing_runtime import (
+            retry_durable_open_cleanups,
+            retry_pending_open_cleanups,
+        )
 
         opening = self.episode_ledger.begin_open(
             self.saved.intent,
@@ -278,10 +353,14 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
                 self.redis_client = redis_client
                 self.worker_id = worker_id
                 self.stopped = 0
+                self.fail_stop_once = True
                 managers.append(self)
 
             def stop(self):
                 self.stopped += 1
+                if self.fail_stop_once:
+                    self.fail_stop_once = False
+                    raise RuntimeError("synthetic manager stop interruption")
 
         live_proxy = types.ModuleType("apps.proxy.live_proxy")
         live_proxy.__path__ = []
@@ -307,10 +386,11 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             "catchuparr.adapters.sharing_native.cleanup_borrowed_client",
             return_value=True,
         ) as cleanup:
-            self.assertEqual((1, 0), retry_durable_open_cleanups(
+            self.assertEqual((0, 1), retry_durable_open_cleanups(
                 self.episode_ledger, redis_text, now=300.0,
             ))
-        self.assertEqual(1, managers[0].stopped)
+            self.assertEqual((1, 0), retry_pending_open_cleanups())
+        self.assertEqual(2, managers[0].stopped)
         self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
         cleanup.assert_called_once()
         rebuilt_ack = cleanup.call_args.args[1]
@@ -390,6 +470,45 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         )
         close.assert_called_once()
         self.assertEqual(1, managers[0].stopped)
+        self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
+
+    def test_expired_unregistered_opening_closes_only_after_projection_and_client_absence(self):
+        from catchuparr.sharing_runtime import retry_durable_open_cleanups
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-expired-recovery-synthetic",
+        )
+        self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        redis_text = SimpleNamespace(type=lambda _key: "none")
+        with patch(
+            "catchuparr.adapters.sharing_reader.redis_backend_signature",
+            return_value="f" * 64,
+        ), patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_grant",
+            return_value=None,
+        ), patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_cleanup_binding",
+            return_value=None,
+        ), patch(
+            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            return_value=True,
+        ) as absent, patch(
+            "catchuparr.adapters.sharing_native.fence_unregistered_opening",
+        ) as fence:
+            self.assertEqual((1, 0), retry_durable_open_cleanups(
+                self.episode_ledger, redis_text, now=300.0,
+            ))
+        absent.assert_called_once_with(
+            redis_text, channel_uuid=CHANNEL,
+            client_id=opening.client_id,
+        )
+        fence.assert_not_called()
         self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
 
     def test_retained_cleanup_callbacks_keep_each_channel_ack_and_manager(self):

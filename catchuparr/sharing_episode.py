@@ -549,10 +549,12 @@ class BorrowEpisodeLedger:
         return tuple(self._snapshot_from_row(row) for row in rows)
 
     def registration_recovery_candidates(
-        self, *, stale_opening_before: float,
+        self, *, stale_opening_before: float, episode_id: str | None = None,
     ) -> tuple[tuple[BorrowEpisodeSnapshot, BorrowRegistrationAttempt | None], ...]:
         """Find pending or expired opening state for restart-safe exact cleanup."""
         cutoff = _finite_time(stale_opening_before, "stale_opening_before")
+        if episode_id is not None and (not isinstance(episode_id, str) or not episode_id):
+            raise ValueError("episode_id must be non-empty or null")
         with self._db() as db:
             rows = db.execute(
                 """SELECT e.*, r.episode_id AS r_episode_id, r.channel_uuid AS r_channel_uuid,
@@ -563,10 +565,11 @@ class BorrowEpisodeLedger:
                 r.status AS r_status
                 FROM sharing_borrow_episodes e
                 LEFT JOIN sharing_borrow_registration_attempts r ON r.episode_id=e.episode_id
-                WHERE e.phase='cleanup_pending'
-                   OR (e.phase='opening' AND e.updated_at<=?)
+                WHERE (e.phase='cleanup_pending'
+                   OR (e.phase='opening' AND e.updated_at<=?))
+                   AND (? IS NULL OR e.episode_id=?)
                 ORDER BY e.updated_at""",
-                (cutoff,),
+                (cutoff, episode_id, episode_id),
             ).fetchall()
         result = []
         for row in rows:
@@ -588,6 +591,31 @@ class BorrowEpisodeLedger:
                 })
             result.append((snapshot, registration))
         return tuple(result)
+
+    def registration_attempt_is_stale(
+        self, episode: BorrowEpisodeSnapshot, *, before: float,
+    ) -> bool:
+        """Check the exact persisted update clock before expired-open recovery."""
+        if not isinstance(episode, BorrowEpisodeSnapshot):
+            return False
+        cutoff = _finite_time(before, "before")
+        try:
+            with self._db() as db:
+                row = db.execute(
+                    "SELECT * FROM sharing_borrow_episodes WHERE channel_uuid=?",
+                    (episode.channel_uuid,),
+                ).fetchone()
+            if row is None:
+                return False
+            current = self._snapshot_from_row(row)
+            return (
+                current.episode_id == episode.episode_id
+                and current.version == episode.version
+                and current.phase == episode.phase
+                and float(row["updated_at"]) <= cutoff
+            )
+        except Exception:
+            return False
 
     @staticmethod
     def _snapshot_from_row(row: sqlite3.Row) -> BorrowEpisodeSnapshot:
