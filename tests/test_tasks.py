@@ -736,6 +736,10 @@ class RecorderTaskTests(unittest.TestCase):
                         return_value={"authority_revision": 2, "catalog_generation": "catalog-synthetic"},
                     ),
                     patch(
+                        "catchuparr.sharing_runtime.RecorderBorrowCoordinator",
+                        return_value=SimpleNamespace(poll=lambda **_kwargs: None),
+                    ),
+                    patch(
                         "catchuparr.recorder_proxy.issue_recorder_attempt",
                         side_effect=lambda _redis, _lease, **kwargs: (
                             lifecycle.append(f"issue:{kwargs['candidate']['id']}")

@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -151,6 +152,58 @@ class BorrowEpisodeTests(unittest.TestCase):
         self.assertEqual(registered, persisted)
         self.assertEqual("100.5", persisted.connected_at)
         self.assertEqual(opening.version + 1, persisted.projection_version)
+
+    def test_legacy_channel_unique_registration_table_migrates_for_sequential_episodes(self):
+        database = Path(self.temp.name) / "legacy-registrations.sqlite"
+        with sqlite3.connect(database) as db:
+            db.execute(
+                """CREATE TABLE sharing_borrow_registration_attempts (
+                    episode_id TEXT PRIMARY KEY, channel_uuid TEXT NOT NULL UNIQUE,
+                    client_id TEXT NOT NULL, local_worker_id TEXT NOT NULL,
+                    backend_signature TEXT NOT NULL, opening_version INTEGER NOT NULL,
+                    user_agent TEXT NOT NULL, client_ip TEXT NOT NULL,
+                    connected_at TEXT, projection_version INTEGER, status TEXT NOT NULL,
+                    updated_at REAL NOT NULL)"""
+            )
+            db.execute(
+                """INSERT INTO sharing_borrow_registration_attempts VALUES
+                ('legacy-episode', ?, 'catchuparr-client-legacy', 'worker-legacy', ?,
+                 1, 'reader', '127.0.0.1', NULL, NULL, 'prepared', 100)""",
+                (CHANNEL, "d" * 64),
+            )
+        ledger = BorrowEpisodeLedger(database, clock=self.clock)
+        first_token = replace(attach_token(), intent_epoch=10)
+        first = ledger.begin_open(
+            first_token, lease_digest=LEASE_DIGEST, identity=IDENTITY,
+            client_id="catchuparr-client-cycle-one",
+        )
+        ledger.prepare_registration(
+            first, local_worker_id="reader-cycle-one", backend_signature="e" * 64,
+            user_agent="reader", client_ip="127.0.0.1",
+        )
+        closed = ledger.revoke(
+            first.episode_id, expected_version=first.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        second_token = replace(attach_token(), revision=5, intent_epoch=11)
+        second = ledger.begin_open(
+            second_token, lease_digest=LEASE_DIGEST, identity=IDENTITY,
+            client_id="catchuparr-client-cycle-two", expected_version=closed.version,
+        )
+        ledger.prepare_registration(
+            second, local_worker_id="reader-cycle-two", backend_signature="f" * 64,
+            user_agent="reader", client_ip="127.0.0.1",
+        )
+        with sqlite3.connect(database) as db:
+            table_sql = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                ("sharing_borrow_registration_attempts",),
+            ).fetchone()[0]
+            self.assertNotIn("channel_uuid TEXT NOT NULL UNIQUE", table_sql)
+            self.assertEqual(3, db.execute(
+                "SELECT COUNT(*) FROM sharing_borrow_registration_attempts"
+            ).fetchone()[0])
+        self.assertEqual("opening", ledger.read(CHANNEL).phase)
 
     def test_registration_ack_cannot_rebind_persisted_worker_or_backend(self):
         opening = self.ledger.begin_open(

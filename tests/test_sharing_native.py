@@ -15,6 +15,7 @@ from catchuparr.adapters.sharing_native import (
     observe_native_connection,
     project_opening_episode,
     publish_current_authority,
+    read_native_episode_cleanup_binding,
     read_native_episode_grant,
     register_borrowed_client,
 )
@@ -135,6 +136,45 @@ class Manager:
 
 
 class NativeSharingTests(unittest.TestCase):
+    def test_cleanup_projection_reader_accepts_exact_non_authorizing_opening(self):
+        item = episode()
+        fields = {
+            "channel_uuid": item.channel_uuid,
+            "episode_id": item.episode_id,
+            "phase": "opening",
+            "configuration_generation": item.configuration_generation,
+            "control_generation": str(item.control_generation),
+            "catalog_generation": "catalog-synthetic-cleanup",
+            "recorder_fence": str(item.recorder_fence),
+            "intent_epoch": str(item.intent_epoch),
+            "lease_digest": item.lease_digest,
+            "worker_id": item.identity[1],
+            "owner_lock_value": item.identity[2],
+            "metadata_owner": item.identity[3],
+            "stream_id": item.identity[4],
+            "account_id": item.identity[5],
+            "m3u_profile_id": item.identity[6],
+            "input_profile_id": item.identity[7],
+        }
+
+        class ProjectionRedis:
+            def type(self, _key):
+                return "hash"
+
+            def ttl(self, _key):
+                return 60
+
+            def hgetall(self, _key):
+                return fields
+
+        redis = ProjectionRedis()
+        self.assertEqual(
+            "catalog-synthetic-cleanup",
+            read_native_episode_cleanup_binding(redis, item),
+        )
+        fields["episode_id"] = "replacement-episode-synthetic"
+        self.assertIsNone(read_native_episode_cleanup_binding(redis, item))
+
     def test_observes_existing_connection_even_when_account_is_excluded_for_new_sources(self):
         redis = NativeObservationRedis()
         source = NativeAssignedSource(

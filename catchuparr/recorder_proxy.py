@@ -206,9 +206,15 @@ if state == 'closed' then
      or redis.call('HGET', KEYS[2], 'capability_digest') ~= ARGV[4] then return 0 end
   return 1
 end
-if state ~= 'closing' or kind(KEYS[1]) ~= 'string'
-   or redis.call('GET', KEYS[1]) ~= ARGV[1] .. ':' .. ARGV[2]
+if state ~= 'closing'
    or redis.call('HGET', KEYS[2], 'capability_digest') ~= ARGV[4] then return 0 end
+local current = kind(KEYS[1]) == 'string' and redis.call('GET', KEYS[1]) or nil
+local capability = kind(KEYS[4]) == 'string' and redis.call('GET', KEYS[4]) or nil
+-- Revocation atomically removes both admission keys before the worker is
+-- reaped. Accept that exact tombstoned state as well as the still-published
+-- closing pointer; a replacement pointer or capability remains a hard denial.
+if (current ~= ARGV[1] .. ':' .. ARGV[2] and current ~= nil)
+   or (current == nil and capability ~= nil) then return 0 end
 redis.call('HSET', KEYS[2], 'status', 'closed', 'closed_at', ARGV[5])
 redis.call('EXPIRE', KEYS[2], ARGV[6])
 redis.call('DEL', KEYS[1])
@@ -242,8 +248,13 @@ if state ~= 'active' and state ~= 'closing' then
   if state == 'closed' and kind(KEYS[1]) == 'none' and kind(KEYS[3]) == 'none' then return 1 end
   return 0
 end
-if redis.call('GET', KEYS[1]) ~= ARGV[1] .. ':' .. ARGV[2]
-   or redis.call('EXISTS', KEYS[3]) ~= 1 then return 0 end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] .. ':' .. ARGV[2] then return 0 end
+-- The short-lived bearer may expire while a task is down. A missing key is
+-- an already-absent capability, not evidence that a replacement is ours. The
+-- exact operation/current pointer, zero opens, issued worker, and same-or-newer
+-- recorder fence above are the cleanup proof; no route can open without the
+-- expired capability, and no token is recreated here.
+if kind(KEYS[3]) == 'string' and redis.call('EXISTS', KEYS[3]) ~= 1 then return 0 end
 redis.call('HSET', KEYS[2], 'status', 'closed', 'closed_at', ARGV[8])
 redis.call('EXPIRE', KEYS[2], ARGV[9])
 redis.call('HSET', KEYS[4], 'state', 'failed')
@@ -426,9 +437,13 @@ def _reconcile_operation_open_slots(
             prefix = f"{operation_id}:{revision}:"
             if value.startswith("ended:" + prefix):
                 continue
-            if not value.startswith(prefix):
+            if value.startswith("pending:" + prefix):
+                encoded = value[len("pending:" + prefix):]
+            elif value.startswith("active:" + prefix):
+                encoded = value[len("active:" + prefix):]
+            else:
                 return False
-            nonce = value[len(prefix):]
+            nonce = encoded
             if not nonce or not end_sharing_operation_open(
                 redis_client, binding, key, nonce,
             ):

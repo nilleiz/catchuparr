@@ -407,6 +407,59 @@ class NativeLuaRedisTests(unittest.TestCase):
                     internal_base_url="http://dispatcharr.invalid", sharing_authority=authority,
                 )
 
+    def test_unlaunched_operation_reconciles_after_capability_expiry_and_new_lease(self):
+        channel = "channel-expired-capability-synthetic-060"
+        lease_key = f"catchuparr:recorder:{channel}"
+        current_key = f"catchuparr:sharing:current:{channel}"
+        config_generation = "config-expired-capability-synthetic"
+        catalog_generation = "catalog-expired-capability-synthetic"
+        self.redis.command(
+            "HSET", current_key,
+            "configuration_generation", config_generation,
+            "control_generation", "3",
+            "catalog_generation", catalog_generation,
+            "authority_revision", "2",
+        )
+        old_lease = "10:old-lease-expired-capability-synthetic"
+        self.redis.command("SET", lease_key, old_lease, "EX", 600)
+        lease = SimpleNamespace(fence=10, _value=old_lease, key=lease_key)
+        django = type(sys)("django")
+        django.__path__ = []
+        django_conf = type(sys)("django.conf")
+        django_conf.settings = SimpleNamespace(SECRET_KEY="synthetic-expired-capability-key")
+        with patch.dict(sys.modules, {"django": django, "django.conf": django_conf}), patch(
+            "catchuparr.configuration._sharing_catalog_generation",
+            return_value=catalog_generation,
+        ):
+            authority = recorder_proxy.current_sharing_authority_context(
+                self.redis, channel, config_generation=config_generation,
+                control_generation=3,
+            )
+            attempt = recorder_proxy.issue_recorder_attempt(
+                self.redis, lease, channel_uuid=channel,
+                candidate={"id": "stream-expired-synthetic", "account_id": "account-expired-synthetic"},
+                config_generation=config_generation, control_generation=3,
+                internal_base_url="http://dispatcharr.invalid", sharing_authority=authority,
+            )
+        self.redis.command("DEL", attempt.capability_key)
+        replacement_lease = "11:new-lease-expired-capability-synthetic"
+        self.redis.command("SET", lease_key, replacement_lease, "EX", 600)
+        self.assertTrue(recorder_proxy.reconcile_unlaunched_sharing_operation(
+            self.redis, channel_uuid=channel,
+            operation_id=attempt.sharing_operation_id,
+            operation_revision=attempt.sharing_operation_revision,
+            worker_id=attempt.worker_id,
+            capability_digest=attempt.capability_key.removeprefix(
+                "catchuparr:recorder-proxy:capability:"
+            ),
+            current_lease_value=replacement_lease,
+            current_lease_fence=11,
+        ))
+        self.assertEqual("closed", self.redis.hget(
+            recorder_proxy._sharing_operation_key(channel, attempt.sharing_operation_id),
+            "status",
+        ))
+
     def _native_source_and_viewer(self):
         keys = _keys()
         self.redis.command("SET", keys["owner"], WORKER, "EX", 600)
