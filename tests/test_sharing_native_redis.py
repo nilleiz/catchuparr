@@ -14,6 +14,7 @@ import subprocess
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from catchuparr.adapters.sharing_borrow_route import (
     consume_opening_capability,
@@ -116,6 +117,19 @@ class RedisCli:
             raise RuntimeError("isolated redis-cli command failed")
         return _decode_hgetall_json(result.stdout)
 
+    def type(self, key: str):
+        """Match redis-py's TYPE method used by exact absence reconciliation."""
+        values = self.command("TYPE", key)
+        if not values:
+            raise AssertionError("Redis TYPE returned no value")
+        return values[0]
+
+    def sismember(self, key: str, member: str):
+        values = self.command("SISMEMBER", key, member)
+        if values not in (["0"], ["1"]):
+            raise AssertionError("Redis SISMEMBER returned an invalid value")
+        return values == ["1"]
+
     def smembers(self, key: str):
         return set(self.command("SMEMBERS", key))
 
@@ -143,6 +157,27 @@ def _decode_hgetall_json(payload: str) -> dict[str, str]:
 
 
 class RedisCliJsonTests(unittest.TestCase):
+    def test_type_facade_matches_redis_py_value_shape(self):
+        cli = RedisCli("synthetic-test-container")
+        with patch(
+            "tests.test_sharing_native_redis.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="hash\n"),
+        ) as run:
+            self.assertEqual(cli.type("key-synthetic"), "hash")
+        self.assertEqual(run.call_args.args[0][-2:], ["TYPE", "key-synthetic"])
+
+    def test_sismember_facade_matches_redis_py_boolean_shape(self):
+        cli = RedisCli("synthetic-test-container")
+        with patch(
+            "tests.test_sharing_native_redis.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="1\n"),
+        ) as run:
+            self.assertTrue(cli.sismember("set-synthetic", "client-synthetic"))
+        self.assertEqual(
+            run.call_args.args[0][-3:],
+            ["SISMEMBER", "set-synthetic", "client-synthetic"],
+        )
+
     def test_hgetall_json_object_preserves_empty_native_profile_field(self):
         self.assertEqual(
             _decode_hgetall_json('{"output_profile_id":"","worker_id":"worker-synthetic"}'),
@@ -437,19 +472,19 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertTrue(publish_current_authority(
             self.redis, CHANNEL, configuration_generation="config-next",
             control_generation=8, catalog_generation="catalog-next",
-            expected_revision=4, authority_revision=5,
+            expected_revision=1, authority_revision=2,
         ))
         self.assertTrue(invalidate_native_episode(
             self.redis, grant, configuration_generation="config-next",
             control_generation=8, catalog_generation="catalog-next",
-            authority_revision=5,
+            authority_revision=2,
         ))
         self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "closing")
         self.assertEqual(self.redis.hget(_keys()["episode"], "version"), str(grant.version + 1))
         self.assertFalse(invalidate_native_episode(
             self.redis, grant, configuration_generation="config-next",
             control_generation=8, catalog_generation="catalog-next",
-            authority_revision=5,
+            authority_revision=2,
         ))
 
     def test_current_authority_invalidation_rejects_stale_revision_and_projection(self):
@@ -460,18 +495,18 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertTrue(publish_current_authority(
             self.redis, CHANNEL, configuration_generation="config-next",
             control_generation=8, catalog_generation="catalog-next",
-            expected_revision=4, authority_revision=5,
+            expected_revision=1, authority_revision=2,
         ))
         self.assertFalse(invalidate_native_episode(
             self.redis, grant, configuration_generation="config-next",
             control_generation=8, catalog_generation="catalog-next",
-            authority_revision=6,
+            authority_revision=3,
         ))
         self.redis.command("HSET", _keys()["episode"], "client_id", "replacement-client-synthetic")
         self.assertFalse(invalidate_native_episode(
             self.redis, grant, configuration_generation="config-next",
             control_generation=8, catalog_generation="catalog-next",
-            authority_revision=5,
+            authority_revision=2,
         ))
         self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "active")
 
