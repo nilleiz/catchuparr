@@ -39,7 +39,8 @@ def episode():
         episode_id="episode-synthetic-7", channel_uuid=CHANNEL, phase="opening",
         configuration_generation="config-synthetic-3", control_generation=7,
         recorder_fence=11, intent_epoch=9, identity=IDENTITY,
-        lease_digest=hashlib.sha256(LEASE.encode()).hexdigest(), client_id=None,
+        lease_digest=hashlib.sha256(LEASE.encode()).hexdigest(),
+        client_id="catchuparr-client-synthetic-7",
         connected_at=None, version=1, last_viewer_left_at=None, return_deadline=None,
     )
 
@@ -265,8 +266,10 @@ class NativeSharingTests(unittest.TestCase):
         ))
         self.assertEqual(values[3:6], ("11", LEASE, "episode-synthetic-7"))
         self.assertEqual(values[6:13], IDENTITY[1:])
-        self.assertEqual(values[-2:], (str(snap.intent_epoch), snap.lease_digest))
-        self.assertEqual(values[-3], CHANNEL)
+        self.assertEqual(values[-3:], (
+            str(snap.intent_epoch), snap.lease_digest, snap.client_id,
+        ))
+        self.assertEqual(values[-4], CHANNEL)
         before = len(redis.calls)
         self.assertFalse(project_opening_episode(
             redis, snap, lease_value="wrong-lease", catalog_generation="catalog-synthetic-4",

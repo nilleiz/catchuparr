@@ -226,6 +226,9 @@ class BorrowEpisodeLedger:
             if row is None or row["phase"] != "opening" or row["version"] != expected_version:
                 db.rollback()
                 raise BorrowEpisodeRejected("opening episode is stale")
+            if row["client_id"] is not None and row["client_id"] != client_id:
+                db.rollback()
+                raise BorrowEpisodeRejected("registration ACK differs from planned client attempt")
             version = expected_version + 1
             cur = db.execute("UPDATE sharing_borrow_episodes SET phase='active',client_id=?,connected_at=?,version=?,updated_at=? WHERE episode_id=? AND version=?",
                              (client_id, connected_at, version, now, episode_id, expected_version))

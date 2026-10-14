@@ -120,6 +120,20 @@ class BorrowEpisodeTests(unittest.TestCase):
         self.assertEqual(pending.phase, "cleanup_pending")
         self.assertEqual(self.ledger.pending_cleanup(), (pending,))
 
+    def test_registration_ack_cannot_replace_persisted_client_attempt(self):
+        opening = self.ledger.begin_open(
+            attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY,
+            client_id="catchuparr-client-planned-synthetic",
+        )
+        with self.assertRaises(BorrowEpisodeRejected):
+            self.ledger.activate(
+                opening.episode_id, expected_version=opening.version,
+                client_id="catchuparr-client-replacement-synthetic",
+                connected_at="100.5", ordinary_viewer_ids=("viewer-synthetic",),
+            )
+        self.assertEqual(self.ledger.read(CHANNEL), opening)
+        self.assertEqual(self.ledger.pending_cleanup(), (opening,))
+
     def test_grace_is_episode_bound_dynamic_and_canceled_on_viewer_return(self):
         opening = self.ledger.begin_open(attach_token(), lease_digest=LEASE_DIGEST, identity=IDENTITY)
         active = self.ledger.activate(

@@ -160,7 +160,7 @@ class RedisCliJsonTests(unittest.TestCase):
                 _decode_hgetall_json(payload)
 
 
-def _episode(*, epoch: int = 9) -> BorrowEpisodeSnapshot:
+def _episode(*, epoch: int = 9, client_id: str = CLIENT) -> BorrowEpisodeSnapshot:
     identity = (
         CHANNEL, WORKER, WORKER, WORKER, STREAM, ACCOUNT, M3U_PROFILE,
         INPUT_PROFILE,
@@ -169,7 +169,7 @@ def _episode(*, epoch: int = 9) -> BorrowEpisodeSnapshot:
         episode_id=EPISODE_ID, channel_uuid=CHANNEL, phase="opening",
         configuration_generation=CONFIG, control_generation=7,
         recorder_fence=11, intent_epoch=epoch, identity=identity,
-        lease_digest=hashlib.sha256(LEASE.encode()).hexdigest(), client_id=None,
+        lease_digest=hashlib.sha256(LEASE.encode()).hexdigest(), client_id=client_id,
         connected_at=None, version=1, last_viewer_left_at=None,
         return_deadline=None,
     )
@@ -231,9 +231,9 @@ class NativeLuaRedisTests(unittest.TestCase):
             "output_format", "mpegts", "output_profile_id", "",
         )
 
-    def _opening_projection(self, *, episode=None, return_seconds=30,
+    def _opening_projection(self, *, episode=None, client_id=CLIENT, return_seconds=30,
                             minimum_switch_seconds=60, last_switch_at=95):
-        episode = episode or _episode()
+        episode = episode or _episode(client_id=client_id)
         self._base_authority()
         self.assertTrue(project_opening_episode(
             self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
@@ -246,6 +246,7 @@ class NativeLuaRedisTests(unittest.TestCase):
     def _register(self, *, client_id: str = CLIENT, return_seconds=30,
                   minimum_switch_seconds=60, last_switch_at=95):
         episode = self._opening_projection(
+            client_id=client_id,
             return_seconds=return_seconds,
             minimum_switch_seconds=minimum_switch_seconds,
             last_switch_at=last_switch_at,
@@ -453,6 +454,19 @@ class NativeLuaRedisTests(unittest.TestCase):
         grant = read_native_episode_grant(self.redis, CHANNEL)
         self.assertIsNotNone(grant)
         self.assertEqual(grant.version, episode.version + 1)
+
+    def test_registration_rejects_client_id_different_from_persisted_attempt(self):
+        episode = self._opening_projection()
+        self._native_source_and_viewer()
+        self.assertIsNone(register_borrowed_client(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            client_id="catchuparr-client-replacement-synthetic",
+            local_worker_id=TASK_WORKER, user_agent="Synthetic Player",
+            client_ip="192.0.2.60", client_record_ttl=60,
+        ))
+        self.assertEqual(self.redis.hget(_keys()["episode"], "phase"), "opening")
+        self.assertEqual(self.redis.hget(_keys()["episode"], "client_id"), CLIENT)
+        self.assertFalse(self.redis.exists(_keys()["client"]))
 
     def test_registration_lost_reply_recovers_exact_committed_ack(self):
         episode = self._opening_projection()
