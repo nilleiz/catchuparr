@@ -1,6 +1,7 @@
 """Run through manage.py shell in an empty, disposable Dispatcharr AIO."""
 
 import inspect
+import json
 import os
 import signal
 import sqlite3
@@ -157,8 +158,12 @@ def probe_source_configuration(channel, root):
     active_path = root / "synthetic-active-settings.json"
     apply_configuration(settings, active_path=active_path)
     active = load_active_configuration(active_path)
-    require(active is not None and active.get("version") == 5,
-            "Apply must persist a v5 active snapshot")
+    from aio_051_configuration_probe import validate_active_v6_snapshot
+
+    validate_active_v6_snapshot(
+        active, json.loads(active_path.read_text(encoding="utf-8")),
+        (str(channel.uuid),),
+    )
     require(active["recording_schedule"] == {
         "timezone": "UTC",
         "channels": {
@@ -280,6 +285,7 @@ def probe():
     if os.environ.get("CATCHUPARR_INTEGRATION_TEST") != "1":
         raise RuntimeError("This probe requires a disposable integration container")
     sys.path.insert(0, "/data/plugins")
+    sys.path.insert(0, "/tmp")
     from apps.accounts.models import User
     from apps.channels.models import Channel, ChannelProfile, ChannelProfileMembership
     from apps.epg.models import EPGData, ProgramData
@@ -375,11 +381,17 @@ def probe():
     require(runtime.validate_configuration(initial_settings)["valid"],
             "Synthetic YAML profile config did not validate")
     runtime.apply_configuration()
-    from catchuparr.configuration import load_active_configuration
+    from catchuparr.configuration import active_settings_path, load_active_configuration
 
     active = load_active_configuration()
-    require(active is not None and active.get("version") == 5,
-            "One Apply must persist a v5 active snapshot")
+    from aio_051_configuration_probe import validate_active_v6_snapshot
+
+    require(active is not None, "One Apply must make the active snapshot readable")
+    active_path = active_settings_path()
+    persisted = json.loads(active_path.read_text(encoding="utf-8"))
+    validate_active_v6_snapshot(
+        active, persisted, tuple(active.get("channel_uuids", "").splitlines()),
+    )
     require(
         active.get("recording_enabled") is True and active.get("log_level") == "INFO",
         "One Apply must activate the global recorder and logging settings",
