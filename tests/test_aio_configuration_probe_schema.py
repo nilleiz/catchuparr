@@ -1,10 +1,18 @@
 import unittest
 from copy import deepcopy
 
-from scripts.aio_051_configuration_probe import validate_active_v6_snapshot
+from scripts.aio_051_configuration_probe import (
+    should_run_probe,
+    validate_active_v6_snapshot,
+)
 
 
 class ActiveConfigurationProbeSchemaTests(unittest.TestCase):
+    def test_probe_runs_as_script_or_django_shell_stdin_but_not_import(self):
+        self.assertTrue(should_run_probe("__main__"))
+        self.assertTrue(should_run_probe("django.core.management.commands.shell"))
+        self.assertFalse(should_run_probe("scripts.aio_051_configuration_probe"))
+
     def setUp(self):
         self.channels = ("synthetic-channel-a", "synthetic-channel-b")
         self.defaults = {
