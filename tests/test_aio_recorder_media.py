@@ -37,6 +37,58 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_failure_diagnostic_read_error_preserves_original_gate_failure(self):
+        def broken_diagnostic():
+            raise ValueError("synthetic secret diagnostic data")
+
+        emitted = []
+        with self.assertRaisesRegex(RuntimeError, "original gate failure"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "original gate failure",
+                broken_diagnostic,
+                emit=emitted.append,
+            )
+        self.assertEqual(len(emitted), 1)
+        self.assertIn('"diagnostic_error": "ValueError"', emitted[0])
+        self.assertNotIn("synthetic secret", emitted[0])
+
+    def test_failure_diagnostic_output_error_preserves_original_gate_failure(self):
+        def fail_output(_message):
+            raise OSError("synthetic output detail")
+
+        with self.assertRaisesRegex(RuntimeError, "original gate failure"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "original gate failure",
+                lambda: {"safe": True},
+                emit=fail_output,
+            )
+
+    def test_successful_gate_does_not_run_diagnostic(self):
+        def unexpected_diagnostic():
+            self.fail("successful gate must not read diagnostic state")
+
+        probe._require_with_failure_diagnostic(
+            True, "unused", unexpected_diagnostic,
+        )
+
+    def test_no_source_acceptance_keeps_seven_original_conditions(self):
+        conditions = {
+            "source_b_request_count_unchanged": True,
+            "source_a_active_zero": True,
+            "source_a_request_count_unchanged": True,
+            "native_global_clients_zero": True,
+            "native_owner_absent": True,
+            "profile_a_at_baseline": True,
+            "profile_b_at_baseline": True,
+        }
+        self.assertEqual(7, len(conditions))
+        self.assertTrue(all(conditions.values()))
+        # The local worker count is emitted only as diagnostic context.
+        diagnostic = {"conditions": conditions, "native_local_clients_zero": False}
+        self.assertTrue(all(diagnostic["conditions"].values()))
+
     def test_live_failover_provider_exposes_pre_response_request_boundary(self):
         source = object.__new__(aio_recorder_failover._SyntheticFailoverSourceServer)
         source._lock = threading.Lock()

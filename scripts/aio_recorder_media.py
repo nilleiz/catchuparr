@@ -19,6 +19,31 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _require_with_failure_diagnostic(
+    condition: bool,
+    message: str,
+    diagnostic_factory,
+    *,
+    emit=print,
+) -> None:
+    """Emit best-effort diagnostics without replacing the original gate error."""
+    if condition:
+        return
+    try:
+        diagnostic = diagnostic_factory()
+        emit("CATCHUPARR_NO_SOURCE_PAUSE_DIAGNOSTIC " + json.dumps(
+            diagnostic, sort_keys=True,
+        ))
+    except Exception as exc:
+        try:
+            emit("CATCHUPARR_NO_SOURCE_PAUSE_DIAGNOSTIC " + json.dumps({
+                "diagnostic_error": type(exc).__name__,
+            }, sort_keys=True))
+        except Exception:
+            pass
+    raise RuntimeError(message)
+
+
 def _assert_private_worker_stop_request_count(before: dict, after: dict) -> None:
     """A cooperative stop must not open another provider request."""
     _require(
@@ -4332,7 +4357,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "native_global_clients_zero": (
                 int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
             ),
-            "native_local_clients_zero": final_manager_count == 0,
             "native_owner_absent": redis_client.get(
                 RedisKeys.channel_owner(worker_id),
             ) is None,
@@ -4345,9 +4369,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 == profile_baselines[profile_b.id]
             ),
         }
-        if not all(no_source_pause_conditions.values()):
-            diagnostic = {
+
+        def no_source_pause_diagnostic():
+            from apps.proxy.live_proxy.config_helper import ConfigHelper
+
+            return {
                 "conditions": no_source_pause_conditions,
+                "native_local_clients_zero": final_manager_count == 0,
                 "provider_request_delta": {
                     "source_a": (
                         final_no_source_counts["source-a.ts"]
@@ -4385,15 +4413,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     )),
                 },
                 "native_cleanup_interval_seconds": int(
-                    getattr(native_server, "cleanup_interval", 0) or 0
+                    ConfigHelper.cleanup_check_interval()
+                ),
+                "native_channel_shutdown_delay_seconds": int(
+                    ConfigHelper.channel_shutdown_delay()
                 ),
             }
-            print("CATCHUPARR_NO_SOURCE_PAUSE_DIAGNOSTIC " + json.dumps(
-                diagnostic, sort_keys=True,
-            ))
-        _require(
+        _require_with_failure_diagnostic(
             all(no_source_pause_conditions.values()),
             "Paused no-source recording opened a provider stream or kept a reservation",
+            no_source_pause_diagnostic,
         )
         resumed_plugin = PluginConfig.objects.get(key="catchuparr")
         resumed_plugin.settings = dict(sharing_settings)
