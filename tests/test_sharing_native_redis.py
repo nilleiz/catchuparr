@@ -146,6 +146,21 @@ class RedisCli:
         values = self.command("HGET", key, field)
         return values[0] if values else None
 
+    def mget(self, keys):
+        result = subprocess.run(
+            ["sudo", "-n", "docker", "exec", self.container,
+             "redis-cli", "--json", "MGET", *(str(key) for key in keys)],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode:
+            raise RuntimeError("isolated redis-cli MGET failed")
+        values = json.loads(result.stdout)
+        if not isinstance(values, list) or any(
+            value is not None and not isinstance(value, str) for value in values
+        ):
+            raise AssertionError("Redis returned malformed MGET JSON")
+        return values
+
     def hset(self, key: str, field: str, value: str):
         values = self.command("HSET", key, field, value)
         if len(values) != 1 or not values[0].isdigit():
@@ -649,6 +664,137 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertIsNotNone(grant)
         ok, _deadline, _version = check_and_touch_borrowed_client(self.redis, grant)
         self.assertTrue(ok)
+
+    def test_registered_borrow_is_hidden_only_by_exact_readonly_stats_verification(self):
+        from catchuparr import stats
+
+        _episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        self.redis.command("EXPIRE", _keys()["client"], "30")
+        self.redis.command("EXPIRE", _keys()["clients"], "30")
+        client_ttl_before = self.redis.ttl(_keys()["client"])
+        clients_ttl_before = self.redis.ttl(_keys()["clients"])
+        self.assertTrue(stats._is_borrowed_recorder_client(self.redis, CHANNEL, CLIENT))
+        self.assertTrue(stats._is_recorder_client_on_redis(self.redis, CHANNEL, CLIENT))
+        self.assertEqual(
+            {CLIENT}, stats._verified_recorder_ids(self.redis, CHANNEL, [CLIENT, VIEWER]),
+        )
+        # Stats verification is observation only; it must not heartbeat or
+        # extend native registrations from a payload-building request.
+        self.assertLessEqual(self.redis.ttl(_keys()["client"]), client_ttl_before)
+        self.assertLessEqual(self.redis.ttl(_keys()["clients"]), clients_ttl_before)
+
+    def test_single_stats_recorder_path_reads_borrow_authority_from_canonical_redis(self):
+        import types
+
+        from catchuparr import stats
+
+        _episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        core = types.ModuleType("core")
+        core.__path__ = []
+        utils = types.ModuleType("core.utils")
+        utils.RedisClient = type(
+            "RedisClient", (), {"get_client": staticmethod(lambda: self.redis)},
+        )
+        with patch.dict(sys.modules, {"core": core, "core.utils": utils}):
+            self.assertTrue(stats._is_recorder_client(CHANNEL, CLIENT))
+            self.assertFalse(stats._is_recorder_client(CHANNEL, VIEWER))
+
+    def test_borrowed_stats_verification_fails_closed_on_stale_or_replaced_state(self):
+        from catchuparr import stats
+
+        cases = (
+            ("replacement-client-epoch", lambda k: self.redis.hset(
+                k["client"], "connected_at", "replacement-synthetic",
+            )),
+            ("replacement-client-worker", lambda k: self.redis.hset(
+                k["client"], "worker_id", "replacement-worker-synthetic",
+            )),
+            ("current-config-revoked", lambda k: self.redis.hset(
+                k["current"], "configuration_generation", "new-config-synthetic",
+            )),
+            ("current-control-revoked", lambda k: self.redis.hset(
+                k["current"], "control_generation", "8",
+            )),
+            ("current-catalog-revoked", lambda k: self.redis.hset(
+                k["current"], "catalog_generation", "new-catalog-synthetic",
+            )),
+            ("lease-replaced", lambda k: self.redis.set(
+                k["lease"], "replacement-lease-synthetic", ex=600,
+            )),
+            ("lease-fence-mismatch", lambda k: self.redis.hset(
+                k["episode"], "recorder_fence", "12",
+            )),
+            ("owner-replaced", lambda k: self.redis.set(
+                k["owner"], "replacement-owner-synthetic", ex=600,
+            )),
+            ("profile-replaced", lambda k: self.redis.hset(
+                k["metadata"], "stream_profile", "replacement-profile-synthetic",
+            )),
+            ("stop-flag", lambda k: self.redis.set(
+                f"live:channel:{CHANNEL}:stopping", "1", ex=60,
+            )),
+            ("client-stop-flag", lambda k: self.redis.set(
+                f"live:channel:{CHANNEL}:client:{CLIENT}:stop", "1", ex=60,
+            )),
+            ("worker-heartbeat-missing", lambda k: self.redis.delete(k["heartbeat"])),
+            ("episode-closing", lambda k: self.redis.hset(k["episode"], "phase", "closing")),
+            ("grace-expired", lambda k: (
+                self.redis.hset(k["episode"], "phase", "wait_return"),
+                self.redis.hset(k["episode"], "viewer_left_at", "1"),
+                self.redis.hset(k["episode"], "return_deadline", "2"),
+            )),
+            ("client-output-profile", lambda k: self.redis.hset(
+                k["client"], "output_profile_id", "replacement-profile-synthetic",
+            )),
+            ("membership-removed", lambda k: self.redis.command(
+                "SREM", k["clients"], CLIENT,
+            )),
+            ("private-ledger-removed", lambda k: self.redis.delete(k["private"])),
+            ("private-episode-rebound", lambda k: self.redis.hset(
+                k["private"], CLIENT, "replacement-episode-synthetic",
+            )),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                self.redis.command("FLUSHDB")
+                _episode, ack = self._register()
+                self.assertIsNotNone(ack)
+                mutate(_keys())
+                self.assertFalse(stats._is_borrowed_recorder_client(
+                    self.redis, CHANNEL, CLIENT,
+                ))
+                self.assertNotIn(
+                    CLIENT, stats._verified_recorder_ids(self.redis, CHANNEL, [CLIENT]),
+                )
+
+    def test_borrowed_stats_verification_accepts_unexpired_native_grace_readonly(self):
+        from catchuparr import stats
+
+        _episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        self.redis.hset(_keys()["episode"], "phase", "wait_return")
+        self.redis.hset(_keys()["episode"], "viewer_left_at", "100")
+        self.redis.hset(_keys()["episode"], "return_deadline", "4102444800")
+        ttl_before = self.redis.ttl(_keys()["episode"])
+        self.assertTrue(stats._is_borrowed_recorder_client(self.redis, CHANNEL, CLIENT))
+        self.assertLessEqual(self.redis.ttl(_keys()["episode"]), ttl_before)
+
+    def test_borrowed_stats_verification_requires_exact_channel_and_keeps_viewers_visible(self):
+        from catchuparr import stats
+
+        _episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        self.assertFalse(stats._is_borrowed_recorder_client(
+            self.redis, "other-channel-synthetic", CLIENT,
+        ))
+        self.assertFalse(stats._is_borrowed_recorder_client(
+            self.redis, CHANNEL, VIEWER,
+        ))
+        self.assertEqual(
+            {CLIENT}, stats._verified_recorder_ids(self.redis, CHANNEL, [CLIENT, VIEWER]),
+        )
 
     def test_register_and_touch_reject_contradictory_optional_channel_uuid(self):
         episode = self._opening_projection()
