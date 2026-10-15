@@ -639,6 +639,139 @@ class RecorderTaskTests(unittest.TestCase):
             ))
             self.assertEqual(ArchiveStore(archive_root).recorder_fence("channel-1"), 26)
 
+    def test_sharing_with_no_allowed_source_still_polls_existing_native_viewers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive_root = Path(temp) / "archive"
+            redis = FakeRedis()
+            config = SimpleNamespace(channel_uuids=("channel-1",), archive_root=archive_root)
+            active = _active_configuration()
+            active["connection_sharing"] = {"channel-1": {
+                "enabled": True, "live_stability_seconds": 0,
+                "last_viewer_return_seconds": 1, "min_switch_interval_seconds": 0,
+            }}
+            expected_generation = configuration_generation(active)
+            coordinator_sources = []
+
+            class StopEvent:
+                def __init__(self):
+                    self.stopped = False
+
+                def set(self):
+                    self.stopped = True
+
+                def is_set(self):
+                    return self.stopped
+
+                def wait(self, _timeout=None):
+                    return self.stopped
+
+            class InlineThread:
+                def __init__(self, *, target, **_kwargs):
+                    self.target = target
+                    self.ident = None
+
+                def start(self):
+                    self.ident = 1
+                    self.target()
+
+                def join(self, timeout=None):
+                    return None
+
+            stop_event = StopEvent()
+
+            class FakeLease:
+                _value = "synthetic-lease"
+                owner = "synthetic-owner"
+                fence = 26
+
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def acquire(self):
+                    return self.fence
+
+                def renew(self):
+                    return True
+
+                def release(self):
+                    return True
+
+            class BorrowCoordinator:
+                def __init__(self, *_args, **kwargs):
+                    self.dedicated_source_available = kwargs["dedicated_source_available"]
+                    coordinator_sources.append(self.dedicated_source_available)
+                    # Let the task finish after the coordinator has been
+                    # created; the key regression is that an empty source
+                    # catalog does not return before sharing is initialized.
+                    stop_event.set()
+
+                def poll(self, **_kwargs):
+                    return None
+
+                def pending_return_intent(self):
+                    return None
+
+            celery = _fake_module(
+                "celery", shared_task=lambda *, name: lambda function: function,
+            )
+            apps = _fake_module("apps")
+            apps_channels = _fake_module("apps.channels")
+            apps_channels_tasks = _fake_module(
+                "apps.channels.tasks", get_dvr_stream_base_url=lambda: "http://dispatcharr",
+            )
+            core = _fake_module("core")
+            core_utils = _fake_module(
+                "core.utils", RedisClient=SimpleNamespace(get_client=lambda: redis),
+            )
+            fake_modules = {
+                "celery": celery,
+                "apps": apps,
+                "apps.channels": apps_channels,
+                "apps.channels.tasks": apps_channels_tasks,
+                "core": core,
+                "core.utils": core_utils,
+                "version": _fake_module("version", __version__="0.32.0"),
+            }
+            with _isolated_plugin_modules(fake_modules):
+                tasks = importlib.import_module("catchuparr.tasks")
+                with (
+                    patch("catchuparr.runtime.load_config", return_value=config),
+                    patch("catchuparr.engine.leases.RedisRecorderLease", FakeLease),
+                    patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
+                    patch(
+                        "catchuparr.configuration.load_applied_state",
+                        return_value=(active, SimpleNamespace(paused=False, generation=6)),
+                    ),
+                    patch(
+                        "catchuparr.tasks._recorder_admission_state",
+                        return_value={
+                            "status": "ready", "active": active, "config": config,
+                            "control": SimpleNamespace(generation=6),
+                        },
+                    ),
+                    patch(
+                        "catchuparr.recorder_proxy.ranked_source_candidates",
+                        side_effect=lambda _channel, _active, *, all_sources: (
+                            self.assertTrue(all_sources) or None
+                        ),
+                    ),
+                    patch("catchuparr.tasks._issue_recorder_capability", return_value=(None, None, None)),
+                    patch(
+                        "catchuparr.sharing_runtime.RecorderBorrowCoordinator",
+                        BorrowCoordinator,
+                    ),
+                    patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
+                    patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
+                    patch(
+                        "catchuparr.tasks.threading",
+                        SimpleNamespace(Event=lambda: stop_event, Lock=threading.Lock, Thread=InlineThread),
+                    ),
+                ):
+                    result = tasks.record_channel("channel-1", expected_generation, 6)
+
+            self.assertEqual({"status": "stopped"}, result)
+            self.assertEqual([False], coordinator_sources)
+
     def test_override_capacity_or_start_failure_falls_through_ranked_sources(self):
         with tempfile.TemporaryDirectory() as temp:
             archive_root = Path(temp) / "archive"

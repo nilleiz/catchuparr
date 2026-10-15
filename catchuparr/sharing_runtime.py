@@ -1702,7 +1702,10 @@ def open_borrow_session(capability: SignedBorrowCapability) -> BorrowedReaderSes
             last_viewer_return_seconds=setting["last_viewer_return_seconds"],
             min_switch_interval_seconds=setting["min_switch_interval_seconds"],
         ),
-        now=time.time(),
+        # The native REGISTER Lua ACK is the committed ATTACH point. Use its
+        # server timestamp for the planner clock so native grace and durable
+        # cooldown state share the same reference after restart.
+        now=float(session.ack.connected_at),
     ):
         try:
             cleaned = session.close() is True

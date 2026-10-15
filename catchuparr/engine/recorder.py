@@ -237,10 +237,15 @@ class FFmpegCopyRecorder:
         status = "exited"
         return_code = None
         first_media_notified = False
+        first_media_at: float | None = None
 
         def notify_first_media(committed: int) -> None:
-            nonlocal first_media_notified
+            nonlocal first_media_at, first_media_notified
             if committed and not first_media_notified:
+                if first_media_at is None:
+                    # A retry acknowledges the first useful committed
+                    # segment, not a later wall-clock time.
+                    first_media_at = time.time()
                 if on_first_media is None:
                     first_media_notified = True
                     return
@@ -248,7 +253,7 @@ class FFmpegCopyRecorder:
                     # The callback commits the sharing return authority. A
                     # transient denial must be retried on a later committed
                     # segment; publishing media alone is not its ACK.
-                    first_media_notified = on_first_media(time.time()) is True
+                    first_media_notified = on_first_media(first_media_at) is True
                 except Exception:
                     first_media_notified = False
 

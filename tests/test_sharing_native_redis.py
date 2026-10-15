@@ -1057,8 +1057,6 @@ class NativeLuaRedisTests(unittest.TestCase):
                     self.redis.command("HSET", keys["lease"], "wrong-type", "lease")
                 elif case == "tombstone_wrong_type":
                     self.redis.command("HSET", tombstone_key, "wrong-type", "value")
-                elif case == "changed_lease":
-                    self.redis.command("SET", keys["lease"], "replacement-lease", "EX", 600)
                 else:
                     self.fail(f"unknown tombstone case {case}")
 
@@ -1077,10 +1075,38 @@ class NativeLuaRedisTests(unittest.TestCase):
                 protected = (keys["current"], keys["episode"], keys["lease"],
                              keys["client"], keys["clients"], keys["private"], tombstone_key)
                 before = {key: snapshot(key) for key in protected}
+                redis_for_call = self.redis
+                if case == "changed_lease":
+                    class LeaseRace:
+                        def __init__(self, wrapped):
+                            self.wrapped = wrapped
+                            self.changed = False
+
+                        def __getattr__(self, name):
+                            return getattr(self.wrapped, name)
+
+                        def eval(self, *args):
+                            if not self.changed:
+                                self.wrapped.command(
+                                    "SET", keys["lease"], "replacement-lease", "EX", 600,
+                                )
+                                self.changed = True
+                            return self.wrapped.eval(*args)
+
+                    redis_for_call = LeaseRace(self.redis)
                 self.assertFalse(tombstone_expired_unprojected_opening(
-                    self.redis, episode, client_id=CLIENT,
+                    redis_for_call, episode, client_id=CLIENT,
                 ))
-                self.assertEqual(before, {key: snapshot(key) for key in protected})
+                if case == "changed_lease":
+                    self.assertEqual(
+                        {key: value for key, value in before.items() if key != keys["lease"]},
+                        {key: snapshot(key) for key in protected if key != keys["lease"]},
+                    )
+                    self.assertEqual(
+                        "replacement-lease", self.redis.get(keys["lease"]),
+                    )
+                else:
+                    self.assertEqual(before, {key: snapshot(key) for key in protected})
 
     def test_registration_rejects_client_id_different_from_persisted_attempt(self):
         episode = self._opening_projection()
@@ -1288,6 +1314,28 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertIsNone(deadline)
         self.assertEqual(version, grant.version + 1)
         self.assertEqual(self.redis.hget(keys["episode"], "phase"), "active")
+
+    def test_first_viewer_departure_uses_committed_attach_clock(self):
+        _episode, ack = self._register(
+            return_seconds=30, minimum_switch_seconds=60, last_switch_at=1,
+        )
+        self.assertIsNotNone(ack)
+        keys = _keys()
+        attached_at = float(ack.connected_at)
+        self.assertEqual(
+            float(self.redis.hget(keys["episode"], "last_switch_at")), attached_at,
+        )
+
+        # A viewer can leave immediately after ATTACH. The native grace
+        # deadline must still honor the full minimum interval from the
+        # successful registration ACK, even when the pre-ATTACH clock was old.
+        self.redis.command("SREM", keys["clients"], VIEWER)
+        self.redis.command("DEL", keys["viewer"])
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        ok, deadline, _version = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertTrue(ok)
+        self.assertIsNotNone(deadline)
+        self.assertGreaterEqual(deadline, attached_at + 59.9)
 
     def test_check_rejects_revoked_flags_expired_grace_and_stale_projection(self):
         self._register()

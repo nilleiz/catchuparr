@@ -587,6 +587,7 @@ redis.call('HSET', KEYS[11], ARGV[16], ARGV[7])
 redis.call('EXPIRE', KEYS[11], ttl)
 redis.call('HSET', KEYS[1], 'phase', 'active', 'client_id', ARGV[16],
   'connected_at', nowstr, 'viewer_left_at', '', 'return_deadline', '',
+  'last_switch_at', nowstr,
   'version', tostring(version), 'client_worker_id', ARGV[19])
 redis.call('EXPIRE', KEYS[1], ttl)
 return {1, nowstr, tostring(version)}
