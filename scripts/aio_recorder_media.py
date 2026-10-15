@@ -141,6 +141,7 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
         self._counts_lock = threading.Lock()
         self.request_counts = {name: 0 for name in payloads}
         self.active_counts = {name: 0 for name in payloads}
+        self.request_started_at = {name: [] for name in payloads}
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -155,6 +156,7 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
                 with owner._counts_lock:
                     owner.request_counts[name] += 1
                     owner.active_counts[name] += 1
+                    owner.request_started_at[name].append(time.time())
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "video/mp2t")
@@ -196,6 +198,10 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
     def snapshot(self) -> tuple[dict[str, int], dict[str, int]]:
         with self._counts_lock:
             return dict(self.request_counts), dict(self.active_counts)
+
+    def request_times(self, source_name: str) -> list[float]:
+        with self._counts_lock:
+            return list(self.request_started_at.get(source_name, ()))
 
     def close(self) -> None:
         if self.thread.is_alive():
@@ -3446,6 +3452,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Sharing did not retain the B-only fallback policy",
         )
         share_source_baseline, share_active_baseline = source_server.snapshot()
+        share_b_request_baseline = len(source_server.request_times("source-b.ts"))
         _require(
             share_active_baseline["source-a.ts"] == 1
             and share_active_baseline["source-b.ts"] == 0,
@@ -3594,14 +3601,44 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         _require(time.time() < return_deadline,
                  "The synthetic viewer left after the tested switch deadline")
-        gevent_sleep(3)
-        _require(time.time() < return_deadline,
-                 "The recorder returned before the observed native grace deadline")
-        counts_during_return_cooldown, _active_during_return_cooldown = source_server.snapshot()
+        b_request_deadline = time.monotonic() + 150
+        b_request_times = source_server.request_times("source-b.ts")
+        while len(b_request_times) <= share_b_request_baseline:
+            _require(time.monotonic() < b_request_deadline,
+                     "Allowed B did not start after the observed native return deadline")
+            gevent_sleep(0.05)
+            b_request_times = source_server.request_times("source-b.ts")
+        first_return_request_at = b_request_times[share_b_request_baseline]
         _require(
-            counts_during_return_cooldown["source-b.ts"]
-            == share_source_baseline["source-b.ts"],
-            "The allowed B source opened before the minimum switch interval",
+            first_return_request_at >= return_deadline,
+            "The allowed B provider request preceded the actual native return deadline",
+        )
+
+        # Assert the borrowed process and its exact native registration are
+        # gone at the first fallback provider effect, not after B media arrives.
+        with run_share._lock:
+            share_processes = list(run_share.processes)
+            share_results_at_first_b = list(run_share.results)
+        _require(
+            bool(share_processes) and share_processes[0].poll() is not None,
+            "Borrowed FFmpeg was still alive when the first B request started",
+        )
+        _require(
+            bool(share_results_at_first_b) and share_results_at_first_b[0].useful_segments > 0,
+            "Borrowed input had not completed with useful media before the first B request",
+        )
+        borrow_client_key = f"live:channel:{worker_id}:clients:{borrow_client_id}"
+        borrow_clients_key = RedisKeys.clients(worker_id)
+        borrow_private_key = f"catchuparr:sharing:private:{worker_id}"
+        _require(
+            not redis_client.exists(borrow_client_key)
+            and not redis_client.sismember(borrow_clients_key, borrow_client_id)
+            and redis_client.hget(borrow_private_key, borrow_client_id) is None,
+            "Borrowed native client hash/set/marker remained at the first B provider request",
+        )
+        _require(
+            _redis_text(redis_client.hget(sharing_episode_key, "phase")) == "closed",
+            "Borrowed episode cleanup was not acknowledged before the first B provider request",
         )
 
         b_before_share = {segment.id for segment in store.segments(worker_id)}

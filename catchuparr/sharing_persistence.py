@@ -696,6 +696,17 @@ class SharingIntentLedger:
             ):
                 db.rollback()
                 raise StaleSharingIntent("sharing state revision changed during recovery")
+            if (row is not None
+                    and row["action"] == SharingAction.RETURN_TO_ALLOWED.value):
+                # Recovery may rebind a valid RETURN intent to the new worker
+                # fence. Validate its complete old row before changing any
+                # columns; a malformed deadline/target/snapshot must never be
+                # repaired into a writable, apparently valid intent.
+                try:
+                    self._decode(row)
+                except Exception:
+                    db.rollback()
+                    raise
             if row is None:
                 from .sharing_planner import SharingObservation, SharingSettings, initial_state
 
