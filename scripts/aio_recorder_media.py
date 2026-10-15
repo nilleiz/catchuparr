@@ -4315,16 +4315,84 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             ):
                 break
             gevent_sleep(0.1)
+        final_no_source_counts, final_no_source_active = source_server.snapshot()
+        final_manager = native_server.client_managers.get(worker_id)
+        final_manager_count = (
+            int(final_manager.get_client_count()) if final_manager is not None else 0
+        )
+        disconnect_key = RedisKeys.last_client_disconnect(worker_id)
+        no_source_pause_conditions = {
+            "source_b_request_count_unchanged": (
+                len(source_server.request_times("source-b.ts")) == no_source_b_requests
+            ),
+            "source_a_active_zero": final_no_source_active["source-a.ts"] == 0,
+            "source_a_request_count_unchanged": (
+                final_no_source_counts["source-a.ts"] == no_source_counts["source-a.ts"]
+            ),
+            "native_global_clients_zero": (
+                int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+            ),
+            "native_local_clients_zero": final_manager_count == 0,
+            "native_owner_absent": redis_client.get(
+                RedisKeys.channel_owner(worker_id),
+            ) is None,
+            "profile_a_at_baseline": (
+                _profile_count(redis_client, profile_a.id, profile_connections_key)
+                == profile_baselines[profile_a.id]
+            ),
+            "profile_b_at_baseline": (
+                _profile_count(redis_client, profile_b.id, profile_connections_key)
+                == profile_baselines[profile_b.id]
+            ),
+        }
+        if not all(no_source_pause_conditions.values()):
+            diagnostic = {
+                "conditions": no_source_pause_conditions,
+                "provider_request_delta": {
+                    "source_a": (
+                        final_no_source_counts["source-a.ts"]
+                        - no_source_counts["source-a.ts"]
+                    ),
+                    "source_b": (
+                        len(source_server.request_times("source-b.ts"))
+                        - no_source_b_requests
+                    ),
+                },
+                "provider_active_counts": {
+                    "source_a": final_no_source_active["source-a.ts"],
+                    "source_b": final_no_source_active["source-b.ts"],
+                },
+                "native_client_count": {
+                    "global": int(redis_client.scard(RedisKeys.clients(worker_id)) or 0),
+                    "local": final_manager_count,
+                },
+                "native_keys": {
+                    "owner_present": redis_client.get(
+                        RedisKeys.channel_owner(worker_id),
+                    ) is not None,
+                    "stop_present": bool(redis_client.exists(
+                        RedisKeys.channel_stopping(worker_id),
+                    )),
+                    "disconnect_present": bool(redis_client.exists(disconnect_key)),
+                    "disconnect_ttl_seconds": int(redis_client.ttl(disconnect_key)),
+                },
+                "reservations": {
+                    "profile_a": int(_profile_count(
+                        redis_client, profile_a.id, profile_connections_key,
+                    )),
+                    "profile_b": int(_profile_count(
+                        redis_client, profile_b.id, profile_connections_key,
+                    )),
+                },
+                "native_cleanup_interval_seconds": int(
+                    getattr(native_server, "cleanup_interval", 0) or 0
+                ),
+            }
+            print("CATCHUPARR_NO_SOURCE_PAUSE_DIAGNOSTIC " + json.dumps(
+                diagnostic, sort_keys=True,
+            ))
         _require(
-            len(source_server.request_times("source-b.ts")) == no_source_b_requests
-            and no_source_paused_active["source-a.ts"] == 0
-            and no_source_paused_counts["source-a.ts"] == no_source_counts["source-a.ts"]
-            and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
-            and redis_client.get(RedisKeys.channel_owner(worker_id)) is None
-            and _profile_count(redis_client, profile_a.id, profile_connections_key)
-            == profile_baselines[profile_a.id]
-            and _profile_count(redis_client, profile_b.id, profile_connections_key)
-            == profile_baselines[profile_b.id],
+            all(no_source_pause_conditions.values()),
             "Paused no-source recording opened a provider stream or kept a reservation",
         )
         resumed_plugin = PluginConfig.objects.get(key="catchuparr")
