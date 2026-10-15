@@ -144,6 +144,7 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
         self.request_started_at = {name: [] for name in payloads}
         self.request_start_callback = None
         self.request_start_callback_errors = []
+        self.request_callback_finished = threading.Event()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -163,11 +164,10 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
                     request_number = owner.request_counts[name]
                     callback = owner.request_start_callback
                 if callback is not None:
-                    try:
-                        callback(name, request_number, started_at)
-                    except Exception as exc:
+                    if not owner._run_request_start_callback(
+                        callback, name, request_number, started_at,
+                    ):
                         with owner._counts_lock:
-                            owner.request_start_callback_errors.append(exc)
                             owner.active_counts[name] -= 1
                         self.send_error(500)
                         return
@@ -204,6 +204,19 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
             name="catchuparr-synthetic-source",
             daemon=True,
         )
+
+    def _run_request_start_callback(self, callback, name, request_number, started_at):
+        """Run and record a boundary check before the upstream response starts."""
+        try:
+            completed = callback(name, request_number, started_at) is True
+        except Exception as exc:
+            with self._counts_lock:
+                self.request_start_callback_errors.append(exc)
+            self.request_callback_finished.set()
+            return False
+        if completed:
+            self.request_callback_finished.set()
+        return True
 
     @property
     def base_url(self) -> str:
@@ -3620,7 +3633,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         def verify_first_b_effect(source_name, request_number, started_at):
             if (source_name != "source-b.ts"
                     or request_number != share_b_request_baseline + 1):
-                return
+                return False
             first_b_boundary["started_at"] = started_at
             first_b_boundary["return_deadline"] = return_deadline
             _require(
@@ -3656,8 +3669,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 _redis_text(redis_client.hget(sharing_episode_key, "phase")) == "closed",
                 "Borrowed episode cleanup was not acknowledged before the first B provider request",
             )
+            return True
 
         source_server.request_start_callback = verify_first_b_effect
+        source_server.request_callback_finished.clear()
         b_request_deadline = time.monotonic() + 150
         b_request_times = source_server.request_times("source-b.ts")
         while len(b_request_times) <= share_b_request_baseline:
@@ -3666,6 +3681,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             gevent_sleep(0.05)
             b_request_times = source_server.request_times("source-b.ts")
         first_return_request_at = b_request_times[share_b_request_baseline]
+        callback_deadline = time.monotonic() + 5
+        while not source_server.request_callback_finished.is_set():
+            _require(time.monotonic() < callback_deadline,
+                     "Provider request boundary check did not complete")
+            gevent_sleep(0.01)
         _require(
             first_return_request_at >= return_deadline,
             "The allowed B provider request preceded the actual native return deadline",

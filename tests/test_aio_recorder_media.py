@@ -36,6 +36,52 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_synthetic_provider_waits_for_boundary_callback_and_rejects_failed_boundary(self):
+        source = object.__new__(probe._SyntheticSourceServer)
+        source._counts_lock = threading.Lock()
+        source.request_start_callback_errors = []
+        source.request_callback_finished = threading.Event()
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+
+        def blocked(*_args):
+            callback_entered.set()
+            self.assertTrue(release_callback.wait(2))
+            return True
+
+        worker = threading.Thread(
+            target=source._run_request_start_callback,
+            args=(blocked, "source-b.ts", 1, 1.0),
+        )
+        worker.start()
+        self.assertTrue(callback_entered.wait(2))
+        self.assertFalse(source.request_callback_finished.is_set())
+        release_callback.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(source.request_callback_finished.is_set())
+
+        source.request_callback_finished.clear()
+        def fail(*_args):
+            raise RuntimeError("synthetic boundary denial")
+        self.assertFalse(source._run_request_start_callback(fail, "source-b.ts", 1, 1.0))
+        self.assertTrue(source.request_callback_finished.is_set())
+        self.assertEqual(1, len(source.request_start_callback_errors))
+
+        source.request_callback_finished.clear()
+        self.assertTrue(
+            source._run_request_start_callback(
+                lambda *_args: False, "unrelated", 2, 2.0,
+            ),
+        )
+        self.assertFalse(source.request_callback_finished.is_set())
+        self.assertTrue(
+            source._run_request_start_callback(
+                lambda *_args: True, "source-b.ts", 3, 3.0,
+            ),
+        )
+        self.assertTrue(source.request_callback_finished.is_set())
+
     def test_private_worker_stop_does_not_count_a_provider_reconnect(self):
         before = {"source-b.ts": 4}
         probe._assert_private_worker_stop_request_count(
