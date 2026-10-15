@@ -1057,6 +1057,10 @@ class NativeLuaRedisTests(unittest.TestCase):
                     self.redis.command("HSET", keys["lease"], "wrong-type", "lease")
                 elif case == "tombstone_wrong_type":
                     self.redis.command("HSET", tombstone_key, "wrong-type", "value")
+                elif case == "changed_lease":
+                    # The race wrapper mutates this after the helper has read
+                    # its snapshot and immediately before Lua EVAL.
+                    pass
                 else:
                     self.fail(f"unknown tombstone case {case}")
 

@@ -1,4 +1,5 @@
 import json
+import math
 import multiprocessing
 import tempfile
 import threading
@@ -963,6 +964,44 @@ class SharingPersistenceTests(unittest.TestCase):
         self.assertEqual(155.0, recovered.intent.not_before)
         self.assertGreater(recovered.intent.intent_epoch, pending.intent.intent_epoch)
         self.assertEqual(12, recovered.state.recorder_fence)
+
+    def test_recovery_rejects_malformed_return_before_rebinding_row(self):
+        saved = self.save_attach()
+        pending_state = replace(
+            saved.state, phase=SharingPhase.WAIT_RETURN,
+            candidate_identity=None, candidate_connection_identity=None,
+            candidate_since=None, last_viewer_left_at=100.0,
+            pending_action=SharingAction.RETURN_TO_ALLOWED,
+            intent_epoch=saved.state.intent_epoch + 1,
+        )
+        pending = self.ledger.save(
+            pending_state, action=SharingAction.RETURN_TO_ALLOWED,
+            expected_revision=saved.revision, not_before=130.0,
+        )
+        with self.ledger._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE sharing_runtime SET not_before=? WHERE channel_uuid=?",
+                (math.inf, CHANNEL),
+            )
+            db.commit()
+        with self.ledger._database() as db:
+            before = dict(db.execute(
+                "SELECT * FROM sharing_runtime WHERE channel_uuid=?", (CHANNEL,),
+            ).fetchone())
+
+        with self.assertRaisesRegex(ValueError, "inconsistent|finite"):
+            self.ledger.recover(
+                CHANNEL, configuration_generation="config-a", control_generation=3,
+                recorder_fence=12, now=110.0, expected_revision=pending.revision,
+                recovery_is_current=lambda *_args: True,
+            )
+
+        with self.ledger._database() as db:
+            after = dict(db.execute(
+                "SELECT * FROM sharing_runtime WHERE channel_uuid=?", (CHANNEL,),
+            ).fetchone())
+        self.assertEqual(before, after)
 
     def test_recovery_cancels_return_intent_after_control_change(self):
         saved = self.save_attach()

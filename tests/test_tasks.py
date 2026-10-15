@@ -651,6 +651,7 @@ class RecorderTaskTests(unittest.TestCase):
             }}
             expected_generation = configuration_generation(active)
             coordinator_sources = []
+            polls = []
 
             class StopEvent:
                 def __init__(self):
@@ -700,12 +701,11 @@ class RecorderTaskTests(unittest.TestCase):
                 def __init__(self, *_args, **kwargs):
                     self.dedicated_source_available = kwargs["dedicated_source_available"]
                     coordinator_sources.append(self.dedicated_source_available)
-                    # Let the task finish after the coordinator has been
-                    # created; the key regression is that an empty source
-                    # catalog does not return before sharing is initialized.
-                    stop_event.set()
 
                 def poll(self, **_kwargs):
+                    polls.append(self.dedicated_source_available)
+                    # Model one native-view observation then end the task.
+                    stop_event.set()
                     return None
 
                 def pending_return_intent(self):
@@ -771,6 +771,7 @@ class RecorderTaskTests(unittest.TestCase):
 
             self.assertEqual({"status": "stopped"}, result)
             self.assertEqual([False], coordinator_sources)
+            self.assertEqual([False], polls)
 
     def test_override_capacity_or_start_failure_falls_through_ranked_sources(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -824,11 +825,13 @@ class RecorderTaskTests(unittest.TestCase):
                     self.input_url = input_url
                     self.headers = kwargs["input_headers"]
 
-                def run_candidate(self, _stop_event, **kwargs):
+                def run_candidate(self, stop_event, **kwargs):
                     attempt_switches.append(kwargs.get("attempt_switch"))
                     outcome = self.outcomes.pop(0)
                     if isinstance(outcome, Exception):
                         raise outcome
+                    if outcome.status == "stopped":
+                        stop_event.set()
                     return outcome
 
             celery = _fake_module(
@@ -876,7 +879,9 @@ class RecorderTaskTests(unittest.TestCase):
                     ),
                     patch(
                         "catchuparr.sharing_runtime.RecorderBorrowCoordinator",
-                        return_value=SimpleNamespace(poll=lambda **_kwargs: None),
+                        return_value=SimpleNamespace(
+                            poll=lambda **_kwargs: lifecycle.append("observe_native") or None,
+                        ),
                     ),
                     patch(
                         "catchuparr.recorder_proxy.issue_recorder_attempt",
@@ -906,7 +911,8 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertTrue(all(attempt.input_url.endswith("/catchuparr/recorder/channel-1") for attempt in attempts))
             self.assertTrue(all(switch is not None for switch in attempt_switches))
             self.assertEqual(
-                ["issue:44", "revoke:44", "stop:44", "ack:44",
+                ["observe_native",
+                 "issue:44", "revoke:44", "stop:44", "ack:44",
                  "issue:45", "revoke:45", "stop:45", "ack:45",
                  "issue:46", "revoke:46", "stop:46", "ack:46"],
                 lifecycle,

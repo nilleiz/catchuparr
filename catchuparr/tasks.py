@@ -317,6 +317,27 @@ def record_channel(
                     stop_event.set()
                     return
 
+        # Observe native viewers synchronously before the first dedicated
+        # provider attempt. The periodic supervisor starts only after this
+        # pass, so a viewer on an excluded source is not missed while the
+        # task opens or fails its first allowed source.
+        if sharing_coordinator is not None:
+            initial_admission = _recorder_admission_state(
+                channel_uuid, expected_generation, expected_control_generation
+            )
+            if initial_admission["status"] != "ready":
+                return {"status": initial_admission["status"]}
+            try:
+                initial_borrow = sharing_coordinator.poll(
+                    active=initial_admission["active"],
+                    control_generation=expected_control_generation,
+                )
+            except Exception:
+                error("sharing_observation_failed")
+                return {"status": "sharing_unavailable"}
+            if initial_borrow is not None:
+                attempt_state["borrow"] = initial_borrow
+
         monitor = threading.Thread(
             target=supervise, name=f"catchuparr-{channel_uuid}", daemon=True
         )
@@ -434,176 +455,179 @@ def record_channel(
                 return True
 
             candidate_index = 0
-            while candidate_index < len(candidates):
-                if run_prepared_borrow():
-                    continue
-                return_prepared = None
-                return_token = None
-                with attempt_state_lock:
-                    return_prepared = attempt_state["return_prepared"]
-                if return_prepared is not None and sharing_coordinator is not None:
-                    return_token = sharing_coordinator.pending_return_intent()
-                    return_origin_epoch = (
-                        return_prepared.capability.intent_epoch
-                        if hasattr(return_prepared, "capability")
-                        else return_prepared.intent_epoch
-                    )
-                    if (return_token is None
-                            or return_token.intent_epoch <= return_origin_epoch):
-                        # The dedicated source is not authorized until the
-                        # exact post-borrow RETURN intent exists.
-                        if stop_event.wait(0.5):
-                            break
-                        continue
-                    remaining = return_token.not_before - time.time()
-                    if remaining > 0:
-                        if stop_event.wait(min(remaining, 0.5)):
-                            break
-                        continue
-                index = candidate_index
-                candidate = candidates[index]
-                if stop_event.is_set():
-                    break
-                sharing_authority = None
-                attempt_switch = None
-                if sharing_enabled:
-                    sharing_authority = current_sharing_authority_context(
-                        redis, channel_uuid, config_generation=generation,
-                        control_generation=expected_control_generation,
-                    )
-                    if sharing_authority is None:
-                        return {"status": "sharing_authority_unavailable"}
-                    from .engine.recorder import RecorderAttemptSwitch
-
-                    attempt_switch = RecorderAttemptSwitch()
-                try:
-                    attempt = issue_recorder_attempt(
-                        redis,
-                        lease,
-                        channel_uuid=channel_uuid,
-                        candidate=candidate,
-                        config_generation=generation,
-                        control_generation=expected_control_generation,
-                        internal_base_url=proxy_base_url,
-                        sharing_authority=sharing_authority,
-                    )
-                except RecorderAttemptAdmissionUncertain as exc:
-                    uncertain = exc.attempt
-                    digest = uncertain.capability_key.removeprefix(
-                        "catchuparr:recorder-proxy:capability:"
-                    )
-                    if not reconcile_unlaunched_sharing_operation(
-                        redis, channel_uuid=str(channel_uuid),
-                        operation_id=str(uncertain.sharing_operation_id),
-                        operation_revision=int(uncertain.sharing_operation_revision),
-                        worker_id=uncertain.worker_id,
-                        capability_digest=digest,
-                        current_lease_value=str(lease._value),
-                        current_lease_fence=int(lease.fence),
-                        unreturned_capability=True,
-                    ):
-                        error("sharing_attempt_cleanup_pending")
-                        stop_event.set()
-                        return {"status": "sharing_cleanup_pending"}
-                    error("sharing_attempt_reconciled")
-                    return {"status": "sharing_admission_uncertain"}
-                with attempt_state_lock:
-                    attempt_state["attempt"] = attempt
-                    attempt_state["candidate"] = candidate
-                    attempt_state["switch"] = attempt_switch
-                    attempt_state["return_token"] = return_token
-                admission_status = None
-                result = None
-                try:
-                    current_state = _recorder_admission_state(
-                        channel_uuid, expected_generation, expected_control_generation
-                    )
-                    if current_state["status"] != "ready":
-                        admission_status = current_state["status"]
-                    else:
-                        recorder = FFmpegCopyRecorder(
-                            store,
-                            channel_uuid,
-                            attempt.input_url,
-                            config.archive_root / "work",
-                            fencing_token=fence,
-                            input_headers={
-                                **attempt.input_headers,
-                                "X-Catchuparr-Stats-Recorder": stats_capability,
-                            },
-                            require_media_progress=True,
-                        )
-                        if index:
-                            recorder._mark_next_discontinuity = True
-                        first_media_callback = None
-                        if (return_token is not None and return_prepared is not None
-                                and sharing_coordinator is not None):
-                            def acknowledge_return_media(media_at):
-                                acknowledged = sharing_coordinator.acknowledge_return_media(
-                                    return_prepared, return_token, attempt, candidate,
-                                    media_at=media_at,
-                                )
-                                if acknowledged:
-                                    with attempt_state_lock:
-                                        if attempt_state.get("return_prepared") is return_prepared:
-                                            attempt_state["return_prepared"] = None
-                                elif not sharing_coordinator.return_ack_retryable(
-                                    return_prepared, return_token, attempt, candidate,
-                                ):
-                                    # A failed fresh completion proof means the
-                                    # old attempt is no longer authorized. Stop
-                                    # instead of keeping media flowing under an
-                                    # uncommitted RETURN intent. A transient SQL
-                                    # commit failure is retried on later media.
-                                    stop_event.set()
-                                return acknowledged
-
-                            first_media_callback = acknowledge_return_media
-                        try:
-                            result = recorder.run_candidate(
-                                stop_event,
-                                startup_timeout=60,
-                                media_idle_timeout=120,
-                                **({"attempt_switch": attempt_switch}
-                                   if attempt_switch is not None else {}),
-                                **({"on_first_media": first_media_callback}
-                                   if first_media_callback is not None else {}),
-                            )
-                        except Exception:
-                            error("recorder_worker_stopped")
-                finally:
-                    revoked = attempt.revoke(redis)
-                    cleanup_ok = False
-                    try:
-                        cleanup_ok = stop_recorder_attempt(redis, attempt, lease)
-                        if cleanup_ok and sharing_authority is not None:
-                            cleanup_ok = attempt.acknowledge_reaped(redis)
-                    except Exception:
-                        error("supervision_failed")
-                    if not revoked or not cleanup_ok:
-                        stop_event.set()
-                    with attempt_state_lock:
-                        if attempt_state["attempt"] is attempt:
-                            attempt_state["attempt"] = None
-                            attempt_state["candidate"] = None
-                            attempt_state["switch"] = None
-                            attempt_state["return_token"] = None
-                if admission_status is not None:
-                    return {"status": admission_status}
-                if result is not None and result.status == "stopped":
-                    break
-                if run_prepared_borrow():
-                    # The prior attempt was reaped and its sharing operation
-                    # acknowledged before the borrowed reader starts. Return to
-                    # an allowlisted source after that reader closes at grace.
-                    candidate_index = 0
-                    continue
-                candidate_index += 1
-            if not candidates and sharing_coordinator is not None:
-                while not stop_event.is_set():
+            while True:
+                while candidate_index < len(candidates):
                     if run_prepared_borrow():
                         continue
-                    stop_event.wait(0.5)
+                    return_prepared = None
+                    return_token = None
+                    with attempt_state_lock:
+                        return_prepared = attempt_state["return_prepared"]
+                    if return_prepared is not None and sharing_coordinator is not None:
+                        return_token = sharing_coordinator.pending_return_intent()
+                        return_origin_epoch = (
+                            return_prepared.capability.intent_epoch
+                            if hasattr(return_prepared, "capability")
+                            else return_prepared.intent_epoch
+                        )
+                        if (return_token is None
+                                or return_token.intent_epoch <= return_origin_epoch):
+                            # The dedicated source is not authorized until the
+                            # exact post-borrow RETURN intent exists.
+                            if stop_event.wait(0.5):
+                                break
+                            continue
+                        remaining = return_token.not_before - time.time()
+                        if remaining > 0:
+                            if stop_event.wait(min(remaining, 0.5)):
+                                break
+                            continue
+                    index = candidate_index
+                    candidate = candidates[index]
+                    if stop_event.is_set():
+                        break
+                    sharing_authority = None
+                    attempt_switch = None
+                    if sharing_enabled:
+                        sharing_authority = current_sharing_authority_context(
+                            redis, channel_uuid, config_generation=generation,
+                            control_generation=expected_control_generation,
+                        )
+                        if sharing_authority is None:
+                            return {"status": "sharing_authority_unavailable"}
+                        from .engine.recorder import RecorderAttemptSwitch
+    
+                        attempt_switch = RecorderAttemptSwitch()
+                    try:
+                        attempt = issue_recorder_attempt(
+                            redis,
+                            lease,
+                            channel_uuid=channel_uuid,
+                            candidate=candidate,
+                            config_generation=generation,
+                            control_generation=expected_control_generation,
+                            internal_base_url=proxy_base_url,
+                            sharing_authority=sharing_authority,
+                        )
+                    except RecorderAttemptAdmissionUncertain as exc:
+                        uncertain = exc.attempt
+                        digest = uncertain.capability_key.removeprefix(
+                            "catchuparr:recorder-proxy:capability:"
+                        )
+                        if not reconcile_unlaunched_sharing_operation(
+                            redis, channel_uuid=str(channel_uuid),
+                            operation_id=str(uncertain.sharing_operation_id),
+                            operation_revision=int(uncertain.sharing_operation_revision),
+                            worker_id=uncertain.worker_id,
+                            capability_digest=digest,
+                            current_lease_value=str(lease._value),
+                            current_lease_fence=int(lease.fence),
+                            unreturned_capability=True,
+                        ):
+                            error("sharing_attempt_cleanup_pending")
+                            stop_event.set()
+                            return {"status": "sharing_cleanup_pending"}
+                        error("sharing_attempt_reconciled")
+                        return {"status": "sharing_admission_uncertain"}
+                    with attempt_state_lock:
+                        attempt_state["attempt"] = attempt
+                        attempt_state["candidate"] = candidate
+                        attempt_state["switch"] = attempt_switch
+                        attempt_state["return_token"] = return_token
+                    admission_status = None
+                    result = None
+                    try:
+                        current_state = _recorder_admission_state(
+                            channel_uuid, expected_generation, expected_control_generation
+                        )
+                        if current_state["status"] != "ready":
+                            admission_status = current_state["status"]
+                        else:
+                            recorder = FFmpegCopyRecorder(
+                                store,
+                                channel_uuid,
+                                attempt.input_url,
+                                config.archive_root / "work",
+                                fencing_token=fence,
+                                input_headers={
+                                    **attempt.input_headers,
+                                    "X-Catchuparr-Stats-Recorder": stats_capability,
+                                },
+                                require_media_progress=True,
+                            )
+                            if index:
+                                recorder._mark_next_discontinuity = True
+                            first_media_callback = None
+                            if (return_token is not None and return_prepared is not None
+                                    and sharing_coordinator is not None):
+                                def acknowledge_return_media(media_at):
+                                    acknowledged = sharing_coordinator.acknowledge_return_media(
+                                        return_prepared, return_token, attempt, candidate,
+                                        media_at=media_at,
+                                    )
+                                    if acknowledged:
+                                        with attempt_state_lock:
+                                            if attempt_state.get("return_prepared") is return_prepared:
+                                                attempt_state["return_prepared"] = None
+                                    elif not sharing_coordinator.return_ack_retryable(
+                                        return_prepared, return_token, attempt, candidate,
+                                    ):
+                                        # A failed fresh completion proof means the
+                                        # old attempt is no longer authorized. Stop
+                                        # instead of keeping media flowing under an
+                                        # uncommitted RETURN intent. A transient SQL
+                                        # commit failure is retried on later media.
+                                        stop_event.set()
+                                    return acknowledged
+    
+                                first_media_callback = acknowledge_return_media
+                            try:
+                                result = recorder.run_candidate(
+                                    stop_event,
+                                    startup_timeout=60,
+                                    media_idle_timeout=120,
+                                    **({"attempt_switch": attempt_switch}
+                                       if attempt_switch is not None else {}),
+                                    **({"on_first_media": first_media_callback}
+                                       if first_media_callback is not None else {}),
+                                )
+                            except Exception:
+                                error("recorder_worker_stopped")
+                    finally:
+                        revoked = attempt.revoke(redis)
+                        cleanup_ok = False
+                        try:
+                            cleanup_ok = stop_recorder_attempt(redis, attempt, lease)
+                            if cleanup_ok and sharing_authority is not None:
+                                cleanup_ok = attempt.acknowledge_reaped(redis)
+                        except Exception:
+                            error("supervision_failed")
+                        if not revoked or not cleanup_ok:
+                            stop_event.set()
+                        with attempt_state_lock:
+                            if attempt_state["attempt"] is attempt:
+                                attempt_state["attempt"] = None
+                                attempt_state["candidate"] = None
+                                attempt_state["switch"] = None
+                                attempt_state["return_token"] = None
+                    if admission_status is not None:
+                        return {"status": admission_status}
+                    if result is not None and result.status == "stopped":
+                        break
+                    if run_prepared_borrow():
+                        # The prior attempt was reaped and its sharing operation
+                        # acknowledged before the borrowed reader starts. Return to
+                        # an allowlisted source after that reader closes at grace.
+                        candidate_index = 0
+                        continue
+                    candidate_index += 1
+                if sharing_coordinator is None or stop_event.is_set():
+                    break
+                if run_prepared_borrow():
+                    candidate_index = 0
+                    continue
+                if stop_event.wait(0.5):
+                    break
     finally:
         try:
             if stop_event is not None:
