@@ -96,12 +96,26 @@ def _recording_task_fake_modules(redis):
 def _isolated_plugin_modules(fake_modules):
     """Keep package children aligned with sys.modules while stubbing Dispatcharr."""
     package = importlib.import_module("catchuparr")
+    fake_modules = {
+        **fake_modules,
+        "catchuparr.adapters.recorder_proxy": fake_modules.get(
+            "catchuparr.adapters.recorder_proxy",
+            _fake_module(
+                "catchuparr.adapters.recorder_proxy",
+                core_api_supported=lambda: True,
+                install_proxyserver_cleanup_hook=lambda: True,
+            ),
+        ),
+    }
     child_names = (
         "tasks", "runtime", "configuration", "recorder_proxy", "recorder_control",
-        "schedule", "logging_utils", "adapters", "engine",
+        "schedule", "logging_utils", "adapters", "engine", "sharing_runtime",
+        "sharing_episode", "sharing_persistence",
     )
     missing = object()
     previous = {name: package.__dict__.get(name, missing) for name in child_names}
+    adapter_package = None
+    previous_adapter_proxy = missing
     try:
         with patch.dict(sys.modules, fake_modules):
             for name in child_names:
@@ -111,10 +125,22 @@ def _isolated_plugin_modules(fake_modules):
                     package.__dict__.pop(name, None)
                 else:
                     package.__dict__[name] = module
+            adapter_package = sys.modules.get("catchuparr.adapters")
+            adapter_proxy = sys.modules.get("catchuparr.adapters.recorder_proxy")
+            if adapter_package is not None and adapter_proxy is not None:
+                previous_adapter_proxy = getattr(
+                    adapter_package, "recorder_proxy", missing,
+                )
+                adapter_package.recorder_proxy = adapter_proxy
             sys.modules.pop("catchuparr.tasks", None)
             package.__dict__.pop("tasks", None)
             yield
     finally:
+        if adapter_package is not None:
+            if previous_adapter_proxy is missing:
+                adapter_package.__dict__.pop("recorder_proxy", None)
+            else:
+                adapter_package.recorder_proxy = previous_adapter_proxy
         for name, value in previous.items():
             if value is missing:
                 package.__dict__.pop(name, None)
@@ -639,7 +665,7 @@ class RecorderTaskTests(unittest.TestCase):
             ))
             self.assertEqual(ArchiveStore(archive_root).recorder_fence("channel-1"), 26)
 
-    def test_sharing_with_no_allowed_source_still_polls_existing_native_viewers(self):
+    def test_initial_existing_native_viewer_is_borrowed_before_allowed_source(self):
         with tempfile.TemporaryDirectory() as temp:
             archive_root = Path(temp) / "archive"
             redis = FakeRedis()
@@ -652,6 +678,8 @@ class RecorderTaskTests(unittest.TestCase):
             expected_generation = configuration_generation(active)
             coordinator_sources = []
             polls = []
+            recorder_inputs = []
+            cleanup_calls = []
 
             class StopEvent:
                 def __init__(self):
@@ -673,7 +701,9 @@ class RecorderTaskTests(unittest.TestCase):
 
                 def start(self):
                     self.ident = 1
-                    self.target()
+                    # Keep the periodic worker out of this deterministic test;
+                    # it exercises the synchronous initial viewer observation.
+                    return None
 
                 def join(self, timeout=None):
                     return None
@@ -701,15 +731,37 @@ class RecorderTaskTests(unittest.TestCase):
                 def __init__(self, *_args, **kwargs):
                     self.dedicated_source_available = kwargs["dedicated_source_available"]
                     coordinator_sources.append(self.dedicated_source_available)
+                    self.opening = SimpleNamespace(
+                        episode_id="episode-synthetic",
+                        capability=SimpleNamespace(intent_epoch=1),
+                    )
 
                 def poll(self, **_kwargs):
                     polls.append(self.dedicated_source_available)
-                    # Model one native-view observation then end the task.
+                    # Model an already-connected native viewer on an excluded
+                    # source. The initial synchronous observation must claim it
+                    # before any dedicated candidate is considered.
+                    return self.opening if len(polls) == 1 else None
+
+                def record_return_after_cleanup(self, _prepared, *, now, outcome):
+                    cleanup_calls.append((now, outcome))
                     stop_event.set()
-                    return None
+                    return True
 
                 def pending_return_intent(self):
                     return None
+
+                def viewer_return_deadline_reached(self, *, now):
+                    return False
+
+            class FakeBorrowRecorder:
+                def __init__(self, _store, _channel, input_url, _work, **kwargs):
+                    self.input_url = input_url
+                    self.headers = kwargs["input_headers"]
+
+                def run_candidate(self, event, **_kwargs):
+                    recorder_inputs.append((self.input_url, self.headers))
+                    return SimpleNamespace(status="no_media", useful_segments=0)
 
             celery = _fake_module(
                 "celery", shared_task=lambda *, name: lambda function: function,
@@ -752,13 +804,27 @@ class RecorderTaskTests(unittest.TestCase):
                     patch(
                         "catchuparr.recorder_proxy.ranked_source_candidates",
                         side_effect=lambda _channel, _active, *, all_sources: (
-                            self.assertTrue(all_sources) or None
+                            self.assertTrue(all_sources) or [
+                                {"id": "excluded-fallback", "account_id": "synthetic"}
+                            ]
                         ),
                     ),
                     patch("catchuparr.tasks._issue_recorder_capability", return_value=(None, None, None)),
                     patch(
                         "catchuparr.sharing_runtime.RecorderBorrowCoordinator",
                         BorrowCoordinator,
+                    ),
+                    patch("catchuparr.sharing_episode.BorrowEpisodeLedger", return_value=object()),
+                    patch("catchuparr.sharing_runtime.retry_durable_open_cleanups"),
+                    patch("catchuparr.sharing_runtime.retry_pending_open_cleanups"),
+                    patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
+                    patch("catchuparr.adapters.sharing_borrow_route.encode_borrow_capability", return_value="synthetic-borrow-token"),
+                    patch("catchuparr.engine.recorder.FFmpegCopyRecorder", FakeBorrowRecorder),
+                    patch(
+                        "catchuparr.recorder_proxy.issue_recorder_attempt",
+                        side_effect=lambda *_args, **_kwargs: self.fail(
+                            "Dedicated source was issued before initial viewer borrow cleanup"
+                        ),
                     ),
                     patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
                     patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
@@ -770,8 +836,20 @@ class RecorderTaskTests(unittest.TestCase):
                     result = tasks.record_channel("channel-1", expected_generation, 6)
 
             self.assertEqual({"status": "stopped"}, result)
-            self.assertEqual([False], coordinator_sources)
-            self.assertEqual([False], polls)
+            self.assertEqual([True], coordinator_sources)
+            self.assertEqual([True], polls)
+            self.assertEqual(1, len(recorder_inputs))
+            self.assertEqual(
+                "http://dispatcharr/catchuparr/sharing/channel-1",
+                recorder_inputs[0][0],
+            )
+            self.assertEqual(
+                {"X-Catchuparr-Borrow": "synthetic-borrow-token",
+                 "X-Catchuparr-Stats-Recorder": None},
+                recorder_inputs[0][1],
+            )
+            self.assertEqual(1, len(cleanup_calls))
+            self.assertEqual("failure", cleanup_calls[0][1])
 
     def test_override_capacity_or_start_failure_falls_through_ranked_sources(self):
         with tempfile.TemporaryDirectory() as temp:
