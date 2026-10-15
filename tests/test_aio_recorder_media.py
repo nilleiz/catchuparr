@@ -53,6 +53,35 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertIn('"diagnostic_error": "ValueError"', emitted[0])
         self.assertNotIn("synthetic secret", emitted[0])
 
+    def test_local_manager_count_error_preserves_original_gate_failure(self):
+        manager = SimpleNamespace(
+            get_client_count=lambda: (_ for _ in ()).throw(ValueError("bad count")),
+        )
+        emitted = []
+
+        def diagnostic_boundary():
+            return {"local": int(manager.get_client_count())}
+
+        with self.assertRaisesRegex(RuntimeError, "original gate failure"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "original gate failure",
+                diagnostic_boundary,
+                emit=emitted.append,
+            )
+        self.assertEqual(len(emitted), 1)
+        self.assertIn('"diagnostic_error": "ValueError"', emitted[0])
+
+    def test_successful_gate_does_not_read_local_manager_count(self):
+        manager = SimpleNamespace(
+            get_client_count=lambda: self.fail("diagnostic-only count was read"),
+        )
+        probe._require_with_failure_diagnostic(
+            True,
+            "unused",
+            lambda: {"local": manager.get_client_count()},
+        )
+
     def test_failure_diagnostic_output_error_preserves_original_gate_failure(self):
         def fail_output(_message):
             raise OSError("synthetic output detail")
