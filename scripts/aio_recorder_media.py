@@ -2268,19 +2268,32 @@ def _wait_for_native_client_count(
     worker_id: str,
     expected: int,
     *,
+    expected_local: int | None = None,
     timeout: float = 15,
     reject_excess: bool = False,
 ) -> None:
+    # The Redis set is shared across workers, while ClientManager counts are
+    # process-local. Borrowed readers deliberately live in a task-owned manager
+    # in the HTTP worker, so the probe must be able to assert those counts
+    # independently instead of pretending they describe one manager.
+    if expected_local is None:
+        expected_local = expected
+    if (
+        isinstance(expected, bool) or not isinstance(expected, int) or expected < 0
+        or isinstance(expected_local, bool) or not isinstance(expected_local, int)
+        or expected_local < 0
+    ):
+        raise ValueError("native client counts must be non-negative integers")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         manager = native_server.client_managers.get(worker_id)
         global_count = int(redis_client.scard(redis_keys.clients(worker_id)) or 0)
         local_count = int(manager.get_client_count()) if manager is not None else -1
-        if global_count == expected and local_count == expected:
+        if global_count == expected and local_count == expected_local:
             return
         if reject_excess:
             _require(
-                global_count <= expected and local_count <= expected,
+                global_count <= expected and local_count <= expected_local,
                 "Native live route registered more clients than the fixture expected",
             )
         time.sleep(0.1)
@@ -3914,7 +3927,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(borrow_headers is not None,
                  "Sharing recorder did not request the signed native-buffer route")
         _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 2, timeout=30,
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=30,
         )
         from catchuparr import stats as catchuparr_stats
         from catchuparr.adapters.sharing_borrow_route import decode_borrow_capability
@@ -3968,7 +3982,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(replay.status_code == 404,
                  "A consumed native-borrow capability opened a second reader")
         _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 2, timeout=10,
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=10,
         )
 
         # Hide=true must hide only the signed borrow client from native Stats.
@@ -3999,14 +4014,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             churn_response, native_server, worker_id,
         )
         _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 3, timeout=20,
+            redis_client, native_server, RedisKeys, worker_id, 3,
+            expected_local=2, timeout=20,
         )
         live_session.close()
         live_session = None
         live_reader = None
         live_response = None
         _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 2, timeout=15,
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=15,
         )
         gevent_sleep(3)
         counts_with_churn, active_with_churn = source_server.snapshot()
@@ -4018,7 +4035,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         churn_session.close()
         churn_session = None
         _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 1, timeout=15,
+            redis_client, native_server, RedisKeys, worker_id, 1,
+            expected_local=0, timeout=15,
         )
         sharing_episode_key = f"catchuparr:sharing:episode:{worker_id}"
         wait_return_until = time.monotonic() + 10
@@ -4203,7 +4221,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(no_source_borrow_headers is not None,
                  "Recorder did not borrow the existing A viewer with no dedicated sources")
         _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 2, timeout=30,
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=30,
         )
         no_source_capability = decode_borrow_capability(
             no_source_borrow_headers["X-Catchuparr-Borrow"],
@@ -4374,7 +4393,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(second_borrow_headers is not None,
                  "Resumed recorder did not borrow the compatible A viewer")
         _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 2, timeout=20,
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=20,
         )
         from catchuparr.adapters.sharing_borrow_route import decode_borrow_capability
 
@@ -4536,7 +4556,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(post_restart_borrow_headers is not None,
                  "Restarted task did not borrow the post-restart A viewer")
         _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 2, timeout=20,
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=20,
         )
         second_capability = decode_borrow_capability(
             post_restart_borrow_headers["X-Catchuparr-Borrow"],
