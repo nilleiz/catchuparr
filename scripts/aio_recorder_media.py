@@ -98,7 +98,87 @@ def _run_registration_crash_recovery_probe(
             if prepared is not None:
                 return prepared
             time.sleep(0.1)
-        raise RuntimeError("Coordinator did not issue the synthetic live-viewer borrow")
+        diagnostic = {}
+        try:
+            from catchuparr.adapters.sharing_native import (
+                observe_native_connection,
+                read_native_episode_grant,
+            )
+            from catchuparr.configuration import _sharing_catalog_generation
+            from catchuparr.recorder_proxy import configuration_generation
+            from catchuparr.sharing_planner import SharingObservation, SharingSettings, observe
+            from catchuparr.sharing_runtime import _native_source_catalog
+
+            current_sources, current_catalog = _native_source_catalog(channel_uuid)
+            native = observe_native_connection(
+                redis_client, channel_uuid,
+                catalog_generation=current_catalog,
+                assigned_sources=current_sources,
+                observed_at=time.time(),
+            )
+            target = native.target if native is not None else None
+            latest = coordinator.intent_ledger.read(channel_uuid)
+            state = latest.state if latest is not None else None
+            setting = active.get("connection_sharing", {}).get(channel_uuid, {})
+            current_generation = configuration_generation(active)
+            live_episode = read_native_episode_grant(redis_client, channel_uuid)
+            diagnostic = {
+                "active_sharing_enabled": setting.get("enabled") is True,
+                "control_paused": bool(control.paused),
+                "config_generation_matches": current_generation == coordinator.configuration_generation,
+                "catalog_generation_matches": (
+                    current_catalog == coordinator.catalog_generation
+                    and _sharing_catalog_generation(channel_uuid) == current_catalog
+                ),
+                "recorder_lease_current": coordinator._recovery_is_current(
+                    channel_uuid,
+                    latest.revision if latest is not None else None,
+                    coordinator.configuration_generation,
+                    control.generation,
+                    coordinator.recorder_fence,
+                ),
+                "native_episode_phase": live_episode.phase if live_episode else "absent",
+                "native_target_present": target is not None,
+                "native_target_healthy": bool(
+                    target and target.healthy_existing_connection(channel_uuid)
+                ),
+                "native_target_eligible": bool(
+                    target and target.eligible_for_new_borrow(channel_uuid)
+                ),
+                "ordinary_viewer_count": len(target.ordinary_client_ids) if target else 0,
+                "source_catalog_row_count": len(current_sources),
+                "intent_action": latest.intent.action.value if latest and latest.intent else None,
+                "sharing_phase": state.phase.value if state else None,
+                "last_switch_clock_present": bool(state and state.last_switch_at is not None),
+            }
+            if state is not None and setting.get("enabled") is True:
+                planned = observe(
+                    state,
+                    SharingObservation(
+                        channel_uuid=channel_uuid,
+                        now=time.time(),
+                        configuration_generation=coordinator.configuration_generation,
+                        control_generation=control.generation,
+                        recorder_fence=coordinator.recorder_fence,
+                        lease_is_current=diagnostic["recorder_lease_current"],
+                        settings=SharingSettings(
+                            enabled=True,
+                            live_stability_seconds=setting["live_stability_seconds"],
+                            last_viewer_return_seconds=setting["last_viewer_return_seconds"],
+                            min_switch_interval_seconds=setting["min_switch_interval_seconds"],
+                        ),
+                        target=target,
+                        dedicated_source_available=True,
+                    ),
+                )
+                diagnostic["planner_action"] = planned.action.value
+                diagnostic["planner_reason"] = planned.reason
+        except Exception as exc:
+            diagnostic["diagnostic_error_type"] = type(exc).__name__
+        raise RuntimeError(
+            "Coordinator did not issue the synthetic live-viewer borrow: "
+            + json.dumps(diagnostic, sort_keys=True)
+        )
 
     try:
         applied = apply_configuration(shared_settings, active_path=active_path)
