@@ -4,6 +4,28 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.6.0] - Prerelease candidate, not published
+
+### Added
+
+- Add optional, disabled-by-default sharing of compatible live connections
+  already used by ordinary viewers. A dedicated reader consumes the native
+  worker's published MPEG-TS buffer without creating another upstream stream
+  or provider reservation.
+- Add per-channel sharing enablement and live-stability, last-viewer-return
+  and minimum-switch cooldowns, persisted with unified configuration Apply.
+- Add fenced episode and operation state, signed one-use borrow capabilities,
+  exact reader cleanup, retryable recovery and a distinct FFmpeg attempt switch
+  signal with segment discontinuities.
+- Include the existing Dispatcharr plugin icon in the packaged ZIP as
+  `catchuparr/logo.png`.
+
+### Notes
+
+- This candidate is not published. Required CI and full native acceptance in
+  both pinned AIO versions remain release gates. The [0.6.0 candidate
+  guide](docs/candidate-0.6.0.md) records intended behavior and remaining checks.
+
 ## [0.5.1] - Prerelease candidate, not published
 
 ### Added
