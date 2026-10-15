@@ -56,45 +56,22 @@ def _run_registration_crash_recovery_probe(
         "  last_viewer_return_seconds: 0\n"
         "  min_switch_interval_seconds: 0\n"
     )
-    applied = apply_configuration(shared_settings, active_path=active_path)
-    _require(applied.get("applied") is True, "Crash-recovery sharing Apply failed")
-    active = load_active_configuration(active_path)
-    _require(active is not None, "Crash-recovery sharing snapshot is unavailable")
-    _require(
-        active.get("connection_sharing", {}).get(channel_uuid, {}).get("enabled") is True,
-        "Crash-recovery sharing defaults were not enabled for the synthetic channel",
-    )
-    _, control = load_applied_state(active_path)
-    provider_before = source_server.snapshot()
-    profile_before = _profile_count(redis_client, profile_a.id, profile_connections_key)
-    _require(
-        profile_before == profile_a_baseline + 1
-        and provider_before[1].get("source-a.ts") == 1
-        and provider_before[1].get("source-b.ts") == 0,
-        "Crash probe did not start with the original live-A provider binding",
-    )
-    store = ArchiveStore(archive_root)
-    lease = RedisRecorderLease(
-        redis_client, channel_uuid, ttl_seconds=90, archive_store=store,
-    )
-    fence = lease.acquire()
-    _require(fence is not None, "Crash-recovery recorder lease was unavailable")
-    database_path = archive_root / ".catchuparr-sharing.sqlite3"
-    coordinator = RecorderBorrowCoordinator(
-        redis_client, archive_root, channel_uuid, active=active,
-        control_generation=control.generation, recorder_fence=fence,
-        lease_value=lease._value, dedicated_source_available=True,
-    )
-
+    lease = None
+    restore_settings = True
     helper = Path(__file__).resolve().with_name("aio_sharing_registration_crash.py")
-    plugin_root = helper.parent.parent
+    import catchuparr
+
+    plugin_root = Path(catchuparr.__file__).resolve().parent.parent
 
     def run_child(mode: str, payload: dict, expected_code: int) -> dict:
         try:
             result = subprocess.run(
                 [sys.executable, str(helper), mode],
                 cwd=plugin_root,
-                env=dict(os.environ),
+                env={
+                    **os.environ,
+                    "CATCHUPARR_PLUGIN_ROOT": str(plugin_root),
+                },
                 input=json.dumps(payload, separators=(",", ":")),
                 capture_output=True,
                 text=True,
@@ -123,6 +100,36 @@ def _run_registration_crash_recovery_probe(
         raise RuntimeError("Coordinator did not issue the synthetic live-viewer borrow")
 
     try:
+        applied = apply_configuration(shared_settings, active_path=active_path)
+        _require(applied.get("applied") is True, "Crash-recovery sharing Apply failed")
+        active = load_active_configuration(active_path)
+        _require(active is not None, "Crash-recovery sharing snapshot is unavailable")
+        _require(
+            active.get("connection_sharing", {}).get(channel_uuid, {}).get("enabled") is True,
+            "Crash-recovery sharing defaults were not enabled for the synthetic channel",
+        )
+        _, control = load_applied_state(active_path)
+        provider_before = source_server.snapshot()
+        profile_before = _profile_count(redis_client, profile_a.id, profile_connections_key)
+        _require(
+            profile_before == profile_a_baseline + 1
+            and provider_before[1].get("source-a.ts") == 1
+            and provider_before[1].get("source-b.ts") == 0,
+            "Crash probe did not start with the original live-A provider binding",
+        )
+        store = ArchiveStore(archive_root)
+        lease = RedisRecorderLease(
+            redis_client, channel_uuid, ttl_seconds=90, archive_store=store,
+        )
+        fence = lease.acquire()
+        _require(fence is not None, "Crash-recovery recorder lease was unavailable")
+        database_path = archive_root / ".catchuparr-sharing.sqlite3"
+        coordinator = RecorderBorrowCoordinator(
+            redis_client, archive_root, channel_uuid, active=active,
+            control_generation=control.generation, recorder_fence=fence,
+            lease_value=lease._value, dedicated_source_available=True,
+        )
+
         first = prepare_fresh()
         capability = __import__(
             "catchuparr.adapters.sharing_borrow_route", fromlist=["encode_borrow_capability"],
@@ -138,6 +145,31 @@ def _run_registration_crash_recovery_probe(
             and opening.phase == "opening"
             and opening.client_id == first.client_id,
             "Crash did not leave the exact durable registration attempt pending",
+        )
+        registration = BorrowEpisodeLedger(database_path).registration_attempt(first.episode_id)
+        _require(
+            registration.status == "prepared"
+            and registration.client_id == first.client_id
+            and registration.connected_at is None
+            and registration.projection_version is None,
+            "Crash child persisted a registration ACK before exiting",
+        )
+        from catchuparr.adapters.sharing_borrow_route import _recover_registration_ack
+
+        native_ack = _recover_registration_ack(
+            redis_client, opening, client_id=registration.client_id,
+            local_worker_id=registration.local_worker_id,
+            user_agent=registration.user_agent,
+            client_ip=registration.client_ip,
+            backend_signature=registration.backend_signature,
+        )
+        _require(
+            native_ack is not None
+            and native_ack.episode_id == first.episode_id
+            and native_ack.client_id == first.client_id
+            and native_ack.projection_version == first.episode_version + 1
+            and native_ack.connected_at,
+            "Native client hash, marker, set, and episode projection do not match the prepared ACK",
         )
 
         recovered = run_child(
@@ -200,10 +232,14 @@ def _run_registration_crash_recovery_probe(
             "Fresh reader cleanup disturbed the original viewer",
         )
     finally:
-        lease.release()
-        restored = apply_configuration(settings, active_path=active_path)
-        _require(restored.get("applied") is True,
-                 "Crash-recovery sharing configuration could not be restored")
+        try:
+            if lease is not None and getattr(lease, "_value", None) is not None:
+                lease.release()
+        finally:
+            if restore_settings:
+                restored = apply_configuration(settings, active_path=active_path)
+                _require(restored.get("applied") is True,
+                         "Crash-recovery sharing configuration could not be restored")
 
 
 def _current_orm_context_snapshot() -> dict[str, object]:

@@ -31,7 +31,14 @@ def _payload() -> dict[str, object]:
 
 
 def _setup_django() -> None:
-    plugin_root = str(Path(__file__).resolve().parent.parent)
+    configured_root = os.environ.get("CATCHUPARR_PLUGIN_ROOT")
+    if isinstance(configured_root, str) and configured_root:
+        plugin_root = str(Path(configured_root).resolve())
+    else:
+        candidate = Path("/data/plugins")
+        plugin_root = str(candidate.resolve()) if candidate.is_dir() else ""
+    if not plugin_root:
+        raise RuntimeError("Catchuparr plugin import root is unavailable")
     if plugin_root not in sys.path:
         sys.path.insert(0, plugin_root)
     import django
