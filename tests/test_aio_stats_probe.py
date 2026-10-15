@@ -20,11 +20,42 @@ from scripts.aio_stats_probe import (
     _NativeBasicProjectionCapture,
     _playback_auth_diagnostics,
     _private_worker_capability_binding,
+    _synthetic_visible_client_ids,
     stats_options_draft,
 )
 
 
 class AIOStatsProbeTests(unittest.TestCase):
+    def test_stats_probe_uses_fresh_clients_for_retained_manager_dedup(self):
+        class RetainedRegistrationManager:
+            def __init__(self):
+                self._registered_clients = set()
+                self.clients = set()
+
+            def add_client(self, client_id):
+                if client_id in self._registered_clients:
+                    return False
+                self._registered_clients.add(client_id)
+                self.clients.add(client_id)
+                return True
+
+            def remove_client(self, client_id):
+                self.clients.discard(client_id)
+
+        manager = RetainedRegistrationManager()
+        first = _synthetic_visible_client_ids()
+        self.assertEqual(11, len(first))
+        self.assertTrue(all(manager.add_client(client_id) for client_id in first))
+        for client_id in first:
+            manager.remove_client(client_id)
+        self.assertFalse(manager.clients)
+
+        second = _synthetic_visible_client_ids()
+        self.assertEqual(11, len(second))
+        self.assertTrue(first.isdisjoint(second))
+        self.assertTrue(all(manager.add_client(client_id) for client_id in second))
+        self.assertEqual(second, manager.clients)
+
     def test_private_worker_binding_ignores_ledger_only_fields(self):
         from catchuparr import recorder_proxy
 
