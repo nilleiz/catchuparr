@@ -1,12 +1,9 @@
-import importlib
+import os
+import subprocess
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-
-from scripts.aio_sharing_registration_crash import _setup_django
 
 
 class CrashProbeBootstrapTests(unittest.TestCase):
@@ -23,29 +20,47 @@ class CrashProbeBootstrapTests(unittest.TestCase):
                 (app_root / "core" / "utils.py").write_text("READY = True\n")
                 (plugin_root / "catchuparr").mkdir()
                 (plugin_root / "catchuparr" / "__init__.py").write_text("READY = True\n")
+                bootstrap = """
+import importlib
+import importlib.util
+import sys
+import types
 
-                def setup_django():
-                    self.assertTrue(importlib.import_module("dispatcharr.settings").READY)
-                    self.assertTrue(importlib.import_module("core.utils").READY)
-                    self.assertTrue(importlib.import_module("catchuparr").READY)
+django = types.ModuleType('django')
+def setup():
+    assert importlib.import_module('dispatcharr.settings').READY is True
+    assert importlib.import_module('core.utils').READY is True
+    assert importlib.import_module('catchuparr').READY is True
+django.setup = setup
+sys.modules['django'] = django
 
-                fake_django = types.SimpleNamespace(setup=setup_django)
-                configured_path = []
-                with (
-                    patch.object(sys, "path", []),
-                    patch.dict(sys.modules, {"django": fake_django}),
-                    patch.dict(
-                        "os.environ",
-                        {
-                            "CATCHUPARR_APP_ROOT": str(app_root),
-                            "CATCHUPARR_PLUGIN_ROOT": str(plugin_root),
-                        },
-                    ),
-                ):
-                    _setup_django()
-                    configured_path = list(sys.path)
+spec = importlib.util.spec_from_file_location('crash_probe', __import__('os').environ['PROBE_HELPER_PATH'])
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+probe._setup_django()
+assert sys.path[:2] == [__import__('os').environ['CATCHUPARR_APP_ROOT'], __import__('os').environ['CATCHUPARR_PLUGIN_ROOT']]
+print('bootstrap-ok')
+"""
+                result = subprocess.run(
+                    [sys.executable, "-c", bootstrap],
+                    cwd=app_root,
+                    env={
+                        **os.environ,
+                        "CATCHUPARR_APP_ROOT": str(app_root),
+                        "CATCHUPARR_PLUGIN_ROOT": str(plugin_root),
+                        "PROBE_HELPER_PATH": str(
+                            Path(__file__).resolve().parents[1]
+                            / "scripts"
+                            / "aio_sharing_registration_crash.py"
+                        ),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
 
-                self.assertEqual(configured_path[:2], [str(app_root), str(plugin_root)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "bootstrap-ok")
 
 
 if __name__ == "__main__":
