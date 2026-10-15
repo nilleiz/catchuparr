@@ -499,6 +499,10 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
         self._finite_claimed: set[str] = set()
         self._request_counts = {name: 0 for name in payloads}
         self._active_counts = {name: 0 for name in payloads}
+        self.request_started_at = {name: [] for name in payloads}
+        self.request_start_callback = None
+        self.request_start_callback_errors = []
+        self.request_callback_finished = threading.Event()
         self._stall_started_counts = {name: 0 for name in payloads}
         self._stall_durations = {name: 0.0 for name in payloads}
         self._stall_null_bytes = {name: 0 for name in payloads}
@@ -518,6 +522,10 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
                     else:
                         mode = owner._modes[name]
                     owner._request_counts[name] = owner._request_counts.get(name, 0) + 1
+                    started_at = time.time()
+                    owner.request_started_at.setdefault(name, []).append(started_at)
+                    request_number = owner._request_counts[name]
+                    callback = owner.request_start_callback
                     finite_repeats = owner._finite_repeats.get(name, 0)
                     finite_already_claimed = name in owner._finite_claimed
                     finite_mode = mode in {"finite", "stall"}
@@ -529,6 +537,16 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
                     if should_serve:
                         owner._active_counts[name] = owner._active_counts.get(name, 0) + 1
                         owner._sockets.add(self.connection)
+
+                if callback is not None and not owner._run_request_start_callback(
+                    callback, name, request_number, started_at,
+                ):
+                    if should_serve:
+                        with owner._lock:
+                            owner._active_counts[name] -= 1
+                            owner._sockets.discard(self.connection)
+                    self.send_error(500)
+                    return
 
                 if not should_serve:
                     self.send_error(404 if mode == "missing" else 503)
@@ -615,6 +633,25 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
     def snapshot(self) -> tuple[dict[str, int], dict[str, int]]:
         with self._lock:
             return dict(self._request_counts), dict(self._active_counts)
+
+    def request_times(self, source_name: str) -> list[float]:
+        with self._lock:
+            return list(self.request_started_at.get(source_name, ()))
+
+    def _run_request_start_callback(
+        self, callback, name: str, request_number: int, started_at: float,
+    ) -> bool:
+        """Run and record a request boundary check before any HTTP response."""
+        try:
+            completed = callback(name, request_number, started_at) is True
+        except Exception as exc:
+            with self._lock:
+                self.request_start_callback_errors.append(exc)
+            self.request_callback_finished.set()
+            return False
+        if completed:
+            self.request_callback_finished.set()
+        return True
 
     def stall_snapshot(self) -> dict[str, dict[str, float | int]]:
         with self._lock:
