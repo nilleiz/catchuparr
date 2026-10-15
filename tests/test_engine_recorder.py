@@ -181,6 +181,10 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual("exited", result.status)
         self.assertEqual(2, result.useful_segments)
         self.assertEqual(2, len(acknowledgements))
+        self.assertEqual(
+            acknowledgements[0], acknowledgements[1],
+            "A callback retry must keep the first committed media timestamp",
+        )
 
     def test_candidate_stop_terminates_ffmpeg_before_indexing_final_segment(self):
         events = []

@@ -3424,7 +3424,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "  enabled: true\n"
             "  live_stability_seconds: 0\n"
             "  last_viewer_return_seconds: 2\n"
-            "  min_switch_interval_seconds: 30\n"
+            "  min_switch_interval_seconds: 60\n"
             "rules:\n"
             "  - channels: {profile: all}\n"
         )
@@ -3580,7 +3580,23 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 1, timeout=15,
         )
+        sharing_episode_key = f"catchuparr:sharing:episode:{worker_id}"
+        wait_return_until = time.monotonic() + 10
+        while _redis_text(redis_client.hget(sharing_episode_key, "phase")) != "wait_return":
+            _require(time.monotonic() < wait_return_until,
+                     "Native borrow did not enter viewer-return grace")
+            gevent_sleep(0.05)
+        attached_clock = float(redis_client.hget(sharing_episode_key, "last_switch_at"))
+        return_deadline = float(redis_client.hget(sharing_episode_key, "return_deadline"))
+        _require(
+            return_deadline >= attached_clock + 59.9,
+            "Native viewer grace did not preserve the full switch interval from ATTACH",
+        )
+        _require(time.time() < return_deadline,
+                 "The synthetic viewer left after the tested switch deadline")
         gevent_sleep(3)
+        _require(time.time() < return_deadline,
+                 "The recorder returned before the observed native grace deadline")
         counts_during_return_cooldown, _active_during_return_cooldown = source_server.snapshot()
         _require(
             counts_during_return_cooldown["source-b.ts"]
