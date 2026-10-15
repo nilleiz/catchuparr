@@ -8,6 +8,7 @@ credentials are used. Tests use synthetic-only keys and flush logical DB 0.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import subprocess
@@ -361,6 +362,41 @@ class RedisCliJsonTests(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(AssertionError):
                 _decode_hgetall_json(payload)
 
+    def test_package_configuration_alias_matches_canonical_module(self):
+        package = importlib.import_module("catchuparr")
+        configuration = importlib.import_module("catchuparr.configuration")
+        self.assertIs(sys.modules["catchuparr.configuration"], configuration)
+        self.assertIs(package.configuration, configuration)
+
+    def test_authority_context_uses_canonical_configuration_module(self):
+        configuration = importlib.import_module("catchuparr.configuration")
+        self.assertIs(sys.modules["catchuparr"].configuration, configuration)
+
+        class SyntheticRedis:
+            @staticmethod
+            def hgetall(_key):
+                return {
+                    b"configuration_generation": b"config-authority-context-synthetic",
+                    b"control_generation": b"7",
+                    b"catalog_generation": b"catalog-authority-context-synthetic",
+                    b"authority_revision": b"11",
+                }
+
+        with patch.object(
+            configuration, "_sharing_catalog_generation",
+            return_value="catalog-authority-context-synthetic",
+        ):
+            authority = recorder_proxy.current_sharing_authority_context(
+                SyntheticRedis(), CHANNEL,
+                config_generation="config-authority-context-synthetic",
+                control_generation=7,
+            )
+        self.assertEqual(
+            {"authority_revision": 11,
+             "catalog_generation": "catalog-authority-context-synthetic"},
+            authority,
+        )
+
 
 def _episode(*, epoch: int = 9, client_id: str = CLIENT) -> BorrowEpisodeSnapshot:
     identity = (
@@ -434,8 +470,10 @@ class NativeLuaRedisTests(unittest.TestCase):
         django.__path__ = []
         django_conf = type(sys)("django.conf")
         django_conf.settings = SimpleNamespace(SECRET_KEY="synthetic-operation-signing-key")
-        with patch.dict(sys.modules, {"django": django, "django.conf": django_conf}), patch(
-            "catchuparr.configuration._sharing_catalog_generation",
+        configuration = importlib.import_module("catchuparr.configuration")
+        self.assertIs(sys.modules["catchuparr"].configuration, configuration)
+        with patch.dict(sys.modules, {"django": django, "django.conf": django_conf}), patch.object(
+            configuration, "_sharing_catalog_generation",
             return_value=catalog_generation,
         ):
             authority = recorder_proxy.current_sharing_authority_context(
@@ -515,8 +553,11 @@ class NativeLuaRedisTests(unittest.TestCase):
         django.__path__ = []
         django_conf = type(sys)("django.conf")
         django_conf.settings = SimpleNamespace(SECRET_KEY="synthetic-expired-capability-key")
-        with patch.dict(sys.modules, {"django": django, "django.conf": django_conf}), patch(
-            "catchuparr.configuration._sharing_catalog_generation",
+        configuration = importlib.import_module("catchuparr.configuration")
+        self.assertIs(sys.modules["catchuparr.configuration"], configuration)
+        self.assertIs(sys.modules["catchuparr"].configuration, configuration)
+        with patch.dict(sys.modules, {"django": django, "django.conf": django_conf}), patch.object(
+            configuration, "_sharing_catalog_generation",
             return_value=catalog_generation,
         ):
             authority = recorder_proxy.current_sharing_authority_context(

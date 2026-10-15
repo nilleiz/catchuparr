@@ -1,3 +1,4 @@
+import importlib
 import sys
 import tempfile
 import types
@@ -421,9 +422,13 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             "enabled": True, "live_stability_seconds": 5,
             "last_viewer_return_seconds": 30, "min_switch_interval_seconds": 60,
         }}}
+        runtime_module = sys.modules[RecorderBorrowCoordinator.__module__]
+        configuration_module = importlib.import_module("catchuparr.configuration")
+        self.assertIs(sys.modules["catchuparr"].sharing_runtime, runtime_module)
+        self.assertIs(sys.modules["catchuparr"].configuration, configuration_module)
         with (
-            patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
-            patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
+            patch.object(runtime_module, "borrow_cleanup_acknowledged", return_value=True),
+            patch.object(configuration_module, "_sharing_catalog_generation", return_value="catalog-synthetic"),
             patch.object(coordinator, "_recovery_is_current", return_value=True),
         ):
             self.assertTrue(RecorderBorrowCoordinator.record_return_after_cleanup(
