@@ -45,7 +45,7 @@ STREAM = "stream-synthetic-lua-060"
 ACCOUNT = "account-synthetic-lua-060"
 M3U_PROFILE = "m3u-profile-synthetic-lua-060"
 INPUT_PROFILE = "input-profile-synthetic-lua-060"
-LEASE = "synthetic-only-lease-lua-060"
+LEASE = "11:synthetic-only-lease-lua-060"
 VIEWER = "viewer-synthetic-lua-060"
 CLIENT = "catchuparr-client-synthetic-lua-060"
 TASK_WORKER = "task-worker-synthetic-lua-060"
@@ -773,6 +773,14 @@ class NativeLuaRedisTests(unittest.TestCase):
         from catchuparr import stats
 
         keys = _keys()
+        now = time.time()
+        def replace_bound_lease(value):
+            self.redis.hset(keys["episode"], "lease_value", value)
+            self.redis.hset(
+                keys["episode"], "lease_digest", hashlib.sha256(value.encode()).hexdigest(),
+            )
+            self.redis.set(keys["lease"], value, ex=600)
+
         cases = (
             ("both-stream-ids-missing", lambda: (
                 self.redis.command("HDEL", keys["episode"], "stream_id"),
@@ -823,6 +831,12 @@ class NativeLuaRedisTests(unittest.TestCase):
             ("lease-digest-does-not-bind-live-lease", lambda: self.redis.hset(
                 keys["episode"], "lease_digest", "0" * 64,
             )),
+            ("opaque-live-lease-rejected", lambda: replace_bound_lease(
+                "opaque-synthetic-live-lease",
+            )),
+            ("numeric-live-lease-fence-mismatch", lambda: replace_bound_lease(
+                "12:replacement-synthetic-lease-owner",
+            )),
             ("matching-control-malformed", lambda: (
                 self.redis.hset(keys["episode"], "control_generation", "7x"),
                 self.redis.hset(keys["current"], "control_generation", "7x"),
@@ -842,8 +856,8 @@ class NativeLuaRedisTests(unittest.TestCase):
             )),
             ("grace-deadline-before-viewer-left", lambda: (
                 self.redis.hset(keys["episode"], "phase", "wait_return"),
-                self.redis.hset(keys["episode"], "viewer_left_at", "200"),
-                self.redis.hset(keys["episode"], "return_deadline", "100"),
+                self.redis.hset(keys["episode"], "viewer_left_at", str(now + 60)),
+                self.redis.hset(keys["episode"], "return_deadline", str(now + 30)),
             )),
         )
         for name, mutate in cases:
@@ -851,6 +865,13 @@ class NativeLuaRedisTests(unittest.TestCase):
                 self.redis.command("FLUSHDB")
                 _episode, ack = self._register()
                 self.assertIsNotNone(ack)
+                self.assertTrue(stats._is_borrowed_recorder_client(
+                    self.redis, CHANNEL, CLIENT,
+                ), "the registered fixture must be valid before mutation")
+                self.assertIn(
+                    CLIENT, stats._verified_recorder_ids(self.redis, CHANNEL, [CLIENT]),
+                    "bulk verification must accept the registered fixture before mutation",
+                )
                 mutate()
                 before = {
                     key: self.redis.hgetall(keys[key])
