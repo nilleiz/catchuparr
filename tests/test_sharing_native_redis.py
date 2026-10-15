@@ -769,6 +769,106 @@ class NativeLuaRedisTests(unittest.TestCase):
                     CLIENT, stats._verified_recorder_ids(self.redis, CHANNEL, [CLIENT]),
                 )
 
+    def test_borrowed_stats_requires_complete_well_formed_grant_without_writes(self):
+        from catchuparr import stats
+
+        keys = _keys()
+        cases = (
+            ("both-stream-ids-missing", lambda: (
+                self.redis.command("HDEL", keys["episode"], "stream_id"),
+                self.redis.command("HDEL", keys["metadata"], "stream_id"),
+            )),
+            ("both-stream-ids-empty", lambda: (
+                self.redis.hset(keys["episode"], "stream_id", ""),
+                self.redis.hset(keys["metadata"], "stream_id", ""),
+            )),
+            ("both-m3u-profiles-missing", lambda: (
+                self.redis.command("HDEL", keys["episode"], "m3u_profile_id"),
+                self.redis.command("HDEL", keys["metadata"], "m3u_profile"),
+            )),
+            ("both-m3u-profiles-empty", lambda: (
+                self.redis.hset(keys["episode"], "m3u_profile_id", ""),
+                self.redis.hset(keys["metadata"], "m3u_profile", ""),
+            )),
+            ("both-input-profiles-missing", lambda: (
+                self.redis.command("HDEL", keys["episode"], "input_profile_id"),
+                self.redis.command("HDEL", keys["metadata"], "stream_profile"),
+            )),
+            ("both-input-profiles-empty", lambda: (
+                self.redis.hset(keys["episode"], "input_profile_id", ""),
+                self.redis.hset(keys["metadata"], "stream_profile", ""),
+            )),
+            ("account-missing", lambda: self.redis.command(
+                "HDEL", keys["episode"], "account_id",
+            )),
+            ("account-empty", lambda: self.redis.hset(keys["episode"], "account_id", "")),
+            ("intent-epoch-missing", lambda: self.redis.command(
+                "HDEL", keys["episode"], "intent_epoch",
+            )),
+            ("return-cooldown-missing", lambda: self.redis.command(
+                "HDEL", keys["episode"], "return_seconds",
+            )),
+            ("switch-cooldown-missing", lambda: self.redis.command(
+                "HDEL", keys["episode"], "minimum_switch_seconds",
+            )),
+            ("switch-clock-missing", lambda: self.redis.command(
+                "HDEL", keys["episode"], "last_switch_at",
+            )),
+            ("lease-digest-missing", lambda: self.redis.command(
+                "HDEL", keys["episode"], "lease_digest",
+            )),
+            ("lease-digest-malformed", lambda: self.redis.hset(
+                keys["episode"], "lease_digest", "not-a-sha256-digest",
+            )),
+            ("lease-digest-does-not-bind-live-lease", lambda: self.redis.hset(
+                keys["episode"], "lease_digest", "0" * 64,
+            )),
+            ("matching-control-malformed", lambda: (
+                self.redis.hset(keys["episode"], "control_generation", "7x"),
+                self.redis.hset(keys["current"], "control_generation", "7x"),
+            )),
+            ("matching-control-negative", lambda: (
+                self.redis.hset(keys["episode"], "control_generation", "-1"),
+                self.redis.hset(keys["current"], "control_generation", "-1"),
+            )),
+            ("return-cooldown-out-of-range", lambda: self.redis.hset(
+                keys["episode"], "return_seconds", "3601",
+            )),
+            ("switch-cooldown-noninteger", lambda: self.redis.hset(
+                keys["episode"], "minimum_switch_seconds", "60.5",
+            )),
+            ("switch-clock-nonfinite", lambda: self.redis.hset(
+                keys["episode"], "last_switch_at", "NaN",
+            )),
+            ("grace-deadline-before-viewer-left", lambda: (
+                self.redis.hset(keys["episode"], "phase", "wait_return"),
+                self.redis.hset(keys["episode"], "viewer_left_at", "200"),
+                self.redis.hset(keys["episode"], "return_deadline", "100"),
+            )),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                self.redis.command("FLUSHDB")
+                _episode, ack = self._register()
+                self.assertIsNotNone(ack)
+                mutate()
+                before = {
+                    key: self.redis.hgetall(keys[key])
+                    for key in ("episode", "current", "metadata", "client", "private")
+                }
+                before_clients = self.redis.smembers(keys["clients"])
+                self.assertFalse(stats._is_borrowed_recorder_client(
+                    self.redis, CHANNEL, CLIENT,
+                ))
+                self.assertNotIn(
+                    CLIENT, stats._verified_recorder_ids(self.redis, CHANNEL, [CLIENT]),
+                )
+                self.assertEqual(before, {
+                    key: self.redis.hgetall(keys[key])
+                    for key in ("episode", "current", "metadata", "client", "private")
+                })
+                self.assertEqual(before_clients, self.redis.smembers(keys["clients"]))
+
     def test_borrowed_stats_verification_accepts_unexpired_native_grace_readonly(self):
         from catchuparr import stats
 
