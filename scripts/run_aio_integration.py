@@ -70,6 +70,8 @@ def run():
                f"{name}:/tmp/aio_native_redis_diagnostic.py")
         docker("cp", str(ROOT / "scripts/aio_051_configuration_probe.py"),
                f"{name}:/tmp/aio_051_configuration_probe.py")
+        docker("cp", str(ROOT / "scripts/aio_sharing_registration_crash.py"),
+               f"{name}:/tmp/aio_sharing_registration_crash.py")
         docker("cp", str(ROOT / "scripts/aio_recorder_failover.py"), f"{name}:/tmp/aio_recorder_failover.py")
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
         docker("cp", str(ROOT / "tests"), f"{name}:/tmp/tests")
