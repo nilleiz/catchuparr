@@ -12,6 +12,12 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def should_run_probe(namespace_name):
+    # `manage.py shell < script.py` execs stdin in Django's shell module
+    # globals; ordinary imports must remain side-effect free for unit tests.
+    return namespace_name in {"__main__", "django.core.management.commands.shell"}
+
+
 _ACTIVE_SCHEMA_VERSION = 6
 _SHARING_DEFAULTS = {
     "enabled": False,
@@ -316,5 +322,5 @@ def probe():
         M3UAccount.objects.filter(id__in=[item.id for item in created_accounts]).delete()
 
 
-if __name__ == "__main__":
+if should_run_probe(__name__):
     probe()
