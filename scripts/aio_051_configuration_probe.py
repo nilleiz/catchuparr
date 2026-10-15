@@ -12,6 +12,41 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+_ACTIVE_SCHEMA_VERSION = 6
+_SHARING_DEFAULTS = {
+    "enabled": False,
+    "live_stability_seconds": 5,
+    "last_viewer_return_seconds": 30,
+    "min_switch_interval_seconds": 60,
+}
+
+
+def validate_active_v6_snapshot(active, persisted, channel_uuids):
+    """Keep this compatibility probe tied to the current persisted schema."""
+    expected_channels = set(channel_uuids)
+    require(
+        isinstance(active, dict) and active.get("version") == _ACTIVE_SCHEMA_VERSION,
+        "Apply did not persist a version 6 active snapshot",
+    )
+    require(
+        isinstance(persisted, dict) and persisted.get("version") == _ACTIVE_SCHEMA_VERSION,
+        "raw active snapshot did not persist schema version 6",
+    )
+    sharing = active.get("connection_sharing")
+    require(
+        isinstance(sharing, dict) and set(sharing) == expected_channels,
+        "v6 active snapshot must resolve sharing defaults for every selected channel",
+    )
+    require(
+        all(value == _SHARING_DEFAULTS for value in sharing.values()),
+        "blank sharing configuration must keep every channel disabled with default cooldowns",
+    )
+    require(
+        persisted.get("connection_sharing") == sharing,
+        "raw v6 sharing snapshot differs from the active configuration view",
+    )
+
+
 def probe():
     sys.path.insert(0, "/data/plugins")
     from apps.channels.models import (
@@ -212,18 +247,21 @@ def probe():
             require(applied.get("applied") is True, "real Django configuration Apply failed")
             require(validated["channels"] == applied["channels"],
                     "Validate and Apply previews diverged")
-            require(active is not None and active["version"] == ACTIVE_CONFIG_VERSION == 5,
-                    "Apply did not persist a version 5 active snapshot")
+            require(ACTIVE_CONFIG_VERSION == _ACTIVE_SCHEMA_VERSION,
+                    "configuration probe must be updated when the active schema changes")
+            validate_active_v6_snapshot(
+                active, persisted, (str(channel_a.uuid), str(channel_b.uuid)),
+            )
             require(active["recording_schedule"]["channels"] == {
                 str(channel_a.uuid): expected_direct_schedule,
                 str(channel_b.uuid): expected_base_schedule,
-            }, "v5 active snapshot did not retain effective schedules")
+            }, "v6 active snapshot did not retain effective schedules")
             require(active["source_policies"][str(channel_a.uuid)]["priorities"]
-                    == [[str(account_b.id), 20]], "v5 snapshot did not retain replacement priorities")
+                    == [[str(account_b.id), 20]], "v6 snapshot did not retain replacement priorities")
             previews = {row["channel_uuid"]: row for row in validated["channels"]}
             require(persisted["configuration_origins"] == {
                 key: value["configuration_origin"] for key, value in previews.items()
-            }, "raw v5 persisted origins differ from the validated effective preview")
+            }, "raw v6 persisted origins differ from the validated effective preview")
             require(previews[str(channel_a.uuid)]["effective_source_policy"] == {
                 "include": None, "exclude": [account_a.name],
                 "priority": {account_b.name: 20},
@@ -241,7 +279,7 @@ def probe():
                 "real Django ORM source catalog fixtures",
                 "named profile with number and name exceptions independent of YAML order",
                 "whole-map filter and priority replacement plus final invalid-policy rejection",
-                "Validate/Apply effective preview, origins, and v5 snapshot parity",
+                "Validate/Apply effective preview, origins, and v6 snapshot parity",
                 "whole-week replacement, group/day precedence, explicit empty days, overnight start-day ownership",
             ],
             "provider_connections": 0,
@@ -256,4 +294,5 @@ def probe():
         M3UAccount.objects.filter(id__in=[item.id for item in created_accounts]).delete()
 
 
-probe()
+if __name__ == "__main__":
+    probe()
