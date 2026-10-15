@@ -27,6 +27,185 @@ def _assert_private_worker_stop_request_count(before: dict, after: dict) -> None
     )
 
 
+def _run_registration_crash_recovery_probe(
+    *, active_path: Path, settings: dict, archive_root: Path, channel_uuid: str,
+    redis_client, native_server, redis_keys, metadata_key: str,
+    native_owner: str, active_state: str, source_server, profile_a,
+    profile_connections_key: str, profile_a_baseline: int,
+) -> None:
+    """Crash one owned request after real REGISTER, then recover in a new process."""
+    from apps.proxy.live_proxy.constants import ChannelMetadataField
+
+    from catchuparr.adapters.sharing_native import native_registration_is_absent
+    from catchuparr.configuration import (
+        apply_configuration,
+        load_active_configuration,
+        load_applied_state,
+    )
+    from catchuparr.engine.leases import RedisRecorderLease
+    from catchuparr.engine.store import ArchiveStore
+    from catchuparr.sharing_episode import BorrowEpisodeLedger
+    from catchuparr.sharing_runtime import RecorderBorrowCoordinator
+
+    shared_settings = dict(settings)
+    shared_settings["connection_sharing_config"] = (
+        "version: 1\n"
+        "default:\n"
+        "  enabled: true\n"
+        "  live_stability_seconds: 0\n"
+        "  last_viewer_return_seconds: 0\n"
+        "  min_switch_interval_seconds: 0\n"
+    )
+    applied = apply_configuration(shared_settings, active_path=active_path)
+    _require(applied.get("applied") is True, "Crash-recovery sharing Apply failed")
+    active = load_active_configuration(active_path)
+    _require(active is not None, "Crash-recovery sharing snapshot is unavailable")
+    _require(
+        active.get("connection_sharing", {}).get(channel_uuid, {}).get("enabled") is True,
+        "Crash-recovery sharing defaults were not enabled for the synthetic channel",
+    )
+    _, control = load_applied_state(active_path)
+    provider_before = source_server.snapshot()
+    profile_before = _profile_count(redis_client, profile_a.id, profile_connections_key)
+    _require(
+        profile_before == profile_a_baseline + 1
+        and provider_before[1].get("source-a.ts") == 1
+        and provider_before[1].get("source-b.ts") == 0,
+        "Crash probe did not start with the original live-A provider binding",
+    )
+    store = ArchiveStore(archive_root)
+    lease = RedisRecorderLease(
+        redis_client, channel_uuid, ttl_seconds=90, archive_store=store,
+    )
+    fence = lease.acquire()
+    _require(fence is not None, "Crash-recovery recorder lease was unavailable")
+    database_path = archive_root / ".catchuparr-sharing.sqlite3"
+    coordinator = RecorderBorrowCoordinator(
+        redis_client, archive_root, channel_uuid, active=active,
+        control_generation=control.generation, recorder_fence=fence,
+        lease_value=lease._value, dedicated_source_available=True,
+    )
+
+    helper = Path(__file__).resolve().with_name("aio_sharing_registration_crash.py")
+    plugin_root = helper.parent.parent
+
+    def run_child(mode: str, payload: dict, expected_code: int) -> dict:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(helper), mode],
+                cwd=plugin_root,
+                env=dict(os.environ),
+                input=json.dumps(payload, separators=(",", ":")),
+                capture_output=True,
+                text=True,
+                timeout=35,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Owned crash-probe child failed: {type(exc).__name__}") from None
+        try:
+            value = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            value = None
+        _require(
+            result.returncode == expected_code and isinstance(value, dict),
+            f"Owned crash-probe child returned an unexpected result in {mode}",
+        )
+        return value
+
+    def prepare_fresh():
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            prepared = coordinator.poll(active=active, control_generation=control.generation)
+            if prepared is not None:
+                return prepared
+            time.sleep(0.1)
+        raise RuntimeError("Coordinator did not issue the synthetic live-viewer borrow")
+
+    try:
+        first = prepare_fresh()
+        capability = __import__(
+            "catchuparr.adapters.sharing_borrow_route", fromlist=["encode_borrow_capability"],
+        ).encode_borrow_capability(first.capability)
+        crashed = run_child(
+            "crash-after-register", {"capability": capability}, expected_code=73,
+        )
+        _require(crashed.get("native_registered") is True,
+                 "Child exited before confirming the real native registration ACK")
+        opening = BorrowEpisodeLedger(database_path).read(channel_uuid)
+        _require(
+            opening.episode_id == first.episode_id
+            and opening.phase == "opening"
+            and opening.client_id == first.client_id,
+            "Crash did not leave the exact durable registration attempt pending",
+        )
+
+        recovered = run_child(
+            "reconcile",
+            {"database_path": str(database_path), "episode_id": first.episode_id},
+            expected_code=0,
+        )
+        _require(recovered == {"completed": 1, "pending": 0},
+                 "Fresh process did not reconcile exactly the crashed registration")
+        closed = BorrowEpisodeLedger(database_path).read(channel_uuid)
+        _require(
+            closed.episode_id == first.episode_id and closed.phase == "closed"
+            and native_registration_is_absent(
+                redis_client, channel_uuid=channel_uuid, client_id=first.client_id,
+            ),
+            "Restart recovery did not close and remove the exact borrowed client",
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, redis_keys, channel_uuid, 1,
+        )
+        _require(
+            _redis_text(redis_client.get(redis_keys.channel_owner(channel_uuid))) == native_owner
+            and _redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE)) == active_state
+            and source_server.snapshot() == provider_before
+            and _profile_count(redis_client, profile_a.id, profile_connections_key) == profile_before,
+            "Crash recovery changed the original viewer owner or native worker",
+        )
+        replay = run_child("replay", {"capability": capability}, expected_code=0)
+        _require(replay == {"denied": True}, "Consumed crash capability was replayable")
+
+        # Recovery of the closed ATTACH claim and a new coordinator poll must
+        # issue a distinct ticket before a fresh reader is allowed to attach.
+        second = prepare_fresh()
+        _require(second.episode_id != first.episode_id and second.client_id != first.client_id,
+                 "Fresh legitimate borrow reused the crashed episode identity")
+        second_token = __import__(
+            "catchuparr.adapters.sharing_borrow_route", fromlist=["encode_borrow_capability"],
+        ).encode_borrow_capability(second.capability)
+        read = run_child(
+            "open-and-read", {"capability": second_token}, expected_code=0,
+        )
+        _require(read == {"closed": True, "opened": True, "read_ts": True},
+                 "Fresh legitimate borrow did not read aligned native TS packets")
+        fresh_episode = BorrowEpisodeLedger(database_path).read(channel_uuid)
+        _require(
+            fresh_episode.episode_id == second.episode_id
+            and fresh_episode.phase == "closed"
+            and native_registration_is_absent(
+                redis_client, channel_uuid=channel_uuid, client_id=second.client_id,
+            ),
+            "Fresh legitimate reader did not acknowledge exact client and episode cleanup",
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, redis_keys, channel_uuid, 1,
+        )
+        _require(
+            _redis_text(redis_client.get(redis_keys.channel_owner(channel_uuid))) == native_owner
+            and source_server.snapshot() == provider_before
+            and _profile_count(redis_client, profile_a.id, profile_connections_key) == profile_before,
+            "Fresh reader cleanup disturbed the original viewer",
+        )
+    finally:
+        lease.release()
+        restored = apply_configuration(settings, active_path=active_path)
+        _require(restored.get("applied") is True,
+                 "Crash-recovery sharing configuration could not be restored")
+
+
 def _current_orm_context_snapshot() -> dict[str, object]:
     """Return only connection counts and transaction booleans for this context."""
     try:
@@ -2904,6 +3083,22 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(counts["source-a.ts"] >= 1 and active_counts["source-a.ts"] == 1,
                  "Native live A did not open its synthetic A source")
         _require(counts["source-b.ts"] == 0, "Native live A opened archive source B")
+        _run_registration_crash_recovery_probe(
+            active_path=active_path,
+            settings=settings,
+            archive_root=archive_root,
+            channel_uuid=worker_id,
+            redis_client=redis_client,
+            native_server=native_server,
+            redis_keys=RedisKeys,
+            metadata_key=metadata_key,
+            native_owner=native_owner,
+            active_state=active_state,
+            source_server=source_server,
+            profile_a=profile_a,
+            profile_connections_key=profile_connections_key,
+            profile_a_baseline=profile_baselines[profile_a.id],
+        )
         _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
 
         assignment_keys = {
