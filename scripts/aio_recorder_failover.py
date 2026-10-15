@@ -638,6 +638,21 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
         with self._lock:
             return list(self.request_started_at.get(source_name, ()))
 
+    def install_request_start_callback(self, callback) -> None:
+        """Publish a one-shot boundary callback against the handler's lock."""
+        with self._lock:
+            self.request_callback_finished.clear()
+            self.request_start_callback_errors.clear()
+            self.request_start_callback = callback
+
+    def clear_request_start_callback(self, callback=None) -> bool:
+        """Disarm only the callback that the caller installed."""
+        with self._lock:
+            if callback is not None and self.request_start_callback is not callback:
+                return False
+            self.request_start_callback = None
+            return True
+
     def _run_request_start_callback(
         self, callback, name: str, request_number: int, started_at: float,
     ) -> bool:

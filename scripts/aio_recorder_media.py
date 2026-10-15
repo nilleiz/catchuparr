@@ -3674,9 +3674,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             )
             return True
 
-        with source_server._counts_lock:
-            source_server.request_callback_finished.clear()
-            source_server.request_start_callback = verify_first_b_effect
+        source_server.install_request_start_callback(verify_first_b_effect)
         b_request_deadline = time.monotonic() + 150
         b_request_times = source_server.request_times("source-b.ts")
         while len(b_request_times) <= share_b_request_baseline:
@@ -3690,6 +3688,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             _require(time.monotonic() < callback_deadline,
                      "Provider request boundary check did not complete")
             gevent_sleep(0.01)
+        source_server.clear_request_start_callback(verify_first_b_effect)
         _require(
             first_return_request_at >= return_deadline,
             "The allowed B provider request preceded the actual native return deadline",
@@ -3875,10 +3874,31 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Borrow cleanup did not settle the no-source task in PAUSED after native grace",
         )
         no_source_paused_counts, no_source_paused_active = source_server.snapshot()
+        no_source_native_release_deadline = time.monotonic() + 25
+        while time.monotonic() < no_source_native_release_deadline:
+            manager = native_server.client_managers.get(worker_id)
+            manager_count = (
+                int(manager.get_client_count()) if manager is not None else 0
+            )
+            owner_present = redis_client.get(RedisKeys.channel_owner(worker_id)) is not None
+            no_source_paused_counts, no_source_paused_active = source_server.snapshot()
+            if (
+                no_source_paused_active["source-a.ts"] == 0
+                and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+                and manager_count == 0
+                and not owner_present
+                and _profile_count(
+                    redis_client, profile_a.id, profile_connections_key,
+                ) == profile_baselines[profile_a.id]
+            ):
+                break
+            gevent_sleep(0.1)
         _require(
             len(source_server.request_times("source-b.ts")) == no_source_b_requests
             and no_source_paused_active["source-a.ts"] == 0
             and no_source_paused_counts["source-a.ts"] == no_source_counts["source-a.ts"]
+            and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+            and redis_client.get(RedisKeys.channel_owner(worker_id)) is None
             and _profile_count(redis_client, profile_a.id, profile_connections_key)
             == profile_baselines[profile_a.id]
             and _profile_count(redis_client, profile_b.id, profile_connections_key)

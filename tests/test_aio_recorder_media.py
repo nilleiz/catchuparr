@@ -41,16 +41,25 @@ class RecorderMediaProbeTests(unittest.TestCase):
         source = object.__new__(aio_recorder_failover._SyntheticFailoverSourceServer)
         source._lock = threading.Lock()
         source.request_started_at = {"source-b.ts": [123.5]}
+        source.request_start_callback = None
         source.request_start_callback_errors = []
         source.request_callback_finished = threading.Event()
         observed = []
+
+        def callback(name, number, started):
+            observed.append((name, number, started))
+            return True
+
         self.assertEqual([123.5], source.request_times("source-b.ts"))
+        source.install_request_start_callback(callback)
+        self.assertIs(source.request_start_callback, callback)
         self.assertTrue(source._run_request_start_callback(
-            lambda name, number, started: observed.append((name, number, started)) or True,
-            "source-b.ts", 1, 123.5,
+            source.request_start_callback, "source-b.ts", 1, 123.5,
         ))
         self.assertTrue(source.request_callback_finished.is_set())
         self.assertEqual([("source-b.ts", 1, 123.5)], observed)
+        self.assertTrue(source.clear_request_start_callback(callback))
+        self.assertIsNone(source.request_start_callback)
 
     def test_synthetic_provider_waits_for_boundary_callback_and_rejects_failed_boundary(self):
         source = object.__new__(probe._SyntheticSourceServer)
