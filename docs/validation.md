@@ -13,11 +13,11 @@ run passed, but the original cause remains unknown. See the
 ## 0.6.0 optional live sharing candidate
 
 The 0.6.0 candidate is implemented but not published. The current candidate
-worktree passed 716 local tests (34 skipped), Ruff, compileall, and package
-validation. Its 40-entry ZIP is `catchuparr-0.6.0.zip` and includes the existing
-plugin icon. The immutable source and artifact hashes will be recorded with the
-candidate assembly checkpoint. Required full native acceptance and CI for both
-pinned Dispatcharr 0.31.0 and 0.32.0 remain pending.
+worktree ran 716 local tests: 682 passed and 34 were skipped. Ruff, compileall
+and package validation passed. Its 40-entry ZIP is `catchuparr-0.6.0.zip` and
+includes the existing plugin icon. The immutable source and artifact hashes
+will be recorded with the candidate assembly checkpoint. Required full native
+acceptance and CI for both pinned Dispatcharr 0.31.0 and 0.32.0 remain pending.
 
 The release gate must demonstrate existing-viewer borrowing without another
 provider request, no opening of excluded sources, ordinary-viewer preservation
