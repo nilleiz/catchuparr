@@ -761,6 +761,13 @@ class NativeLuaRedisTests(unittest.TestCase):
                 self.redis.command("FLUSHDB")
                 _episode, ack = self._register()
                 self.assertIsNotNone(ack)
+                self.assertTrue(stats._is_borrowed_recorder_client(
+                    self.redis, CHANNEL, CLIENT,
+                ), "the registered fixture must be valid before mutation")
+                self.assertIn(
+                    CLIENT, stats._verified_recorder_ids(self.redis, CHANNEL, [CLIENT]),
+                    "bulk verification must accept the registered fixture before mutation",
+                )
                 mutate(_keys())
                 self.assertFalse(stats._is_borrowed_recorder_client(
                     self.redis, CHANNEL, CLIENT,
@@ -773,13 +780,19 @@ class NativeLuaRedisTests(unittest.TestCase):
         from catchuparr import stats
 
         keys = _keys()
-        now = time.time()
+
         def replace_bound_lease(value):
             self.redis.hset(keys["episode"], "lease_value", value)
             self.redis.hset(
                 keys["episode"], "lease_digest", hashlib.sha256(value.encode()).hexdigest(),
             )
             self.redis.set(keys["lease"], value, ex=600)
+
+        def set_reversed_grace():
+            now = time.time()
+            self.redis.hset(keys["episode"], "phase", "wait_return")
+            self.redis.hset(keys["episode"], "viewer_left_at", str(now + 600))
+            self.redis.hset(keys["episode"], "return_deadline", str(now + 300))
 
         cases = (
             ("both-stream-ids-missing", lambda: (
@@ -854,11 +867,7 @@ class NativeLuaRedisTests(unittest.TestCase):
             ("switch-clock-nonfinite", lambda: self.redis.hset(
                 keys["episode"], "last_switch_at", "NaN",
             )),
-            ("grace-deadline-before-viewer-left", lambda: (
-                self.redis.hset(keys["episode"], "phase", "wait_return"),
-                self.redis.hset(keys["episode"], "viewer_left_at", str(now + 60)),
-                self.redis.hset(keys["episode"], "return_deadline", str(now + 30)),
-            )),
+            ("grace-deadline-before-viewer-left", set_reversed_grace),
         )
         for name, mutate in cases:
             with self.subTest(name=name):
