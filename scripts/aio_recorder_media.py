@@ -67,9 +67,10 @@ def _run_registration_crash_recovery_probe(
         try:
             result = subprocess.run(
                 [sys.executable, str(helper), mode],
-                cwd=plugin_root,
+                cwd="/app",
                 env={
                     **os.environ,
+                    "CATCHUPARR_APP_ROOT": "/app",
                     "CATCHUPARR_PLUGIN_ROOT": str(plugin_root),
                 },
                 input=json.dumps(payload, separators=(",", ":")),
