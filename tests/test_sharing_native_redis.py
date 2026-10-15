@@ -599,7 +599,7 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.redis.command("SET", keys["heartbeat"], "alive", "EX", 600)
         self.redis.command(
             "HSET", keys["metadata"], "owner", WORKER,
-            "channel_uuid", CHANNEL, "state", "active", "stream_id", STREAM,
+            "state", "active", "stream_id", STREAM,
             "m3u_profile", M3U_PROFILE, "stream_profile", INPUT_PROFILE,
         )
         self.redis.command("SET", keys["buffer_index"], "1")
@@ -640,6 +640,43 @@ class NativeLuaRedisTests(unittest.TestCase):
             client_record_ttl=60,
         )
         return episode, ack
+
+    def test_native_registration_accepts_writer_schema_without_channel_uuid(self):
+        episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        self.assertNotIn("channel_uuid", self.redis.hgetall(_keys()["metadata"]))
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.assertIsNotNone(grant)
+        ok, _deadline, _version = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertTrue(ok)
+
+    def test_register_and_touch_reject_contradictory_optional_channel_uuid(self):
+        episode = self._opening_projection()
+        self._native_source_and_viewer()
+        keys = _keys()
+        self.redis.command("HSET", keys["metadata"], "channel_uuid", "other-channel-synthetic")
+        before_episode = self.redis.hgetall(keys["episode"])
+        before_clients = self.redis.smembers(keys["clients"])
+        self.assertIsNone(register_borrowed_client(
+            self.redis, episode, lease_value=LEASE, catalog_generation=CATALOG,
+            client_id=CLIENT, local_worker_id=TASK_WORKER,
+            user_agent="Synthetic Player", client_ip="192.0.2.60",
+            client_record_ttl=60,
+        ))
+        self.assertEqual(self.redis.hgetall(keys["episode"]), before_episode)
+        self.assertEqual(self.redis.smembers(keys["clients"]), before_clients)
+        self.assertFalse(self.redis.hgetall(keys["client"]))
+
+    def test_touch_rejects_contradictory_optional_channel_uuid(self):
+        _registered_episode, ack = self._register()
+        self.assertIsNotNone(ack)
+        keys = _keys()
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.redis.command("HSET", keys["metadata"], "channel_uuid", "other-channel-synthetic")
+        before_active_episode = self.redis.hgetall(keys["episode"])
+        ok, _deadline, _version = check_and_touch_borrowed_client(self.redis, grant)
+        self.assertFalse(ok)
+        self.assertEqual(self.redis.hgetall(keys["episode"]), before_active_episode)
 
     def _capability(self, episode, *, expires_at=None):
         identity = (

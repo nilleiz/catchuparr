@@ -316,7 +316,13 @@ def observe_native_connection(
         if (
             owner != owner_value
             or state not in {"active", "waiting_for_clients"}
-            or metadata.get("channel_uuid") != channel_uuid
+            # Native metadata is already scoped by the channel-specific Redis
+            # key. Current Dispatcharr writers do not store channel_uuid in
+            # this hash; reject it only when a writer supplies a contradiction.
+            or (
+                "channel_uuid" in metadata
+                and metadata["channel_uuid"] != channel_uuid
+            )
             or int(redis.ttl(f"live:channel:{channel_uuid}:owner")) <= 0
             or redis.exists(f"live:channel:{channel_uuid}:stopping")
         ):
@@ -511,6 +517,8 @@ for i = 1, #expected do
 end
 local ttl = tonumber(ARGV[20])
 if not ttl or ttl < 1 or ttl > 720 or ttl % 1 ~= 0 then return 0 end
+local metadata_channel = redis.call('HGET', KEYS[6], 'channel_uuid')
+if metadata_channel and metadata_channel ~= ARGV[15] then return 0 end
 if redis.call('EXISTS', KEYS[14]) ~= 0 then return 0 end
 if redis.call('HGET', KEYS[2], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[2], 'control_generation') ~= ARGV[2]
@@ -538,7 +546,6 @@ if redis.call('HGET', KEYS[2], 'configuration_generation') ~= ARGV[1]
    or redis.call('HGET', KEYS[1], 'channel_uuid') ~= ARGV[15]
    or redis.call('GET', KEYS[4]) ~= ARGV[8]
    or redis.call('HGET', KEYS[6], 'owner') ~= ARGV[10]
-   or redis.call('HGET', KEYS[6], 'channel_uuid') ~= ARGV[15]
    or redis.call('HGET', KEYS[6], 'stream_id') ~= ARGV[11]
    or redis.call('HGET', KEYS[6], 'm3u_profile') ~= ARGV[13]
    or redis.call('HGET', KEYS[6], 'stream_profile') ~= ARGV[14]
@@ -629,6 +636,8 @@ for i = 1, #allowed do
 end
 local ttl = tonumber(ARGV[20])
 if not ttl or ttl < 1 or ttl > 720 or ttl % 1 ~= 0 then return 0 end
+local metadata_channel = redis.call('HGET', KEYS[6], 'channel_uuid')
+if metadata_channel and metadata_channel ~= ARGV[10] then return 0 end
 local phase = redis.call('HGET', KEYS[1], 'phase')
 if (phase ~= 'active' and phase ~= 'wait_return')
    or redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[7]
@@ -656,7 +665,6 @@ if (phase ~= 'active' and phase ~= 'wait_return')
    or redis.call('HGET', KEYS[2], 'control_generation') ~= ARGV[2]
    or redis.call('HGET', KEYS[2], 'catalog_generation') ~= ARGV[3]
    or redis.call('HGET', KEYS[6], 'owner') ~= ARGV[11]
-   or redis.call('HGET', KEYS[6], 'channel_uuid') ~= ARGV[10]
    or redis.call('HGET', KEYS[6], 'stream_id') ~= ARGV[13]
    or redis.call('HGET', KEYS[6], 'm3u_profile') ~= ARGV[15]
    or redis.call('HGET', KEYS[6], 'stream_profile') ~= ARGV[16]
