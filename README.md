@@ -17,8 +17,8 @@ assignments, cloud storage or a transcoding service.
 ## Version and compatibility
 
 - The package version is **0.6.0 prerelease candidate**. It is not published.
-  Required CI, both pinned AIO jobs, isolated Dev verification and final native
-  sharing acceptance are still gates. See [candidate 0.6.0](docs/candidate-0.6.0.md)
+  Required CI, both pinned AIO jobs and final native sharing acceptance are
+  still gates. See [candidate 0.6.0](docs/candidate-0.6.0.md)
   and the [validation record](docs/validation.md).
 - The supported Dispatcharr versions in the compatibility guard are 0.31.0 and
   0.32.0. This statement does not claim the pending 0.6.0 integration jobs have
