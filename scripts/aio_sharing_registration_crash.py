@@ -31,6 +31,15 @@ def _payload() -> dict[str, object]:
 
 
 def _setup_django() -> None:
+    configured_app_root = os.environ.get("CATCHUPARR_APP_ROOT")
+    if isinstance(configured_app_root, str) and configured_app_root:
+        app_root = str(Path(configured_app_root).resolve())
+    else:
+        candidate = Path("/app")
+        app_root = str(candidate.resolve()) if candidate.is_dir() else ""
+    if not app_root:
+        raise RuntimeError("Dispatcharr application import root is unavailable")
+
     configured_root = os.environ.get("CATCHUPARR_PLUGIN_ROOT")
     if isinstance(configured_root, str) and configured_root:
         plugin_root = str(Path(configured_root).resolve())
@@ -39,8 +48,9 @@ def _setup_django() -> None:
         plugin_root = str(candidate.resolve()) if candidate.is_dir() else ""
     if not plugin_root:
         raise RuntimeError("Catchuparr plugin import root is unavailable")
-    if plugin_root not in sys.path:
-        sys.path.insert(0, plugin_root)
+    for import_root in reversed((app_root, plugin_root)):
+        if import_root not in sys.path:
+            sys.path.insert(0, import_root)
     import django
 
     django.setup()
