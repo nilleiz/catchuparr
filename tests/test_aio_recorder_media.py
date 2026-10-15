@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from scripts import aio_recorder_failover
 from scripts import aio_recorder_media as probe
 
 
@@ -36,6 +37,21 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_live_failover_provider_exposes_pre_response_request_boundary(self):
+        source = object.__new__(aio_recorder_failover._SyntheticFailoverSourceServer)
+        source._lock = threading.Lock()
+        source.request_started_at = {"source-b.ts": [123.5]}
+        source.request_start_callback_errors = []
+        source.request_callback_finished = threading.Event()
+        observed = []
+        self.assertEqual([123.5], source.request_times("source-b.ts"))
+        self.assertTrue(source._run_request_start_callback(
+            lambda name, number, started: observed.append((name, number, started)) or True,
+            "source-b.ts", 1, 123.5,
+        ))
+        self.assertTrue(source.request_callback_finished.is_set())
+        self.assertEqual([("source-b.ts", 1, 123.5)], observed)
+
     def test_synthetic_provider_waits_for_boundary_callback_and_rejects_failed_boundary(self):
         source = object.__new__(probe._SyntheticSourceServer)
         source._counts_lock = threading.Lock()
