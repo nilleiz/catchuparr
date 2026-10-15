@@ -25,24 +25,46 @@ def validate_active_v6_snapshot(active, persisted, channel_uuids):
     """Keep this compatibility probe tied to the current persisted schema."""
     expected_channels = set(channel_uuids)
     require(
-        isinstance(active, dict) and active.get("version") == _ACTIVE_SCHEMA_VERSION,
+        isinstance(active, dict)
+        and type(active.get("version")) is int
+        and active.get("version") == _ACTIVE_SCHEMA_VERSION,
         "Apply did not persist a version 6 active snapshot",
     )
     require(
-        isinstance(persisted, dict) and persisted.get("version") == _ACTIVE_SCHEMA_VERSION,
+        isinstance(persisted, dict)
+        and type(persisted.get("version")) is int
+        and persisted.get("version") == _ACTIVE_SCHEMA_VERSION,
         "raw active snapshot did not persist schema version 6",
     )
-    sharing = active.get("connection_sharing")
+    active_sharing = active.get("connection_sharing")
+    persisted_sharing = persisted.get("connection_sharing")
+
+    def valid_disabled_map(sharing):
+        if not isinstance(sharing, dict) or set(sharing) != expected_channels:
+            return False
+        for value in sharing.values():
+            if not isinstance(value, dict) or set(value) != set(_SHARING_DEFAULTS):
+                return False
+            if type(value.get("enabled")) is not bool or value["enabled"] is not False:
+                return False
+            for name in (
+                "live_stability_seconds", "last_viewer_return_seconds",
+                "min_switch_interval_seconds",
+            ):
+                if type(value.get(name)) is not int or value[name] != _SHARING_DEFAULTS[name]:
+                    return False
+        return True
+
     require(
-        isinstance(sharing, dict) and set(sharing) == expected_channels,
-        "v6 active snapshot must resolve sharing defaults for every selected channel",
+        valid_disabled_map(active_sharing),
+        "v6 active snapshot must resolve strict disabled sharing defaults for every selected channel",
     )
     require(
-        all(value == _SHARING_DEFAULTS for value in sharing.values()),
-        "blank sharing configuration must keep every channel disabled with default cooldowns",
+        valid_disabled_map(persisted_sharing),
+        "raw v6 snapshot must preserve strict disabled sharing defaults for every selected channel",
     )
     require(
-        persisted.get("connection_sharing") == sharing,
+        persisted_sharing == active_sharing,
         "raw v6 sharing snapshot differs from the active configuration view",
     )
 
