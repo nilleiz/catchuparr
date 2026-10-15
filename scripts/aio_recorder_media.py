@@ -142,6 +142,8 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
         self.request_counts = {name: 0 for name in payloads}
         self.active_counts = {name: 0 for name in payloads}
         self.request_started_at = {name: [] for name in payloads}
+        self.request_start_callback = None
+        self.request_start_callback_errors = []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -156,7 +158,19 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
                 with owner._counts_lock:
                     owner.request_counts[name] += 1
                     owner.active_counts[name] += 1
-                    owner.request_started_at[name].append(time.time())
+                    started_at = time.time()
+                    owner.request_started_at[name].append(started_at)
+                    request_number = owner.request_counts[name]
+                    callback = owner.request_start_callback
+                if callback is not None:
+                    try:
+                        callback(name, request_number, started_at)
+                    except Exception as exc:
+                        with owner._counts_lock:
+                            owner.request_start_callback_errors.append(exc)
+                            owner.active_counts[name] -= 1
+                        self.send_error(500)
+                        return
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "video/mp2t")
@@ -3601,6 +3615,49 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         _require(time.time() < return_deadline,
                  "The synthetic viewer left after the tested switch deadline")
+        first_b_boundary = {}
+
+        def verify_first_b_effect(source_name, request_number, started_at):
+            if (source_name != "source-b.ts"
+                    or request_number != share_b_request_baseline + 1):
+                return
+            first_b_boundary["started_at"] = started_at
+            first_b_boundary["return_deadline"] = return_deadline
+            _require(
+                started_at >= return_deadline,
+                "The allowed B provider request preceded the actual native return deadline",
+            )
+            # This callback runs at the provider request boundary, before the
+            # synthetic source sends its first byte. A later polling snapshot
+            # cannot stand in for the state at the first fallback effect.
+            with run_share._lock:
+                processes_at_boundary = list(run_share.processes)
+                results_at_boundary = list(run_share.results)
+            _require(
+                bool(processes_at_boundary)
+                and processes_at_boundary[0].poll() is not None,
+                "Borrowed FFmpeg was still alive when the first B request started",
+            )
+            _require(
+                bool(results_at_boundary)
+                and results_at_boundary[0].useful_segments > 0,
+                "Borrowed input had not completed with useful media before the first B request",
+            )
+            borrow_client_key = f"live:channel:{worker_id}:clients:{borrow_client_id}"
+            borrow_clients_key = RedisKeys.clients(worker_id)
+            borrow_private_key = f"catchuparr:sharing:private:{worker_id}"
+            _require(
+                not redis_client.exists(borrow_client_key)
+                and not redis_client.sismember(borrow_clients_key, borrow_client_id)
+                and redis_client.hget(borrow_private_key, borrow_client_id) is None,
+                "Borrowed native client hash/set/marker remained at the first B provider request",
+            )
+            _require(
+                _redis_text(redis_client.hget(sharing_episode_key, "phase")) == "closed",
+                "Borrowed episode cleanup was not acknowledged before the first B provider request",
+            )
+
+        source_server.request_start_callback = verify_first_b_effect
         b_request_deadline = time.monotonic() + 150
         b_request_times = source_server.request_times("source-b.ts")
         while len(b_request_times) <= share_b_request_baseline:
@@ -3613,33 +3670,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             first_return_request_at >= return_deadline,
             "The allowed B provider request preceded the actual native return deadline",
         )
-
-        # Assert the borrowed process and its exact native registration are
-        # gone at the first fallback provider effect, not after B media arrives.
-        with run_share._lock:
-            share_processes = list(run_share.processes)
-            share_results_at_first_b = list(run_share.results)
-        _require(
-            bool(share_processes) and share_processes[0].poll() is not None,
-            "Borrowed FFmpeg was still alive when the first B request started",
-        )
-        _require(
-            bool(share_results_at_first_b) and share_results_at_first_b[0].useful_segments > 0,
-            "Borrowed input had not completed with useful media before the first B request",
-        )
-        borrow_client_key = f"live:channel:{worker_id}:clients:{borrow_client_id}"
-        borrow_clients_key = RedisKeys.clients(worker_id)
-        borrow_private_key = f"catchuparr:sharing:private:{worker_id}"
-        _require(
-            not redis_client.exists(borrow_client_key)
-            and not redis_client.sismember(borrow_clients_key, borrow_client_id)
-            and redis_client.hget(borrow_private_key, borrow_client_id) is None,
-            "Borrowed native client hash/set/marker remained at the first B provider request",
-        )
-        _require(
-            _redis_text(redis_client.hget(sharing_episode_key, "phase")) == "closed",
-            "Borrowed episode cleanup was not acknowledged before the first B provider request",
-        )
+        _require(not source_server.request_start_callback_errors,
+                 "The first B provider effect failed its borrowed-cleanup boundary checks")
+        _require(first_b_boundary.get("started_at") == first_return_request_at,
+                 "The first B request was not checked synchronously at its provider boundary")
 
         b_before_share = {segment.id for segment in store.segments(worker_id)}
         returned_segments = _wait_for_indexed_tone(
