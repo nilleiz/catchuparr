@@ -577,8 +577,8 @@ class StatsProjectionTests(unittest.TestCase):
         }
         with mock.patch.object(
             stats,
-            "_is_recorder_client",
-            side_effect=lambda channel, client: client == "recorder",
+            "_is_recorder_client_on_redis",
+            side_effect=lambda _redis, _channel, client: client == "recorder",
         ):
             result = stats._visible_basic_channel_info(channel_status, "42", native)
         self.assertEqual(13, native["client_count"])
