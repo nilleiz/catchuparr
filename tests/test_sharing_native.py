@@ -73,7 +73,7 @@ class NativeObservationRedis:
         }
         self.hashes = {
             f"live:channel:{CHANNEL}:metadata": {
-                "owner": IDENTITY[3], "channel_uuid": CHANNEL, "state": "active",
+                "owner": IDENTITY[3], "state": "active",
                 "stream_id": IDENTITY[4], "m3u_profile": IDENTITY[6],
                 "stream_profile": IDENTITY[7],
             },
@@ -282,6 +282,25 @@ class NativeSharingTests(unittest.TestCase):
         )
         self.assertIsNone(observe_native_connection(
             NativeObservationRedis(), CHANNEL, catalog_generation="catalog-synthetic-4",
+            assigned_sources=(source,), observed_at=101,
+        ))
+
+    def test_native_metadata_may_omit_channel_uuid_but_rejects_a_contradiction(self):
+        source = NativeAssignedSource(
+            channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],
+            m3u_profile_id=IDENTITY[6], input_profile_id=IDENTITY[7], assigned=True,
+            account_active=True, profile_active=True, media_compatible=True,
+        )
+        redis = NativeObservationRedis()
+        self.assertNotIn("channel_uuid", redis.hashes[f"live:channel:{CHANNEL}:metadata"])
+        self.assertIsNotNone(observe_native_connection(
+            redis, CHANNEL, catalog_generation="catalog-synthetic-4",
+            assigned_sources=(source,), observed_at=101,
+        ))
+
+        redis.hashes[f"live:channel:{CHANNEL}:metadata"]["channel_uuid"] = "other-channel-synthetic"
+        self.assertIsNone(observe_native_connection(
+            redis, CHANNEL, catalog_generation="catalog-synthetic-4",
             assigned_sources=(source,), observed_at=101,
         ))
 
