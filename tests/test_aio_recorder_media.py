@@ -701,6 +701,45 @@ class RecorderMediaProbeTests(unittest.TestCase):
             ClientRedis(), server, Keys, "worker", 1, timeout=1,
         )
 
+    def test_native_client_wait_separates_global_borrow_from_parent_local_count(self):
+        manager = SimpleNamespace(get_client_count=lambda: 1)
+        server = SimpleNamespace(client_managers={"worker": manager})
+
+        class ClientRedis:
+            @staticmethod
+            def scard(_key):
+                return 2
+
+        class Keys:
+            @staticmethod
+            def clients(_worker_id):
+                return "clients"
+
+        probe._wait_for_native_client_count(
+            ClientRedis(), server, Keys, "worker", 2,
+            expected_local=1, timeout=1,
+        )
+
+    def test_native_client_wait_rejects_global_borrow_missing_from_redis(self):
+        manager = SimpleNamespace(get_client_count=lambda: 1)
+        server = SimpleNamespace(client_managers={"worker": manager})
+
+        class ClientRedis:
+            @staticmethod
+            def scard(_key):
+                return 1
+
+        class Keys:
+            @staticmethod
+            def clients(_worker_id):
+                return "clients"
+
+        with self.assertRaisesRegex(RuntimeError, "bounded state"):
+            probe._wait_for_native_client_count(
+                ClientRedis(), server, Keys, "worker", 2,
+                expected_local=1, timeout=0.01,
+            )
+
     def test_native_active_wait_does_not_accept_connecting(self):
         redis = _FakeRedis(state_after_reads=10**9)
         manager = SimpleNamespace(running=True)
