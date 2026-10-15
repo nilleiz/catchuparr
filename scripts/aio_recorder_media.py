@@ -4341,10 +4341,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 break
             gevent_sleep(0.1)
         final_no_source_counts, final_no_source_active = source_server.snapshot()
-        final_manager = native_server.client_managers.get(worker_id)
-        final_manager_count = (
-            int(final_manager.get_client_count()) if final_manager is not None else 0
-        )
         disconnect_key = RedisKeys.last_client_disconnect(worker_id)
         no_source_pause_conditions = {
             "source_b_request_count_unchanged": (
@@ -4373,9 +4369,14 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         def no_source_pause_diagnostic():
             from apps.proxy.live_proxy.config_helper import ConfigHelper
 
+            diagnostic_manager = native_server.client_managers.get(worker_id)
+            diagnostic_local_count = (
+                int(diagnostic_manager.get_client_count())
+                if diagnostic_manager is not None else 0
+            )
             return {
                 "conditions": no_source_pause_conditions,
-                "native_local_clients_zero": final_manager_count == 0,
+                "native_local_clients_zero": diagnostic_local_count == 0,
                 "provider_request_delta": {
                     "source_a": (
                         final_no_source_counts["source-a.ts"]
@@ -4392,7 +4393,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 },
                 "native_client_count": {
                     "global": int(redis_client.scard(RedisKeys.clients(worker_id)) or 0),
-                    "local": final_manager_count,
+                    "local": diagnostic_local_count,
                 },
                 "native_keys": {
                     "owner_present": redis_client.get(
