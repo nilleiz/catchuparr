@@ -10,6 +10,23 @@ The initial 0.32.0 media run failed before 96,256 bytes; a later diagnostic-only
 run passed, but the original cause remains unknown. See the
 [0.5.1 candidate guide](candidate-0.5.1.md) and the 0.5.0 evidence below.
 
+## 0.6.0 optional live sharing candidate
+
+The 0.6.0 candidate is implemented but not published. The current candidate
+worktree passed 716 local tests (34 skipped), Ruff, compileall, and package
+validation. Its 40-entry ZIP is `catchuparr-0.6.0.zip` and includes the existing
+plugin icon. The immutable source and artifact hashes will be recorded with the
+candidate assembly checkpoint. Required full native acceptance and CI for both
+pinned Dispatcharr 0.31.0 and 0.32.0 remain pending.
+
+The release gate must demonstrate existing-viewer borrowing without another
+provider request, no opening of excluded sources, ordinary-viewer preservation
+through Stop, exact client/process cleanup before fallback launch, cooldown
+deadlines, repeated borrow/return, Apply and Stop revocation, restart recovery,
+failure handling and acknowledgement retries. The complete checklist is in the
+[candidate guide](candidate-0.6.0.md). Synthetic tests alone do not establish
+native acceptance.
+
 ## 0.5.1 named profile inheritance prerelease
 
 The candidate passed 453 unit tests, Ruff, Python compilation and package

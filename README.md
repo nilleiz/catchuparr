@@ -6,119 +6,89 @@
 
 Catchuparr adds a local rolling catch-up archive and start-over playback to
 [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr). It records selected
-live channels into a shared local archive and exposes the indexed programmes
-through authenticated M3U/XMLTV links. A native XC adapter is also available.
+channels to a shared local archive and provides authenticated M3U/XMLTV links.
+It also includes guarded native XC playback hooks and optional reuse of a
+compatible live connection while recording.
 
-Dispatcharr remains responsible for live streams, EPG data, users and playback
-permissions. Catchuparr does not create channel-to-provider assignments. The
-archive is local to the Dispatcharr installation and is not a cloud service.
+Dispatcharr remains responsible for live streams, EPG data, users, channel
+permissions and provider assignments. Catchuparr does not create source
+assignments, cloud storage or a transcoding service.
 
-## Compatibility and status
+## Version and compatibility
 
-- Version 0.4.0 is released. Version 0.5.0 implementation and user acceptance
-  are complete; publication awaits the required release workflow and it is not
-  yet published. Version 0.5.1 is a prerelease candidate; its 453-test suite
-  and full pinned AIO probes pass. CI, isolated Dev verification and publication
-  remain pending.
-- Dispatcharr 0.31.0 and 0.32.0 are the supported versions covered by the
-  repository's pinned native integration checks.
-- The primary path is M3U/XMLTV with HLS playback using MPEG-TS segments.
-- Native XC playback is implemented behind guarded Dispatcharr hooks. Native
-  server integration is covered by synthetic checks; player-specific XC
-  acceptance is still separate and should be verified with the client in use.
-- Version 0.5.0 adds an optional native M3U/XMLTV archive toggle. The earlier
-  implementation passed 433 tests and full pinned AIO probes on Dispatcharr
-  0.31.0 and 0.32.0. Its final parity correction passed four focused native
-  0.32.0 cases; required release CI remains pending. See the
-  [0.5.0 guide](docs/candidate-0.5.0.md).
-- The 0.5.1 prerelease candidate adds named-profile configuration inheritance.
-  CI, isolated Dev verification and publication remain pending; see the
-  [0.5.1 candidate guide](docs/candidate-0.5.1.md).
-- Playback follows the selected user's Dispatcharr permissions, channel access,
-  catch-up permission and stream/session limits. It does not provide transcoding
-  or frame-accurate seeking.
-
-See the [changelog](CHANGELOG.md), [validation record](docs/validation.md),
-[development and deployment guide](docs/development.md), and
-[release roadmap](docs/roadmap.md).
+- The package version is **0.6.0 prerelease candidate**. It is not published.
+  Required CI, both pinned AIO jobs, isolated Dev verification and final native
+  sharing acceptance are still gates. See [candidate 0.6.0](docs/candidate-0.6.0.md)
+  and the [validation record](docs/validation.md).
+- The supported Dispatcharr versions in the compatibility guard are 0.31.0 and
+  0.32.0. This statement does not claim the pending 0.6.0 integration jobs have
+  passed.
+- The primary playback path is authenticated M3U/XMLTV with local HLS playback
+  using MPEG-TS segments. Native XC is guarded; acceptance with a particular
+  playback client is not established here.
+- Playback checks the active Dispatcharr user, channel access, catch-up
+  permission and existing stream/session limits. Seeking follows indexed
+  segment boundaries; it is not frame-accurate. Catchuparr does not transcode
+  output into a requested profile.
 
 ## Install or update
 
-1. Download the `catchuparr-<version>.zip` asset from the
-   [latest GitHub release](https://github.com/nilleiz/catchuparr/releases).
-2. In Dispatcharr, open its plugin manager and import the ZIP. Use the plugin
-   manager's overwrite/update option when replacing an existing Catchuparr.
-3. Restart the Dispatcharr web and worker processes as required by the plugin
-   manager so they all load the same package.
-4. Configure the plugin as described below, then use **Validate** and
-   **Apply configuration**.
+1. Download `catchuparr-<version>.zip` from a GitHub release once one is
+   published.
+2. In Dispatcharr's Plugins page, import the ZIP and choose its update or
+   overwrite option when replacing an existing installation.
+3. Follow Dispatcharr's restart or reload prompt so web and worker processes
+   load the same version.
+4. Configure the plugin, then use **Validate configuration** and **Apply
+   configuration**.
 
-The ZIP is a folder-shaped plugin package with `catchuparr/plugin.json` at its
-root. Do not unpack it and upload an individual Python file.
+The ZIP contains a `catchuparr/` package with `plugin.json`, `plugin.py` and
+`logo.png`. Dispatcharr documents `logo.png` beside the plugin entry point as
+its optional plugin-card logo; the manifest has no separate icon field. Do not
+upload an individual Python file. See [Dispatcharr's plugin guide](https://github.com/Dispatcharr/Dispatcharr/blob/main/Plugins.md).
 
-When upgrading directly from a version before the 0.2.1 YAML configuration,
-Catchuparr clears the obsolete channel selection. After upgrade, enter the new
-YAML, validate it and Apply before expecting recording to resume. The reset
-preserves archive data, recordings, general archive settings and playback
-credentials.
+When upgrading from a version before the 0.2.1 YAML configuration, Catchuparr
+clears the obsolete channel selection and requires a fresh Validate and Apply.
+This legacy reset preserves the archive, recordings, general storage settings
+and playback credentials.
 
-## Configure the archive
+## Settings overview
 
-Catchuparr's settings are plugin fields in Dispatcharr. Settings that affect
-operation are activated together by **Apply configuration**. Editing or saving
-a draft alone does not alter the active recorder configuration.
+Plugin settings are edited in Dispatcharr. **Apply configuration** validates
+and activates the complete settings draft as one generation. Editing or saving
+a draft alone does not change active recording policy. Pause and Resume are
+immediate operational actions.
 
-| Setting | Purpose |
+| Setting | What it controls |
 | --- | --- |
-| **Channel and source filter (YAML)** | Select channels, optionally restrict assigned M3U sources, rank allowed sources and set recording hours. Blank YAML selects no channels. |
-| **Archive path** | Local directory for recordings and archive metadata. It must be writable and resolve to the same storage for every Dispatcharr web and Celery worker. |
-| **Retention (hours)** | How far back archive playback is kept. Accepted range: 1–720 hours. |
-| **Storage limit (GiB)** | Maximum total Catchuparr archive storage. Accepted range: 1–10240 GiB. |
-| **User ID for new M3U token** | Existing Dispatcharr user ID to attach to a newly created playlist token. Set this before creating the token. |
-| **Public base URL for token links** | Absolute externally reachable `http://` or `https://` base used in generated M3U and XMLTV links. It may include a path prefix, but cannot contain credentials, a query or a fragment. |
-| **Recording enabled** | Whether scheduled recording is enabled. Apply the setting, or use the immediate Pause/Resume actions. |
-| **Catchuparr log level** | Catchuparr-only log verbosity: `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
-| **Show archive playback in Stats** | Add active Catchuparr archive viewers to native Timeshift Stats. Enabled by default. |
-| **Hide recorders in Stats** | Hide positively identified Catchuparr recorder clients from live Stats details. Enabled by default. |
-| **Add Catchuparr catch-up to native output** | Optional 0.5.0 candidate setting. Adds local archive metadata to eligible native Dispatcharr M3U/XMLTV output. Disabled by default; use the same unified Apply as other settings. |
+| **Channel and source filter (YAML)** | Channel selection, assigned M3U source include/exclude and priority, schedule and timezone. Blank YAML selects no channels. |
+| **Recorder connection sharing (YAML)** | Optional per-selected-channel reuse of a compatible existing native live connection. Blank YAML disables sharing. |
+| **Archive path** | Local writable storage shared by Dispatcharr web and worker processes. Default: `/data/catchuparr`. |
+| **Retention (hours)** | Archive retention from 1 to 720 hours. |
+| **Storage limit (GiB)** | Archive size limit from 1 to 10240 GiB. |
+| **User ID for new M3U token** | Existing Dispatcharr user to bind to a newly created token. |
+| **Public base URL for token links** | Absolute reachable HTTP(S) origin, optionally with a path prefix. No credentials, query or fragment. |
+| **Recording enabled** | Global recording state activated by Apply. Pause and Resume act immediately. |
+| **Catchuparr log level** | Catchuparr-only `DEBUG`, `INFO`, `WARNING` or `ERROR` logging. |
+| **Show archive playback in Stats** | Adds active Catchuparr archive viewers to native Timeshift Stats; enabled by default. |
+| **Hide recorders in Stats** | Hides only positively identified Catchuparr recorder clients in live details; enabled by default. |
+| **Add Catchuparr catch-up to native output** | Optional native Dispatcharr M3U/XMLTV annotation and covered local guide history; disabled by default. |
 
-### Select channels and sources
+## Select channels and assigned sources
 
-Use YAML version 1. A rule selects channels using exactly one of `numbers`,
-`names`, `groups` or `profile`. Use numbers for individual channel numbers and
-quoted strings for ranges, such as `numbers: [100, "102-105"]`. Names and group
-names must match Dispatcharr entries. A named profile selects its enabled
-members; `channels: {profile: all}` selects every eligible channel.
+The filter field accepts strict YAML version 1. Each rule selects channels with
+exactly one of `numbers`, `names`, `groups` or `profile`. Use integers for
+individual channel numbers and quoted strings for number ranges, for example
+`numbers: [100, "102-105"]`. Names and group names must match Dispatcharr. A
+named profile resolves to its enabled members.
 
-The outer `profile` (default `all`) limits which channels are eligible for rule
-selection; it does not select or record those channels by itself. A nonblank
-configuration with no rules selects no channels. Each rule's selector must
-resolve to at least one eligible channel. Direct channel rules may not overlap
-each other, and named profile rules may not compete for the same channel.
-Direct rules selected by channel name or number may overlap a named profile
-rule; they act as exceptions regardless of YAML order. A group selector cannot
-act as a named-profile exception. `channels.profile: all` selects all eligible
-channels and can provide a baseline configuration.
-
-The following selector forms are examples. For the combined example, choose
-values that resolve to disjoint channels in your catalog:
-
-```yaml
-version: 1
-profile: "Synthetic Scope"  # Optional outer scope: enabled members only.
-rules:
-  - channels:
-      numbers: [100, "102-105"]
-  - channels:
-      names: ["Synthetic Channel A"]
-  - channels:
-      groups: ["Synthetic Group"]
-  - channels:
-      profile: "Synthetic Enabled Profile"
-```
-
-To select all channels eligible under the outer profile and keep all of their
-assigned sources eligible, add an explicit `channels.profile: all` rule:
+The outer `profile` limits which channels can be selected; it does not select
+channels by itself. Blank YAML and a document with no rules select nothing. To
+select every eligible channel, add an explicit `channels: {profile: all}` rule.
+Each selector must resolve to eligible channels. Overlapping direct channel
+rules and overlapping named profile rules are rejected. Direct rules by number
+or name can override a named-profile rule regardless of YAML order; groups do
+not act as profile exceptions.
 
 ```yaml
 version: 1
@@ -126,81 +96,30 @@ profile: all
 rules:
   - channels:
       profile: all
+    exclude: ["Synthetic Backup Source"]
 ```
 
-`include` and `exclude` refer to exact M3U source names already assigned to a
-channel. They are mutually exclusive. `exclude: []` allows every assigned
-source. When a rule omits both fields, its effective filter inherits from the
-matching named profile rule, then from `channels.profile: all` when present.
-An explicit `include` or `exclude` replaces the inherited filter. An explicit
-`priority` replaces the entire inherited priority map; an omitted priority map
-inherits, and `priority: {}` clears inherited scores. Priorities are integer
-scores for allowed sources; higher scores are tried first, missing scores are
-zero, and equal scores keep Dispatcharr's channel stream order. The final
-combined filter and priority map are validated when you validate or Apply. A
-source filter never assigns a source to a channel and never selects a source
-outside the allowed set. A filtered or prioritized rule may use a dedicated
-recorder and require another provider slot.
+`include` and `exclude` refer only to exact M3U source names already assigned
+to a channel, and cannot appear together. `exclude: []` leaves all assigned
+sources eligible. An omitted filter inherits from a matching profile rule,
+then from a `profile: all` rule. An explicit filter replaces the inherited one.
+
+A `priority` map ranks allowed source names: higher integer scores are tried
+first; unlisted sources have score zero; ties retain Dispatcharr stream order.
+An omitted map inherits. An explicit map replaces the whole inherited map, and
+`priority: {}` clears inherited priorities. A source filter cannot add an
+assignment or make a disallowed source eligible. Filtered or prioritized
+recording may need a separate provider slot.
+
+### Named-profile inheritance
+
+A named `channels.profile` rule can provide the base filter, priority and
+schedule for enabled members. A direct number or name rule can override those
+values in either YAML order. The outer profile remains an eligibility scope.
 
 ```yaml
 version: 1
 profile: all
-timezone: Etc/UTC  # Optional IANA timezone for schedules.
-schedule:
-  weekdays:
-    - start: "18:00"
-      end: "23:00"
-  weekend:
-    - start: "10:00"
-      end: "13:00"
-rules:
-  - channels:
-      numbers: ["100-102"]
-    include: ["Synthetic M3U A", "Synthetic M3U B"]
-    priority:
-      "Synthetic M3U A": 100
-      "Synthetic M3U B": 50
-    schedule:
-      weekdays:
-        - start: "18:00"
-          end: "23:00"
-      weekend:
-        - start: "10:00"
-          end: "13:00"
-      friday:
-        - start: "19:00"
-          end: "23:30"
-  - channels:
-      groups: ["Synthetic Group"]
-    exclude: ["Synthetic M3U Backup"]
-    schedule: continuous
-```
-
-Replace the synthetic channel, group and source values with exact entries from
-your Dispatcharr catalog. The outer schedule applies to the selected channels
-unless a rule supplies its own schedule. The first rule's schedule replaces the
-global one: channels 100–102 use its weekday and weekend windows, with the
-explicit Friday window replacing that rule's weekday window. Channels in
-`Synthetic Group` record continuously, excluding the named source.
-
-### Named profile inheritance in the 0.5.1 prerelease
-
-A named profile rule supplies source and schedule settings for its enabled
-members. Direct rules selected by channel name or number can override those
-settings before or after the profile rule in the YAML. Profile membership is
-still Dispatcharr's enabled membership; this feature does not change it.
-
-In this complete example, the profile excludes one source and sets its source
-priority map and weekday schedule. The direct channel rule replaces the source
-filter and whole priority map. Its `override_days` schedule changes Monday
-through Friday and turns Sunday off; Saturday inherits the profile's hours.
-Group expansion happens before inheritance, so `weekdays` means Monday through
-Friday. An empty day means recording is off for that day.
-
-```yaml
-version: 1
-profile: all
-timezone: Etc/UTC
 rules:
   - channels:
       profile: "Synthetic Profile All"
@@ -224,234 +143,202 @@ rules:
       sunday: []
 ```
 
-A rule with its own schedule uses `schedule_mode: replace` by default. It
-replaces the entire inherited week, and unspecified days are off. Spell
-`schedule_mode: replace` to make that choice explicit. Use
-`schedule_mode: override_days` to replace only days present after group
-expansion; all other days inherit. `schedule_mode` requires a `schedule` on the
-same rule. Overnight windows belong to their start day: replacing or emptying
-that day removes its inherited overnight window, while an overnight window
-starting on the preceding day can still extend into it.
+A rule schedule uses `schedule_mode: replace` by default and replaces the whole
+week; unspecified days are off. `schedule_mode: override_days` changes only the
+specified days after group expansion and inherits the rest. An explicitly empty
+day is off. A rule with `schedule_mode` must contain a schedule. Validate
+previews show the resolved filter, priority and schedule origins; Apply stores
+those resolved values.
 
-Validation previews show the effective source filter, priority map and schedule
-along with the rule or document schedule each value came from. Validate and
-Apply compile the same complete settings draft, and Apply stores the resolved
-values and their origins together. Multiple direct rules selecting the same
-channel are invalid. Named profile rules whose enabled memberships overlap are
-also invalid.
+## Recording schedules
 
-Order does not affect the inheritance. This complete example places the direct
-numeric-channel exception before its named-profile rule; it resolves the same
-effective values as the reversed order.
+Omit the global or rule schedule for continuous recording. A schedule can use
+`daily`, `weekdays`, `weekend` and explicit weekday names. More-specific day
+entries take precedence: explicit weekday, then group, then `daily`. A rule's
+schedule replaces the global week unless `override_days` is selected.
 
 ```yaml
 version: 1
 profile: all
+timezone: Etc/UTC
+schedule:
+  weekdays:
+    - start: "18:00"
+      end: "23:00"
+  weekend:
+    - start: "10:00"
+      end: "13:00"
 rules:
   - channels:
-      numbers: ["3.5"]
-    include: ["Synthetic Source B"]
-    priority:
-      "Synthetic Source B": 80
-  - channels:
-      profile: "Synthetic Profile All"
-    exclude: ["Synthetic Source C"]
-    priority:
-      "Synthetic Source A": 10
+      numbers: [100]
+    schedule_mode: override_days
     schedule:
-      monday:
-        - start: "08:00"
-          end: "10:00"
+      friday:
+        - start: "19:00"
+          end: "23:30"
+      sunday: []
 ```
 
-These two sketches are invalid examples because each creates a conflict:
+Intervals use local wall-clock time, have exclusive end times, and may cross
+midnight. `24:00` is valid only as an end time. An overnight interval belongs to
+its start day. Overlapping or adjacent windows are merged. During a daylight
+saving repeated hour, the matching local time can occur twice; a skipped time
+in a DST gap does not occur. Timezone resolution is a valid YAML `timezone`,
+then a valid container `TZ`, then the detectable system timezone. Apply stores
+the resolved timezone.
+
+The YAML parser rejects unknown and duplicate fields, tags, anchors, aliases
+and merges. Input is limited to 64 KiB and 256 rules. Validation errors name the
+field and line without echoing the full YAML document.
+
+## Smart live connection sharing (0.6.0 candidate)
+
+Sharing is disabled by default. It is configured separately from the source
+filter but applies only to channels selected by that filter. It can reuse a
+healthy, compatible native live connection that already has an ordinary viewer,
+even when that viewer's assigned source is outside a recorder's `include`
+list. This reuses that viewer's stream; it does not open a new connection to an
+excluded source. If no reusable viewer connection exists, recording uses only
+sources allowed by the filter. If none is allowed, the recorder waits paused.
+
+The feature checks the existing Dispatcharr owner, assignment, account,
+profile, input compatibility, worker heartbeat and published media. It attaches
+an owned reader to that worker's published MPEG-TS buffer; it does not
+initialize or reserve another upstream stream. Viewer churn does not reset the
+stability timer for the same native connection.
 
 ```yaml
 version: 1
-profile: all
+default:
+  enabled: true
+  live_stability_seconds: 5
+  last_viewer_return_seconds: 30
+  min_switch_interval_seconds: 60
 rules:
-  # Synthetic Channel A is channel number 1 in this catalog.
-  - channels: {numbers: [1]}
-  - channels: {names: ["Synthetic Channel A"]}
+  - channels:
+      numbers: [100]
+    min_switch_interval_seconds: 90
+  - channels:
+      names: ["Synthetic Channel B"]
+    enabled: false
 ```
 
-```yaml
-version: 1
-profile: all
-rules:
-  - channels: {profile: "Synthetic Profile All"}
-  - channels: {profile: "Synthetic Profile Limited"}
-```
+The defaults are 5 seconds of stable live connection, 30 seconds after its last
+ordinary viewer leaves, and 60 seconds between successful switches. Values
+must be integers from 0 through 3600; booleans, floats and numeric strings are
+invalid. Zero disables only that cooldown. Use `default.enabled: true` to enable
+sharing for all selected channels, then add selector rules to override values.
+Per-rule values inherit from `default`. Apply sharing settings together with
+the filter and other settings.
 
-### Schedule behavior
+After a borrow, the recorder waits until both the last-viewer grace and the
+remaining minimum switch interval have elapsed, then returns to an allowed
+source. If none is available, it stays paused. Explicit Stop, invalidated
+authority and recorder failure take the cleanup path without waiting for normal
+viewer cooldowns. A switch ends the current FFmpeg attempt and starts the next
+with a segment discontinuity. The recorder's channel fence remains in force.
 
-Top-level and per-rule schedules accept `daily`, `weekdays`, `weekend` and
-explicit weekday keys (`monday` through `sunday`). For each day, an explicit
-weekday entry overrides its group, which overrides `daily`. A day without a
-matching entry is off in a replacing schedule. An omitted rule schedule
-inherits the applicable named profile schedule, then the top-level schedule,
-then continuous recording when neither is present. A rule with its own schedule
-replaces the inherited week by default; use `schedule_mode: override_days` to
-merge only specified expanded days. In `replace` mode, `schedule: {}` means off;
-in `override_days` mode, `schedule: {}` changes no days. `schedule: continuous`
-means always on in replace mode.
+**0.6.0 is still a candidate.** The feature's end-to-end AIO and required CI
+gates are pending. Do not treat synthetic tests or the configuration example
+as evidence that a particular Dispatcharr deployment has passed acceptance.
+See [candidate 0.6.0](docs/candidate-0.6.0.md) for the exact remaining gates.
 
-Times are local wall-clock values in the selected IANA timezone. The timezone
-is resolved when applying configuration in this order: valid YAML `timezone`,
-valid container `TZ`, then a detectable timezone from the container's system
-configuration. The resolved timezone is stored with the active schedule;
-changing the container timezone later takes effect after another Apply.
-
-Each window has `start` and `end` in `HH:MM` format. The end is exclusive;
-`24:00` is permitted only as an end time. Equal start and end are invalid. An
-end earlier than its start crosses midnight and belongs to its start weekday.
-Adjacent or overlapping windows merge. During daylight-saving transitions,
-nonexistent local times create no instants and repeated times apply in both
-occurrences.
-
-### Validate and apply
-
-1. Edit the complete set of settings, including YAML and archive values.
-2. Choose **Validate configuration** to preview selected channels, source
-   policy and schedule. Validation errors include the field and, when available,
-   line number.
-3. Choose **Apply configuration** to activate the validated set together.
-4. Choose **Archive status** to check recorder and archive state.
-
-The YAML document is limited to 64 KiB and 256 rules. Duplicate or unknown keys,
-unknown fields, invalid selectors, tags, anchors, aliases and YAML merge keys
-are rejected. A failed validation keeps the active settings. A failed or
-interrupted activation denies new recorder admission until recovery succeeds.
-
-Changing the archive path does not move or delete old recordings or access
-tokens. They remain at the previous path; copy archive data deliberately and
-update your storage mounts before changing the setting.
-
-## Recorders and controls
-
-- **Pause recording** immediately pauses recorders and fences queued recording
-  work. It does not stop archive playback or retention cleanup.
-- **Resume recording** immediately resumes according to the active configuration
-  and schedule.
-- **Reconcile recorders** asks Catchuparr to compare desired recorders with the
-  current workers and queue the needed changes.
-- **Archive status** reports recorder state, indexed archive age and storage
-  information. “Oldest indexed footage” is the age of the oldest indexed item;
-  it does not promise uninterrupted recording for that entire span.
-
-When a schedule closes, the recorder stops and releases its provider reservation.
-Archive playback and retention continue. The archive storage limit applies to
-Catchuparr's total archive data; older data is removed according to retention
-and space pressure.
-
-## Create M3U and XMLTV links
+## Access tokens and playback
 
 1. Set **User ID for new M3U token** to an existing Dispatcharr user.
-2. Set **Public base URL for token links** to a URL playback clients can reach.
-   If Dispatcharr is behind a reverse proxy or served under a path prefix, make
-   sure proxy forwarding preserves the correct external scheme and prefix.
-3. Apply the settings.
-4. Choose **Create M3U/XMLTV access token**. Copy the separately displayed M3U
-   playlist and XMLTV EPG links from the confirmation.
-5. Add the M3U link and, if the player does not read its XMLTV URL automatically,
-   the XMLTV link to the playback client.
+2. Set **Public base URL for token links** to the URL playback clients can
+   reach. Behind a reverse proxy, preserve the trusted external origin and any
+   path prefix.
+3. Apply settings, then run **Create M3U/XMLTV access token**.
+4. Copy the M3U and XMLTV URLs from the action result. Treat both URLs and the
+   token as bearer credentials; do not paste them in issue reports or logs.
 
-Both links use the same token and the selected Dispatcharr user's permissions.
-The user must have access to the relevant channel, M3U/EPG access, catch-up
-permission and an available stream/session slot. A token does not grant extra
-Dispatcharr permissions. The token is shown when created; treat the links like
-passwords and do not put real tokens into logs, screenshots, issues or source
-files. Token revocation is an administrative operation with no plugin UI
-action; creating another token does not revoke an existing one. Custom clients
-may send the token in the `X-Catchuparr-Token` header instead of a query
-parameter.
+Routes are `/catchuparr/m3u` and `/catchuparr/xmltv`. A token can be supplied as
+`X-Catchuparr-Token` or in the `access_token`/`token` query parameter. The
+associated Dispatcharr user must still be active. Playback additionally checks
+that user's channel access, catch-up permission and session limits. A token
+creation action makes a new token; there is no token-revoke button in the
+current UI.
 
-The generated playlist keeps Dispatcharr's live URLs and metadata. Selected
-channels get catch-up entries when indexed archive coverage is available. The
-XMLTV output preserves provider guide data and overlays complete local historical
-programme entries where available. Current and future guide entries remain
-available. If guide data or an indexed programme is unavailable, that archive
-programme cannot be played.
+M3U output provides live channels and adds catch-up metadata where local
+indexed segments and user permissions allow it. The plugin M3U's archived
+playback uses local HLS MPEG-TS segments. XMLTV combines the provider guide
+with complete, covered local programme history; current and future guide data
+is retained. Playback of an archived programme requires matching EPG bounds.
+M3U catch-up duration is expressed in seconds and capped at 24 hours. Seeking
+uses segment boundaries, so it is not frame-accurate.
 
-## Playback behavior
+### Native Dispatcharr M3U/XMLTV output
 
-Catchuparr serves archive playback from the same host/path used for its local
-archive service. The M3U path uses HLS with MPEG-TS segments; byte-range reads
-are available for supported routes. Native XC playback uses MPEG-TS. Catchuparr
-does not transcode streams or claim client-specific output-profile support.
+**Add Catchuparr catch-up to native output** is off by default. When enabled and
+applied, eligible native M3U channels keep their live URLs and metadata; local
+catch-up metadata is added only for selected channels with indexed archive
+segments and user catch-up permission. Native XMLTV retains current/future and
+other-channel provider history while merging complete covered local programme
+history for eligible selected channels. If Catchuparr cannot authorize or
+produce the local response, it does not replace the native provider response.
 
-Start-over and seek positions use programme boundaries and available indexed
-segments. Start-over can begin at the start of a programme that is still in
-progress; playback stops at that programme's observed EPG end, and only the
-already captured part is available. Completed programmes use the same indexed
-archive and retention checks. Segment boundaries and EPG timing mean seeks are
-not frame-accurate. Incomplete archive coverage, missing EPG data, expired
-content or missing segments can prevent playback. Live playback remains handled
-by Dispatcharr.
+### Native XC
 
-Pause and Resume in a client control that playback session. The plugin's global
-Pause/Resume actions control recording only.
+Catchuparr includes guarded native XC hooks for archive programme selection and
+segment delivery. XC request duration is interpreted in minutes. Provider
+history for other channels is retained. Native server checks do not establish
+acceptance by every XC client. Test program selection, start-over, seeking and
+programme changes in the intended client before relying on this path.
 
-### XC adapter
+## Stats and archive status
 
-The native XC adapter can add Catchuparr archive entries to the XC playlist and
-serve local TS archive playback through Dispatcharr's guarded XC integration.
-Use it when a client consumes Dispatcharr's XC interface and has been validated
-with that client's XC behavior. M3U/XMLTV is the primary documented path.
-Although native server behavior has synthetic integration coverage for both
-supported Dispatcharr versions, actual XC client behavior remains a separate
-acceptance check.
+- **Show archive playback in Stats** displays active archive viewers in native
+  Timeshift Stats. IDs are opaque and stable across seeks and session refreshes.
+  The view uses successful playback requests and a 180-second heartbeat expiry;
+  it does not prove that video is displayed or report an unobserved pause or
+  position.
+- An administrator can stop a displayed archive viewer. That action revokes
+  its local playback lease; it does not stop a live channel or recorder.
+- **Hide recorders in Stats** hides only positively identified Catchuparr
+  recorder clients from live details. It does not change provider reservations
+  or the live stream.
+- **Archive status** reports selected-channel running counts, archive storage
+  and the age of the oldest indexed footage. That age is not continuous
+  coverage or recorded duration.
 
-## Native Timeshift Stats
+## Actions
 
-Both Stats settings default to enabled and are applied with the rest of the
-configuration:
-
-- **Show archive playback in Stats** adds active Catchuparr archive viewers to
-  native Timeshift Stats. The displayed ID is opaque, generated by Catchuparr,
-  and is not a playback credential. Successful playback heartbeats refresh the
-  row; it expires after 180 seconds without one. Values the playback request
-  does not provide, such as position or pause state, remain unknown.
-- **Hide recorders in Stats** removes only positively identified Catchuparr
-  recorder clients from the returned live details. It does not change provider
-  reservations, live streams or client limits. Ordinary viewers on a shared
-  channel remain visible.
-
-The native Stop action accepts a Catchuparr display ID after Dispatcharr's
-native administrator authorization and revokes that local playback lease. It
-does not revoke the user's access token or stop other viewers.
-
-## Logging and privacy
-
-Set **Catchuparr log level** to `DEBUG`, `INFO`, `WARNING` or `ERROR`. It affects
-Catchuparr logs only. Events use fixed names and sanitized fields; access tokens,
-authenticated URLs, credentials and EPG text are not included. Avoid sharing
-raw configuration, exported databases, playback URLs, tokens or guide data when
-requesting help.
+| Action | Use |
+| --- | --- |
+| **Archive status** | Show recorder state, selected/running counts, oldest indexed footage age and storage use. |
+| **Reconcile recorders** | Queue reconciliation against the current applied configuration. |
+| **Create M3U/XMLTV access token** | Create a token for the configured existing user and return both links. |
+| **Validate configuration** | Check the complete draft and preview resolved channels, sources, priorities and schedules without applying it. |
+| **Apply configuration** | Validate and activate the full draft as one generation. |
+| **Pause recording** | Immediately pause recorder activity and fence stale queued starts. |
+| **Resume recording** | Re-enable recording according to the applied configuration and schedule. |
 
 ## Troubleshooting
 
-| Symptom | Check |
-| --- | --- |
-| No recorder starts | Confirm YAML is nonblank, **Validate** and **Apply configuration** succeeded, recording is enabled, the schedule is open and the channel selector matches. |
-| A channel is missing | Check the outer profile, enabled profile membership, exact channel/group name, number/range and overlapping rules. |
-| A source is not used | Check the exact M3U source name and that Dispatcharr already assigns it to the channel. Filtered rules may need provider capacity. |
-| Token creation fails or links are wrong | Set the Dispatcharr user ID and reachable public base URL, apply both, and check reverse proxy scheme/path forwarding. |
-| Playlist works but archive is absent | Check user catch-up permission, selected channel, retention, indexed footage, archive status, shared storage and archive path permissions. |
-| Playback returns an authorization or limit error | Check the user's active status, channel ACL, M3U/EPG and stream permissions, concurrent stream/session limits and token URL. |
-| Archive playback does not appear in Stats | Apply **Show archive playback in Stats**, start a supported archive session and allow its successful heartbeat to register. |
-| Recorders remain paused | Check **Recording enabled**, apply the settings, use **Resume recording**, then check status and worker logs for recovery errors. |
+- **No channels record:** confirm the YAML has a matching selector, validate and
+  Apply it, check recording enabled and Pause state, then review schedule and
+  source eligibility.
+- **No source can be selected:** check exact assigned source names and channel
+  assignments in Dispatcharr. Catchuparr will not create assignments.
+- **Filtered source cannot start:** a dedicated worker may need another
+  provider slot. Check Dispatcharr's account/profile capacity.
+- **Sharing stays idle:** confirm it is enabled for a selected channel and that
+  an ordinary viewer is using a healthy, compatible assigned stream. Sharing
+  never starts a source outside the allowed set.
+- **Token links fail:** check the applied public URL, user ID, active user,
+  channel permission, catch-up permission, stream limits and reverse-proxy path.
+- **History is missing:** verify local recording coverage, retention, selected
+  channels and EPG programme bounds. Incomplete coverage is not advertised as
+  a full historical programme.
+- **Native XC does not play:** validate against the actual client's programme,
+  duration and seeking behavior; native server tests alone are not player
+  acceptance.
 
-## Build from source
+## Development checks
 
-The repository build creates the same ZIP layout used by the release workflow:
-
-```sh
-python3 scripts/build_plugin.py
-```
-
-For local development, the project uses Python 3.10+ syntax and Python 3.12 in
-CI. The primary checks are:
+The repository uses synthetic media and strict native hook checks. The normal
+local gates are:
 
 ```sh
 python3 -m unittest discover -s tests -q
@@ -460,37 +347,12 @@ ruff check .
 python3 scripts/build_plugin.py
 ```
 
-## Optional native output archive (0.5.0 candidate)
+Release CI also runs pinned Dispatcharr 0.31.0 and 0.32.0 AIO integration jobs.
+For 0.6.0, native sharing must pass both versions, including ordinary-viewer
+retention, first-viewer borrowing, cooldown timing, Stop and Apply revocation,
+restart recovery, exact client cleanup, source switching, and retryable
+acknowledgements. The current candidate has not yet cleared those gates.
 
-The candidate adds local archive metadata to Dispatcharr's native M3U/XMLTV
-exports when **Add Catchuparr catch-up to native output** is enabled and applied.
-It preserves the native channel/profile output and provider catch-up fields.
-Native archive playback serves stored MPEG-TS segments; a live output profile
-does not transcode archive media. The setting defaults off. The 433-test local
-suite and full pinned native AIO probes pass; required CI, isolated Dev
-verification and player acceptance remain pending. Read the
-[candidate guide](docs/candidate-0.5.0.md) before enabling it.
-
-CI also runs synthetic integration against pinned Dispatcharr AIO images for
-0.31.0 and 0.32.0. See [development and deployment](docs/development.md) for an
-isolated development environment, upgrade and rollback guidance.
-
-## Release workflow
-
-Maintainers can start a release by pushing a `v<version>` tag or by choosing
-**Build and publish release** under GitHub Actions. The workflow reuses the
-complete CI workflow, including unit/lint/package checks and both pinned native
-integration jobs. Publishing only proceeds for a commit contained in `main`
-and when the tag, plugin manifest and built ZIP all have the same version.
-
-For a manual run, select `main`, enter the version without its `v` prefix, and
-choose whether the release should be a pre-release. A missing version tag is
-created at the exact tested commit; an existing tag is accepted only when it
-points to that same commit. Tags for suffixed versions such as `0.5.0-rc.1` are
-automatically marked as pre-releases. The workflow refuses to move or replace
-an existing tag.
-
-The GitHub release includes `catchuparr-<version>.zip`, `SHA256SUMS`, and the
-complete changelog from 0.2.0 through the release version. A pre-release is
-excluded from GitHub's latest-stable designation. The workflow validates the
-ZIP layout and checksum before publication.
+See the [changelog](CHANGELOG.md), [release roadmap](docs/roadmap.md),
+[validation record](docs/validation.md) and
+[development guide](docs/development.md).

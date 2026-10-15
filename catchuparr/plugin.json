@@ -1,7 +1,7 @@
 {
   "name": "Catchuparr",
-  "version": "0.5.1",
-  "description": "Local rolling catch-up archive and start-over for Dispatcharr",
+  "version": "0.6.0",
+  "description": "Local rolling catch-up archive, start-over and optional live connection sharing for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
   "fields": [
@@ -17,7 +17,7 @@
       "label": "Recorder connection sharing (YAML)",
       "type": "text",
       "default": "",
-      "help_text": "Optional version: 1 YAML. The default is disabled, with cooldowns of 5 seconds for a stable live target, 30 seconds after the last viewer leaves, and 60 seconds between switches. Set default.enabled and add per-channel rules using the same number/name/group/profile selectors as channel filters. Cooldowns are strict integers from 0 to 3600; zero disables only that cooldown. Sharing only applies to channels selected in Channel and source filter. Validate and Apply this together with all settings."
+      "help_text": "Optional version: 1 YAML; blank disables sharing. Enabled per selected channel only. Defaults: 5 seconds for a stable live connection, 30 seconds after its last ordinary viewer leaves, and 60 seconds between switches. Add default.enabled: true or channel rules using the filter selectors. Cooldowns are strict integers from 0 to 3600; zero disables that cooldown. Sharing reuses only a compatible existing native live connection; it never opens an excluded source. Validate and Apply with the complete settings."
     },
     {
       "id": "archive_root",

@@ -1,6 +1,6 @@
 # Catchuparr roadmap
 
-Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed with Dispatcharr 0.32.0. Version 0.5.0 implementation and user acceptance are complete; publication awaits the required release workflow. The 0.5.1 configuration-inheritance prerelease is implemented, with its full pinned AIO probes passed; CI, isolated Dev verification and publication remain pending. Production deployment is outside this roadmap. Later work is planned, not implemented.
+Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidates with publication gates recorded below. Version 0.6.0 adds optional live connection sharing; required CI and complete native acceptance on both pinned AIO versions remain pending. This roadmap does not authorize production deployment.
 
 ## Workflow and release gates
 
@@ -21,7 +21,7 @@ Baseline: 0.4.0 released; M3U/XMLTV + HLS real-player acceptance was completed w
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | User acceptance complete; final parity correction passed four focused native 0.32.0 cases; required release workflow remains pending; not yet published |
 | 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Implemented in the prerelease candidate; the 453-test suite and full pinned AIO probes passed; CI and isolated Dev verification remain pending |
-| 0.6.0 | Smart sharing of compatible live connections | High | Planned; implementation deferred until 0.5.1 acceptance is complete |
+| 0.6.0 | Optional sharing of compatible live connections | High | Candidate implementation; required CI and complete native acceptance pending; not published |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.
@@ -397,30 +397,31 @@ rules:
       sunday: []
 ```
 
-## 0.6.0 — smart connection sharing (planned)
+## 0.6.0 — optional live connection sharing (prerelease candidate)
 
-Implementation is deferred. This release is a future plan and none of the
-behavior below is available in the current release or 0.5.0 development.
+The candidate can read a compatible, already-running native worker's published
+MPEG-TS buffer through its own reader client. It does not initialize a channel,
+claim its owner, reserve provider capacity or open a source that is outside the
+applied allowed-source policy. An eligible ordinary viewer may therefore keep
+using a source outside that list while Catchuparr borrows the existing stream.
+If no compatible viewed stream exists, Catchuparr uses only allowed assigned
+sources; without one, it remains paused.
 
-- Keep the feature disabled by default. When enabled, share one upstream live
-  connection for compatible viewers of the same channel, while respecting
-  Dispatcharr's native authentication, provider limits and output profiles.
-- A source rule that requires an exception to the shared connection may use a
-  separate upstream connection while viewers are active. Release design must
-  preserve the selected source policy and return viewers to the shared route
-  when the last viewer leaves.
-- Provide three integer cooldown settings, each accepting 0 through 3600
-  seconds: live stability (default 5 seconds), last-viewer return (default 30
-  seconds), and minimum switch interval (default 60 seconds). Zero disables
-  that cooldown. Store each setting persistently per sender so it survives
-  worker restarts.
-- Coalesce repeated viewer and source events. Failure recovery and an explicit
-  control stop bypass cooldowns so failed or stopped connections are handled
-  promptly. The minimum switch interval governs native upstream switching; it
-  is not a Catchuparr plugin cooldown.
-- Validate sharing against native authorization, provider capacity, output
-  profile behavior, source-rule exceptions, last-viewer return, worker restart,
-  event bursts, failure recovery and control stop before release.
+Sharing remains disabled by default and is configured in its own version 1 YAML
+field. The applied per-channel defaults are 5 seconds of stable native live
+state, 30 seconds after the last ordinary viewer leaves and a 60-second minimum
+between successful switches. Each integer setting accepts 0 through 3600;
+zero disables only its associated cooldown. Explicit Stop, invalid authority
+and recorder failure use prompt cleanup. Normal return waits for both the
+viewer grace and remaining switch interval.
+
+The candidate adds fenced episode and operation records, one-use signed borrow
+capabilities, exact reader registration and cleanup, restart reconciliation,
+and an FFmpeg attempt switch signal. A switch must reap the previous attempt
+and acknowledge exact reader cleanup before another source can launch. The
+release is not published. Required CI and full pinned 0.31.0 and 0.32.0 AIO
+acceptance remain open; see the [0.6.0 candidate guide](candidate-0.6.0.md)
+and [validation record](validation.md).
 
 ## Deferred validation
 
