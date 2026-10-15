@@ -101,6 +101,8 @@ def _run_registration_crash_recovery_probe(
         diagnostic = {}
         try:
             from catchuparr.adapters.sharing_native import (
+                _private_client,
+                _text,
                 observe_native_connection,
                 read_native_episode_grant,
             )
@@ -122,6 +124,94 @@ def _run_registration_crash_recovery_probe(
             setting = active.get("connection_sharing", {}).get(channel_uuid, {})
             current_generation = configuration_generation(active)
             live_episode = read_native_episode_grant(redis_client, channel_uuid)
+            native_observer = {}
+            owner_key = f"live:channel:{channel_uuid}:owner"
+            metadata_key = f"live:channel:{channel_uuid}:metadata"
+            owner_raw = redis_client.get(owner_key)
+            metadata_raw = redis_client.hgetall(metadata_key) or {}
+            metadata = {_text(key): _text(value) for key, value in metadata_raw.items()}
+            owner = _text(owner_raw) if owner_raw else ""
+            heartbeat_key = f"live:worker:{owner}:heartbeat"
+            source_matches = [
+                source for source in current_sources
+                if source.channel_uuid == channel_uuid
+                and source.stream_id == metadata.get("stream_id")
+                and source.m3u_profile_id == metadata.get("m3u_profile")
+                and source.input_profile_id == metadata.get("stream_profile")
+                and source.assigned
+            ]
+            buffer_index_key = f"live:channel:{channel_uuid}:input:buffer:index"
+            head_raw = redis_client.get(buffer_index_key)
+            buffer_head = int(_text(head_raw)) if head_raw is not None else 0
+            newest_chunks = redis_client.zrevrange(
+                f"live:channel:{channel_uuid}:input:buffer:chunk_timestamps", 0, 0,
+            )
+            newest_chunk = int(_text(newest_chunks[0])) if newest_chunks else 0
+            clients_key = f"live:channel:{channel_uuid}:clients"
+            native_client_ids = [_text(item) for item in redis_client.smembers(clients_key)]
+            ordinary_client_ids = []
+            unknown_client_classifications = 0
+            for client_id in native_client_ids:
+                classification = _private_client(redis_client, channel_uuid, client_id)
+                if classification is None:
+                    unknown_client_classifications += 1
+                    continue
+                if classification:
+                    continue
+                record = redis_client.hgetall(
+                    f"live:channel:{channel_uuid}:clients:{client_id}",
+                ) or {}
+                fields = {_text(key): _text(value) for key, value in record.items()}
+                if (
+                    fields.get("worker_id")
+                    and fields.get("connected_at")
+                    and not redis_client.exists(
+                        f"live:channel:{channel_uuid}:client:{client_id}:stop",
+                    )
+                ):
+                    ordinary_client_ids.append(client_id)
+            source = source_matches[0] if len(source_matches) == 1 else None
+            native_observer = {
+                "owner_present": bool(owner),
+                "metadata_present": bool(metadata),
+                "metadata_owner_matches_lock": metadata.get("owner") == owner and bool(owner),
+                "metadata_state_allowed": metadata.get("state", "").lower()
+                in {"active", "waiting_for_clients"},
+                "metadata_channel_matches": metadata.get("channel_uuid") == channel_uuid,
+                "owner_ttl_positive": int(redis_client.ttl(owner_key)) > 0,
+                "channel_not_stopping": not bool(
+                    redis_client.exists(f"live:channel:{channel_uuid}:stopping"),
+                ),
+                "worker_heartbeat_positive": bool(
+                    redis_client.exists(heartbeat_key)
+                    and int(redis_client.ttl(heartbeat_key)) > 0
+                ),
+                "metadata_stream_present": bool(metadata.get("stream_id")),
+                "metadata_m3u_profile_present": bool(metadata.get("m3u_profile")),
+                "metadata_input_profile_present": bool(metadata.get("stream_profile")),
+                "assigned_metadata_match_count": len(source_matches),
+                "matched_source_eligible": bool(
+                    source
+                    and source.account_active
+                    and source.profile_active
+                    and source.media_compatible
+                    and source.supported_worker_kind
+                    and not source.redirect_channel
+                    and not source.vod_or_preview
+                ),
+                "buffer_head_positive": buffer_head > 0,
+                "buffer_timestamp_present": bool(newest_chunks),
+                "buffer_chunk_in_range": 0 < newest_chunk <= buffer_head,
+                "buffer_chunk_present": bool(
+                    newest_chunk > 0
+                    and redis_client.exists(
+                        f"live:channel:{channel_uuid}:input:buffer:chunk:{newest_chunk}",
+                    )
+                ),
+                "native_client_count": len(native_client_ids),
+                "unknown_private_marker_classifications": unknown_client_classifications,
+                "ordinary_clients_with_valid_records": len(ordinary_client_ids),
+            }
             diagnostic = {
                 "active_sharing_enabled": setting.get("enabled") is True,
                 "control_paused": bool(control.paused),
@@ -146,6 +236,7 @@ def _run_registration_crash_recovery_probe(
                     target and target.eligible_for_new_borrow(channel_uuid)
                 ),
                 "ordinary_viewer_count": len(target.ordinary_client_ids) if target else 0,
+                "native_observer_guards": native_observer,
                 "source_catalog_row_count": len(current_sources),
                 "intent_action": latest.intent.action.value if latest and latest.intent else None,
                 "sharing_phase": state.phase.value if state else None,
