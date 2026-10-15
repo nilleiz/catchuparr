@@ -3671,8 +3671,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             )
             return True
 
-        source_server.request_start_callback = verify_first_b_effect
-        source_server.request_callback_finished.clear()
+        with source_server._counts_lock:
+            source_server.request_callback_finished.clear()
+            source_server.request_start_callback = verify_first_b_effect
         b_request_deadline = time.monotonic() + 150
         b_request_times = source_server.request_times("source-b.ts")
         while len(b_request_times) <= share_b_request_baseline:
