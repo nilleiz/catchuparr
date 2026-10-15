@@ -2520,6 +2520,8 @@ def _probe_running_recorder_controls(
 
 def probe_actual_live_archive_isolation(root: Path) -> None:
     """Keep native live A active while real recorder tasks first share A, then isolate B."""
+    from unittest.mock import patch
+
     from aio_recorder_failover import (
         _assert_worker_cleanup,
         _DjangoHTTPBridge,
@@ -2553,6 +2555,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     from gevent import sleep as gevent_sleep
 
     from catchuparr import runtime as catchuparr_runtime
+    from catchuparr import tasks as catchuparr_tasks
     from catchuparr.adapters.recorder_proxy import _release_worker_reservation
     from catchuparr.configuration import (
         active_settings_path,
@@ -3728,8 +3731,172 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             == profile_baselines[profile_b.id] + 1,
             "Borrow return did not release A and reserve only the allowed B profile",
         )
-        run_share.stop()
-        run_share.join(cooperative_sleep=gevent_sleep)
+        # Re-open an ordinary A viewer after the first successful return. The
+        # recorder should borrow A a second time, then explicit Pause must
+        # remove only its reader while leaving the ordinary viewer untouched.
+        second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
+        live_response = client.get(
+            f"/proxy/ts/stream/{channel.uuid}",
+            HTTP_HOST="localhost",
+            HTTP_USER_AGENT="Synthetic second-cycle ordinary viewer",
+        )
+        _require(live_response.status_code == 200,
+                 "Second-cycle ordinary A viewer could not open")
+        live_session, live_reader = _create_native_live_reader_session(
+            live_response, native_server, worker_id,
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+        )
+        _require(
+            source_server.snapshot()[0]["source-a.ts"] == second_cycle_a_baseline + 1,
+            "Second-cycle viewer did not open exactly one native A connection",
+        )
+        second_borrow_headers = None
+        second_cycle_deadline = time.monotonic() + 90
+        while time.monotonic() < second_cycle_deadline:
+            with run_share._lock:
+                borrow_headers_seen = [
+                    dict(headers) for headers in run_share.input_headers
+                    if "X-Catchuparr-Borrow" in headers
+                ]
+            if len(borrow_headers_seen) >= 2:
+                second_borrow_headers = borrow_headers_seen[1]
+                break
+            if run_share.failures:
+                raise RuntimeError("Second sharing cycle failed before native borrow")
+            gevent_sleep(0.1)
+        _require(second_borrow_headers is not None,
+                 "Recorder did not borrow the second compatible A viewer")
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2, timeout=20,
+        )
+        from catchuparr.adapters.sharing_borrow_route import decode_borrow_capability
+
+        second_capability = decode_borrow_capability(
+            second_borrow_headers["X-Catchuparr-Borrow"],
+        )
+        second_borrow_client_id = f"catchuparr-client-{second_capability.nonce}"
+        _require(
+            second_borrow_client_id != borrow_client_id
+            and catchuparr_stats._is_recorder_client(worker_id, second_borrow_client_id),
+            "Second borrow did not create a distinct verified recorder reader",
+        )
+        second_native_manager = native_server.stream_managers.get(worker_id)
+        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
+        second_source_counts, second_active_counts = source_server.snapshot()
+        _require(
+            second_native_manager is not None and second_native_manager.running
+            and second_native_owner is not None
+            and second_source_counts["source-a.ts"] == second_cycle_a_baseline + 1
+            and second_active_counts["source-a.ts"] == 1
+            and second_active_counts["source-b.ts"] == 0,
+            "Second borrow opened an extra provider source instead of reading A",
+        )
+        second_borrowed_ids = {
+            segment.id for segment in store.segments(worker_id)
+        }
+        second_borrowed_segments = _wait_for_indexed_tone(
+            run_share, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=second_borrowed_ids,
+            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(second_borrowed_segments),
+                 "Second native borrow did not archive fresh A media")
+        from catchuparr import sharing_runtime as sharing_runtime_module
+        from catchuparr.adapters import sharing_borrow_route
+
+        real_borrow_cleanup = sharing_borrow_route.cleanup_borrowed_client
+        cleanup_attempts = []
+
+        def fail_first_borrow_cleanup(*args, **kwargs):
+            if not cleanup_attempts:
+                cleanup_attempts.append(False)
+                return False
+            result = real_borrow_cleanup(*args, **kwargs)
+            cleanup_attempts.append(result)
+            return result
+
+        # Force one exact native cleanup ACK loss on the Stop path. The
+        # durable session retry must remove only the recorder reader and leave
+        # the ordinary viewer connected.
+        with patch.object(
+            sharing_borrow_route,
+            "cleanup_borrowed_client",
+            side_effect=fail_first_borrow_cleanup,
+        ), patch.object(catchuparr_tasks.reconcile_recorders, "apply_async"):
+            second_pause_result = catchuparr_runtime.pause_recorders()
+            _require(
+                second_pause_result.get("paused") is True,
+                "Pause did not persist during the second borrowed cycle",
+            )
+            run_share.join_after_supervisor(timeout=25, cooperative_sleep=gevent_sleep)
+            _require(
+                run_share.result == {"status": "stopped"},
+                "Pause did not stop the second borrowed recorder attempt",
+            )
+            _require(
+                cleanup_attempts == [False],
+                "The synthetic borrowed cleanup did not lose exactly its first ACK",
+            )
+            borrow_client_key = (
+                f"live:channel:{worker_id}:clients:{second_borrow_client_id}"
+            )
+            _require(
+                redis_client.exists(borrow_client_key)
+                and redis_client.sismember(
+                    RedisKeys.clients(worker_id), second_borrow_client_id,
+                ),
+                "The failed first cleanup ACK did not retain its exact registration for retry",
+            )
+            completed_retry, pending_retry = (
+                sharing_runtime_module.retry_pending_open_cleanups()
+            )
+            _require(
+                completed_retry >= 1
+                and cleanup_attempts == [False, True],
+                "A retained borrowed cleanup did not succeed on its explicit retry ACK",
+            )
+        _require(
+            run_share.result == {"status": "stopped"},
+            "Borrowing recorder restarted after Stop before viewer cleanup",
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1, timeout=15,
+        )
+        second_borrow_client_key = (
+            f"live:channel:{worker_id}:clients:{second_borrow_client_id}"
+        )
+        _require(
+            not redis_client.exists(second_borrow_client_key)
+            and not redis_client.sismember(RedisKeys.clients(worker_id), second_borrow_client_id)
+            and redis_client.hget(
+                f"catchuparr:sharing:private:{worker_id}", second_borrow_client_id,
+            ) is None,
+            "Pause left the second borrowed reader registered",
+        )
+        paused_source_counts, paused_active_counts = source_server.snapshot()
+        _require(
+            native_server.stream_managers.get(worker_id) is second_native_manager
+            and second_native_manager.running
+            and redis_client.get(RedisKeys.channel_owner(worker_id)) == second_native_owner
+            and _native_source_metadata(redis_client, metadata_key) == second_source_metadata
+            and paused_source_counts["source-a.ts"] == second_source_counts["source-a.ts"]
+            and paused_active_counts["source-a.ts"] == 1
+            and paused_active_counts["source-b.ts"] == 0
+            and _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id],
+            "Pause changed the ordinary A viewer, its native owner, or provider reservations",
+        )
+
+        if live_session is not None:
+            live_session.close()
+            live_response = None
+            live_reader = None
+            live_session = None
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if (
