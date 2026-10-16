@@ -100,7 +100,7 @@ class ViewBoundaryTests(unittest.TestCase):
         tail.append(SimpleNamespace(end_utc=datetime.fromtimestamp(1000, timezone.utc)))
         self.assertFalse(_archive_window_live(service, "viewer", "news", 1000, 1010))
         tail.clear()
-        self.assertFalse(_archive_window_live(service, "viewer", "news", 1000, 1120))
+        self.assertFalse(_archive_window_live(service, "viewer", "news", 1000, 1126))
 
     def test_future_window_stays_live_only_while_indexed_edge_is_fresh(self):
         now = datetime.now(timezone.utc).timestamp()
@@ -118,6 +118,32 @@ class ViewBoundaryTests(unittest.TestCase):
         self.assertFalse(_archive_window_live(
             service, "viewer", "news", now + 3600, now
         ))
+
+    def test_active_recorder_lease_keeps_future_hls_window_open(self):
+        import sys
+
+        now = datetime.now(timezone.utc).timestamp()
+        service = SimpleNamespace(
+            authorize_user_channel=lambda *_: True,
+            catchup_enabled=lambda *_: True,
+            store=SimpleNamespace(segments=lambda *_: []),
+        )
+        core_module = types.ModuleType("core")
+        core_module.__path__ = []
+        core_utils = types.ModuleType("core.utils")
+        core_utils.RedisClient = SimpleNamespace(
+            get_client=lambda: object(),
+        )
+        with (
+            patch.dict(sys.modules, {"core": core_module, "core.utils": core_utils}),
+            patch("catchuparr.engine.leases.recorder_lease_active", return_value=True),
+        ):
+            self.assertTrue(_archive_window_live(
+                service, "viewer", "news", now + 3600, now,
+            ))
+            self.assertFalse(_archive_window_live(
+                service, "viewer", "news", now - 130, now,
+            ))
 
     def test_shifted_tivimate_windows_are_bounded_across_epg_programmes(self):
         programme_start = datetime(2026, 10, 7, 15, 15, tzinfo=timezone.utc)

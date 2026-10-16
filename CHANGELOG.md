@@ -12,8 +12,10 @@ included here to explain the feature history leading to 0.4.0.
   requiring later EPG entries. M3U/XMLTV HLS playlists follow newly indexed
   segments up to a 24-hour session bound; XC streams follow contiguous indexed
   segments within Dispatcharr's duration limit.
-- Keep XC live-edge waiting finite. A real archive gap ends the raw TS stream,
-  and a stopped recorder ends follow mode after its bounded idle wait.
+- Keep live-edge waiting finite and recorder-aware. XC waits at most 125 seconds
+  (the recorder's 120-second media-idle timeout plus five seconds for indexing
+  and finalization), stops at a real archive gap, and ends promptly when its
+  recorder lease is absent. HLS uses the same edge freshness window.
 
 ### Notes
 

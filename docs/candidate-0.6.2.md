@@ -5,8 +5,11 @@ programme boundaries without requiring each later EPG row. Playback remains
 bounded: M3U/XMLTV sessions cover at most 24 hours from the requested start;
 XC follows contiguous indexed transport-stream segments within Dispatcharr's
 duration limit. An XC stream stops at an indexed gap and waits no longer than
-10 seconds for a next segment at the live edge. HLS finishes when the archive
-edge is stale for 120 seconds or its 24-hour bound is reached.
+125 seconds for a next segment at the live edge. The bound covers the
+recorder's 120-second media-idle timeout and five seconds for indexing and
+finalization; a missing recorder lease closes follow mode promptly. HLS uses
+the same 125-second edge window and recorder lease, with its 24-hour session
+bound.
 
 Focused synthetic tests cover multiple programme boundaries, appending new
 segments during playback, seek behavior, missing EPG metadata, cleanup on

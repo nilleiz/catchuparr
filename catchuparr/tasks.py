@@ -152,7 +152,10 @@ def record_channel(
     from .adapters.recorder_proxy import core_api_supported, install_proxyserver_cleanup_hook
     from .configuration import reset_legacy_configuration
     from .engine.leases import RedisRecorderLease
-    from .engine.recorder import FFmpegCopyRecorder
+    from .engine.recorder import (
+        DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
+        FFmpegCopyRecorder,
+    )
     from .engine.store import ArchiveStore
     from .logging_utils import error, event
     from .recorder_proxy import (
@@ -423,7 +426,8 @@ def record_channel(
                 borrow_outcome = "failure"
                 try:
                     borrow_result = recorder.run_candidate(
-                        stop_event, startup_timeout=60, media_idle_timeout=120,
+                        stop_event, startup_timeout=60,
+                        media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
                     )
                 except Exception:
                     error("borrowed_recorder_worker_stopped")
@@ -585,7 +589,7 @@ def record_channel(
                                 result = recorder.run_candidate(
                                     stop_event,
                                     startup_timeout=60,
-                                    media_idle_timeout=120,
+                                    media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
                                     **({"attempt_switch": attempt_switch}
                                        if attempt_switch is not None else {}),
                                     **({"on_first_media": first_media_callback}
