@@ -127,6 +127,67 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         for private_value in ("synthetic.invalid", "password", "private-token", "secret-token"):
             self.assertNotIn(private_value, serialized)
 
+    def test_recorder_task_exit_diagnostic_is_allowlisted(self):
+        class FakeProcess:
+            @staticmethod
+            def poll():
+                return 7
+
+        class FakeThread:
+            @staticmethod
+            def is_alive():
+                return False
+
+        run = SimpleNamespace(
+            results=[SimpleNamespace(
+                status="no_media", useful_segments=0,
+                input_url="http://user:password@synthetic.invalid/private-token",
+            )],
+            failures=["task:BorrowBindingLost", "Bearer private-token"],
+            processes=[FakeProcess()],
+            result={"status": "sharing_cleanup_pending", "token": "private-token"},
+            thread=FakeThread(),
+            stop_event=threading.Event(),
+            expected_generation="synthetic-generation",
+            expected_control_generation=3,
+        )
+
+        diagnostic = probe._recorder_task_exit_diagnostic(run)
+        serialized = json.dumps(diagnostic)
+        self.assertEqual(diagnostic["task_status"], "sharing_cleanup_pending")
+        self.assertEqual(diagnostic["failure_classes"], ["BorrowBindingLost", "other"])
+        self.assertEqual(diagnostic["attempts"], [
+            {"status": "no_media", "useful_segments": 0},
+        ])
+        self.assertEqual(diagnostic["process_exit_codes"], [7])
+        for private_value in ("synthetic.invalid", "password", "private-token", "synthetic-generation"):
+            self.assertNotIn(private_value, serialized)
+
+    def test_early_task_exit_emits_diagnostic_and_keeps_original_error(self):
+        run = SimpleNamespace(
+            thread=SimpleNamespace(is_alive=lambda: False),
+            result={"status": "stale_configuration"},
+            failures=["task:RecorderControlError"],
+            results=[],
+            processes=[],
+            stop_event=threading.Event(),
+            expected_generation="synthetic-generation",
+            expected_control_generation=2,
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaisesRegex(RuntimeError, "^Recorder task ended before media was indexed$"):
+                probe._wait_for_source_segments(
+                    run, object(), "synthetic-channel", "ffmpeg", "ffprobe",
+                    "Synthetic Source B", minimum=1, timeout=1,
+                )
+        line = stderr.getvalue().strip()
+        self.assertTrue(line.startswith(probe.RECORDER_EXIT_DIAGNOSTIC_PREFIX))
+        diagnostic = json.loads(line[len(probe.RECORDER_EXIT_DIAGNOSTIC_PREFIX):])
+        self.assertEqual(diagnostic["task_status"], "stale_configuration")
+        self.assertEqual(diagnostic["failure_classes"], ["RecorderControlError"])
+        self.assertNotIn("synthetic-generation", line)
+
     def test_native_failure_observations_are_categories_without_native_values(self):
         worker_a = "catchuparr-r" + "a" * 40
 
