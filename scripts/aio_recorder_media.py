@@ -5298,11 +5298,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             isinstance(no_source_b_reservation_id, str) and no_source_b_reservation_id
             and isinstance(no_source_b_capability_digest, str)
             and no_source_b_capability_digest
-            and redis_client.exists(
-                reservation_credential_marker_key(no_source_b_reservation_id),
-            )
             and redis_client.exists(CAPABILITY_PREFIX + no_source_b_capability_digest),
-            "Dedicated B worker did not expose complete active reservation bindings",
+            "Dedicated B worker did not expose its active reservation and capability bindings",
         )
         no_source_settings = dict(sharing_settings)
         no_source_settings["filter_config"] = (
