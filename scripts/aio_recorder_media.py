@@ -86,6 +86,25 @@ def _native_teardown_ready_conditions(
     }
 
 
+def _wait_for_native_teardown_after_pause(
+    pause_conditions: dict[str, bool],
+    wait_for_native_teardown,
+    read_final_conditions,
+):
+    """Wait only after CLOSED/PAUSED proof, then read final gate conditions."""
+    required = {
+        "episode_closed", "borrow_hash_absent", "borrow_membership_absent",
+        "borrow_marker_absent", "ledger_paused", "grace_deadline_elapsed",
+        "task_completed_cleanly",
+    }
+    _require(
+        set(pause_conditions) == required and all(pause_conditions.values()),
+        "Borrow cleanup did not settle the no-source task in PAUSED after native grace",
+    )
+    wait_for_native_teardown()
+    return read_final_conditions()
+
+
 def _wait_for_readiness_snapshot(
     snapshot_reader,
     timeout_seconds: float,
@@ -4322,11 +4341,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             shutdown_bound = _native_teardown_readiness_timeout(
                 float(ConfigHelper.channel_shutdown_delay()),
                 float(ConfigHelper.cleanup_check_interval()),
-                # StreamManager's native failure cleanup also publishes the
-                # channel_stopping marker for 60 seconds. Cover that exact
-                # source-defined phase as well as the normal 30-second owner
-                # release marker; do not infer completion from provider count.
-                stopping_marker_ttl=60,
+                # Conservatively allow both source-defined stop-marker phases:
+                # 60 seconds from StreamManager failure and 30 seconds from
+                # normal owner release, plus the configured disconnect/cleanup
+                # phases below. Do not infer completion from provider count.
+                stopping_marker_ttl=90,
             )
 
             def snapshot():
@@ -4649,51 +4668,63 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             ):
                 break
             gevent_sleep(0.1)
-        _require(
-            no_source_projection_phase == "closed"
-            and not redis_client.exists(no_source_client_key)
-            and not redis_client.sismember(
+        pause_preconditions = {
+            "episode_closed": no_source_projection_phase == "closed",
+            "borrow_hash_absent": not redis_client.exists(no_source_client_key),
+            "borrow_membership_absent": not redis_client.sismember(
                 RedisKeys.clients(worker_id), no_source_client_id,
-            )
-            and redis_client.hget(
+            ),
+            "borrow_marker_absent": redis_client.hget(
                 f"catchuparr:sharing:private:{worker_id}", no_source_client_id,
-            ) is None
-            and no_source_record is not None
-            and no_source_record.state.phase.value == "paused"
-            and time.time() >= no_source_return_deadline
-            and not run_no_source.failures,
-            "Borrow cleanup did not settle the no-source task in PAUSED after native grace",
-        )
+            ) is None,
+            "ledger_paused": (
+                no_source_record is not None
+                and no_source_record.state.phase.value == "paused"
+            ),
+            "grace_deadline_elapsed": time.time() >= no_source_return_deadline,
+            "task_completed_cleanly": not run_no_source.failures,
+        }
         # PAUSED is acknowledged before Dispatcharr finishes its asynchronous
         # last-owner/profile teardown. Use the same A-scoped readiness contract
         # as the return and reopen boundaries; B remains independently checked
         # by the exact zero-request/profile assertions below.
-        wait_for_native_a_teardown(no_source_client_id)
-        final_no_source_counts, final_no_source_active = source_server.snapshot()
+        def read_final_no_source_conditions():
+            final_counts, final_active = source_server.snapshot()
+            pause_conditions = {
+                "source_b_request_count_unchanged": (
+                    len(source_server.request_times("source-b.ts")) == no_source_b_requests
+                ),
+                "source_a_active_zero": final_active["source-a.ts"] == 0,
+                "source_a_request_count_unchanged": (
+                    final_counts["source-a.ts"] == no_source_counts["source-a.ts"]
+                ),
+                "native_global_clients_zero": (
+                    int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+                ),
+                "native_owner_absent": redis_client.get(
+                    RedisKeys.channel_owner(worker_id),
+                ) is None,
+                "profile_a_at_baseline": (
+                    _profile_count(redis_client, profile_a.id, profile_connections_key)
+                    == profile_baselines[profile_a.id]
+                ),
+                "profile_b_at_baseline": (
+                    _profile_count(redis_client, profile_b.id, profile_connections_key)
+                    == profile_baselines[profile_b.id]
+                ),
+            }
+            return final_counts, final_active, pause_conditions
+
+        (
+            final_no_source_counts,
+            final_no_source_active,
+            no_source_pause_conditions,
+        ) = _wait_for_native_teardown_after_pause(
+            pause_preconditions,
+            lambda: wait_for_native_a_teardown(no_source_client_id),
+            read_final_no_source_conditions,
+        )
         disconnect_key = RedisKeys.last_client_disconnect(worker_id)
-        no_source_pause_conditions = {
-            "source_b_request_count_unchanged": (
-                len(source_server.request_times("source-b.ts")) == no_source_b_requests
-            ),
-            "source_a_active_zero": final_no_source_active["source-a.ts"] == 0,
-            "source_a_request_count_unchanged": (
-                final_no_source_counts["source-a.ts"] == no_source_counts["source-a.ts"]
-            ),
-            "native_global_clients_zero": (
-                int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
-            ),
-            "native_owner_absent": redis_client.get(
-                RedisKeys.channel_owner(worker_id),
-            ) is None,
-            "profile_a_at_baseline": (
-                _profile_count(redis_client, profile_a.id, profile_connections_key)
-                == profile_baselines[profile_a.id]
-            ),
-            "profile_b_at_baseline": (
-                _profile_count(redis_client, profile_b.id, profile_connections_key)
-                == profile_baselines[profile_b.id]
-            ),
-        }
 
         def no_source_pause_diagnostic():
             from apps.proxy.live_proxy.config_helper import ConfigHelper
