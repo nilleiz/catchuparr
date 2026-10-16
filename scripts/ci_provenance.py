@@ -148,6 +148,7 @@ def validate_provenance(
     repository: str,
     workflow_id: int,
     run: dict,
+    tested_commit: dict,
     source_tree: str,
     expected_inventory: dict[str, str],
     archive_name: str,
@@ -170,7 +171,39 @@ def validate_provenance(
 
     run_id = run.get("id")
     attempt = run.get("run_attempt")
-    source_sha = str(run.get("head_sha", "")).lower()
+    source_sha = str(provenance.get("source_sha", "")).lower()
+    pull_requests = run.get("pull_requests")
+    pr = pull_requests[0] if isinstance(pull_requests, list) and len(pull_requests) == 1 else None
+    head = pr.get("head") if isinstance(pr, dict) else None
+    base = pr.get("base") if isinstance(pr, dict) else None
+    head = head if isinstance(head, dict) else {}
+    base = base if isinstance(base, dict) else {}
+    head_repo = head.get("repo")
+    base_repo = base.get("repo")
+    head_repo = head_repo if isinstance(head_repo, dict) else {}
+    base_repo = base_repo if isinstance(base_repo, dict) else {}
+    parents = tested_commit.get("parents") if isinstance(tested_commit, dict) else None
+    tested_tree = tested_commit.get("tree") if isinstance(tested_commit, dict) else None
+    tested_tree_sha = tested_tree.get("sha") if isinstance(tested_tree, dict) else None
+    pr_number = pr.get("number") if isinstance(pr, dict) else None
+    valid_merge = (
+        isinstance(tested_commit, dict)
+        and isinstance(tested_commit.get("sha"), str)
+        and tested_commit["sha"].lower() == source_sha
+        and isinstance(parents, list) and len(parents) == 2
+        and all(isinstance(item, dict) and isinstance(item.get("sha"), str) for item in parents)
+        and {item["sha"].lower() for item in parents}
+        == {str(head.get("sha", "")).lower(), str(base.get("sha", "")).lower()}
+        and len({str(head.get("sha", "")).lower(), str(base.get("sha", "")).lower()}) == 2
+        and isinstance(tested_tree_sha, str) and tested_tree_sha.lower() == source_tree.lower()
+        and type(pr_number) is int and pr_number > 0
+        and isinstance(run.get("head_sha"), str)
+        and run["head_sha"].lower() == str(head.get("sha", "")).lower()
+        and isinstance(head_repo.get("full_name"), str)
+        and head_repo["full_name"].casefold() == repository.casefold()
+        and isinstance(base_repo.get("full_name"), str)
+        and base_repo["full_name"].casefold() == repository.casefold()
+    )
     ref_prefix = f"{repository}/{WORKFLOW_PATH}@refs/pull/"
     if (
         not isinstance(provenance.get("repository"), str)
@@ -179,12 +212,12 @@ def validate_provenance(
         or provenance.get("workflow_path") != WORKFLOW_PATH
         or not isinstance(provenance.get("workflow_ref"), str)
         or not provenance["workflow_ref"].startswith(ref_prefix)
-        or not provenance["workflow_ref"].endswith("/merge")
+        or provenance["workflow_ref"] != f"{repository}/{WORKFLOW_PATH}@refs/pull/{pr_number}/merge"
         or type(provenance.get("run_id")) is not int
         or provenance["run_id"] != run_id
         or type(provenance.get("run_attempt")) is not int
         or provenance["run_attempt"] != attempt
-        or provenance.get("source_sha") != source_sha
+        or not valid_merge
         or provenance.get("source_tree") != source_tree
         or provenance.get("artifact_name") != ARTIFACT_NAME
         or provenance.get("archive_name") != archive_name
@@ -294,13 +327,13 @@ class GitHubAPI:
         return data
 
 
-def _run_tree(api: GitHubAPI, sha: str) -> str:
+def _run_commit(api: GitHubAPI, sha: str) -> dict:
     commit = api.get_json(f"git/commits/{urllib.parse.quote(sha, safe='')}")
     tree = commit.get("tree")
     value = tree.get("sha") if isinstance(tree, dict) else None
-    if commit.get("sha", "").lower() != sha.lower() or not isinstance(value, str):
+    if not isinstance(commit.get("sha"), str) or commit["sha"].lower() != sha.lower() or not isinstance(value, str):
         raise ProvenanceError("GitHub commit identity did not verify")
-    return value.lower()
+    return commit
 
 
 def _artifact_contents(artifact_zip: bytes, archive_name: str) -> tuple[dict, bytes]:
@@ -391,9 +424,6 @@ def reuse_ci_artifact(package_root: Path, output_dir: Path, repository: str, tok
         for run in runs:
             if not _trusted_run(run, repository, workflow_id):
                 continue
-            tree = _run_tree(api, run["head_sha"])
-            if tree != release_tree:
-                continue
             jobs_data = api.get_json(f"actions/runs/{run['id']}/jobs?per_page=100")
             run["jobs"] = jobs_data.get("jobs")
             if not _trusted_run(run, repository, workflow_id):
@@ -408,9 +438,14 @@ def reuse_ci_artifact(package_root: Path, output_dir: Path, repository: str, tok
                 continue
             data_zip = api.get_bytes(f"actions/artifacts/{artifact['id']}/zip")
             provenance, package_bytes = _artifact_contents(data_zip, archive_name)
+            tested_commit = _run_commit(api, str(provenance.get("source_sha", "")))
+            tree_obj = tested_commit.get("tree")
+            tree = tree_obj.get("sha", "").lower() if isinstance(tree_obj, dict) else ""
+            if tree != release_tree:
+                continue
             validate_provenance(
                 provenance, repository=repository, workflow_id=workflow_id,
-                run=run, source_tree=tree, expected_inventory=source_inventory,
+                run=run, tested_commit=tested_commit, source_tree=tree, expected_inventory=source_inventory,
                 archive_name=archive_name, archive_bytes=package_bytes,
             )
             _compare_archive_to_source(package_bytes, package_root, source_inventory)

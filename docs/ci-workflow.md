@@ -18,10 +18,14 @@ from the release commit SHA; their tree identities must match. The
 `test-and-package` and `AIO integration (0.32.0)` jobs must both have succeeded.
 
 Before release publication, the workflow downloads that run's CI artifact and
-checks its run identity, attempt, source commit and tree, artifact checksum,
-package file inventory, and every packaged file byte against the release
-checkout. Existing version, changelog, main-branch, tag, and release checks
-remain in force.
+checks its run identity and attempt. For a pull-request run, the artifact's
+tested synthetic merge commit must have exactly the base and head commits
+recorded for that run as its parents. The workflow then compares that tested
+commit's tree with the release checkout. This also permits a squash merge when
+the resulting release tree is identical. The workflow checks the artifact
+checksum, package file inventory, and every packaged file byte against the
+release checkout. Existing version, changelog, main-branch, tag, and release
+checks remain in force.
 
 Missing, expired, failed, mismatched, or incomplete evidence stops publication
 with an instruction to rerun the complete pull-request CI workflow explicitly
