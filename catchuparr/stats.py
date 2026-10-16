@@ -366,13 +366,202 @@ def refresh_recorder_markers(redis: Any, capability_digest: str) -> None:
         logger.debug("Unable to refresh verified recorder Stats markers", exc_info=True)
 
 
+_BORROWED_RECORDER_STATS_CURRENT_LUA = """
+local function kind(key)
+  return redis.call('TYPE', key).ok
+end
+local channel = ARGV[1]
+local client = ARGV[2]
+local expected_lease_digest = ARGV[3]
+local function nonempty(value)
+  return type(value) == 'string' and value ~= ''
+end
+local function finite_number(raw)
+  if not nonempty(raw) then return nil end
+  local value = tonumber(raw)
+  if not value or value ~= value or value == math.huge or value == -math.huge then
+    return nil
+  end
+  return value
+end
+local function bounded_integer(raw, minimum, maximum)
+  local value = finite_number(raw)
+  if not value or value % 1 ~= 0 or value < minimum or value > maximum then
+    return nil
+  end
+  return value
+end
+local allowed = {
+  {'hash'}, {'hash'}, {'string'}, {'string'}, {'string'}, {'hash'},
+  {'none', 'string'}, {'hash'}, {'set'}, {'hash'}, {'none', 'string'}
+}
+for i = 1, #allowed do
+  local actual = kind(KEYS[i])
+  local valid = false
+  for _, expected in ipairs(allowed[i]) do
+    if actual == expected then valid = true end
+  end
+  if not valid then return 0 end
+end
+if redis.call('TTL', KEYS[1]) <= 0 or redis.call('TTL', KEYS[3]) <= 0
+   or redis.call('TTL', KEYS[4]) <= 0 or redis.call('TTL', KEYS[5]) <= 0
+   or redis.call('TTL', KEYS[8]) <= 0 or redis.call('TTL', KEYS[9]) <= 0
+   or redis.call('TTL', KEYS[10]) <= 0 then return 0 end
+local phase = redis.call('HGET', KEYS[1], 'phase')
+local connected_at = finite_number(redis.call('HGET', KEYS[1], 'connected_at'))
+local episode_id = redis.call('HGET', KEYS[1], 'episode_id')
+local worker_id = redis.call('HGET', KEYS[1], 'worker_id')
+local client_worker_id = redis.call('HGET', KEYS[1], 'client_worker_id')
+local version = bounded_integer(redis.call('HGET', KEYS[1], 'version'), 2, 9007199254740991)
+local stream_id = redis.call('HGET', KEYS[1], 'stream_id')
+local account_id = redis.call('HGET', KEYS[1], 'account_id')
+local m3u_profile = redis.call('HGET', KEYS[1], 'm3u_profile_id')
+local input_profile = redis.call('HGET', KEYS[1], 'input_profile_id')
+local configuration = redis.call('HGET', KEYS[1], 'configuration_generation')
+local control_raw = redis.call('HGET', KEYS[1], 'control_generation')
+local control = bounded_integer(control_raw, 0, 9007199254740991)
+local catalog = redis.call('HGET', KEYS[1], 'catalog_generation')
+local fence = bounded_integer(redis.call('HGET', KEYS[1], 'recorder_fence'), 0, 9007199254740991)
+local intent_epoch = bounded_integer(redis.call('HGET', KEYS[1], 'intent_epoch'), 0, 9007199254740991)
+local return_seconds = bounded_integer(redis.call('HGET', KEYS[1], 'return_seconds'), 0, 3600)
+local minimum_switch = bounded_integer(redis.call('HGET', KEYS[1], 'minimum_switch_seconds'), 0, 3600)
+local last_switch = finite_number(redis.call('HGET', KEYS[1], 'last_switch_at'))
+local lease_digest = redis.call('HGET', KEYS[1], 'lease_digest')
+local lease_value_projection = redis.call('HGET', KEYS[1], 'lease_value')
+local owner_lock = redis.call('HGET', KEYS[1], 'owner_lock_value')
+local metadata_owner = redis.call('HGET', KEYS[1], 'metadata_owner')
+if (phase ~= 'active' and phase ~= 'wait_return')
+   or redis.call('HGET', KEYS[1], 'channel_uuid') ~= channel
+   or redis.call('HGET', KEYS[1], 'client_id') ~= client
+   or not nonempty(episode_id)
+   or not connected_at or connected_at <= 0
+   or not version
+   or not nonempty(worker_id)
+   or not nonempty(client_worker_id)
+   or not nonempty(stream_id) or not nonempty(account_id)
+   or not nonempty(m3u_profile) or not nonempty(input_profile)
+   or not nonempty(configuration) or not control or not nonempty(catalog)
+   or not fence or not intent_epoch or not return_seconds or not minimum_switch
+   or not last_switch or last_switch < 0
+   or not nonempty(lease_digest) or string.len(lease_digest) ~= 64
+   or string.match(lease_digest, '^[0-9a-f]+$') == nil
+   or lease_digest ~= expected_lease_digest
+   or not nonempty(lease_value_projection)
+   or not nonempty(owner_lock) or not nonempty(metadata_owner)
+   or not string.match(lease_value_projection, '^(%d+):') then return 0 end
+if KEYS[5] ~= 'live:worker:' .. worker_id .. ':heartbeat' then return 0 end
+local deadline_raw = redis.call('HGET', KEYS[1], 'return_deadline') or ''
+local left_raw = redis.call('HGET', KEYS[1], 'viewer_left_at') or ''
+if phase == 'active' then
+  if deadline_raw ~= '' or left_raw ~= '' then return 0 end
+else
+  local deadline = finite_number(deadline_raw)
+  local left_at = finite_number(left_raw)
+  local nowparts = redis.call('TIME')
+  local now = tonumber(nowparts[1]) + tonumber(nowparts[2]) / 1000000
+  if not deadline or deadline <= 0
+     or not left_at or left_at <= 0 or deadline < left_at
+     or now >= deadline then return 0 end
+end
+local current = redis.call('HGET', KEYS[2], 'configuration_generation')
+local current_control_raw = redis.call('HGET', KEYS[2], 'control_generation')
+local current_control = bounded_integer(current_control_raw, 0, 9007199254740991)
+local current_catalog = redis.call('HGET', KEYS[2], 'catalog_generation')
+local revision = bounded_integer(redis.call('HGET', KEYS[2], 'authority_revision'), 1, 9007199254740991)
+local lease_value = redis.call('GET', KEYS[3])
+local lease_fence = lease_value and bounded_integer(string.match(lease_value, '^(%d+):'), 0, 9007199254740991) or nil
+if not nonempty(current) or current ~= configuration
+   or not current_control or current_control ~= control
+   or current_control_raw ~= control_raw
+   or not nonempty(current_catalog) or current_catalog ~= catalog
+   or not revision or not lease_fence or lease_fence ~= fence then return 0 end
+if lease_value ~= lease_value_projection
+   or redis.call('GET', KEYS[4]) ~= owner_lock
+   or worker_id ~= owner_lock
+   or worker_id ~= metadata_owner
+   or redis.call('HGET', KEYS[6], 'owner') ~= worker_id
+   or redis.call('HGET', KEYS[6], 'stream_id') ~= stream_id
+   or redis.call('HGET', KEYS[6], 'm3u_profile') ~= m3u_profile
+   or redis.call('HGET', KEYS[6], 'stream_profile') ~= input_profile
+   or (redis.call('HGET', KEYS[6], 'state') ~= 'active'
+       and redis.call('HGET', KEYS[6], 'state') ~= 'waiting_for_clients') then return 0 end
+local metadata_channel = redis.call('HGET', KEYS[6], 'channel_uuid')
+if metadata_channel and metadata_channel ~= channel then return 0 end
+if redis.call('EXISTS', KEYS[7]) ~= 0 or redis.call('EXISTS', KEYS[11]) ~= 0
+   or redis.call('HGET', KEYS[8], 'connected_at') ~= redis.call('HGET', KEYS[1], 'connected_at')
+   or redis.call('HGET', KEYS[8], 'worker_id') ~= client_worker_id
+   or redis.call('HGET', KEYS[8], 'user_id') ~= '0'
+   or redis.call('HGET', KEYS[8], 'output_format') ~= 'mpegts'
+   or redis.call('HGET', KEYS[8], 'output_profile_id') ~= ''
+   or redis.call('SISMEMBER', KEYS[9], client) ~= 1
+   or redis.call('HGET', KEYS[10], client) ~= episode_id then return 0 end
+return 1
+"""
+
+
+def _is_borrowed_recorder_client(redis: Any, channel_id: str, client_id: str) -> bool:
+    """Read-only verification for the exact native client admitted by sharing."""
+    channel = str(channel_id)
+    client = str(client_id)
+    if not channel or not client.startswith("catchuparr-client-"):
+        return False
+    try:
+        from .adapters.sharing_native import episode_projection_key
+
+        raw_worker_id = redis.hget(episode_projection_key(channel), "worker_id")
+        if raw_worker_id is None:
+            return False
+        worker_id = _decode_redis_value(raw_worker_id)
+        if not worker_id:
+            return False
+        raw_lease_value = redis.get(f"catchuparr:recorder:{channel}")
+        if raw_lease_value is None:
+            return False
+        lease_value = _decode_redis_value(raw_lease_value)
+        if not lease_value:
+            return False
+        lease_digest = hashlib.sha256(lease_value.encode("utf-8")).hexdigest()
+        keys = (
+            episode_projection_key(channel),
+            f"catchuparr:sharing:current:{channel}",
+            f"catchuparr:recorder:{channel}",
+            f"live:channel:{channel}:owner",
+            f"live:worker:{worker_id}:heartbeat",
+            f"live:channel:{channel}:metadata",
+            f"live:channel:{channel}:stopping",
+            f"live:channel:{channel}:clients:{client}",
+            f"live:channel:{channel}:clients",
+            f"catchuparr:sharing:private:{channel}",
+            f"live:channel:{channel}:client:{client}:stop",
+        )
+        # The preliminary projection read supplies only the heartbeat-key
+        # name; Lua checks that key against the current worker atomically.
+        result = redis.eval(
+            _BORROWED_RECORDER_STATS_CURRENT_LUA, len(keys), *keys,
+            channel, client, lease_digest,
+        )
+        return type(result) is int and result == 1
+    except Exception:
+        return False
+
+
+def _is_recorder_client_on_redis(redis: Any, channel_id: str, client_id: str) -> bool:
+    try:
+        marker = redis.get(_recorder_marker_key(str(channel_id), str(client_id)))
+        if marker and _capability_is_current(redis, marker):
+            return True
+    except Exception:
+        return False
+    return _is_borrowed_recorder_client(redis, channel_id, client_id)
+
+
 def _is_recorder_client(channel_id: str, client_id: str) -> bool:
     try:
         from core.utils import RedisClient
 
-        redis = RedisClient.get_client()
-        marker = redis.get(_recorder_marker_key(str(channel_id), str(client_id)))
-        return bool(marker and _capability_is_current(redis, marker))
+        return _is_recorder_client_on_redis(
+            RedisClient.get_client(), str(channel_id), str(client_id),
+        )
     except Exception:
         return False
 
@@ -437,15 +626,18 @@ def _verified_recorder_ids(redis: Any, channel_id: str, client_ids: list[str]) -
         values = redis.mget(keys)
         verified = set()
         for client_id, value in zip(client_ids, values, strict=False):
-            if value is None or not _capability_is_current(redis, value):
-                continue
-            redis.expire(_recorder_marker_key(channel_id, client_id), RECORDER_MARKER_TTL_SECONDS)
-            verified.add(client_id)
+            if value is not None and _capability_is_current(redis, value):
+                redis.expire(
+                    _recorder_marker_key(channel_id, client_id), RECORDER_MARKER_TTL_SECONDS,
+                )
+                verified.add(client_id)
+            elif _is_borrowed_recorder_client(redis, channel_id, client_id):
+                verified.add(client_id)
         return verified
     except Exception:
         return {
             client_id for client_id in client_ids
-            if _is_recorder_client(channel_id, client_id)
+            if _is_recorder_client_on_redis(redis, channel_id, client_id)
         }
 
 
@@ -1220,7 +1412,7 @@ def _install_builder(module: Any, name: str, transform) -> bool:
 
 
 def install_stats_hooks(*, route_hooks: bool = True) -> bool:
-    """Install hooks only for inspected Dispatcharr 0.31/0.32 signatures."""
+    """Install hooks only for the inspected Dispatcharr 0.32.0 signatures."""
     from version import __version__ as dispatcharr_version
 
     if not is_supported_dispatcharr_version(dispatcharr_version):

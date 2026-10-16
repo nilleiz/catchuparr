@@ -11,6 +11,7 @@ from unittest.mock import patch
 from catchuparr.engine import ArchiveStore
 from catchuparr.engine.recorder import (
     FFmpegCopyRecorder,
+    RecorderAttemptSwitch,
     has_useful_transport_stream,
 )
 
@@ -125,11 +126,65 @@ class RecorderTests(unittest.TestCase):
             require_media_progress=True,
         )
         with patch("catchuparr.engine.recorder.subprocess.Popen", FinishedProcess):
-            result = recorder.run_candidate(threading.Event())
+            acknowledgements = []
+            result = recorder.run_candidate(
+                threading.Event(), on_first_media=acknowledgements.append,
+            )
 
         self.assertEqual("exited", result.status)
         self.assertEqual(1, result.useful_segments)
         self.assertEqual(1, len(self.store.segments("ch1")))
+        self.assertEqual(1, len(acknowledgements))
+        self.assertGreater(acknowledgements[0], 0)
+
+    def test_first_media_ack_retries_after_false_result(self):
+        class ProgressiveProcess:
+            def __init__(self, command, **_kwargs):
+                self.output = Path(command[-1]).parent
+                self.listing = Path(command[command.index("-segment_list") + 1])
+                first = self.output / "first.ts"
+                first.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                self.listing.write_text("first.ts,0,6\n", encoding="utf-8")
+                self.polls = 0
+
+            def poll(self):
+                self.polls += 1
+                if self.polls == 2:
+                    second = self.output / "second.ts"
+                    second.write_bytes(
+                        RecorderTests._ts_packet(257, start=True)
+                        + RecorderTests._ts_packet(257)
+                    )
+                    self.listing.write_text(
+                        "first.ts,0,6\nsecond.ts,6,12\n", encoding="utf-8",
+                    )
+                return 0 if self.polls >= 3 else None
+
+        recorder = FFmpegCopyRecorder(
+            self.store, "ch1", "http://dispatcharr/proxy/ts/stream/id",
+            self.root / "callback-retry-work", require_media_progress=True,
+        )
+        acknowledgements = []
+
+        def acknowledge(media_at):
+            acknowledgements.append(media_at)
+            return len(acknowledgements) >= 2
+
+        with patch("catchuparr.engine.recorder.subprocess.Popen", ProgressiveProcess):
+            result = recorder.run_candidate(
+                threading.Event(), on_first_media=acknowledge,
+            )
+
+        self.assertEqual("exited", result.status)
+        self.assertEqual(2, result.useful_segments)
+        self.assertEqual(2, len(acknowledgements))
+        self.assertEqual(
+            acknowledgements[0], acknowledgements[1],
+            "A callback retry must keep the first committed media timestamp",
+        )
 
     def test_candidate_stop_terminates_ffmpeg_before_indexing_final_segment(self):
         events = []
@@ -184,6 +239,180 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(1, result.useful_segments)
         self.assertEqual(["terminate", "wait"], events)
         self.assertEqual(1, len(self.store.segments("ch1")))
+
+    def test_attempt_switch_terminates_only_current_ffmpeg_and_blocks_late_old_rows(self):
+        events = []
+        switch = RecorderAttemptSwitch()
+        stop_event = threading.Event()
+
+        class SwitchedProcess:
+            def __init__(self, command, **_kwargs):
+                self.command = command
+                self.return_code = None
+                self.write_row("old-before-switch.ts")
+
+            def write_row(self, name):
+                output = Path(self.command[-1]).parent / name
+                output.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                listing = Path(self.command[self.command.index("-segment_list") + 1])
+                listing.write_text(f"{name},0,6\n", encoding="utf-8")
+
+            def poll(self):
+                if self.return_code is not None:
+                    return self.return_code
+                switch.request()
+                return None
+
+            def terminate(self):
+                events.append("terminate")
+
+            def wait(self, timeout=None):
+                events.append("wait")
+                self.write_row("old-after-switch.ts")
+                self.return_code = -15
+                return self.return_code
+
+            def kill(self):
+                events.append("kill")
+
+        class NextSourceProcess:
+            def __init__(self, command, **_kwargs):
+                output = Path(command[-1])
+                output.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                listing = Path(command[command.index("-segment_list") + 1])
+                listing.write_text(f"{output.name},0,6\n", encoding="utf-8")
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                raise AssertionError("finished next-source process must not be terminated")
+
+            def kill(self):
+                raise AssertionError("finished next-source process must not be killed")
+
+        recorder = FFmpegCopyRecorder(
+            self.store, "ch1", "http://dispatcharr/catchuparr/recorder/ch1",
+            self.root / "switch-work", fencing_token=11, require_media_progress=True,
+        )
+        with patch("catchuparr.engine.recorder.subprocess.Popen", SwitchedProcess):
+            switched = recorder.run_candidate(stop_event, attempt_switch=switch)
+        self.assertEqual("switch_requested", switched.status)
+        self.assertEqual(["terminate", "wait"], events)
+        self.assertFalse(stop_event.is_set())
+        self.assertEqual([], self.store.segments("ch1"))
+
+        with patch("catchuparr.engine.recorder.subprocess.Popen", NextSourceProcess):
+            next_source = recorder.run_candidate(stop_event)
+        self.assertEqual("exited", next_source.status)
+        segments = self.store.segments("ch1")
+        self.assertEqual(1, len(segments))
+        self.assertTrue(segments[0].discontinuity)
+
+    def test_attempt_switch_counts_segment_committed_immediately_before_request(self):
+        switch = RecorderAttemptSwitch()
+        stop_event = threading.Event()
+
+        class CommittedThenSwitchedProcess:
+            def __init__(self, command, **_kwargs):
+                self.command = command
+                self.return_code = None
+                output = Path(command[-1]).parent / "committed.ts"
+                output.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                listing = Path(command[command.index("-segment_list") + 1])
+                listing.write_text("committed.ts,0,6\n", encoding="utf-8")
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self):
+                self.return_code = -15
+
+            def wait(self, timeout=None):
+                return self.return_code
+
+            def kill(self):
+                raise AssertionError("terminated process should already be reaped")
+
+        recorder = FFmpegCopyRecorder(
+            self.store, "ch1", "http://dispatcharr/catchuparr/recorder/ch1",
+            self.root / "switch-committed-work", fencing_token=11, require_media_progress=True,
+        )
+        publish = FFmpegCopyRecorder._publish_csv_rows
+
+        def publish_then_request(instance, *args, **kwargs):
+            result = publish(instance, *args, **kwargs)
+            if result[1]:
+                switch.request()
+            return result
+
+        with (
+            patch("catchuparr.engine.recorder.subprocess.Popen", CommittedThenSwitchedProcess),
+            patch.object(FFmpegCopyRecorder, "_publish_csv_rows", publish_then_request),
+        ):
+            result = recorder.run_candidate(stop_event, attempt_switch=switch)
+
+        self.assertEqual("switch_requested", result.status)
+        self.assertEqual(1, result.useful_segments)
+        self.assertEqual(1, len(self.store.segments("ch1")))
+
+    def test_media_stall_without_attempt_switch_keeps_existing_final_flush_behavior(self):
+        class StallingProcess:
+            def __init__(self, command, **_kwargs):
+                self.command = command
+                self.return_code = None
+                self.append_row("first.ts")
+
+            def append_row(self, name):
+                output = Path(self.command[-1]).parent / name
+                output.write_bytes(
+                    RecorderTests._ts_packet(256, start=True)
+                    + RecorderTests._ts_packet(256)
+                )
+                listing = Path(self.command[self.command.index("-segment_list") + 1])
+                with listing.open("a", encoding="utf-8") as stream:
+                    stream.write(f"{name},0,6\n")
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.append_row("final.ts")
+                self.return_code = -15
+                return self.return_code
+
+            def kill(self):
+                raise AssertionError("terminated process should not be killed")
+
+        recorder = FFmpegCopyRecorder(
+            self.store, "ch1", "http://dispatcharr/proxy/ts/stream/ch1",
+            self.root / "stall-work", require_media_progress=True,
+        )
+        with (
+            patch("catchuparr.engine.recorder.subprocess.Popen", StallingProcess),
+            patch("catchuparr.engine.recorder.time.monotonic", side_effect=[0.0, 1.0, 2.0]),
+        ):
+            result = recorder.run_candidate(
+                threading.Event(), startup_timeout=10, media_idle_timeout=0.5,
+            )
+        self.assertEqual("media_stalled", result.status)
+        self.assertEqual(2, result.useful_segments)
+        self.assertEqual(2, len(self.store.segments("ch1")))
 
     def test_completed_csv_rows_are_indexed_only_after_file_exists(self):
         out = self.root / "session"

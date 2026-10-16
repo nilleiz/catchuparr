@@ -109,7 +109,7 @@ jobs:
                   or "\\" in name
                   or ".." in Path(name).parts
                   or not name.startswith("catchuparr/")
-                  or Path(name).suffix not in {".py", ".json"}
+                  or Path(name).suffix not in {".py", ".json", ".png"}
                   for name in names
               ):
                   raise SystemExit("Plugin ZIP contains an unexpected path or file type")
@@ -118,6 +118,8 @@ jobs:
               packaged_manifest = json.loads(package.read("catchuparr/plugin.json"))
               if packaged_manifest.get("version") != version:
                   raise SystemExit("Packaged manifest version does not match release version")
+              if "catchuparr/logo.png" not in names:
+                  raise SystemExit("Dispatcharr plugin logo is missing from the archive")
               plugin_source = package.read("catchuparr/plugin.py").decode("utf-8")
               plugin_version = re.search(
                   r"^\s+version\s*=\s*['\"]([^'\"]+)['\"]",

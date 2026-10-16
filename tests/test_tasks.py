@@ -96,12 +96,26 @@ def _recording_task_fake_modules(redis):
 def _isolated_plugin_modules(fake_modules):
     """Keep package children aligned with sys.modules while stubbing Dispatcharr."""
     package = importlib.import_module("catchuparr")
+    fake_modules = {
+        **fake_modules,
+        "catchuparr.adapters.recorder_proxy": fake_modules.get(
+            "catchuparr.adapters.recorder_proxy",
+            _fake_module(
+                "catchuparr.adapters.recorder_proxy",
+                core_api_supported=lambda: True,
+                install_proxyserver_cleanup_hook=lambda: True,
+            ),
+        ),
+    }
     child_names = (
         "tasks", "runtime", "configuration", "recorder_proxy", "recorder_control",
-        "schedule", "logging_utils", "adapters", "engine",
+        "schedule", "logging_utils", "adapters", "engine", "sharing_runtime",
+        "sharing_episode", "sharing_persistence",
     )
     missing = object()
     previous = {name: package.__dict__.get(name, missing) for name in child_names}
+    adapter_package = None
+    previous_adapter_proxy = missing
     try:
         with patch.dict(sys.modules, fake_modules):
             for name in child_names:
@@ -111,10 +125,22 @@ def _isolated_plugin_modules(fake_modules):
                     package.__dict__.pop(name, None)
                 else:
                     package.__dict__[name] = module
+            adapter_package = sys.modules.get("catchuparr.adapters")
+            adapter_proxy = sys.modules.get("catchuparr.adapters.recorder_proxy")
+            if adapter_package is not None and adapter_proxy is not None:
+                previous_adapter_proxy = getattr(
+                    adapter_package, "recorder_proxy", missing,
+                )
+                adapter_package.recorder_proxy = adapter_proxy
             sys.modules.pop("catchuparr.tasks", None)
             package.__dict__.pop("tasks", None)
             yield
     finally:
+        if adapter_package is not None:
+            if previous_adapter_proxy is missing:
+                adapter_package.__dict__.pop("recorder_proxy", None)
+            else:
+                adapter_package.recorder_proxy = previous_adapter_proxy
         for name, value in previous.items():
             if value is missing:
                 package.__dict__.pop(name, None)
@@ -323,6 +349,14 @@ class RecorderTaskTests(unittest.TestCase):
                         raise AssertionError("media must not start after the admission fence")
 
                 modules = _recording_task_fake_modules(redis)
+                adapter_package = _fake_module("catchuparr.adapters")
+                recorder_proxy_adapter = _fake_module(
+                    "catchuparr.adapters.recorder_proxy",
+                    core_api_supported=lambda: True,
+                    install_proxyserver_cleanup_hook=lambda: True,
+                )
+                modules["catchuparr.adapters"] = adapter_package
+                modules["catchuparr.adapters.recorder_proxy"] = recorder_proxy_adapter
                 with _isolated_plugin_modules(modules):
                     tasks = importlib.import_module("catchuparr.tasks")
                     lease_module = importlib.import_module("catchuparr.engine.leases")
@@ -341,8 +375,6 @@ class RecorderTaskTests(unittest.TestCase):
                         patch("catchuparr.engine.recorder.FFmpegCopyRecorder", FakeRecorder),
                         patch("catchuparr.tasks.threading.Event", threading.Event),
                         patch("catchuparr.recorder_proxy.ranked_source_candidates", return_value=candidates),
-                        patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
-                        patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
                         patch(
                             "catchuparr.recorder_proxy.issue_recorder_attempt",
                             side_effect=lambda *_args, **_kwargs: (attempts.append(Attempt()) or attempts[-1]),
@@ -633,15 +665,204 @@ class RecorderTaskTests(unittest.TestCase):
             ))
             self.assertEqual(ArchiveStore(archive_root).recorder_fence("channel-1"), 26)
 
+    def test_initial_existing_native_viewer_is_borrowed_before_allowed_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive_root = Path(temp) / "archive"
+            redis = FakeRedis()
+            config = SimpleNamespace(channel_uuids=("channel-1",), archive_root=archive_root)
+            active = _active_configuration()
+            active["connection_sharing"] = {"channel-1": {
+                "enabled": True, "live_stability_seconds": 0,
+                "last_viewer_return_seconds": 1, "min_switch_interval_seconds": 0,
+            }}
+            expected_generation = configuration_generation(active)
+            coordinator_sources = []
+            polls = []
+            recorder_inputs = []
+            cleanup_calls = []
+
+            class StopEvent:
+                def __init__(self):
+                    self.stopped = False
+
+                def set(self):
+                    self.stopped = True
+
+                def is_set(self):
+                    return self.stopped
+
+                def wait(self, _timeout=None):
+                    return self.stopped
+
+            class InlineThread:
+                def __init__(self, *, target, **_kwargs):
+                    self.target = target
+                    self.ident = None
+
+                def start(self):
+                    self.ident = 1
+                    # Keep the periodic worker out of this deterministic test;
+                    # it exercises the synchronous initial viewer observation.
+                    return None
+
+                def join(self, timeout=None):
+                    return None
+
+            stop_event = StopEvent()
+
+            class FakeLease:
+                _value = "synthetic-lease"
+                owner = "synthetic-owner"
+                fence = 26
+
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def acquire(self):
+                    return self.fence
+
+                def renew(self):
+                    return True
+
+                def release(self):
+                    return True
+
+            class BorrowCoordinator:
+                def __init__(self, *_args, **kwargs):
+                    self.dedicated_source_available = kwargs["dedicated_source_available"]
+                    coordinator_sources.append(self.dedicated_source_available)
+                    self.opening = SimpleNamespace(
+                        episode_id="episode-synthetic",
+                        capability=SimpleNamespace(intent_epoch=1),
+                    )
+
+                def poll(self, **_kwargs):
+                    polls.append(self.dedicated_source_available)
+                    # Model an already-connected native viewer on an excluded
+                    # source. The initial synchronous observation must claim it
+                    # before any dedicated candidate is considered.
+                    return self.opening if len(polls) == 1 else None
+
+                def record_return_after_cleanup(self, _prepared, *, now, outcome):
+                    cleanup_calls.append((now, outcome))
+                    stop_event.set()
+                    return True
+
+                def pending_return_intent(self):
+                    return None
+
+                def viewer_return_deadline_reached(self, *, now):
+                    return False
+
+            class FakeBorrowRecorder:
+                def __init__(self, _store, _channel, input_url, _work, **kwargs):
+                    self.input_url = input_url
+                    self.headers = kwargs["input_headers"]
+
+                def run_candidate(self, event, **_kwargs):
+                    recorder_inputs.append((self.input_url, self.headers))
+                    return SimpleNamespace(status="no_media", useful_segments=0)
+
+            celery = _fake_module(
+                "celery", shared_task=lambda *, name: lambda function: function,
+            )
+            apps = _fake_module("apps")
+            apps_channels = _fake_module("apps.channels")
+            apps_channels_tasks = _fake_module(
+                "apps.channels.tasks", get_dvr_stream_base_url=lambda: "http://dispatcharr",
+            )
+            core = _fake_module("core")
+            core_utils = _fake_module(
+                "core.utils", RedisClient=SimpleNamespace(get_client=lambda: redis),
+            )
+            fake_modules = {
+                "celery": celery,
+                "apps": apps,
+                "apps.channels": apps_channels,
+                "apps.channels.tasks": apps_channels_tasks,
+                "core": core,
+                "core.utils": core_utils,
+                "version": _fake_module("version", __version__="0.32.0"),
+            }
+            with _isolated_plugin_modules(fake_modules):
+                tasks = importlib.import_module("catchuparr.tasks")
+                with (
+                    patch("catchuparr.runtime.load_config", return_value=config),
+                    patch("catchuparr.engine.leases.RedisRecorderLease", FakeLease),
+                    patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
+                    patch(
+                        "catchuparr.configuration.load_applied_state",
+                        return_value=(active, SimpleNamespace(paused=False, generation=6)),
+                    ),
+                    patch(
+                        "catchuparr.tasks._recorder_admission_state",
+                        return_value={
+                            "status": "ready", "active": active, "config": config,
+                            "control": SimpleNamespace(generation=6),
+                        },
+                    ),
+                    patch(
+                        "catchuparr.recorder_proxy.ranked_source_candidates",
+                        side_effect=lambda _channel, _active, *, all_sources: (
+                            self.assertTrue(all_sources) or [
+                                {"id": "excluded-fallback", "account_id": "synthetic"}
+                            ]
+                        ),
+                    ),
+                    patch("catchuparr.tasks._issue_recorder_capability", return_value=(None, None, None)),
+                    patch(
+                        "catchuparr.sharing_runtime.RecorderBorrowCoordinator",
+                        BorrowCoordinator,
+                    ),
+                    patch("catchuparr.sharing_episode.BorrowEpisodeLedger", return_value=object()),
+                    patch("catchuparr.sharing_runtime.retry_durable_open_cleanups"),
+                    patch("catchuparr.sharing_runtime.retry_pending_open_cleanups"),
+                    patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
+                    patch("catchuparr.adapters.sharing_borrow_route.encode_borrow_capability", return_value="synthetic-borrow-token"),
+                    patch("catchuparr.engine.recorder.FFmpegCopyRecorder", FakeBorrowRecorder),
+                    patch(
+                        "catchuparr.recorder_proxy.issue_recorder_attempt",
+                        side_effect=lambda *_args, **_kwargs: self.fail(
+                            "Dedicated source was issued before initial viewer borrow cleanup"
+                        ),
+                    ),
+                    patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
+                    patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
+                    patch(
+                        "catchuparr.tasks.threading",
+                        SimpleNamespace(Event=lambda: stop_event, Lock=threading.Lock, Thread=InlineThread),
+                    ),
+                ):
+                    result = tasks.record_channel("channel-1", expected_generation, 6)
+
+            self.assertEqual({"status": "stopped"}, result)
+            self.assertEqual([True], coordinator_sources)
+            self.assertEqual([True], polls)
+            self.assertEqual(1, len(recorder_inputs))
+            self.assertEqual(
+                "http://dispatcharr/catchuparr/sharing/channel-1",
+                recorder_inputs[0][0],
+            )
+            self.assertEqual(
+                {"X-Catchuparr-Borrow": "synthetic-borrow-token",
+                 "X-Catchuparr-Stats-Recorder": None},
+                recorder_inputs[0][1],
+            )
+            self.assertEqual(1, len(cleanup_calls))
+            self.assertEqual("failure", cleanup_calls[0][1])
+
     def test_override_capacity_or_start_failure_falls_through_ranked_sources(self):
         with tempfile.TemporaryDirectory() as temp:
             archive_root = Path(temp) / "archive"
             redis = FakeRedis()
             config = SimpleNamespace(channel_uuids=("channel-1",), archive_root=archive_root)
             active = _active_configuration()
+            active["connection_sharing"] = {"channel-1": {"enabled": True}}
             expected_generation = configuration_generation(active)
             attempts = []
             stopped = []
+            lifecycle = []
+            attempt_switches = []
             source_candidates = [
                 {"id": "44", "account_id": "12"},
                 {"id": "45", "account_id": "13"},
@@ -661,6 +882,15 @@ class RecorderTaskTests(unittest.TestCase):
 
                 def revoke(self, redis_client):
                     self.revoked = True
+                    lifecycle.append(f"revoke:{self.stream_id}")
+                    return True
+
+                def operation_needs_switch(self, _redis_client):
+                    return False
+
+                def acknowledge_reaped(self, _redis_client):
+                    lifecycle.append(f"ack:{self.stream_id}")
+                    return True
 
             class FakeRecorder:
                 outcomes = [
@@ -673,10 +903,13 @@ class RecorderTaskTests(unittest.TestCase):
                     self.input_url = input_url
                     self.headers = kwargs["input_headers"]
 
-                def run_candidate(self, _stop_event, **_kwargs):
+                def run_candidate(self, stop_event, **kwargs):
+                    attempt_switches.append(kwargs.get("attempt_switch"))
                     outcome = self.outcomes.pop(0)
                     if isinstance(outcome, Exception):
                         raise outcome
+                    if outcome.status == "stopped":
+                        stop_event.set()
                     return outcome
 
             celery = _fake_module(
@@ -712,16 +945,36 @@ class RecorderTaskTests(unittest.TestCase):
                         "catchuparr.configuration.load_applied_state",
                         return_value=(active, SimpleNamespace(paused=False, generation=6)),
                     ),
-                    patch("catchuparr.recorder_proxy.ranked_source_candidates", return_value=source_candidates),
+                    patch(
+                        "catchuparr.recorder_proxy.ranked_source_candidates",
+                        side_effect=lambda _channel, _active, *, all_sources: (
+                            self.assertTrue(all_sources) or source_candidates
+                        ),
+                    ),
+                    patch(
+                        "catchuparr.recorder_proxy.current_sharing_authority_context",
+                        return_value={"authority_revision": 2, "catalog_generation": "catalog-synthetic"},
+                    ),
+                    patch(
+                        "catchuparr.sharing_runtime.RecorderBorrowCoordinator",
+                        return_value=SimpleNamespace(
+                            poll=lambda **_kwargs: lifecycle.append("observe_native") or None,
+                        ),
+                    ),
                     patch(
                         "catchuparr.recorder_proxy.issue_recorder_attempt",
                         side_effect=lambda _redis, _lease, **kwargs: (
-                            attempts.append(Attempt(kwargs["candidate"])) or attempts[-1]
+                            lifecycle.append(f"issue:{kwargs['candidate']['id']}")
+                            or self.assertEqual(2, kwargs["sharing_authority"]["authority_revision"])
+                            or attempts.append(Attempt(kwargs["candidate"])) or attempts[-1]
                         ),
                     ),
                     patch(
                         "catchuparr.recorder_proxy.stop_recorder_attempt",
-                        side_effect=lambda *_args: (stopped.append(True) or True),
+                        side_effect=lambda _redis, attempt, _lease: (
+                            lifecycle.append(f"stop:{attempt.stream_id}")
+                            or stopped.append(True) or True
+                        ),
                     ),
                     patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
                     patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
@@ -734,6 +987,14 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertTrue(all(attempt.revoked for attempt in attempts))
             self.assertEqual(3, len(stopped))
             self.assertTrue(all(attempt.input_url.endswith("/catchuparr/recorder/channel-1") for attempt in attempts))
+            self.assertTrue(all(switch is not None for switch in attempt_switches))
+            self.assertEqual(
+                ["observe_native",
+                 "issue:44", "revoke:44", "stop:44", "ack:44",
+                 "issue:45", "revoke:45", "stop:45", "ack:45",
+                 "issue:46", "revoke:46", "stop:46", "ack:46"],
+                lifecycle,
+            )
 
 
 if __name__ == "__main__":

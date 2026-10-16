@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,9 +79,9 @@ def apply_recorder_control(active_path: Path | None = None) -> RecorderControlSt
         try:
             enabled = _read_recording_enabled_setting()
         except RecorderControlError:
-            _force_paused_locked(sidecar, current)
+            _force_paused_locked(sidecar, current, active_path=active)
             raise
-        return _transition_locked(sidecar, current, paused=not enabled)
+        return _transition_locked(sidecar, current, paused=not enabled, active_path=active)
 
 
 def pause_recorders(active_path: Path | None = None) -> RecorderControlState:
@@ -105,7 +106,7 @@ def _set_recording_enabled(enabled: bool, active_path: Path | None) -> RecorderC
         current = _load_or_initialize_locked(sidecar, allow_pending=True)
         target_paused = not enabled
         if target_paused:
-            current = _transition_locked(sidecar, current, paused=True)
+            current = _transition_locked(sidecar, current, paused=True, active_path=active)
             try:
                 _write_recording_enabled_setting(enabled)
             except RecorderControlError:
@@ -117,9 +118,9 @@ def _set_recording_enabled(enabled: bool, active_path: Path | None) -> RecorderC
         try:
             _write_recording_enabled_setting(enabled)
         except RecorderControlError:
-            _force_paused_locked(sidecar, current)
+            _force_paused_locked(sidecar, current, active_path=active)
             raise
-        return _transition_locked(sidecar, current, paused=False)
+        return _transition_locked(sidecar, current, paused=False, active_path=active)
 
 
 def _default_active_path() -> Path:
@@ -233,6 +234,7 @@ def _transition_locked(
     current: RecorderControlState,
     *,
     paused: bool,
+    active_path: Path | None = None,
 ) -> RecorderControlState:
     marker_pending = _deny_marker_exists(control_deny_path(sidecar))
     if current.paused == paused and not marker_pending:
@@ -254,9 +256,27 @@ def _transition_locked(
         generation=current.generation + (1 if advance_generation else 0),
         configuration_generation=current.configuration_generation,
     )
+    path = Path(active_path) if active_path is not None else _default_active_path()
+    outbox_id = f"control-{uuid.uuid4().hex}"
+    staged = False
+    try:
+        from .configuration import _stage_sharing_authority_control
+
+        staged = _stage_sharing_authority_control(path, outbox_id, updated)
+    except Exception:
+        raise RecorderControlError(
+            "sharing authority revocation could not be staged; admission remains denied"
+        ) from None
     try:
         _atomic_replace_sidecar(sidecar, updated)
     except OSError:
+        if staged:
+            try:
+                from .configuration import _sharing_authority_outbox
+
+                _sharing_authority_outbox(path).cancel_activation(outbox_id)
+            except Exception:
+                pass
         # Keep the deny marker on every state-write failure. A published
         # unpaused sidecar is still non-authoritative while that marker exists.
         if paused:
@@ -265,6 +285,17 @@ def _transition_locked(
             except OSError:
                 pass
         raise RecorderControlError("recorder control transition failed; admission remains denied") from None
+    if staged:
+        from .configuration import (
+            _commit_sharing_authority_activation,
+            _drain_sharing_authority_outbox,
+        )
+
+        if (not _commit_sharing_authority_activation(path, outbox_id)
+                or not _drain_sharing_authority_outbox(path, outbox_id)):
+            raise RecorderControlError(
+                "sharing authority publication is pending; recorder admission remains denied"
+            )
     try:
         _clear_deny_marker(sidecar)
     except RecorderControlError:
@@ -275,6 +306,8 @@ def _transition_locked(
 def _force_paused_locked(
     sidecar: Path,
     current: RecorderControlState,
+    *,
+    active_path: Path | None = None,
 ) -> RecorderControlState:
     marker_pending = _deny_marker_exists(control_deny_path(sidecar))
     if current.paused and not marker_pending:
@@ -295,6 +328,27 @@ def _force_paused_locked(
             raise RecorderControlError(
                 "recorder control could not confirm a paused state; admission remains denied"
             ) from None
+    path = Path(active_path) if active_path is not None else _default_active_path()
+    outbox_id = f"control-{uuid.uuid4().hex}"
+    try:
+        from .configuration import (
+            _commit_sharing_authority_activation,
+            _drain_sharing_authority_outbox,
+            _stage_sharing_authority_control,
+        )
+
+        if _stage_sharing_authority_control(path, outbox_id, paused):
+            if (not _commit_sharing_authority_activation(path, outbox_id)
+                    or not _drain_sharing_authority_outbox(path, outbox_id)):
+                raise RecorderControlError(
+                    "sharing authority publication is pending; admission remains denied"
+                )
+    except RecorderControlError:
+        raise
+    except Exception:
+        raise RecorderControlError(
+            "sharing authority revocation is unresolved; admission remains denied"
+        ) from None
     _clear_deny_marker(sidecar)
     return paused
 

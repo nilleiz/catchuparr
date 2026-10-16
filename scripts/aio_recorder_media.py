@@ -13,10 +13,510 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+CRASH_CHILD_RESULT_PREFIX = "CATCHUPARR_SHARING_CRASH_CHILD_RESULT "
+
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def _crash_child_failure_diagnostic(result, expected_code, parsed_value, stdout_shape):
+    """Describe a child failure without exposing captured stdout or stderr."""
+    if not isinstance(parsed_value, dict):
+        shape = stdout_shape
+        keys = []
+        exception_class = "unavailable"
+    else:
+        shape = "object"
+        keys = sorted(
+            key for key in parsed_value
+            if key in {
+                "native_registered", "completed", "pending", "denied",
+                "closed", "opened", "read_ts", "error", "exception_class",
+            }
+        )
+        raw_exception_class = parsed_value.get("exception_class")
+        exception_class = (
+            raw_exception_class
+            if raw_exception_class in {
+                "AssertionError", "AttributeError", "BorrowBindingLost",
+                "ConnectionError", "ImportError", "JSONDecodeError", "KeyError", "OSError",
+                "PermissionError", "RedisError", "RuntimeError", "TimeoutError",
+                "TypeError", "ValueError",
+            }
+            else "other" if parsed_value.get("error") is True else "unavailable"
+        )
+    exit_code = result.returncode if type(result.returncode) is int else None
+    return {
+        "exit_code": exit_code,
+        "expected_exit_code": expected_code,
+        "stdout_json_shape": shape,
+        "known_result_keys": keys,
+        "child_exception_class": exception_class,
+    }
+
+
+def _parse_crash_child_result(stdout):
+    """Parse exactly one framed child receipt while ignoring unrelated startup output."""
+    if not isinstance(stdout, str):
+        return None, "invalid_output"
+    frames = [
+        line[len(CRASH_CHILD_RESULT_PREFIX):]
+        for line in stdout.splitlines()
+        if line.startswith(CRASH_CHILD_RESULT_PREFIX)
+    ]
+    if not frames:
+        return None, "no_receipt"
+    if len(frames) != 1:
+        return None, "multiple_receipts"
+    try:
+        value = json.loads(frames[0])
+    except (json.JSONDecodeError, TypeError):
+        return None, "invalid_receipt_json"
+    if isinstance(value, dict):
+        return value, "object"
+    if isinstance(value, list):
+        return None, "array"
+    return None, "scalar"
+
+
+def _require_with_failure_diagnostic(
+    condition: bool,
+    message: str,
+    diagnostic_factory,
+    *,
+    emit=print,
+    diagnostic_label="CATCHUPARR_NO_SOURCE_PAUSE_DIAGNOSTIC",
+) -> None:
+    """Emit best-effort diagnostics without replacing the original gate error."""
+    if condition:
+        return
+    try:
+        diagnostic = diagnostic_factory()
+        emit(diagnostic_label + " " + json.dumps(
+            diagnostic, sort_keys=True,
+        ))
+    except Exception as exc:
+        try:
+            emit(diagnostic_label + " " + json.dumps({
+                "diagnostic_error": type(exc).__name__,
+            }, sort_keys=True))
+        except Exception:
+            pass
+    raise RuntimeError(message)
+
+
+def _native_teardown_readiness_timeout(
+    shutdown_delay: float,
+    cleanup_interval: float,
+    *,
+    stopping_marker_ttl: float = 30.0,
+    monitor_allowance: float = 5.0,
+) -> float:
+    """Budget sequential native disconnect, cleanup, and stop-marker phases."""
+    return max(
+        stopping_marker_ttl + monitor_allowance,
+        float(shutdown_delay) + float(cleanup_interval)
+        + stopping_marker_ttl + monitor_allowance,
+    )
+
+
+def _native_teardown_ready_conditions(
+    *,
+    route_available: bool,
+    stopping_marker_absent: bool,
+    metadata_not_stopping: bool,
+    owner_absent: bool,
+    clients_zero: bool,
+    managers_absent: bool,
+    source_inactive: bool,
+    profile_at_baseline: bool,
+    previous_borrow_absent: bool,
+) -> dict[str, bool]:
+    """Define readiness from exact A teardown facts, independent of B activity."""
+    return {
+        "native_route_admits_new_clients": route_available,
+        "redis_stopping_marker_absent": stopping_marker_absent,
+        "metadata_not_stopping": metadata_not_stopping,
+        "native_owner_absent": owner_absent,
+        "native_clients_zero": clients_zero,
+        "native_managers_absent": managers_absent,
+        "source_a_inactive": source_inactive,
+        "profile_a_at_baseline": profile_at_baseline,
+        "previous_borrow_registration_absent": previous_borrow_absent,
+    }
+
+
+def _wait_for_native_teardown_after_pause(
+    pause_conditions: dict[str, bool],
+    wait_for_native_teardown,
+    read_final_conditions,
+):
+    """Wait only after CLOSED/PAUSED proof, then read final gate conditions."""
+    required = {
+        "episode_closed", "borrow_hash_absent", "borrow_membership_absent",
+        "borrow_marker_absent", "ledger_paused", "grace_deadline_elapsed",
+        "task_completed_cleanly",
+    }
+    _require(
+        set(pause_conditions) == required and all(pause_conditions.values()),
+        "Borrow cleanup did not settle the no-source task in PAUSED after native grace",
+    )
+    wait_for_native_teardown()
+    return read_final_conditions()
+
+
+def _source_removal_transition_conditions(
+    *,
+    a_owner_preserved: bool,
+    a_active: bool,
+    a_client_preserved: bool,
+    a_provider_preserved: bool,
+    a_profile_preserved: bool,
+    a_assignments_preserved: bool,
+    b_worker_released: bool,
+    b_native_resources_absent: bool,
+    b_binding_preserved: bool,
+    b_reservation_released: bool,
+    b_private_markers_absent: bool,
+    b_provider_inactive: bool,
+    b_request_count_preserved: bool,
+    b_profile_released: bool,
+) -> dict[str, bool]:
+    """Keep the ordinary A viewer while the removed dedicated B worker drains."""
+    return {
+        "ordinary_a_owner_preserved": a_owner_preserved,
+        "ordinary_a_active": a_active,
+        "ordinary_a_client_preserved": a_client_preserved,
+        "ordinary_a_provider_preserved": a_provider_preserved,
+        "ordinary_a_profile_preserved": a_profile_preserved,
+        "ordinary_a_assignments_preserved": a_assignments_preserved,
+        "dedicated_b_worker_released": b_worker_released,
+        "dedicated_b_native_resources_absent": b_native_resources_absent,
+        "dedicated_b_binding_preserved": b_binding_preserved,
+        "dedicated_b_reservation_released": b_reservation_released,
+        "dedicated_b_private_markers_absent": b_private_markers_absent,
+        "dedicated_b_provider_inactive": b_provider_inactive,
+        "dedicated_b_request_count_preserved": b_request_count_preserved,
+        "dedicated_b_profile_released": b_profile_released,
+    }
+
+
+def _stop_join_and_freeze_attempt_bindings(
+    task,
+    read_records,
+    *,
+    baseline_worker_ids: set[str],
+    stream_id: str,
+    cooperative_sleep=time.sleep,
+):
+    """Stop a recorder task, then freeze every exact attempt it created.
+
+    Attempts observed before stop are retained as evidence, but the final set
+    is read only after join so a retry created during shutdown cannot escape
+    the cleanup oracle.
+    """
+    def matching(records):
+        return [
+            record for record in records
+            if record.get("stream_id") == stream_id
+            and record.get("worker_id")
+            and str(record.get("worker_id")) not in baseline_worker_ids
+        ]
+
+    before = matching(read_records())
+    task.stop()
+    task.join(timeout=25, cooperative_sleep=cooperative_sleep)
+    after = matching(read_records())
+    by_worker = {}
+    for record in (*before, *after):
+        worker_id = str(record["worker_id"])
+        binding = (
+            record.get("capability_digest"),
+            record.get("reservation_id"),
+        )
+        if (not all(isinstance(value, str) and value for value in binding)
+                or (worker_id in by_worker and by_worker[worker_id] != binding)):
+            return (), {}, False
+        by_worker[worker_id] = binding
+    return tuple(sorted(by_worker)), {
+        worker: {
+            "capability_digest": by_worker[worker][0],
+            "reservation_id": by_worker[worker][1],
+        }
+        for worker in sorted(by_worker)
+    }, bool(by_worker)
+
+
+def _attempt_records_match_frozen_bindings(
+    records,
+    *,
+    baseline_worker_ids: set[str],
+    stream_id: str,
+    attempt_ids: tuple[str, ...],
+    bindings: dict,
+):
+    """Require an unchanged frozen attempt set and all exact credentials."""
+    matching = [
+        record for record in records
+        if record.get("stream_id") == stream_id
+        and record.get("worker_id")
+        and str(record.get("worker_id")) not in baseline_worker_ids
+    ]
+    current_ids = {str(record["worker_id"]) for record in matching}
+    if current_ids != set(attempt_ids):
+        return False, {}
+    by_worker = {str(record["worker_id"]): record for record in matching}
+    exact = all(
+        by_worker[worker].get("capability_digest")
+        == bindings[worker]["capability_digest"]
+        and by_worker[worker].get("reservation_id")
+        == bindings[worker]["reservation_id"]
+        for worker in attempt_ids
+    )
+    return exact, by_worker
+
+
+def _profile_count_matches_original_baseline(current_count: int, original_baseline: int) -> bool:
+    """Do not let an intermediate async reservation become the expected value."""
+    return current_count == original_baseline
+
+
+def _run_after_required_gate(gate, action):
+    """Run a side effect only after the required gate returns successfully."""
+    gate()
+    return action()
+
+
+def _run_after_readiness_ack(
+    snapshot_reader,
+    action,
+    timeout_seconds: float,
+    *,
+    message: str,
+    diagnostic_label: str,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_interval: float = 0.1,
+):
+    """Do not begin a replacement attempt before its release snapshot is ACKed."""
+    ready, snapshot = _wait_for_readiness_snapshot(
+        snapshot_reader, timeout_seconds,
+        monotonic=monotonic, sleep=sleep, poll_interval=poll_interval,
+    )
+    _require_with_failure_diagnostic(
+        ready, message, lambda: snapshot, diagnostic_label=diagnostic_label,
+    )
+    return action()
+
+
+def _wait_for_source_removal_transition(
+    snapshot_reader,
+    timeout_seconds: float,
+    *,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_interval: float = 0.1,
+):
+    """Fail fast on any A change; wait only for the independent B cleanup ACK."""
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        snapshot = snapshot_reader()
+        conditions = snapshot.get("conditions", {})
+        a_conditions = {
+            key: value for key, value in conditions.items()
+            if key.startswith("ordinary_a_")
+        }
+        b_conditions = {
+            key: value for key, value in conditions.items()
+            if key.startswith("dedicated_b_")
+        }
+        if not a_conditions or not b_conditions or not all(a_conditions.values()):
+            return False, snapshot, "ordinary_a_changed"
+        if all(b_conditions.values()):
+            return True, snapshot, None
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, snapshot, "dedicated_b_release_timeout"
+        sleep(min(poll_interval, remaining))
+
+
+def _read_after_current_buffer_head(session, buffer, *, minimum_bytes: int, timeout: float):
+    """Read only chunks published after the newly admitted buffer's current head."""
+    floor = _current_buffer_head(buffer)
+    return session.reader.read_after(floor, minimum_bytes=minimum_bytes, timeout=timeout)
+
+
+def _current_buffer_head(buffer) -> int:
+    return int(buffer.redis_client.get(buffer.buffer_index_key) or 0)
+
+
+def _allowlisted_state(value, allowed: frozenset[str]) -> str:
+    """Keep free-form ledger contents out of probe diagnostics."""
+    return value if isinstance(value, str) and value in allowed else "unknown"
+
+
+def _native_client_identity_matches(
+    client_ids,
+    *,
+    expected_client_id: str,
+    connected_at,
+    expected_connected_at: str,
+    worker_id,
+    expected_worker_id: str,
+) -> bool:
+    return (
+        set(client_ids) == {expected_client_id}
+        and connected_at == expected_connected_at
+        and worker_id == expected_worker_id
+    )
+
+
+def _wait_for_readiness_snapshot(
+    snapshot_reader,
+    timeout_seconds: float,
+    *,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_interval: float = 0.1,
+):
+    """Poll a read-only boolean snapshot until ready or its explicit bound."""
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        snapshot = snapshot_reader()
+        conditions = snapshot.get("conditions", {})
+        if conditions and all(conditions.values()):
+            return True, snapshot
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, snapshot
+        sleep(min(poll_interval, remaining))
+
+
+def _open_after_readiness(wait_for_ready, open_request):
+    """Issue exactly one request, only after the read-only readiness gate."""
+    wait_for_ready()
+    return open_request()
+
+
+def _recorder_task_early_exit_diagnostic(run) -> dict:
+    """Return only safe terminal task/attempt summaries, never inputs or secrets."""
+    lock = getattr(run, "_lock", None)
+    if lock is None:
+        failures = list(getattr(run, "failures", ()))
+        results = list(getattr(run, "results", ()))
+        inputs = list(getattr(run, "input_headers", ()))
+        processes = list(getattr(run, "processes", ()))
+    else:
+        with lock:
+            failures = list(getattr(run, "failures", ()))
+            results = list(getattr(run, "results", ()))
+            inputs = list(getattr(run, "input_headers", ()))
+            processes = list(getattr(run, "processes", ()))
+
+    allowed_statuses = {
+        "stopped", "switch_requested", "media_stalled", "exited", "no_media",
+        "already_running", "no_permitted_sources", "proxy_integration_unsupported",
+        "sharing_return_recovery_pending", "sharing_authority_unavailable",
+        "sharing_cleanup_pending", "sharing_admission_uncertain", "recording_paused",
+        "sharing_unavailable", "control_unavailable", "legacy_job", "stale_control",
+        "disabled", "stale_configuration", "invalid_schedule", "outside_schedule",
+    }
+    allowed_exception_classes = {
+        "AssertionError", "AttributeError", "BorrowBindingLost", "CalledProcessError",
+        "ConnectionError", "FileExistsError", "ImportError", "KeyError", "OSError",
+        "PermissionError", "RecorderAttemptAdmissionUncertain", "RecorderControlError",
+        "RecorderLeaseError", "RedisError", "RuntimeError", "ScheduleError",
+        "TimeoutError", "TimeoutExpired", "TypeError", "ValueError",
+    }
+
+    def safe_status(value):
+        return value if isinstance(value, str) and value in allowed_statuses else "other"
+
+    attempt_summaries = []
+    for result in results:
+        useful = getattr(result, "useful_segments", None)
+        return_code = getattr(result, "return_code", None)
+        attempt_summaries.append({
+            "status": safe_status(getattr(result, "status", None)),
+            "useful_segments": useful if type(useful) is int and useful >= 0 else None,
+            "return_code": return_code if type(return_code) is int else None,
+            "switch_id_present": isinstance(
+                getattr(result, "attempt_switch_id", None), str,
+            ),
+        })
+
+    task_result = getattr(run, "result", None)
+    task_status = (
+        safe_status(task_result.get("status"))
+        if isinstance(task_result, dict) else "unavailable"
+    )
+    failure_classes = []
+    for failure in failures:
+        if isinstance(failure, str):
+            class_name = (
+                failure[len("task:"):] if failure.startswith("task:") else failure
+            )
+        else:
+            class_name = ""
+        failure_classes.append(
+            class_name if class_name in allowed_exception_classes else "other"
+        )
+
+    process_exit_codes = []
+    for process in processes:
+        code = process.poll()
+        process_exit_codes.append(code if type(code) is int else None)
+
+    thread = getattr(run, "thread", None)
+    stop_event = getattr(run, "stop_event", None)
+    return {
+        "thread_alive": bool(thread is not None and thread.is_alive()),
+        "stop_requested": bool(stop_event is not None and stop_event.is_set()),
+        "stop_source": (
+            getattr(stop_event, "first_set_source", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
+        "supervisor_admission_status": (
+            getattr(stop_event, "first_supervisor_admission_status", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
+        "supervisor_stop_reason": (
+            getattr(stop_event, "first_supervisor_stop_reason", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
+        "task_status": task_status,
+        "failure_classes": failure_classes,
+        "attempts": attempt_summaries,
+        "attempt_count": len(inputs),
+        "process_exit_codes": process_exit_codes,
+    }
+
+
+def _wait_for_allowed_source_request(
+    run,
+    request_times_reader,
+    request_baseline: int,
+    *,
+    timeout: float,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> float:
+    """Wait for the existing allowed-source request gate and report task state on failure."""
+    message = "Allowed B did not start after the observed native return deadline"
+    deadline = monotonic() + timeout
+    request_times = request_times_reader()
+    while len(request_times) <= request_baseline and monotonic() < deadline:
+        sleep(0.05)
+        request_times = request_times_reader()
+    _require_with_failure_diagnostic(
+        len(request_times) > request_baseline,
+        message,
+        lambda: _recorder_task_early_exit_diagnostic(run),
+        diagnostic_label="CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC",
+    )
+    return request_times[request_baseline]
 
 
 def _assert_private_worker_stop_request_count(before: dict, after: dict) -> None:
@@ -25,6 +525,394 @@ def _assert_private_worker_stop_request_count(before: dict, after: dict) -> None
         after.get("source-b.ts") == before.get("source-b.ts"),
         "Stopping a private recorder unexpectedly reopened provider B",
     )
+
+
+def _run_registration_crash_recovery_probe(
+    *, active_path: Path, settings: dict, archive_root: Path, channel_uuid: str,
+    redis_client, native_server, redis_keys, metadata_key: str,
+    native_owner: str, active_state: str, source_server, profile_a,
+    profile_connections_key: str, profile_a_baseline: int,
+) -> None:
+    """Crash one owned request after real REGISTER, then recover in a new process."""
+    from apps.proxy.live_proxy.constants import ChannelMetadataField
+
+    from catchuparr.adapters.sharing_native import native_registration_is_absent
+    from catchuparr.configuration import (
+        apply_configuration,
+        load_active_configuration,
+        load_applied_state,
+    )
+    from catchuparr.engine.leases import RedisRecorderLease
+    from catchuparr.engine.store import ArchiveStore
+    from catchuparr.sharing_episode import BorrowEpisodeLedger
+    from catchuparr.sharing_runtime import RecorderBorrowCoordinator
+
+    shared_settings = dict(settings)
+    shared_settings["connection_sharing_config"] = (
+        "version: 1\n"
+        "default:\n"
+        "  enabled: true\n"
+        "  live_stability_seconds: 0\n"
+        "  last_viewer_return_seconds: 0\n"
+        "  min_switch_interval_seconds: 0\n"
+    )
+    lease = None
+    restore_settings = True
+    helper = Path(__file__).resolve().with_name("aio_sharing_registration_crash.py")
+    import catchuparr
+
+    plugin_root = Path(catchuparr.__file__).resolve().parent.parent
+
+    def run_child(mode: str, payload: dict, expected_code: int) -> dict:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(helper), mode],
+                cwd="/app",
+                env={
+                    **os.environ,
+                    "CATCHUPARR_APP_ROOT": "/app",
+                    "CATCHUPARR_PLUGIN_ROOT": str(plugin_root),
+                },
+                input=json.dumps(payload, separators=(",", ":")),
+                capture_output=True,
+                text=True,
+                timeout=35,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Owned crash-probe child failed: {type(exc).__name__}") from None
+        value, stdout_shape = _parse_crash_child_result(result.stdout)
+        _require_with_failure_diagnostic(
+            result.returncode == expected_code and isinstance(value, dict),
+            f"Owned crash-probe child returned an unexpected result in {mode}",
+            lambda: _crash_child_failure_diagnostic(
+                result, expected_code, value, stdout_shape,
+            ),
+            diagnostic_label="CATCHUPARR_SHARING_CRASH_CHILD_FAILURE",
+        )
+        return value
+
+    def prepare_fresh():
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            prepared = coordinator.poll(active=active, control_generation=control.generation)
+            if prepared is not None:
+                return prepared
+            time.sleep(0.1)
+        diagnostic = {}
+        try:
+            from catchuparr.adapters.sharing_native import (
+                _private_client,
+                _text,
+                observe_native_connection,
+                read_native_episode_grant,
+            )
+            from catchuparr.configuration import _sharing_catalog_generation
+            from catchuparr.recorder_proxy import configuration_generation
+            from catchuparr.sharing_planner import SharingObservation, SharingSettings, observe
+            from catchuparr.sharing_runtime import _native_source_catalog
+
+            current_sources, current_catalog = _native_source_catalog(channel_uuid)
+            native = observe_native_connection(
+                redis_client, channel_uuid,
+                catalog_generation=current_catalog,
+                assigned_sources=current_sources,
+                observed_at=time.time(),
+            )
+            target = native.target if native is not None else None
+            latest = coordinator.intent_ledger.read(channel_uuid)
+            state = latest.state if latest is not None else None
+            setting = active.get("connection_sharing", {}).get(channel_uuid, {})
+            current_generation = configuration_generation(active)
+            live_episode = read_native_episode_grant(redis_client, channel_uuid)
+            native_observer = {}
+            owner_key = f"live:channel:{channel_uuid}:owner"
+            metadata_key = f"live:channel:{channel_uuid}:metadata"
+            owner_raw = redis_client.get(owner_key)
+            metadata_raw = redis_client.hgetall(metadata_key) or {}
+            metadata = {_text(key): _text(value) for key, value in metadata_raw.items()}
+            owner = _text(owner_raw) if owner_raw else ""
+            heartbeat_key = f"live:worker:{owner}:heartbeat"
+            source_matches = [
+                source for source in current_sources
+                if source.channel_uuid == channel_uuid
+                and source.stream_id == metadata.get("stream_id")
+                and source.m3u_profile_id == metadata.get("m3u_profile")
+                and source.input_profile_id == metadata.get("stream_profile")
+                and source.assigned
+            ]
+            buffer_index_key = f"live:channel:{channel_uuid}:input:buffer:index"
+            head_raw = redis_client.get(buffer_index_key)
+            buffer_head = int(_text(head_raw)) if head_raw is not None else 0
+            newest_chunks = redis_client.zrevrange(
+                f"live:channel:{channel_uuid}:input:buffer:chunk_timestamps", 0, 0,
+            )
+            newest_chunk = int(_text(newest_chunks[0])) if newest_chunks else 0
+            clients_key = f"live:channel:{channel_uuid}:clients"
+            native_client_ids = [_text(item) for item in redis_client.smembers(clients_key)]
+            ordinary_client_ids = []
+            unknown_client_classifications = 0
+            for client_id in native_client_ids:
+                classification = _private_client(redis_client, channel_uuid, client_id)
+                if classification is None:
+                    unknown_client_classifications += 1
+                    continue
+                if classification:
+                    continue
+                record = redis_client.hgetall(
+                    f"live:channel:{channel_uuid}:clients:{client_id}",
+                ) or {}
+                fields = {_text(key): _text(value) for key, value in record.items()}
+                if (
+                    fields.get("worker_id")
+                    and fields.get("connected_at")
+                    and not redis_client.exists(
+                        f"live:channel:{channel_uuid}:client:{client_id}:stop",
+                    )
+                ):
+                    ordinary_client_ids.append(client_id)
+            source = source_matches[0] if len(source_matches) == 1 else None
+            native_observer = {
+                "owner_present": bool(owner),
+                "metadata_present": bool(metadata),
+                "metadata_owner_matches_lock": metadata.get("owner") == owner and bool(owner),
+                "metadata_state_allowed": metadata.get("state", "").lower()
+                in {"active", "waiting_for_clients"},
+                "metadata_channel_matches": metadata.get("channel_uuid") == channel_uuid,
+                "owner_ttl_positive": int(redis_client.ttl(owner_key)) > 0,
+                "channel_not_stopping": not bool(
+                    redis_client.exists(f"live:channel:{channel_uuid}:stopping"),
+                ),
+                "worker_heartbeat_positive": bool(
+                    redis_client.exists(heartbeat_key)
+                    and int(redis_client.ttl(heartbeat_key)) > 0
+                ),
+                "metadata_stream_present": bool(metadata.get("stream_id")),
+                "metadata_m3u_profile_present": bool(metadata.get("m3u_profile")),
+                "metadata_input_profile_present": bool(metadata.get("stream_profile")),
+                "assigned_metadata_match_count": len(source_matches),
+                "matched_source_eligible": bool(
+                    source
+                    and source.account_active
+                    and source.profile_active
+                    and source.media_compatible
+                    and source.supported_worker_kind
+                    and not source.redirect_channel
+                    and not source.vod_or_preview
+                ),
+                "buffer_head_positive": buffer_head > 0,
+                "buffer_timestamp_present": bool(newest_chunks),
+                "buffer_chunk_in_range": 0 < newest_chunk <= buffer_head,
+                "buffer_chunk_present": bool(
+                    newest_chunk > 0
+                    and redis_client.exists(
+                        f"live:channel:{channel_uuid}:input:buffer:chunk:{newest_chunk}",
+                    )
+                ),
+                "native_client_count": len(native_client_ids),
+                "unknown_private_marker_classifications": unknown_client_classifications,
+                "ordinary_clients_with_valid_records": len(ordinary_client_ids),
+            }
+            diagnostic = {
+                "active_sharing_enabled": setting.get("enabled") is True,
+                "control_paused": bool(control.paused),
+                "config_generation_matches": current_generation == coordinator.configuration_generation,
+                "catalog_generation_matches": (
+                    current_catalog == coordinator.catalog_generation
+                    and _sharing_catalog_generation(channel_uuid) == current_catalog
+                ),
+                "recorder_lease_current": coordinator._recovery_is_current(
+                    channel_uuid,
+                    latest.revision if latest is not None else None,
+                    coordinator.configuration_generation,
+                    control.generation,
+                    coordinator.recorder_fence,
+                ),
+                "native_episode_phase": live_episode.phase if live_episode else "absent",
+                "native_target_present": target is not None,
+                "native_target_healthy": bool(
+                    target and target.healthy_existing_connection(channel_uuid)
+                ),
+                "native_target_eligible": bool(
+                    target and target.eligible_for_new_borrow(channel_uuid)
+                ),
+                "ordinary_viewer_count": len(target.ordinary_client_ids) if target else 0,
+                "native_observer_guards": native_observer,
+                "source_catalog_row_count": len(current_sources),
+                "intent_action": latest.intent.action.value if latest and latest.intent else None,
+                "sharing_phase": state.phase.value if state else None,
+                "last_switch_clock_present": bool(state and state.last_switch_at is not None),
+            }
+            if state is not None and setting.get("enabled") is True:
+                planned = observe(
+                    state,
+                    SharingObservation(
+                        channel_uuid=channel_uuid,
+                        now=time.time(),
+                        configuration_generation=coordinator.configuration_generation,
+                        control_generation=control.generation,
+                        recorder_fence=coordinator.recorder_fence,
+                        lease_is_current=diagnostic["recorder_lease_current"],
+                        settings=SharingSettings(
+                            enabled=True,
+                            live_stability_seconds=setting["live_stability_seconds"],
+                            last_viewer_return_seconds=setting["last_viewer_return_seconds"],
+                            min_switch_interval_seconds=setting["min_switch_interval_seconds"],
+                        ),
+                        target=target,
+                        dedicated_source_available=True,
+                    ),
+                )
+                diagnostic["planner_action"] = planned.action.value
+                diagnostic["planner_reason"] = planned.reason
+        except Exception as exc:
+            diagnostic["diagnostic_error_type"] = type(exc).__name__
+        raise RuntimeError(
+            "Coordinator did not issue the synthetic live-viewer borrow: "
+            + json.dumps(diagnostic, sort_keys=True)
+        )
+
+    try:
+        applied = apply_configuration(shared_settings, active_path=active_path)
+        _require(applied.get("applied") is True, "Crash-recovery sharing Apply failed")
+        active = load_active_configuration(active_path)
+        _require(active is not None, "Crash-recovery sharing snapshot is unavailable")
+        _require(
+            active.get("connection_sharing", {}).get(channel_uuid, {}).get("enabled") is True,
+            "Crash-recovery sharing defaults were not enabled for the synthetic channel",
+        )
+        _, control = load_applied_state(active_path)
+        provider_before = source_server.snapshot()
+        profile_before = _profile_count(redis_client, profile_a.id, profile_connections_key)
+        _require(
+            profile_before == profile_a_baseline + 1
+            and provider_before[1].get("source-a.ts") == 1
+            and provider_before[1].get("source-b.ts") == 0,
+            "Crash probe did not start with the original live-A provider binding",
+        )
+        store = ArchiveStore(archive_root)
+        lease = RedisRecorderLease(
+            redis_client, channel_uuid, ttl_seconds=90, archive_store=store,
+        )
+        fence = lease.acquire()
+        _require(fence is not None, "Crash-recovery recorder lease was unavailable")
+        database_path = archive_root / ".catchuparr-sharing.sqlite3"
+        coordinator = RecorderBorrowCoordinator(
+            redis_client, archive_root, channel_uuid, active=active,
+            control_generation=control.generation, recorder_fence=fence,
+            lease_value=lease._value, dedicated_source_available=True,
+        )
+
+        first = prepare_fresh()
+        capability = __import__(
+            "catchuparr.adapters.sharing_borrow_route", fromlist=["encode_borrow_capability"],
+        ).encode_borrow_capability(first.capability)
+        crashed = run_child(
+            "crash-after-register", {"capability": capability}, expected_code=73,
+        )
+        _require(crashed.get("native_registered") is True,
+                 "Child exited before confirming the real native registration ACK")
+        opening = BorrowEpisodeLedger(database_path).read(channel_uuid)
+        _require(
+            opening.episode_id == first.episode_id
+            and opening.phase == "opening"
+            and opening.client_id == first.client_id,
+            "Crash did not leave the exact durable registration attempt pending",
+        )
+        registration = BorrowEpisodeLedger(database_path).registration_attempt(first.episode_id)
+        _require(
+            registration.status == "prepared"
+            and registration.client_id == first.client_id
+            and registration.connected_at is None
+            and registration.projection_version is None,
+            "Crash child persisted a registration ACK before exiting",
+        )
+        from catchuparr.adapters.sharing_borrow_route import _recover_registration_ack
+
+        native_ack = _recover_registration_ack(
+            redis_client, opening, client_id=registration.client_id,
+            local_worker_id=registration.local_worker_id,
+            user_agent=registration.user_agent,
+            client_ip=registration.client_ip,
+            backend_signature=registration.backend_signature,
+        )
+        _require(
+            native_ack is not None
+            and native_ack.episode_id == first.episode_id
+            and native_ack.client_id == first.client_id
+            and native_ack.projection_version == first.episode_version + 1
+            and native_ack.connected_at,
+            "Native client hash, marker, set, and episode projection do not match the prepared ACK",
+        )
+
+        recovered = run_child(
+            "reconcile",
+            {"database_path": str(database_path), "episode_id": first.episode_id},
+            expected_code=0,
+        )
+        _require(recovered == {"completed": 1, "pending": 0},
+                 "Fresh process did not reconcile exactly the crashed registration")
+        closed = BorrowEpisodeLedger(database_path).read(channel_uuid)
+        _require(
+            closed.episode_id == first.episode_id and closed.phase == "closed"
+            and native_registration_is_absent(
+                redis_client, channel_uuid=channel_uuid, client_id=first.client_id,
+            ),
+            "Restart recovery did not close and remove the exact borrowed client",
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, redis_keys, channel_uuid, 1,
+        )
+        _require(
+            _redis_text(redis_client.get(redis_keys.channel_owner(channel_uuid))) == native_owner
+            and _redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE)) == active_state
+            and source_server.snapshot() == provider_before
+            and _profile_count(redis_client, profile_a.id, profile_connections_key) == profile_before,
+            "Crash recovery changed the original viewer owner or native worker",
+        )
+        replay = run_child("replay", {"capability": capability}, expected_code=0)
+        _require(replay == {"denied": True}, "Consumed crash capability was replayable")
+
+        # Recovery of the closed ATTACH claim and a new coordinator poll must
+        # issue a distinct ticket before a fresh reader is allowed to attach.
+        second = prepare_fresh()
+        _require(second.episode_id != first.episode_id and second.client_id != first.client_id,
+                 "Fresh legitimate borrow reused the crashed episode identity")
+        second_token = __import__(
+            "catchuparr.adapters.sharing_borrow_route", fromlist=["encode_borrow_capability"],
+        ).encode_borrow_capability(second.capability)
+        read = run_child(
+            "open-and-read", {"capability": second_token}, expected_code=0,
+        )
+        _require(read == {"closed": True, "opened": True, "read_ts": True},
+                 "Fresh legitimate borrow did not read aligned native TS packets")
+        fresh_episode = BorrowEpisodeLedger(database_path).read(channel_uuid)
+        _require(
+            fresh_episode.episode_id == second.episode_id
+            and fresh_episode.phase == "closed"
+            and native_registration_is_absent(
+                redis_client, channel_uuid=channel_uuid, client_id=second.client_id,
+            ),
+            "Fresh legitimate reader did not acknowledge exact client and episode cleanup",
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, redis_keys, channel_uuid, 1,
+        )
+        _require(
+            _redis_text(redis_client.get(redis_keys.channel_owner(channel_uuid))) == native_owner
+            and source_server.snapshot() == provider_before
+            and _profile_count(redis_client, profile_a.id, profile_connections_key) == profile_before,
+            "Fresh reader cleanup disturbed the original viewer",
+        )
+    finally:
+        try:
+            if lease is not None and getattr(lease, "_value", None) is not None:
+                lease.release()
+        finally:
+            if restore_settings:
+                restored = apply_configuration(settings, active_path=active_path)
+                _require(restored.get("applied") is True,
+                         "Crash-recovery sharing configuration could not be restored")
 
 
 def _current_orm_context_snapshot() -> dict[str, object]:
@@ -141,6 +1029,10 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
         self._counts_lock = threading.Lock()
         self.request_counts = {name: 0 for name in payloads}
         self.active_counts = {name: 0 for name in payloads}
+        self.request_started_at = {name: [] for name in payloads}
+        self.request_start_callback = None
+        self.request_start_callback_errors = []
+        self.request_callback_finished = threading.Event()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -155,6 +1047,18 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
                 with owner._counts_lock:
                     owner.request_counts[name] += 1
                     owner.active_counts[name] += 1
+                    started_at = time.time()
+                    owner.request_started_at[name].append(started_at)
+                    request_number = owner.request_counts[name]
+                    callback = owner.request_start_callback
+                if callback is not None:
+                    if not owner._run_request_start_callback(
+                        callback, name, request_number, started_at,
+                    ):
+                        with owner._counts_lock:
+                            owner.active_counts[name] -= 1
+                        self.send_error(500)
+                        return
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "video/mp2t")
@@ -189,6 +1093,19 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
             daemon=True,
         )
 
+    def _run_request_start_callback(self, callback, name, request_number, started_at):
+        """Run and record a boundary check before the upstream response starts."""
+        try:
+            completed = callback(name, request_number, started_at) is True
+        except Exception as exc:
+            with self._counts_lock:
+                self.request_start_callback_errors.append(exc)
+            self.request_callback_finished.set()
+            return False
+        if completed:
+            self.request_callback_finished.set()
+        return True
+
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.server_port}"
@@ -196,6 +1113,10 @@ class _SyntheticSourceServer(ThreadingHTTPServer):
     def snapshot(self) -> tuple[dict[str, int], dict[str, int]]:
         with self._counts_lock:
             return dict(self.request_counts), dict(self.active_counts)
+
+    def request_times(self, source_name: str) -> list[float]:
+        with self._counts_lock:
+            return list(self.request_started_at.get(source_name, ()))
 
     def close(self) -> None:
         if self.thread.is_alive():
@@ -539,6 +1460,85 @@ def _verify_audio_video_tone(
     return frequency
 
 
+def _verified_task_borrow_client_ids(
+    task,
+    *,
+    worker_id: str,
+    channel_uuid: str,
+    decode_capability,
+    is_server_verified,
+):
+    """Return only this task's signed borrow IDs that are still server verified."""
+    with task._lock:
+        headers = [dict(item) for item in task.input_headers]
+    verified = set()
+    for item in headers:
+        token = item.get("X-Catchuparr-Borrow")
+        if not isinstance(token, str) or not token:
+            continue
+        try:
+            capability = decode_capability(token)
+        except (TypeError, ValueError):
+            continue
+        if capability.channel_uuid != channel_uuid:
+            continue
+        client_id = f"catchuparr-client-{capability.nonce}"
+        if is_server_verified(worker_id, client_id):
+            verified.add(client_id)
+    return frozenset(verified)
+
+
+def _native_ordinary_client_observation(
+    redis_client,
+    clients_key: str,
+    client_ids: set[str],
+    verified_borrow_ids: set[str],
+    *,
+    local_clients: int,
+    expected_owner: str,
+    expected_identity=None,
+):
+    """Validate one exact ordinary client plus at most one current task borrow."""
+    current_borrow_ids = client_ids & verified_borrow_ids
+    ordinary_ids = client_ids - current_borrow_ids
+    missing_verified_ids = verified_borrow_ids - client_ids
+    _require(
+        local_clients == 1
+        and len(client_ids) in (1, 2)
+        and len(ordinary_ids) == 1
+        and len(current_borrow_ids) <= 1
+        and len(verified_borrow_ids) <= 1
+        and (
+            not missing_verified_ids
+            or (
+                len(client_ids) == 1
+                and len(missing_verified_ids) == 1
+                and len(verified_borrow_ids) == 1
+            )
+        ),
+        "Native recorder parent client detached or an unverified client joined",
+    )
+    ordinary_client_id = next(iter(ordinary_ids))
+    if expected_identity is not None:
+        _require(
+            ordinary_client_id == expected_identity["client_id"],
+            "Native recorder ordinary client registration changed before ACTIVE",
+        )
+    ordinary_key = f"{clients_key}:{ordinary_client_id}"
+    identity = {
+        "client_id": ordinary_client_id,
+        "connected_at": _redis_text(redis_client.hget(ordinary_key, "connected_at")),
+        "worker_id": _redis_text(redis_client.hget(ordinary_key, "worker_id")),
+    }
+    _require(
+        identity["connected_at"]
+        and identity["worker_id"] == expected_owner
+        and (expected_identity is None or identity == expected_identity),
+        "Native recorder ordinary client registration changed before ACTIVE",
+    )
+    return identity, bool(missing_verified_ids)
+
+
 def _wait_for_native_active(
     redis_client,
     native_server,
@@ -548,8 +1548,15 @@ def _wait_for_native_active(
     metadata_field,
     channel_state,
     timeout: float = 45,
+    verified_borrow_client_ids=None,
+    expected_ordinary_identity=None,
 ):
-    """Verify strict native readiness after one real response client registers."""
+    """Verify native readiness while preserving the exact ordinary client.
+
+    The default contract remains one global/local ordinary client. Later sharing
+    probe phases may pass the current task's server-verified borrow IDs; then one
+    exact borrow can join the ordinary client while ACTIVE readiness is pending.
+    """
     from time import monotonic
 
     owner_key = redis_keys.channel_owner(worker_id)
@@ -558,6 +1565,7 @@ def _wait_for_native_active(
     expected_owner = _redis_text(native_server.worker_id)
     active_state = _constant_text(channel_state.ACTIVE)
     deadline = monotonic() + timeout
+    ordinary_identity = None
 
     while True:
         owner = _redis_text(redis_client.get(owner_key))
@@ -567,11 +1575,49 @@ def _wait_for_native_active(
         _require(manager is not None, "Native recorder parent stream manager is absent")
         _require(client_manager is not None, "Native recorder parent client manager is absent")
         local_clients = int(client_manager.get_client_count())
-        global_clients = int(redis_client.scard(clients_key) or 0)
-        _require(
-            local_clients == 1 and global_clients == 1,
-            "Native recorder parent client detached before ACTIVE readiness",
-        )
+        if verified_borrow_client_ids is None:
+            global_clients = int(redis_client.scard(clients_key) or 0)
+            _require(
+                local_clients == 1 and global_clients == 1,
+                "Native recorder parent client detached before ACTIVE readiness",
+            )
+        else:
+            # SMEMBERS is the authoritative complete membership observation.
+            # Do not compare it with a separately sampled SCARD: an atomic
+            # borrow registration can occur between those two Redis reads.
+            client_ids = {
+                _redis_text(value) for value in redis_client.smembers(clients_key)
+            }
+            verified_borrow_ids = {
+                _redis_text(value) for value in verified_borrow_client_ids()
+            }
+            expected_identity = expected_ordinary_identity or ordinary_identity
+            observed_identity, missing_verified_ids = _native_ordinary_client_observation(
+                redis_client,
+                clients_key,
+                client_ids,
+                verified_borrow_ids,
+                local_clients=local_clients,
+                expected_owner=expected_owner,
+                expected_identity=expected_identity,
+            )
+            ordinary_identity = observed_identity
+            if missing_verified_ids:
+                # The server verifier saw this task's atomic registration after
+                # SMEMBERS. Validate the local ordinary client and reject every
+                # unrelated shape before taking a fresh membership snapshot.
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Native recorder did not reach ACTIVE before its bounded timeout"
+                    )
+                time.sleep(min(0.01, remaining))
+                continue
+            current_borrow_ids = client_ids & verified_borrow_ids
+            _require(
+                len(current_borrow_ids) == len(verified_borrow_ids),
+                "Native recorder borrow membership changed during readiness",
+            )
         state = _redis_text(redis_client.hget(metadata_key, metadata_field.STATE))
         manager_running = bool(getattr(manager, "running", False))
         if state == active_state and manager_running:
@@ -1810,9 +2856,12 @@ def _wait_for_indexed_tone(
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        _require(
-            run.thread is not None and run.thread.is_alive(),
+        task_alive = run.thread is not None and run.thread.is_alive()
+        _require_with_failure_diagnostic(
+            task_alive,
             "Synthetic recorder task ended before expected media was indexed",
+            lambda: _recorder_task_early_exit_diagnostic(run),
+            diagnostic_label="CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC",
         )
         matched = []
         for segment in store.segments(channel_uuid):
@@ -1848,19 +2897,97 @@ def _wait_for_native_client_count(
     worker_id: str,
     expected: int,
     *,
+    expected_local: int | None = None,
     timeout: float = 15,
     reject_excess: bool = False,
-) -> None:
+    return_identity: bool = False,
+    verified_borrow_client_ids=None,
+):
+    # The Redis set is shared across workers, while ClientManager counts are
+    # process-local. Borrowed readers deliberately live in a task-owned manager
+    # in the HTTP worker, so the probe must be able to assert those counts
+    # independently instead of pretending they describe one manager.
+    if expected_local is None:
+        expected_local = expected
+    if (
+        isinstance(expected, bool) or not isinstance(expected, int) or expected < 0
+        or isinstance(expected_local, bool) or not isinstance(expected_local, int)
+        or expected_local < 0
+    ):
+        raise ValueError("native client counts must be non-negative integers")
     deadline = time.monotonic() + timeout
+    clients_key = redis_keys.clients(worker_id)
+    expected_owner = _redis_text(native_server.worker_id) if return_identity else None
+    ordinary_identity = None
     while time.monotonic() < deadline:
         manager = native_server.client_managers.get(worker_id)
-        global_count = int(redis_client.scard(redis_keys.clients(worker_id)) or 0)
+        if return_identity:
+            client_ids = {_redis_text(item) for item in redis_client.smembers(clients_key)}
+            global_count = len(client_ids)
+        else:
+            client_ids = None
+            global_count = int(redis_client.scard(clients_key) or 0)
         local_count = int(manager.get_client_count()) if manager is not None else -1
-        if global_count == expected and local_count == expected:
-            return
+        if return_identity and verified_borrow_client_ids is not None:
+            if expected != 1 or expected_local != 1:
+                raise ValueError("verified borrow identity capture requires one ordinary client")
+            verified_ids = {
+                _redis_text(value) for value in verified_borrow_client_ids()
+            }
+            if local_count > 1 or len(verified_ids) > 1:
+                raise RuntimeError("Native live route registered an unverified client")
+            if ordinary_identity is not None and local_count != 1:
+                raise RuntimeError(
+                    "Native recorder ordinary client detached during identity capture"
+                )
+            if local_count == 1:
+                ordinary_identity, missing_verified_ids = _native_ordinary_client_observation(
+                    redis_client,
+                    clients_key,
+                    client_ids,
+                    verified_ids,
+                    local_clients=local_count,
+                    expected_owner=expected_owner,
+                    expected_identity=ordinary_identity,
+                )
+                if not missing_verified_ids:
+                    return ordinary_identity
+                # A verified borrow can register between SMEMBERS and the
+                # task-local capability scan. Reconcile only after validating
+                # and latching the exact ordinary client above.
+                time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+                continue
+            # The native ordinary client may be between Redis and local
+            # ClientManager registration. Do not accept arbitrary memberships
+            # while waiting for that one expected local client.
+            ordinary_ids = client_ids - verified_ids
+            _require(
+                local_count == 0
+                and len(client_ids) <= 2
+                and len(ordinary_ids) <= 1
+                and (not ordinary_ids or len(verified_ids) <= 1),
+                "Native live route registered an unverified client",
+            )
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            continue
+        if global_count == expected and local_count == expected_local:
+            if not return_identity:
+                return None
+            if expected != 1:
+                raise ValueError("identity capture requires exactly one expected client")
+            client_id = next(iter(client_ids))
+            client_key = f"{clients_key}:{client_id}"
+            connected_at = _redis_text(redis_client.hget(client_key, "connected_at"))
+            client_worker = _redis_text(redis_client.hget(client_key, "worker_id"))
+            if connected_at and client_worker == expected_owner:
+                return {
+                    "client_id": client_id,
+                    "connected_at": connected_at,
+                    "worker_id": client_worker,
+                }
         if reject_excess:
             _require(
-                global_count <= expected and local_count <= expected,
+                global_count <= expected and local_count <= expected_local,
                 "Native live route registered more clients than the fixture expected",
             )
         time.sleep(0.1)
@@ -1911,13 +3038,17 @@ def _probe_running_recorder_controls(
         profile_credential_release_key,
     )
     from apps.plugins.models import PluginConfig
+    from apps.proxy.live_proxy.config_helper import ConfigHelper
     from apps.proxy.live_proxy.constants import ChannelMetadataField
     from apps.proxy.live_proxy.redis_keys import RedisKeys
 
     from catchuparr import runtime, tasks
     from catchuparr.configuration import load_active_configuration
     from catchuparr.recorder_control import load_recorder_control
-    from catchuparr.recorder_proxy import CAPABILITY_PREFIX, configuration_generation
+    from catchuparr.recorder_proxy import (
+        CAPABILITY_PREFIX,
+        configuration_generation,
+    )
     from catchuparr.schedule import schedule_from_snapshot, schedule_is_active
 
     def require_live_a(
@@ -2077,9 +3208,14 @@ def _probe_running_recorder_controls(
             row.save(update_fields=("settings",))
 
     def wait_for_private_cleanup(worker_id: str, expected_b_requests: int) -> None:
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
         while time.monotonic() < deadline:
             manager = native_server.stream_managers.get(worker_id)
+            client_manager = native_server.client_managers.get(worker_id)
             owner = redis_client.get(RedisKeys.channel_owner(worker_id))
             clients = int(redis_client.scard(RedisKeys.clients(worker_id)) or 0)
             active_counts = source_server.snapshot()[1]
@@ -2087,7 +3223,11 @@ def _probe_running_recorder_controls(
                 redis_client, profile_b.id, profile_connections_key,
             )
             if (
-                manager is None and owner is None and clients == 0
+                manager is None
+                and worker_id not in native_server._live_stream_managers
+                and client_manager is None
+                and owner is None and clients == 0
+                and not redis_client.exists(RedisKeys.channel_stopping(worker_id))
                 and active_counts["source-b.ts"] == 0
                 and source_server.snapshot()[0]["source-b.ts"] == expected_b_requests
                 and profile_count == profile_baselines[profile_b.id]
@@ -2096,8 +3236,11 @@ def _probe_running_recorder_controls(
             gevent_sleep(0.1)
         _require(
             native_server.stream_managers.get(worker_id) is None
+            and worker_id not in native_server._live_stream_managers
+            and native_server.client_managers.get(worker_id) is None
             and redis_client.get(RedisKeys.channel_owner(worker_id)) is None
             and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+            and not redis_client.exists(RedisKeys.channel_stopping(worker_id))
             and source_server.snapshot()[1]["source-b.ts"] == 0
             and source_server.snapshot()[0]["source-b.ts"] == expected_b_requests
             and _profile_count(redis_client, profile_b.id, profile_connections_key)
@@ -2487,6 +3630,8 @@ def _probe_running_recorder_controls(
 
 def probe_actual_live_archive_isolation(root: Path) -> None:
     """Keep native live A active while real recorder tasks first share A, then isolate B."""
+    from unittest.mock import patch
+
     from aio_recorder_failover import (
         _assert_worker_cleanup,
         _DjangoHTTPBridge,
@@ -2511,6 +3656,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     )
     from apps.m3u.models import M3UAccount
     from apps.plugins.models import PluginConfig
+    from apps.proxy.live_proxy.config_helper import ConfigHelper
     from apps.proxy.live_proxy.constants import ChannelMetadataField, ChannelState
     from apps.proxy.live_proxy.redis_keys import RedisKeys
     from apps.proxy.live_proxy.server import ProxyServer
@@ -2520,7 +3666,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     from gevent import sleep as gevent_sleep
 
     from catchuparr import runtime as catchuparr_runtime
-    from catchuparr.adapters.recorder_proxy import _release_worker_reservation
+    from catchuparr import tasks as catchuparr_tasks
+    from catchuparr.adapters.recorder_proxy import (
+        _release_worker_reservation,
+        reservation_credential_marker_key,
+    )
     from catchuparr.configuration import (
         active_settings_path,
         apply_configuration,
@@ -2528,7 +3678,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     )
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.recorder_control import control_deny_path, control_state_path
-    from catchuparr.recorder_proxy import configuration_generation, ranked_source_candidates
+    from catchuparr.recorder_proxy import (
+        CAPABILITY_PREFIX,
+        configuration_generation,
+        ranked_source_candidates,
+    )
 
     _require(
         os.environ.get("CATCHUPARR_INTEGRATION_TEST") == "1",
@@ -2588,6 +3742,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     live_response = None
     live_reader = None
     live_session = None
+    churn_session = None
     native_server = None
     native_diagnostic = None
     native_diagnostic_report = None
@@ -2867,6 +4022,22 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(counts["source-a.ts"] >= 1 and active_counts["source-a.ts"] == 1,
                  "Native live A did not open its synthetic A source")
         _require(counts["source-b.ts"] == 0, "Native live A opened archive source B")
+        _run_registration_crash_recovery_probe(
+            active_path=active_path,
+            settings=settings,
+            archive_root=archive_root,
+            channel_uuid=worker_id,
+            redis_client=redis_client,
+            native_server=native_server,
+            redis_keys=RedisKeys,
+            metadata_key=metadata_key,
+            native_owner=native_owner,
+            active_state=active_state,
+            source_server=source_server,
+            profile_a=profile_a,
+            profile_connections_key=profile_connections_key,
+            profile_a_baseline=profile_baselines[profile_a.id],
+        )
         _wait_for_native_client_count(redis_client, native_server, RedisKeys, worker_id, 1)
 
         assignment_keys = {
@@ -3138,15 +4309,23 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         first_b_worker_id = b_worker_id
         run_b.stop()
         run_b.join(cooperative_sleep=gevent_sleep)
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
         while time.monotonic() < deadline:
             b_manager = native_server.stream_managers.get(first_b_worker_id)
+            b_client_manager = native_server.client_managers.get(first_b_worker_id)
             b_clients = int(redis_client.scard(RedisKeys.clients(first_b_worker_id)) or 0)
             _counts, b_active = source_server.snapshot()
             if (
                 b_manager is None
+                and first_b_worker_id not in native_server._live_stream_managers
+                and b_client_manager is None
                 and redis_client.get(RedisKeys.channel_owner(first_b_worker_id)) is None
                 and b_clients == 0
+                and not redis_client.exists(RedisKeys.channel_stopping(first_b_worker_id))
                 and b_active["source-b.ts"] == 0
             ):
                 break
@@ -3154,8 +4333,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         first_b_stopped_counts, first_b_stopped_active = source_server.snapshot()
         _require(
             native_server.stream_managers.get(first_b_worker_id) is None
+            and first_b_worker_id not in native_server._live_stream_managers
+            and native_server.client_managers.get(first_b_worker_id) is None
             and redis_client.get(RedisKeys.channel_owner(first_b_worker_id)) is None
             and int(redis_client.scard(RedisKeys.clients(first_b_worker_id)) or 0) == 0
+            and not redis_client.exists(RedisKeys.channel_stopping(first_b_worker_id))
             and first_b_stopped_active["source-b.ts"] == 0
             and first_b_stopped_counts["source-b.ts"]
             == counts_during_b["source-b.ts"],
@@ -3331,23 +4513,34 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     880,
                     "Final indexed archive B",
                 )
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
         while time.monotonic() < deadline:
             b_manager = native_server.stream_managers.get(b_worker_id)
+            b_client_manager = native_server.client_managers.get(b_worker_id)
             b_clients = int(redis_client.scard(RedisKeys.clients(b_worker_id)) or 0)
             _counts, b_active = source_server.snapshot()
             if (
                 b_manager is None
+                and b_worker_id not in native_server._live_stream_managers
+                and b_client_manager is None
                 and redis_client.get(RedisKeys.channel_owner(b_worker_id)) is None
                 and b_clients == 0
+                and not redis_client.exists(RedisKeys.channel_stopping(b_worker_id))
                 and b_active["source-b.ts"] == 0
             ):
                 break
-            time.sleep(0.1)
+            gevent_sleep(0.1)
         _require(
             native_server.stream_managers.get(b_worker_id) is None
+            and b_worker_id not in native_server._live_stream_managers
+            and native_server.client_managers.get(b_worker_id) is None
             and redis_client.get(RedisKeys.channel_owner(b_worker_id)) is None
             and int(redis_client.scard(RedisKeys.clients(b_worker_id)) or 0) == 0
+            and not redis_client.exists(RedisKeys.channel_stopping(b_worker_id))
             and source_server.snapshot()[0]["source-b.ts"]
             == counts_after_running_controls["source-b.ts"]
             and source_server.snapshot()[1]["source-b.ts"] == 0,
@@ -3409,47 +4602,1766 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Native live A after archive B cleanup",
         )
 
-        live_session.close()
-        live_response = None
-        live_reader = None
-        live_session = None
-        deadline = time.monotonic() + 20
+        # Exercise the real opt-in connection-sharing path with the only
+        # allowed archive source set to B while the existing native viewer is
+        # on A. The first recorder input must borrow A's published TS buffer;
+        # after the final ordinary viewer leaves, it must return to B only
+        # after the applied switch cooldown.
+        from aio_stats_probe import stats_options_draft
+
+        sharing_settings = stats_options_draft(settings_b, hide_recorders=True)
+        sharing_settings["connection_sharing_config"] = (
+            "version: 1\n"
+            "default:\n"
+            "  enabled: true\n"
+            "  live_stability_seconds: 0\n"
+            "  last_viewer_return_seconds: 2\n"
+            "  min_switch_interval_seconds: 60\n"
+            "rules:\n"
+            "  - channels: {profile: all}\n"
+        )
+        current_plugin_config = PluginConfig.objects.get(key="catchuparr")
+        current_plugin_config.settings = dict(sharing_settings)
+        current_plugin_config.save(update_fields=("settings",))
+        applied_sharing = catchuparr_runtime.apply_configuration(sharing_settings)
+        _require(
+            applied_sharing.get("applied") is True,
+            "Unified Apply rejected the synthetic sharing-enabled B policy",
+        )
+        active_sharing = load_active_configuration(active_path)
+        _require(active_sharing is not None, "Applied sharing configuration was not readable")
+        _require(
+            active_sharing["connection_sharing"][worker_id]["enabled"] is True
+            and [str(item.get("id")) for item in ranked_source_candidates(
+                worker_id, active_sharing,
+            )] == [str(stream_b.id)],
+            "Sharing did not retain the B-only fallback policy",
+        )
+        share_source_baseline, share_active_baseline = source_server.snapshot()
+        share_b_request_baseline = len(source_server.request_times("source-b.ts"))
+        _require(
+            share_active_baseline["source-a.ts"] == 1
+            and share_active_baseline["source-b.ts"] == 0,
+            "Sharing fixture did not start with only the existing live A connection",
+        )
+        run_share = _RecorderTaskRun(
+            worker_id, startup_timeout=45, media_idle_timeout=25,
+        )
+        run_share.start()
+        harnesses.append(run_share)
+
+        borrow_headers = None
+        deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+            with run_share._lock:
+                borrow_headers = next(
+                    (dict(headers) for headers in run_share.input_headers
+                     if "X-Catchuparr-Borrow" in headers),
+                    None,
+                )
+            if borrow_headers is not None:
+                break
+            if run_share.failures:
+                raise RuntimeError("Sharing recorder failed before opening a native borrow")
+            time.sleep(0.1)
+        _require(borrow_headers is not None,
+                 "Sharing recorder did not request the signed native-buffer route")
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=30,
+        )
+        from catchuparr import stats as catchuparr_stats
+        from catchuparr.adapters.sharing_borrow_route import decode_borrow_capability
+
+        capability_token = borrow_headers["X-Catchuparr-Borrow"]
+        borrow_capability = decode_borrow_capability(capability_token)
+        borrow_client_id = f"catchuparr-client-{borrow_capability.nonce}"
+        _require(
+            catchuparr_stats._is_recorder_client(worker_id, borrow_client_id),
+            "The borrowed native reader was not tagged as a server-verified recorder",
+        )
+        _require(
+            native_server.stream_managers.get(worker_id) is native_manager
+            and native_manager.running
+            and _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner
+            and _native_source_metadata(redis_client, metadata_key) == source_metadata
+            and {key: _key_dump(redis_client, key) for key in assignment_keys}
+            == assignment_snapshot,
+            "Borrowing changed native A ownership, source metadata, or assignments",
+        )
+        _require(
+            _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id],
+            "Borrowing reserved a duplicate provider profile slot",
+        )
+        counts_borrowing, active_borrowing = source_server.snapshot()
+        _require(
+            counts_borrowing["source-a.ts"] == share_source_baseline["source-a.ts"]
+            and counts_borrowing["source-b.ts"] == share_source_baseline["source-b.ts"]
+            and active_borrowing["source-a.ts"] == 1
+            and active_borrowing["source-b.ts"] == 0,
+            "Borrowing opened another provider source instead of reusing native A",
+        )
+        borrowed_ids = {segment.id for segment in store.segments(worker_id)}
+        borrowed_segments = _wait_for_indexed_tone(
+            run_share, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=borrowed_ids, minimum=1, timeout=45,
+            cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(borrowed_segments), "Borrowed live A did not reach the archive")
+
+        # A consumed opening capability cannot be replayed into a second
+        # reader, even while its first reader remains active.
+        replay = client.get(
+            f"/catchuparr/sharing/{channel.uuid}",
+            HTTP_HOST="localhost",
+            HTTP_X_CATCHUPARR_BORROW=capability_token,
+        )
+        _require(replay.status_code == 404,
+                 "A consumed native-borrow capability opened a second reader")
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=10,
+        )
+
+        # Hide=true must hide only the signed borrow client from native Stats.
+        from aio_stats_probe import probe_actual_recorder_stats
+
+        probe_actual_recorder_stats(
+            channel_id=worker_id,
+            redis_client=redis_client,
+            native_server=native_server,
+            profile_a=profile_a,
+            profile_b=profile_b,
+            profile_connections_key=profile_connections_key,
+            assignment_snapshot=assignment_snapshot,
+            metadata_key=metadata_key,
+        )
+
+        # Add a second ordinary viewer, then remove the original. The borrow
+        # must continue while that second viewer remains, so return is based on
+        # actual ordinary membership rather than viewer count snapshots.
+        churn_response = client.get(
+            f"/proxy/ts/stream/{channel.uuid}",
+            HTTP_HOST="localhost",
+            HTTP_USER_AGENT="Synthetic sharing churn viewer",
+        )
+        _require(churn_response.status_code == 200,
+                 "A second synthetic native viewer could not join the borrowed source")
+        churn_session, _churn_buffer = _create_native_live_reader_session(
+            churn_response, native_server, worker_id,
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 3,
+            expected_local=2, timeout=20,
+        )
+        live_session.close()
+        live_session = None
+        live_reader = None
+        live_response = None
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=15,
+        )
+        gevent_sleep(3)
+        counts_with_churn, active_with_churn = source_server.snapshot()
+        _require(
+            counts_with_churn["source-b.ts"] == share_source_baseline["source-b.ts"]
+            and active_with_churn["source-a.ts"] == 1,
+            "The borrow returned while another ordinary native viewer remained",
+        )
+        churn_session.close()
+        churn_session = None
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1,
+            expected_local=0, timeout=15,
+        )
+        sharing_episode_key = f"catchuparr:sharing:episode:{worker_id}"
+        wait_return_until = time.monotonic() + 10
+        while _redis_text(redis_client.hget(sharing_episode_key, "phase")) != "wait_return":
+            _require(time.monotonic() < wait_return_until,
+                     "Native borrow did not enter viewer-return grace")
+            gevent_sleep(0.05)
+        attached_clock = float(redis_client.hget(sharing_episode_key, "last_switch_at"))
+        return_deadline = float(redis_client.hget(sharing_episode_key, "return_deadline"))
+        _require(
+            return_deadline >= attached_clock + 59.9,
+            "Native viewer grace did not preserve the full switch interval from ATTACH",
+        )
+        _require(time.time() < return_deadline,
+                 "The synthetic viewer left after the tested switch deadline")
+        first_b_boundary = {}
+
+        def verify_first_b_effect(source_name, request_number, started_at):
+            if (source_name != "source-b.ts"
+                    or request_number != share_b_request_baseline + 1):
+                return False
+            first_b_boundary["started_at"] = started_at
+            first_b_boundary["return_deadline"] = return_deadline
+            _require(
+                started_at >= return_deadline,
+                "The allowed B provider request preceded the actual native return deadline",
+            )
+            # This callback runs at the provider request boundary, before the
+            # synthetic source sends its first byte. A later polling snapshot
+            # cannot stand in for the state at the first fallback effect.
+            with run_share._lock:
+                processes_at_boundary = list(run_share.processes)
+                results_at_boundary = list(run_share.results)
+            _require(
+                bool(processes_at_boundary)
+                and processes_at_boundary[0].poll() is not None,
+                "Borrowed FFmpeg was still alive when the first B request started",
+            )
+            _require(
+                bool(results_at_boundary)
+                and results_at_boundary[0].useful_segments > 0,
+                "Borrowed input had not completed with useful media before the first B request",
+            )
+            borrow_client_key = f"live:channel:{worker_id}:clients:{borrow_client_id}"
+            borrow_clients_key = RedisKeys.clients(worker_id)
+            borrow_private_key = f"catchuparr:sharing:private:{worker_id}"
+            _require(
+                not redis_client.exists(borrow_client_key)
+                and not redis_client.sismember(borrow_clients_key, borrow_client_id)
+                and redis_client.hget(borrow_private_key, borrow_client_id) is None,
+                "Borrowed native client hash/set/marker remained at the first B provider request",
+            )
+            _require(
+                _redis_text(redis_client.hget(sharing_episode_key, "phase")) == "closed",
+                "Borrowed episode cleanup was not acknowledged before the first B provider request",
+            )
+            return True
+
+        source_server.install_request_start_callback(verify_first_b_effect)
+        first_return_request_at = _wait_for_allowed_source_request(
+            run_share,
+            lambda: source_server.request_times("source-b.ts"),
+            share_b_request_baseline,
+            timeout=150,
+            sleep=gevent_sleep,
+        )
+        callback_deadline = time.monotonic() + 5
+        while not source_server.request_callback_finished.is_set():
+            _require(time.monotonic() < callback_deadline,
+                     "Provider request boundary check did not complete")
+            gevent_sleep(0.01)
+        source_server.clear_request_start_callback(verify_first_b_effect)
+        _require(
+            first_return_request_at >= return_deadline,
+            "The allowed B provider request preceded the actual native return deadline",
+        )
+        _require(not source_server.request_start_callback_errors,
+                 "The first B provider effect failed its borrowed-cleanup boundary checks")
+        _require(first_b_boundary.get("started_at") == first_return_request_at,
+                 "The first B request was not checked synchronously at its provider boundary")
+
+        b_before_share = {segment.id for segment in store.segments(worker_id)}
+        returned_segments = _wait_for_indexed_tone(
+            run_share, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=880, existing_ids=b_before_share, minimum=1, timeout=150,
+            cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(returned_segments), "Recorder did not return to allowed source B")
+        with run_share._lock:
+            share_results = list(run_share.results)
+        _require(
+            bool(share_results)
+            and share_results[0].useful_segments > 0
+            and share_results[0].status in {"switch_requested", "media_stalled", "exited"},
+            "The borrowed recorder did not finish its useful A input before returning",
+        )
+
+        from apps.proxy.live_proxy.services.channel_service import ChannelService
+
+        def wait_for_native_a_teardown(previous_borrow_client_id: str) -> None:
+            """Wait for the exact borrowed A owner and its reservation to release."""
+            shutdown_bound = _native_teardown_readiness_timeout(
+                float(ConfigHelper.channel_shutdown_delay()),
+                float(ConfigHelper.cleanup_check_interval()),
+                # Conservatively allow both source-defined stop-marker phases:
+                # 60 seconds from StreamManager failure and 30 seconds from
+                # normal owner release, plus the configured disconnect/cleanup
+                # phases below. Do not infer completion from provider count.
+                stopping_marker_ttl=90,
+            )
+
+            def snapshot():
+                state = _redis_text(redis_client.hget(
+                    RedisKeys.channel_metadata(worker_id), ChannelMetadataField.STATE,
+                ))
+                profile_a_count = _profile_count(
+                    redis_client, profile_a.id, profile_connections_key,
+                )
+                provider_counts, provider_active = source_server.snapshot()
+                local_manager = native_server.client_managers.get(worker_id)
+                borrowed_hash = (
+                    f"live:channel:{worker_id}:clients:{previous_borrow_client_id}"
+                )
+                borrowed_absent = (
+                    not redis_client.exists(borrowed_hash)
+                    and not redis_client.sismember(
+                        RedisKeys.clients(worker_id), previous_borrow_client_id,
+                    )
+                    and redis_client.hget(
+                        f"catchuparr:sharing:private:{worker_id}",
+                        previous_borrow_client_id,
+                    ) is None
+                )
+                conditions = _native_teardown_ready_conditions(
+                    route_available=(
+                        not ChannelService.is_channel_unavailable_for_new_clients(worker_id)
+                    ),
+                    stopping_marker_absent=not redis_client.exists(
+                        RedisKeys.channel_stopping(worker_id),
+                    ),
+                    metadata_not_stopping=(
+                        state != _constant_text(ChannelState.STOPPING)
+                    ),
+                    owner_absent=(
+                        redis_client.get(RedisKeys.channel_owner(worker_id)) is None
+                    ),
+                    clients_zero=(
+                        int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+                    ),
+                    managers_absent=(
+                        worker_id not in native_server.stream_managers
+                        and worker_id not in native_server._live_stream_managers
+                        and local_manager is None
+                    ),
+                    source_inactive=provider_active["source-a.ts"] == 0,
+                    profile_at_baseline=(
+                        profile_a_count == profile_baselines[profile_a.id]
+                    ),
+                    previous_borrow_absent=borrowed_absent,
+                )
+                return {
+                    "conditions": conditions,
+                    "metadata_state_stopping": (
+                        state == _constant_text(ChannelState.STOPPING)
+                    ),
+                    "metadata_state_error": (
+                        state == _constant_text(ChannelState.ERROR)
+                    ),
+                    "provider_a": {
+                        "active": provider_active["source-a.ts"],
+                        "requests": provider_counts["source-a.ts"],
+                    },
+                    "native": {
+                        "global_clients": int(
+                            redis_client.scard(RedisKeys.clients(worker_id)) or 0
+                        ),
+                        "owner_present": redis_client.get(
+                            RedisKeys.channel_owner(worker_id),
+                        ) is not None,
+                        "stream_manager_present": (
+                            worker_id in native_server.stream_managers
+                        ),
+                        "live_stream_manager_present": (
+                            worker_id in native_server._live_stream_managers
+                        ),
+                    },
+                    "profile_a": {
+                        "current": profile_a_count,
+                        "baseline": profile_baselines[profile_a.id],
+                    },
+                    "previous_borrow_registration_absent": borrowed_absent,
+                }
+
+            ready, last_snapshot = _wait_for_readiness_snapshot(
+                snapshot,
+                shutdown_bound,
+                monotonic=time.monotonic,
+                sleep=gevent_sleep,
+                poll_interval=0.1,
+            )
+            if ready:
+                return
+
+            def readiness_failure_diagnostic():
+                diagnostic = dict(last_snapshot)
+                manager = native_server.client_managers.get(worker_id)
+                diagnostic["native_local_clients"] = (
+                    int(manager.get_client_count()) if manager is not None else 0
+                )
+                diagnostic["native"]["stopping_marker_ttl_seconds"] = int(
+                    redis_client.ttl(RedisKeys.channel_stopping(worker_id))
+                )
+                diagnostic["native"]["last_disconnect_ttl_seconds"] = int(
+                    redis_client.ttl(RedisKeys.last_client_disconnect(worker_id))
+                )
+                return diagnostic
+
+            _require_with_failure_diagnostic(
+                False,
+                "Native A teardown did not finish after its last borrowed reader",
+                readiness_failure_diagnostic,
+                diagnostic_label="CATCHUPARR_NATIVE_REOPEN_DIAGNOSTIC",
+            )
+
+        # The native last-client disconnect releases profile capacity after
+        # its configured shutdown and cleanup phases. Wait for that exact
+        # teardown before asserting the provider/profile handoff to B. This
+        # readiness gate does not require the independent B source to stop.
+        wait_for_native_a_teardown(borrow_client_id)
+        counts_after_share_return, active_after_share_return = source_server.snapshot()
+        _require(
+            counts_after_share_return["source-b.ts"]
+            == share_source_baseline["source-b.ts"] + 1
+            and active_after_share_return["source-b.ts"] == 1
+            and counts_after_share_return["source-a.ts"]
+            == share_source_baseline["source-a.ts"]
+            and active_after_share_return["source-a.ts"] == 0,
+            "Return did not use one allowed B connection after releasing borrowed A",
+        )
+
+        profile_a_return_count = _profile_count(
+            redis_client, profile_a.id, profile_connections_key,
+        )
+        profile_b_return_count = _profile_count(
+            redis_client, profile_b.id, profile_connections_key,
+        )
+        profile_return_conditions = {
+            "profile_a_at_baseline": (
+                profile_a_return_count == profile_baselines[profile_a.id]
+            ),
+            "profile_b_has_one_allowed_reservation": (
+                profile_b_return_count == profile_baselines[profile_b.id] + 1
+            ),
+        }
+
+        def borrow_return_diagnostic():
+            manager = native_server.client_managers.get(worker_id)
+            local_client_count = (
+                int(manager.get_client_count()) if manager is not None else 0
+            )
+            return {
+                "conditions": profile_return_conditions,
+                "profile_reservations": {
+                    "a": {
+                        "current": profile_a_return_count,
+                        "baseline": profile_baselines[profile_a.id],
+                    },
+                    "b": {
+                        "current": profile_b_return_count,
+                        "expected": profile_baselines[profile_b.id] + 1,
+                    },
+                },
+                "provider": {
+                    "a_active": active_after_share_return["source-a.ts"],
+                    "a_requests": counts_after_share_return["source-a.ts"],
+                    "b_active": active_after_share_return["source-b.ts"],
+                    "b_requests": counts_after_share_return["source-b.ts"],
+                    "b_expected_requests": share_source_baseline["source-b.ts"] + 1,
+                },
+                "native": {
+                    "global_clients": int(
+                        redis_client.scard(RedisKeys.clients(worker_id)) or 0
+                    ),
+                    "local_clients": local_client_count,
+                    "owner_present": redis_client.get(
+                        RedisKeys.channel_owner(worker_id),
+                    ) is not None,
+                    "disconnect_present": bool(redis_client.exists(
+                        RedisKeys.last_client_disconnect(worker_id),
+                    )),
+                },
+                "recorder": {
+                    "useful_segments": int(share_results[0].useful_segments),
+                    "status": str(share_results[0].status),
+                },
+            }
+
+        def require_borrow_return_gate():
+            _require_with_failure_diagnostic(
+                all(profile_return_conditions.values()),
+                "Borrow return did not release A and reserve only the allowed B profile",
+                borrow_return_diagnostic,
+                diagnostic_label="CATCHUPARR_BORROW_RETURN_DIAGNOSTIC",
+            )
+
+        def prepare_dedicated_b():
+            # Establish the dedicated B fixture under sharing-OFF before opening
+            # the next ordinary A viewer. With sharing left enabled, live_stability
+            # is zero and the long A startup/validation path can legitimately let
+            # the supervisor migrate B onto A before the source-removal assertion.
+            # This Apply boundary keeps the later B-active prerequisite stable
+            # without changing its gate or extending any recorder deadline.
+            old_dedicated_b_records = [
+                record for record in _worker_records(redis_client, worker_id)
+                if record.get("state") == "active"
+                and record.get("reservation_state") == "reserved"
+                and record.get("stream_id") == str(stream_b.id)
+                and record.get("profile_id") == str(profile_b.id)
+            ]
+            _require(
+                len(old_dedicated_b_records) == 1
+                and old_dedicated_b_records[0].get("worker_id")
+                and old_dedicated_b_records[0].get("capability_digest")
+                and old_dedicated_b_records[0].get("reservation_id"),
+                "Sharing-enabled B phase lacked one exact active worker before reconfiguration",
+            )
+            old_dedicated_b = old_dedicated_b_records[0]
+            old_dedicated_b_worker = str(old_dedicated_b["worker_id"])
+            old_dedicated_b_digest = str(old_dedicated_b["capability_digest"])
+            old_dedicated_b_reservation = str(old_dedicated_b["reservation_id"])
+            dedicated_settings = dict(sharing_settings)
+            dedicated_settings["connection_sharing_config"] = (
+                "version: 1\n"
+                "default:\n"
+                "  enabled: false\n"
+            )
+            dedicated_plugin = PluginConfig.objects.get(key="catchuparr")
+            dedicated_plugin.settings = dict(dedicated_settings)
+            dedicated_plugin.save(update_fields=("settings",))
+            applied_dedicated = catchuparr_runtime.apply_configuration(dedicated_settings)
+            _require(
+                applied_dedicated.get("applied") is True,
+                "Unified Apply rejected the sharing-off B preparation phase",
+            )
+            active_dedicated = load_active_configuration(active_path)
+            _require(
+                active_dedicated is not None
+                and active_dedicated["connection_sharing"][worker_id]["enabled"] is False
+                and [str(item.get("id")) for item in ranked_source_candidates(
+                    worker_id, active_dedicated,
+                )] == [str(stream_b.id)],
+                "Sharing-off preparation did not preserve the assigned B fallback",
+            )
+            run_share.stop()
+            run_share.join(timeout=30, cooperative_sleep=gevent_sleep)
+            old_dedicated_b_request_count = len(
+                source_server.request_times("source-b.ts"),
+            )
+
+            def old_dedicated_b_cleanup_snapshot():
+                matching = [
+                    record for record in _worker_records(redis_client, worker_id)
+                    if record.get("worker_id") == old_dedicated_b_worker
+                ]
+                record = matching[0] if len(matching) == 1 else None
+                counts, active_counts = source_server.snapshot()
+                return {
+                    "conditions": {
+                        "attempt_binding_preserved": bool(
+                            record
+                            and record.get("capability_digest") == old_dedicated_b_digest
+                            and record.get("reservation_id") == old_dedicated_b_reservation
+                        ),
+                        "attempt_released": bool(
+                            record
+                            and record.get("state") in {"failed", "released"}
+                            and record.get("reservation_state") in {"none", "released"}
+                        ),
+                        "attempt_credentials_absent": (
+                            not redis_client.exists(CAPABILITY_PREFIX + old_dedicated_b_digest)
+                            and not redis_client.exists(
+                                reservation_credential_marker_key(
+                                    old_dedicated_b_reservation,
+                                ),
+                            )
+                        ),
+                        "native_manager_absent": (
+                            old_dedicated_b_worker not in native_server.stream_managers
+                            and old_dedicated_b_worker not in native_server._live_stream_managers
+                            and old_dedicated_b_worker not in native_server.client_managers
+                        ),
+                        "native_owner_absent": (
+                            redis_client.get(
+                                RedisKeys.channel_owner(old_dedicated_b_worker),
+                            ) is None
+                        ),
+                        "native_clients_absent": (
+                            int(redis_client.scard(
+                                RedisKeys.clients(old_dedicated_b_worker),
+                            ) or 0) == 0
+                        ),
+                        "native_stopping_marker_absent": not redis_client.exists(
+                            RedisKeys.channel_stopping(old_dedicated_b_worker),
+                        ),
+                        "provider_b_inactive": active_counts["source-b.ts"] == 0,
+                        "provider_b_requests_stable": (
+                            counts["source-b.ts"] == old_dedicated_b_request_count
+                            and len(source_server.request_times("source-b.ts"))
+                            == old_dedicated_b_request_count
+                        ),
+                        "profile_b_at_original_baseline": (
+                            _profile_count(
+                                redis_client, profile_b.id, profile_connections_key,
+                            ) == profile_baselines[profile_b.id]
+                        ),
+                    },
+                    "worker_state": _allowlisted_state(
+                        record.get("state") if record else None,
+                        frozenset({
+                            "issued", "reserving", "reserved", "starting", "active",
+                            "releasing", "released", "release_failed", "failed",
+                        }),
+                    ),
+                    "reservation_state": _allowlisted_state(
+                        record.get("reservation_state") if record else None,
+                        frozenset({
+                            "none", "reserving", "reserved", "releasing",
+                            "released", "release_failed",
+                        }),
+                    ),
+                }
+
+            old_dedicated_b_timeout = _native_teardown_readiness_timeout(
+                float(ConfigHelper.channel_shutdown_delay()),
+                float(ConfigHelper.cleanup_check_interval()),
+                stopping_marker_ttl=90,
+            )
+            def start_dedicated_b_after_ack():
+                request_baseline = len(
+                    source_server.request_times("source-b.ts"),
+                )
+                segment_baseline = {
+                    segment.id for segment in store.segments(worker_id)
+                }
+                run = _RecorderTaskRun(
+                    worker_id, startup_timeout=45, media_idle_timeout=25,
+                )
+                run.start()
+                harnesses.append(run)
+                return run, request_baseline, segment_baseline
+
+            (
+                run_dedicated_b,
+                dedicated_b_request_baseline,
+                dedicated_b_segment_baseline,
+            ) = _run_after_readiness_ack(
+                old_dedicated_b_cleanup_snapshot,
+                start_dedicated_b_after_ack,
+                old_dedicated_b_timeout,
+                message=(
+                    "Prior B attempt had not received exact native/profile release acknowledgment"
+                ),
+                diagnostic_label="CATCHUPARR_DEDICATED_B_PREPARATION_DIAGNOSTIC",
+                monotonic=time.monotonic,
+                sleep=gevent_sleep,
+                poll_interval=0.1,
+            )
+            dedicated_b_segments = _wait_for_indexed_tone(
+                run_dedicated_b, store, worker_id, ffmpeg, ffprobe,
+                expected_hz=880, existing_ids=dedicated_b_segment_baseline,
+                minimum=1, timeout=90, cooperative_sleep=gevent_sleep,
+            )
+            _require(bool(dedicated_b_segments),
+                     "Sharing-off B preparation did not index fresh B media")
+            dedicated_b_counts, dedicated_b_active = source_server.snapshot()
+            dedicated_b_records = [
+                record for record in _worker_records(redis_client, worker_id)
+                if record.get("state") == "active"
+                and record.get("reservation_state") == "reserved"
+                and record.get("stream_id") == str(stream_b.id)
+                and record.get("profile_id") == str(profile_b.id)
+            ]
+            _require(
+                dedicated_b_counts["source-b.ts"] == dedicated_b_request_baseline + 1
+                and dedicated_b_active["source-b.ts"] == 1
+                and dedicated_b_active["source-a.ts"] == 0
+                and _profile_count(
+                    redis_client, profile_b.id, profile_connections_key,
+                ) == profile_baselines[profile_b.id] + 1
+                and len(dedicated_b_records) == 1
+                and dedicated_b_records[0].get("capability_digest")
+                and dedicated_b_records[0].get("reservation_id"),
+                "Sharing-off preparation did not establish one exact active B worker",
+            )
+            # The source-removal phase below joins this task after its enabled
+            # no-source Apply, while the exact active B bindings are captured.
+            return run_dedicated_b
+
+        run_dedicated_b = _run_after_required_gate(
+            require_borrow_return_gate, prepare_dedicated_b,
+        )
+        run_share = run_dedicated_b
+
+        # Remove all dedicated sources while an ordinary A viewer is present.
+        # The new task must still borrow the existing A reader, close it at the
+        # native grace deadline, persist PAUSED, and resume on B after Apply
+        # restores an allowed source.
+        no_source_response = client.get(
+            f"/proxy/ts/stream/{channel.uuid}",
+            HTTP_HOST="localhost",
+            HTTP_USER_AGENT="Synthetic no-source ordinary viewer",
+        )
+        _require(no_source_response.status_code == 200,
+                 "No-source ordinary A viewer could not open")
+        live_session, no_source_native_buffer = _create_native_live_reader_session(
+            no_source_response, native_server, worker_id,
+        )
+        live_reader = live_session.reader
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+        )
+        no_source_a_client_ids = {
+            _redis_text(client_id)
+            for client_id in redis_client.smembers(RedisKeys.clients(worker_id))
+        }
+        _require(
+            len(no_source_a_client_ids) == 1,
+            "Ordinary A viewer did not have one exact native registration",
+        )
+        no_source_a_client_id = next(iter(no_source_a_client_ids))
+        no_source_a_client_key = (
+            f"live:channel:{worker_id}:clients:{no_source_a_client_id}"
+        )
+        no_source_a_connected_at = _redis_text(
+            redis_client.hget(no_source_a_client_key, "connected_at"),
+        )
+        no_source_a_client_worker = _redis_text(
+            redis_client.hget(no_source_a_client_key, "worker_id"),
+        )
+        _require(
+            no_source_a_connected_at and no_source_a_client_worker,
+            "Ordinary A client registration did not expose its stable identity fields",
+        )
+        no_source_native_owner, no_source_native_manager, no_source_client_manager = (
+            _wait_for_native_active(
+                redis_client, native_server, worker_id, redis_keys=RedisKeys,
+                metadata_field=ChannelMetadataField,
+                channel_state=ChannelState, timeout=45,
+            )
+        )
+        _require(
+            _native_client_identity_matches(
+                {
+                    _redis_text(client_id)
+                    for client_id in redis_client.smembers(RedisKeys.clients(worker_id))
+                },
+                expected_client_id=no_source_a_client_id,
+                connected_at=_redis_text(redis_client.hget(
+                    no_source_a_client_key, "connected_at",
+                )),
+                expected_connected_at=no_source_a_connected_at,
+                worker_id=_redis_text(redis_client.hget(
+                    no_source_a_client_key, "worker_id",
+                )),
+                expected_worker_id=no_source_a_client_worker,
+            ),
+            "Ordinary A registration changed before reaching ACTIVE",
+        )
+        no_source_first_media, _no_source_first_index = _read_after_current_buffer_head(
+            live_session, no_source_native_buffer,
+            minimum_bytes=188 * 100, timeout=20,
+        )
+        _verify_audio_video_tone(
+            ffmpeg, ffprobe, no_source_first_media, 440,
+            "Ordinary live A before dedicated-source removal",
+        )
+        no_source_a_counts, no_source_a_active = source_server.snapshot()
+        no_source_a_profile_count = _profile_count(
+            redis_client, profile_a.id, profile_connections_key,
+        )
+        no_source_a_assignments = {
+            key: _key_dump(redis_client, key) for key in assignment_keys
+        }
+        no_source_a_metadata = _native_source_metadata(redis_client, metadata_key)
+        _require(
+            no_source_a_active["source-a.ts"] == 1
+            and no_source_a_profile_count == profile_baselines[profile_a.id] + 1
+            and no_source_native_manager.running
+            and no_source_client_manager.get_client_count() == 1
+            and no_source_a_connected_at
+            and no_source_a_client_worker,
+            "Ordinary A viewer did not reach ACTIVE with its exact provider reservation",
+        )
+        live_dedicated_b_records = [
+            record for record in _worker_records(redis_client, worker_id)
+            if record.get("state") == "active"
+            and record.get("reservation_state") == "reserved"
+            and record.get("stream_id") == str(stream_b.id)
+            and record.get("profile_id") == str(profile_b.id)
+        ]
+        _require(
+            len(live_dedicated_b_records) == 1
+            and no_source_a_active["source-b.ts"] == 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + 1,
+            "Dedicated B worker was not active before source-removal Apply",
+        )
+        no_source_b_record = live_dedicated_b_records[0]
+        no_source_b_worker_id = no_source_b_record.get("worker_id")
+        _require(
+            no_source_b_worker_id and no_source_b_worker_id != worker_id,
+            "Dedicated B worker identity was not available for the removal check",
+        )
+        no_source_b_requests = len(source_server.request_times("source-b.ts"))
+        no_source_b_reservation_id = no_source_b_record.get("reservation_id")
+        no_source_b_capability_digest = no_source_b_record.get("capability_digest")
+        _require(
+            isinstance(no_source_b_reservation_id, str) and no_source_b_reservation_id
+            and isinstance(no_source_b_capability_digest, str)
+            and no_source_b_capability_digest
+            and redis_client.exists(CAPABILITY_PREFIX + no_source_b_capability_digest),
+            "Dedicated B worker did not expose its active reservation and capability bindings",
+        )
+        no_source_settings = dict(sharing_settings)
+        no_source_settings["filter_config"] = (
+            "version: 1\n"
+            f"profile: {profile_name}\n"
+            "rules:\n"
+            "  - channels: {profile: all}\n"
+            f'    exclude: ["{account_a.name}", "{account_b.name}"]\n'
+        )
+        no_source_plugin = PluginConfig.objects.get(key="catchuparr")
+        no_source_plugin.settings = dict(no_source_settings)
+        no_source_plugin.save(update_fields=("settings",))
+        applied_no_source = catchuparr_runtime.apply_configuration(no_source_settings)
+        _require(applied_no_source.get("applied") is True,
+                 "Unified Apply rejected the no-allowed-source policy")
+        active_no_source = load_active_configuration(active_path)
+        _require(
+            active_no_source is not None
+            and active_no_source["connection_sharing"][worker_id]["enabled"] is True
+            and ranked_source_candidates(worker_id, active_no_source) == [],
+            "No-source policy did not leave the channel eligible with zero dedicated candidates",
+        )
+        run_share.join_after_supervisor(timeout=30, cooperative_sleep=gevent_sleep)
+        no_source_release_timeout = _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
+        def no_source_transition_snapshot():
+            current_counts, current_active = source_server.snapshot()
+            current_a_profile = _profile_count(
+                redis_client, profile_a.id, profile_connections_key,
+            )
+            current_b_profile = _profile_count(
+                redis_client, profile_b.id, profile_connections_key,
+            )
+            matching_b_records = [
+                record for record in _worker_records(redis_client, worker_id)
+                if record.get("worker_id") == no_source_b_worker_id
+            ]
+            b_record = matching_b_records[0] if len(matching_b_records) == 1 else None
+            b_worker_released = bool(
+                b_record
+                and b_record.get("state") in {"released", "failed"}
+                and b_record.get("reservation_state") in {"released", "none"}
+            )
+            b_reservation_released = (
+                b_record is not None
+                and (no_source_b_reservation_id is None
+                     or b_record.get("reservation_id") == no_source_b_reservation_id)
+            )
+            b_binding_preserved = bool(
+                b_record
+                and b_record.get("reservation_id") == no_source_b_reservation_id
+                and b_record.get("capability_digest") == no_source_b_capability_digest
+            )
+            markers_absent = (
+                not redis_client.exists(CAPABILITY_PREFIX + no_source_b_capability_digest)
+                and not redis_client.exists(
+                    reservation_credential_marker_key(no_source_b_reservation_id),
+                )
+            )
+            state = _redis_text(redis_client.hget(
+                metadata_key, ChannelMetadataField.STATE,
+            ))
             manager = native_server.stream_managers.get(worker_id)
             client_manager = native_server.client_managers.get(worker_id)
-            clients = int(redis_client.scard(RedisKeys.clients(worker_id)) or 0)
-            counts_final, active_final = source_server.snapshot()
+            owner = _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id)))
+            conditions = _source_removal_transition_conditions(
+                a_owner_preserved=(
+                    owner == no_source_native_owner
+                    and _redis_text(native_server.worker_id) == no_source_native_owner
+                ),
+                a_active=(
+                    state == _constant_text(ChannelState.ACTIVE)
+                    and manager is no_source_native_manager
+                    and bool(getattr(manager, "running", False))
+                ),
+                a_client_preserved=(
+                    int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 1
+                    and client_manager is no_source_client_manager
+                    and client_manager is not None
+                    and int(client_manager.get_client_count()) == 1
+                    and bool(redis_client.exists(no_source_a_client_key))
+                    and _native_client_identity_matches(
+                        {
+                            _redis_text(client_id)
+                            for client_id in redis_client.smembers(RedisKeys.clients(worker_id))
+                        },
+                        expected_client_id=no_source_a_client_id,
+                        connected_at=_redis_text(redis_client.hget(
+                            no_source_a_client_key, "connected_at",
+                        )),
+                        expected_connected_at=no_source_a_connected_at,
+                        worker_id=_redis_text(redis_client.hget(
+                            no_source_a_client_key, "worker_id",
+                        )),
+                        expected_worker_id=no_source_a_client_worker,
+                    )
+                ),
+                a_provider_preserved=(
+                    current_active["source-a.ts"] == 1
+                    and current_counts["source-a.ts"] == no_source_a_counts["source-a.ts"]
+                ),
+                a_profile_preserved=(
+                    current_a_profile == no_source_a_profile_count
+                ),
+                a_assignments_preserved=(
+                    {key: _key_dump(redis_client, key) for key in assignment_keys}
+                    == no_source_a_assignments
+                    and _native_source_metadata(redis_client, metadata_key)
+                    == no_source_a_metadata
+                ),
+                b_worker_released=b_worker_released,
+                b_native_resources_absent=(
+                    no_source_b_worker_id not in native_server.stream_managers
+                    and no_source_b_worker_id not in native_server._live_stream_managers
+                    and no_source_b_worker_id not in native_server.client_managers
+                    and redis_client.get(
+                        RedisKeys.channel_owner(no_source_b_worker_id),
+                    ) is None
+                    and int(redis_client.scard(
+                        RedisKeys.clients(no_source_b_worker_id),
+                    ) or 0) == 0
+                    and not redis_client.exists(
+                        RedisKeys.channel_stopping(no_source_b_worker_id),
+                    )
+                    and _redis_text(redis_client.hget(
+                        RedisKeys.channel_metadata(no_source_b_worker_id),
+                        ChannelMetadataField.STATE,
+                    )) != _constant_text(ChannelState.STOPPING)
+                ),
+                b_binding_preserved=b_binding_preserved,
+                b_reservation_released=b_reservation_released,
+                b_private_markers_absent=markers_absent,
+                b_provider_inactive=current_active["source-b.ts"] == 0,
+                b_request_count_preserved=(
+                    len(source_server.request_times("source-b.ts")) == no_source_b_requests
+                    and current_counts["source-b.ts"] == no_source_a_counts["source-b.ts"]
+                ),
+                b_profile_released=(
+                    current_b_profile == profile_baselines[profile_b.id]
+                ),
+            )
+            return {
+                "conditions": conditions,
+                "a_provider": {
+                    "active": current_active["source-a.ts"],
+                    "requests": current_counts["source-a.ts"],
+                },
+                "b_provider": {
+                    "active": current_active["source-b.ts"],
+                    "requests": current_counts["source-b.ts"],
+                },
+                "a_profile": current_a_profile,
+                "b_profile": current_b_profile,
+                "b_worker_state": _allowlisted_state(
+                    b_record.get("state") if b_record else None,
+                    frozenset({
+                        "issued", "reserving", "reserved", "starting", "active",
+                        "releasing", "released", "release_failed", "failed",
+                    }),
+                ),
+                "b_reservation_state": (
+                    _allowlisted_state(
+                        b_record.get("reservation_state") if b_record else None,
+                        frozenset({
+                            "none", "reserving", "reserved", "releasing",
+                            "released", "release_failed",
+                        }),
+                    )
+                ),
+                "native_a_active": conditions["ordinary_a_active"],
+            }
+
+        no_source_ready, no_source_last_snapshot, no_source_wait_reason = (
+            _wait_for_source_removal_transition(
+            no_source_transition_snapshot, no_source_release_timeout,
+            monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
+            )
+        )
+        _require_with_failure_diagnostic(
+            no_source_ready,
+            "Removing dedicated sources disturbed live A or retained B's reservation",
+            lambda: dict(no_source_last_snapshot, wait_reason=no_source_wait_reason),
+            diagnostic_label="CATCHUPARR_NO_SOURCE_TRANSITION_DIAGNOSTIC",
+        )
+        no_source_counts, no_source_active = source_server.snapshot()
+        run_no_source = _RecorderTaskRun(
+            worker_id, startup_timeout=45, media_idle_timeout=25,
+        )
+        run_no_source.start()
+        harnesses.append(run_no_source)
+        no_source_borrow_headers = None
+        no_source_borrow_deadline = time.monotonic() + 90
+        while time.monotonic() < no_source_borrow_deadline:
+            with run_no_source._lock:
+                no_source_borrow_headers = next(
+                    (dict(headers) for headers in run_no_source.input_headers
+                     if "X-Catchuparr-Borrow" in headers),
+                    None,
+                )
+            if no_source_borrow_headers is not None:
+                break
+            if run_no_source.failures:
+                raise RuntimeError("No-source task failed before borrowing live A")
+            gevent_sleep(0.1)
+        _require(no_source_borrow_headers is not None,
+                 "Recorder did not borrow the existing A viewer with no dedicated sources")
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=30,
+        )
+        no_source_capability = decode_borrow_capability(
+            no_source_borrow_headers["X-Catchuparr-Borrow"],
+        )
+        no_source_client_id = f"catchuparr-client-{no_source_capability.nonce}"
+        no_source_old_segments = {segment.id for segment in store.segments(worker_id)}
+        no_source_media = _wait_for_indexed_tone(
+            run_no_source, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=no_source_old_segments,
+            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(no_source_media), "No-source borrow did not archive live A media")
+        _require(
+            len(source_server.request_times("source-b.ts")) == no_source_b_requests
+            and source_server.snapshot()[1]["source-a.ts"] == 1,
+            "No-source borrowing opened another provider connection or duplicated A",
+        )
+        live_session.close()
+        live_session = None
+        live_reader = None
+        no_source_episode_key = f"catchuparr:sharing:episode:{worker_id}"
+        no_source_grace_deadline = time.monotonic() + 10
+        while _redis_text(redis_client.hget(no_source_episode_key, "phase")) != "wait_return":
+            _require(time.monotonic() < no_source_grace_deadline,
+                     "No-source borrow did not enter native viewer grace")
+            gevent_sleep(0.05)
+        no_source_return_deadline = float(
+            redis_client.hget(no_source_episode_key, "return_deadline")
+        )
+        from catchuparr.sharing_persistence import SharingIntentLedger
+
+        no_source_ledger = SharingIntentLedger(
+            archive_root / ".catchuparr-sharing.sqlite3",
+        )
+        no_source_cleanup_deadline = time.monotonic() + 150
+        no_source_record = None
+        while time.monotonic() < no_source_cleanup_deadline:
+            no_source_projection_phase = _redis_text(
+                redis_client.hget(no_source_episode_key, "phase")
+            )
+            no_source_client_key = (
+                f"live:channel:{worker_id}:clients:{no_source_client_id}"
+            )
+            no_source_private_key = f"catchuparr:sharing:private:{worker_id}"
+            no_source_record = no_source_ledger.read(worker_id)
             if (
-                owner is None
-                and manager is None
-                and clients == 0
-                and (client_manager is None or client_manager.get_client_count() == 0)
-                and active_final["source-a.ts"] == 0
-                and counts_final["source-a.ts"] == counts["source-a.ts"]
-                and _profile_count(redis_client, profile_a.id, profile_connections_key)
-                == profile_baselines[profile_a.id]
+                no_source_projection_phase == "closed"
+                and not redis_client.exists(no_source_client_key)
+                and not redis_client.sismember(
+                    RedisKeys.clients(worker_id), no_source_client_id,
+                )
+                and redis_client.hget(no_source_private_key, no_source_client_id) is None
+                and no_source_record is not None
+                and no_source_record.state.phase.value == "paused"
             ):
                 break
-            # ClientManager schedules the owner's normal disconnect cleanup
-            # onto ProxyServer's gevent hub. Drive that hub while waiting so
-            # the harness observes the same cleanup path as a running web
-            # worker instead of blocking it with time.sleep.
             gevent_sleep(0.1)
+        pause_preconditions = {
+            "episode_closed": no_source_projection_phase == "closed",
+            "borrow_hash_absent": not redis_client.exists(no_source_client_key),
+            "borrow_membership_absent": not redis_client.sismember(
+                RedisKeys.clients(worker_id), no_source_client_id,
+            ),
+            "borrow_marker_absent": redis_client.hget(
+                f"catchuparr:sharing:private:{worker_id}", no_source_client_id,
+            ) is None,
+            "ledger_paused": (
+                no_source_record is not None
+                and no_source_record.state.phase.value == "paused"
+            ),
+            "grace_deadline_elapsed": time.time() >= no_source_return_deadline,
+            "task_completed_cleanly": not run_no_source.failures,
+        }
+        # PAUSED is acknowledged before Dispatcharr finishes its asynchronous
+        # last-owner/profile teardown. Use the same A-scoped readiness contract
+        # as the return and reopen boundaries; B remains independently checked
+        # by the exact zero-request/profile assertions below.
+        def read_final_no_source_conditions():
+            final_counts, final_active = source_server.snapshot()
+            pause_conditions = {
+                "source_b_request_count_unchanged": (
+                    len(source_server.request_times("source-b.ts")) == no_source_b_requests
+                ),
+                "source_a_active_zero": final_active["source-a.ts"] == 0,
+                "source_a_request_count_unchanged": (
+                    final_counts["source-a.ts"] == no_source_counts["source-a.ts"]
+                ),
+                "native_global_clients_zero": (
+                    int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+                ),
+                "native_owner_absent": redis_client.get(
+                    RedisKeys.channel_owner(worker_id),
+                ) is None,
+                "profile_a_at_baseline": (
+                    _profile_count(redis_client, profile_a.id, profile_connections_key)
+                    == profile_baselines[profile_a.id]
+                ),
+                "profile_b_at_baseline": (
+                    _profile_count(redis_client, profile_b.id, profile_connections_key)
+                    == profile_baselines[profile_b.id]
+                ),
+            }
+            return final_counts, final_active, pause_conditions
+
+        (
+            final_no_source_counts,
+            final_no_source_active,
+            no_source_pause_conditions,
+        ) = _wait_for_native_teardown_after_pause(
+            pause_preconditions,
+            lambda: wait_for_native_a_teardown(no_source_client_id),
+            read_final_no_source_conditions,
+        )
+        disconnect_key = RedisKeys.last_client_disconnect(worker_id)
+
+        def no_source_pause_diagnostic():
+            from apps.proxy.live_proxy.config_helper import ConfigHelper
+
+            diagnostic_manager = native_server.client_managers.get(worker_id)
+            diagnostic_local_count = (
+                int(diagnostic_manager.get_client_count())
+                if diagnostic_manager is not None else 0
+            )
+            return {
+                "conditions": no_source_pause_conditions,
+                "native_local_clients_zero": diagnostic_local_count == 0,
+                "provider_request_delta": {
+                    "source_a": (
+                        final_no_source_counts["source-a.ts"]
+                        - no_source_counts["source-a.ts"]
+                    ),
+                    "source_b": (
+                        len(source_server.request_times("source-b.ts"))
+                        - no_source_b_requests
+                    ),
+                },
+                "provider_active_counts": {
+                    "source_a": final_no_source_active["source-a.ts"],
+                    "source_b": final_no_source_active["source-b.ts"],
+                },
+                "native_client_count": {
+                    "global": int(redis_client.scard(RedisKeys.clients(worker_id)) or 0),
+                    "local": diagnostic_local_count,
+                },
+                "native_keys": {
+                    "owner_present": redis_client.get(
+                        RedisKeys.channel_owner(worker_id),
+                    ) is not None,
+                    "stop_present": bool(redis_client.exists(
+                        RedisKeys.channel_stopping(worker_id),
+                    )),
+                    "disconnect_present": bool(redis_client.exists(disconnect_key)),
+                    "disconnect_ttl_seconds": int(redis_client.ttl(disconnect_key)),
+                },
+                "reservations": {
+                    "profile_a": int(_profile_count(
+                        redis_client, profile_a.id, profile_connections_key,
+                    )),
+                    "profile_b": int(_profile_count(
+                        redis_client, profile_b.id, profile_connections_key,
+                    )),
+                },
+                "native_cleanup_interval_seconds": int(
+                    ConfigHelper.cleanup_check_interval()
+                ),
+                "native_channel_shutdown_delay_seconds": int(
+                    ConfigHelper.channel_shutdown_delay()
+                ),
+            }
+        _require_with_failure_diagnostic(
+            all(no_source_pause_conditions.values()),
+            "Paused no-source recording opened a provider stream or kept a reservation",
+            no_source_pause_diagnostic,
+        )
+        resumed_plugin = PluginConfig.objects.get(key="catchuparr")
+        resumed_plugin.settings = dict(sharing_settings)
+        resumed_plugin.save(update_fields=("settings",))
+        applied_resume = catchuparr_runtime.apply_configuration(sharing_settings)
+        _require(applied_resume.get("applied") is True,
+                 "Unified Apply rejected restoring the B-only source policy")
+        run_no_source.join_after_supervisor(timeout=30, cooperative_sleep=gevent_sleep)
+        share_b_request_baseline = len(source_server.request_times("source-b.ts"))
+        run_share = _RecorderTaskRun(
+            worker_id, startup_timeout=45, media_idle_timeout=25,
+        )
+        run_share.start()
+        harnesses.append(run_share)
+        resume_deadline = time.monotonic() + 150
+        while time.monotonic() < resume_deadline:
+            resumed_counts, resumed_active = source_server.snapshot()
+            if (len(source_server.request_times("source-b.ts")) > share_b_request_baseline
+                    and resumed_active["source-b.ts"] == 1):
+                break
+            if run_share.failures:
+                raise RuntimeError("Recorder failed while resuming allowed source B")
+            gevent_sleep(0.1)
+        _require(
+            len(source_server.request_times("source-b.ts")) > share_b_request_baseline
+            and resumed_active["source-a.ts"] == 0
+            and resumed_active["source-b.ts"] == 1,
+            "Recorder did not resume the allowed B source after the paused episode",
+        )
+        # Re-open A after the same native teardown readiness gate used
+        # immediately after the first return.
+        second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
+        live_response = _open_after_readiness(
+            lambda: wait_for_native_a_teardown(no_source_client_id),
+            lambda: client.get(
+                f"/proxy/ts/stream/{channel.uuid}",
+                HTTP_HOST="localhost",
+                HTTP_USER_AGENT="Synthetic second-cycle ordinary viewer",
+            ),
+        )
+        _require(live_response.status_code == 200,
+                 "Second-cycle ordinary A viewer could not open")
+        live_session, second_cycle_native_buffer = _create_native_live_reader_session(
+            live_response, native_server, worker_id,
+        )
+        live_reader = live_session.reader
+        second_cycle_ordinary_identity = _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+            return_identity=True,
+            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
+                run_share,
+                worker_id=worker_id,
+                channel_uuid=str(channel.uuid),
+                decode_capability=decode_borrow_capability,
+                is_server_verified=catchuparr_stats._is_recorder_client,
+            ),
+        )
+        _wait_for_native_active(
+            redis_client, native_server, worker_id, redis_keys=RedisKeys,
+            metadata_field=ChannelMetadataField,
+            channel_state=ChannelState, timeout=45,
+            expected_ordinary_identity=second_cycle_ordinary_identity,
+            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
+                run_share,
+                worker_id=worker_id,
+                channel_uuid=str(channel.uuid),
+                decode_capability=decode_borrow_capability,
+                is_server_verified=catchuparr_stats._is_recorder_client,
+            ),
+        )
+        second_cycle_first_media, _second_cycle_media_index = _read_after_current_buffer_head(
+            live_session, second_cycle_native_buffer,
+            minimum_bytes=188 * 100, timeout=20,
+        )
+        _verify_audio_video_tone(
+            ffmpeg, ffprobe, second_cycle_first_media, 440,
+            "Second-cycle ordinary live A before borrow",
+        )
+        _require(
+            source_server.snapshot()[0]["source-a.ts"] == second_cycle_a_baseline + 1,
+            "Second-cycle viewer did not open exactly one native A connection",
+        )
+        second_borrow_headers = None
+        second_cycle_deadline = time.monotonic() + 90
+        while time.monotonic() < second_cycle_deadline:
+            with run_share._lock:
+                borrow_headers_seen = [
+                    dict(headers) for headers in run_share.input_headers
+                    if "X-Catchuparr-Borrow" in headers
+                ]
+            if len(borrow_headers_seen) >= 1:
+                second_borrow_headers = borrow_headers_seen[0]
+                break
+            if run_share.failures:
+                raise RuntimeError("Second sharing cycle failed before native borrow")
+            gevent_sleep(0.1)
+        _require(second_borrow_headers is not None,
+                 "Resumed recorder did not borrow the compatible A viewer")
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=20,
+        )
+        from catchuparr.adapters.sharing_borrow_route import decode_borrow_capability
+
+        second_capability = decode_borrow_capability(
+            second_borrow_headers["X-Catchuparr-Borrow"],
+        )
+        second_borrow_client_id = f"catchuparr-client-{second_capability.nonce}"
+        _require(
+            second_borrow_client_id != borrow_client_id
+            and catchuparr_stats._is_recorder_client(worker_id, second_borrow_client_id),
+            "Second borrow did not create a distinct verified recorder reader",
+        )
+        second_native_manager = native_server.stream_managers.get(worker_id)
+        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
+        second_source_counts, second_active_counts = source_server.snapshot()
+        _require(
+            second_native_manager is not None and second_native_manager.running
+            and second_native_owner is not None
+            and second_source_counts["source-a.ts"] == second_cycle_a_baseline + 1
+            and second_active_counts["source-a.ts"] == 1
+            and second_active_counts["source-b.ts"] == 0,
+            "Second borrow opened an extra provider source instead of reading A",
+        )
+        second_borrowed_ids = {
+            segment.id for segment in store.segments(worker_id)
+        }
+        second_borrowed_segments = _wait_for_indexed_tone(
+            run_share, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=second_borrowed_ids,
+            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(second_borrowed_segments),
+                 "Second native borrow did not archive fresh A media")
+
+        # Exercise a real recorder-task restart with a durable RETURN pending.
+        # Leave the native reader at its deadline, let the task create the
+        # RETURN intent, then deny B before useful media so a new task must
+        # recover that exact intent and acknowledge it only after fresh media.
+        return_ledger = SharingIntentLedger(
+            archive_root / ".catchuparr-sharing.sqlite3",
+        )
+        restart_b_worker_ids_before = {
+            str(record.get("worker_id"))
+            for record in _worker_records(redis_client, worker_id)
+            if record.get("stream_id") == str(stream_b.id)
+            and record.get("worker_id")
+        }
+        # Compare against the original pre-probe baseline. Sampling during
+        # asynchronous cleanup could capture a still-live B reservation as
+        # the expected value and hide its later leak.
+        restart_b_profile_baseline = profile_baselines[profile_b.id]
+        source_server.set_mode("source-b.ts", "unavailable")
+        restart_b_request_baseline = len(source_server.request_times("source-b.ts"))
+        live_session.close()
+        live_session = None
+        live_reader = None
+        restart_episode_key = f"catchuparr:sharing:episode:{worker_id}"
+        restart_grace_deadline = time.monotonic() + 10
+        while _redis_text(redis_client.hget(restart_episode_key, "phase")) != "wait_return":
+            _require(time.monotonic() < restart_grace_deadline,
+                     "Restart probe did not enter native viewer-return grace")
+            gevent_sleep(0.05)
+        restart_native_deadline = float(
+            redis_client.hget(restart_episode_key, "return_deadline")
+        )
+        pending_return = None
+        restart_return_deadline = time.monotonic() + 150
+        while time.monotonic() < restart_return_deadline:
+            current_return = return_ledger.read(worker_id)
+            if (current_return is not None and current_return.intent is not None
+                    and current_return.intent.action.value == "return_to_allowed"):
+                pending_return = current_return.intent
+                break
+            if run_share.failures:
+                raise RuntimeError("Task failed before persisting its RETURN intent")
+            gevent_sleep(0.1)
+        _require(
+            pending_return is not None
+            and time.time() >= restart_native_deadline
+            and pending_return.not_before >= restart_native_deadline,
+            "Native return did not produce a durable RETURN intent at its deadline",
+        )
+        b_unavailable_deadline = time.monotonic() + 15
+        while (len(source_server.request_times("source-b.ts"))
+               <= restart_b_request_baseline):
+            _require(time.monotonic() < b_unavailable_deadline,
+                     "Task did not attempt B while the RETURN intent was pending")
+            gevent_sleep(0.05)
+        (
+            restart_b_attempt_ids,
+            restart_b_attempt_bindings,
+            restart_b_attempts_bound,
+        ) = _stop_join_and_freeze_attempt_bindings(
+            run_share,
+            lambda: _worker_records(redis_client, worker_id),
+            baseline_worker_ids=restart_b_worker_ids_before,
+            stream_id=str(stream_b.id),
+            cooperative_sleep=gevent_sleep,
+        )
+        _require(
+            restart_b_attempts_bound,
+            "Pending RETURN did not expose stable exact B attempt bindings after task join",
+        )
+        restart_b_request_count_after_stop = len(
+            source_server.request_times("source-b.ts"),
+        )
+
+        def restart_b_cleanup_snapshot():
+            attempt_set_unchanged, current_records = (
+                _attempt_records_match_frozen_bindings(
+                    _worker_records(redis_client, worker_id),
+                    baseline_worker_ids=restart_b_worker_ids_before,
+                    stream_id=str(stream_b.id),
+                    attempt_ids=restart_b_attempt_ids,
+                    bindings=restart_b_attempt_bindings,
+                )
+            )
+            records = [current_records.get(worker) for worker in restart_b_attempt_ids]
+            exact_bindings = attempt_set_unchanged
+            ledger_released = bool(records) and all(
+                record is not None
+                and record.get("state") in {"failed", "released"}
+                and record.get("reservation_state") in {"none", "released"}
+                for record in records
+            )
+            private_markers_absent = all(
+                record is not None
+                and not redis_client.exists(
+                    CAPABILITY_PREFIX
+                    + restart_b_attempt_bindings[worker]["capability_digest"],
+                )
+                and not redis_client.exists(
+                    reservation_credential_marker_key(
+                        restart_b_attempt_bindings[worker]["reservation_id"],
+                    ),
+                )
+                for worker, record in zip(restart_b_attempt_ids, records)
+            )
+            native_resources_absent = all(
+                worker not in native_server.stream_managers
+                and worker not in native_server._live_stream_managers
+                and worker not in native_server.client_managers
+                and redis_client.get(RedisKeys.channel_owner(worker)) is None
+                and int(redis_client.scard(RedisKeys.clients(worker)) or 0) == 0
+                and not redis_client.exists(RedisKeys.channel_stopping(worker))
+                for worker in restart_b_attempt_ids
+            )
+            provider_counts, provider_active = source_server.snapshot()
+            return {
+                "conditions": {
+                    "attempt_ledger_released": ledger_released,
+                    "attempt_binding_preserved": exact_bindings,
+                    "attempt_set_unchanged_after_join": attempt_set_unchanged,
+                    "attempt_markers_absent": private_markers_absent,
+                    "native_resources_absent": native_resources_absent,
+                    "provider_b_inactive": provider_active["source-b.ts"] == 0,
+                    "provider_b_requests_unchanged": (
+                        len(source_server.request_times("source-b.ts"))
+                        == restart_b_request_count_after_stop
+                        and provider_counts["source-b.ts"]
+                        == restart_b_request_count_after_stop
+                    ),
+                    "profile_b_at_baseline": (
+                        _profile_count_matches_original_baseline(
+                            _profile_count(
+                                redis_client, profile_b.id,
+                                profile_connections_key,
+                            ),
+                            restart_b_profile_baseline,
+                        )
+                    ),
+                },
+                "worker_states": [
+                    _allowlisted_state(
+                        record.get("state") if record else None,
+                        frozenset({
+                            "issued", "reserving", "reserved", "starting", "active",
+                            "releasing", "released", "release_failed", "failed",
+                        }),
+                    )
+                    for record in records
+                ],
+                "reservation_states": [
+                    _allowlisted_state(
+                        record.get("reservation_state") if record else None,
+                        frozenset({
+                            "none", "reserving", "reserved", "releasing",
+                            "released", "release_failed",
+                        }),
+                    )
+                    for record in records
+                ],
+                "provider_b_active": provider_active["source-b.ts"],
+                "provider_b_requests": provider_counts["source-b.ts"],
+            }
+
+        restart_b_release_timeout = _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
+        restart_b_resources_released, restart_b_release_snapshot = (
+            _wait_for_readiness_snapshot(
+                restart_b_cleanup_snapshot, restart_b_release_timeout,
+                monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
+            )
+        )
+        _require_with_failure_diagnostic(
+            restart_b_resources_released,
+            "Stopping the pending RETURN task did not release its exact B attempt",
+            lambda: restart_b_release_snapshot,
+            diagnostic_label="CATCHUPARR_PENDING_RETURN_B_CLEANUP_DIAGNOSTIC",
+        )
+        interrupted_return = return_ledger.read(worker_id)
+        _require(
+            interrupted_return is not None
+            and interrupted_return.intent is not None
+            and interrupted_return.intent.action.value == "return_to_allowed"
+            and interrupted_return.intent.intent_epoch == pending_return.intent_epoch
+            and not redis_client.exists(
+                f"live:channel:{worker_id}:clients:{second_borrow_client_id}"
+            )
+            and _redis_text(redis_client.hget(restart_episode_key, "phase")) == "closed",
+            "Stopping before B media lost the durable RETURN or retained its borrow client",
+        )
+        source_server.set_mode("source-b.ts", "continuous")
+        restart_b_media_baseline = {segment.id for segment in store.segments(worker_id)}
+        restart_request_baseline = len(source_server.request_times("source-b.ts"))
+        run_restart = _RecorderTaskRun(
+            worker_id, startup_timeout=45, media_idle_timeout=25,
+        )
+        run_restart.start()
+        harnesses.append(run_restart)
+        restarted_return_request_deadline = time.monotonic() + 150
+        while time.monotonic() < restarted_return_request_deadline:
+            if len(source_server.request_times("source-b.ts")) > restart_request_baseline:
+                break
+            if run_restart.failures:
+                raise RuntimeError("Replacement task failed before retrying the pending RETURN")
+            gevent_sleep(0.1)
+        _require(
+            len(source_server.request_times("source-b.ts")) > restart_request_baseline,
+            "Replacement task did not resume the pending allowed B source",
+        )
+        restart_returned_segments = _wait_for_indexed_tone(
+            run_restart, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=880, existing_ids=restart_b_media_baseline,
+            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(restart_returned_segments),
+                 "Restarted RETURN did not archive useful B media")
+        restart_committed = return_ledger.read(worker_id)
+        _require(
+            restart_committed is not None
+            and restart_committed.intent is None
+            and restart_committed.state.phase.value == "dedicated"
+            and restart_committed.state.last_switch_at is not None
+            and restart_committed.state.last_switch_at >= pending_return.not_before,
+            "The restarted task did not commit the RETURN on its first useful B media",
+        )
+        # The replacement task now borrows a fresh ordinary A viewer. Keep it
+        # alive through Pause to prove cleanup leaves the native viewer intact.
+        second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
+        live_response = _open_after_readiness(
+            lambda: wait_for_native_a_teardown(second_borrow_client_id),
+            lambda: client.get(
+                f"/proxy/ts/stream/{channel.uuid}",
+                HTTP_HOST="localhost",
+                HTTP_USER_AGENT="Synthetic post-restart ordinary viewer",
+            ),
+        )
+        _require(live_response.status_code == 200,
+                 "Post-restart ordinary A viewer could not open")
+        live_session, post_restart_native_buffer = _create_native_live_reader_session(
+            live_response, native_server, worker_id,
+        )
+        live_reader = live_session.reader
+        post_restart_ordinary_identity = _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+            return_identity=True,
+            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
+                run_restart,
+                worker_id=worker_id,
+                channel_uuid=str(channel.uuid),
+                decode_capability=decode_borrow_capability,
+                is_server_verified=catchuparr_stats._is_recorder_client,
+            ),
+        )
+        _wait_for_native_active(
+            redis_client, native_server, worker_id, redis_keys=RedisKeys,
+            metadata_field=ChannelMetadataField,
+            channel_state=ChannelState, timeout=45,
+            expected_ordinary_identity=post_restart_ordinary_identity,
+            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
+                run_restart,
+                worker_id=worker_id,
+                channel_uuid=str(channel.uuid),
+                decode_capability=decode_borrow_capability,
+                is_server_verified=catchuparr_stats._is_recorder_client,
+            ),
+        )
+        post_restart_first_media, _post_restart_media_index = _read_after_current_buffer_head(
+            live_session, post_restart_native_buffer,
+            minimum_bytes=188 * 100, timeout=20,
+        )
+        _verify_audio_video_tone(
+            ffmpeg, ffprobe, post_restart_first_media, 440,
+            "Post-restart ordinary live A before borrow",
+        )
+        post_restart_borrow_headers = None
+        post_restart_borrow_deadline = time.monotonic() + 90
+        while time.monotonic() < post_restart_borrow_deadline:
+            with run_restart._lock:
+                post_restart_borrow_headers = next(
+                    (dict(headers) for headers in run_restart.input_headers
+                     if "X-Catchuparr-Borrow" in headers),
+                    None,
+                )
+            if post_restart_borrow_headers is not None:
+                break
+            if run_restart.failures:
+                raise RuntimeError("Restarted task failed before borrowing live A")
+            gevent_sleep(0.1)
+        _require(post_restart_borrow_headers is not None,
+                 "Restarted task did not borrow the post-restart A viewer")
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 2,
+            expected_local=1, timeout=20,
+        )
+        second_capability = decode_borrow_capability(
+            post_restart_borrow_headers["X-Catchuparr-Borrow"],
+        )
+        second_borrow_client_id = f"catchuparr-client-{second_capability.nonce}"
+        second_native_manager = native_server.stream_managers.get(worker_id)
+        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
+        second_source_counts, second_active_counts = source_server.snapshot()
+        _require(
+            second_borrow_client_id != borrow_client_id
+            and catchuparr_stats._is_recorder_client(worker_id, second_borrow_client_id)
+            and second_native_manager is not None and second_native_manager.running
+            and second_native_owner is not None
+            and second_source_counts["source-a.ts"] == second_cycle_a_baseline + 1
+            and second_active_counts["source-a.ts"] == 1
+            and second_active_counts["source-b.ts"] == 0,
+            "Post-restart borrow opened another provider source instead of reading A",
+        )
+        second_borrowed_ids = {segment.id for segment in store.segments(worker_id)}
+        second_borrowed_segments = _wait_for_indexed_tone(
+            run_restart, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=second_borrowed_ids,
+            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(second_borrowed_segments),
+                 "Post-restart borrow did not archive fresh A media")
+        final_a_request_total = second_cycle_a_baseline + 1
+        run_share = run_restart
+        share_b_request_baseline = restart_request_baseline
+        from catchuparr import sharing_runtime as sharing_runtime_module
+        from catchuparr.adapters import sharing_borrow_route
+
+        real_borrow_cleanup = sharing_borrow_route.cleanup_borrowed_client
+        cleanup_attempts = []
+        cleanup_ack_released = {"value": False}
+
+        def fail_first_borrow_cleanup(*args, **kwargs):
+            result = real_borrow_cleanup(*args, **kwargs)
+            # Simulate a lost reply only after Redis has removed the exact
+            # registration. Keep suppressing successful replies until the
+            # task's normal close/retry paths have run; their call count is an
+            # implementation detail. A later retry must receive the
+            # idempotent native absence ACK.
+            if result and not cleanup_ack_released["value"]:
+                cleanup_attempts.append(False)
+                return False
+            cleanup_attempts.append(result)
+            return result
+
+        # Force one exact native cleanup ACK loss on the Stop path. The
+        # durable session retry must remove only the recorder reader and leave
+        # the ordinary viewer connected.
+        with patch.object(
+            sharing_borrow_route,
+            "cleanup_borrowed_client",
+            side_effect=fail_first_borrow_cleanup,
+        ), patch.object(catchuparr_tasks.reconcile_recorders, "apply_async"):
+            second_pause_result = catchuparr_runtime.pause_recorders()
+            _require(
+                second_pause_result.get("paused") is True,
+                "Pause did not persist during the second borrowed cycle",
+            )
+            run_share.join_after_supervisor(timeout=25, cooperative_sleep=gevent_sleep)
+            _require(
+                run_share.result == {"status": "stopped"},
+                "Pause did not stop the second borrowed recorder attempt",
+            )
+            _require(
+                cleanup_attempts and all(result is False for result in cleanup_attempts),
+                "The synthetic borrowed cleanup did not suppress post-effect ACKs",
+            )
+            borrow_client_key = (
+                f"live:channel:{worker_id}:clients:{second_borrow_client_id}"
+            )
+            _require(
+                not redis_client.exists(borrow_client_key)
+                and not redis_client.sismember(
+                    RedisKeys.clients(worker_id), second_borrow_client_id,
+                ),
+                "Lost cleanup ACK did not follow an actual native registration removal",
+            )
+            cleanup_ack_released["value"] = True
+            completed_retry, pending_retry = (
+                sharing_runtime_module.retry_pending_open_cleanups()
+            )
+            _require(
+                completed_retry >= 1
+                and pending_retry == 0
+                and cleanup_attempts[-1] is True,
+                "A retained borrowed cleanup did not succeed on its explicit retry ACK",
+            )
+        _require(
+            run_share.result == {"status": "stopped"},
+            "Borrowing recorder restarted after Stop before viewer cleanup",
+        )
+        _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1, timeout=15,
+        )
+        second_borrow_client_key = (
+            f"live:channel:{worker_id}:clients:{second_borrow_client_id}"
+        )
+        _require(
+            not redis_client.exists(second_borrow_client_key)
+            and not redis_client.sismember(RedisKeys.clients(worker_id), second_borrow_client_id)
+            and redis_client.hget(
+                f"catchuparr:sharing:private:{worker_id}", second_borrow_client_id,
+            ) is None,
+            "Pause or the lost-ACK retry left the second borrowed reader registered",
+        )
+        paused_source_counts, paused_active_counts = source_server.snapshot()
+        _require(
+            native_server.stream_managers.get(worker_id) is second_native_manager
+            and second_native_manager.running
+            and redis_client.get(RedisKeys.channel_owner(worker_id)) == second_native_owner
+            and _native_source_metadata(redis_client, metadata_key) == second_source_metadata
+            and paused_source_counts["source-a.ts"] == second_source_counts["source-a.ts"]
+            and paused_active_counts["source-a.ts"] == 1
+            and paused_active_counts["source-b.ts"] == 0
+            and _profile_count(redis_client, profile_a.id, profile_connections_key)
+            == profile_baselines[profile_a.id] + 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id],
+            "Pause changed the ordinary A viewer, its native owner, or provider reservations",
+        )
+
+        if live_session is not None:
+            live_session.close()
+            live_response = None
+            live_reader = None
+            live_session = None
+        # Reuse the full native A release acknowledgment instead of shorter
+        # owner-only waits: Dispatcharr can retain the stopping marker after
+        # the last response closes while its native cleanup monitor drains.
+        wait_for_native_a_teardown(second_borrow_client_id)
+        counts_final, active_final = source_server.snapshot()
         _require(
             redis_client.get(RedisKeys.channel_owner(worker_id)) is None
             and native_server.stream_managers.get(worker_id) is None
             and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+            and native_server.client_managers.get(worker_id) is None
             and _profile_count(redis_client, profile_a.id, profile_connections_key)
             == profile_baselines[profile_a.id]
-            and source_server.snapshot()[0]["source-a.ts"] == counts["source-a.ts"]
-            and source_server.snapshot()[1]["source-a.ts"] == 0,
-            "Stopping the final native live A client did not release its owner and provider slot",
-        )
-        _require(
-            _profile_count(redis_client, profile_b.id, profile_connections_key)
+            and counts_final["source-a.ts"] == final_a_request_total
+            and active_final["source-a.ts"] == 0
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
             == profile_baselines[profile_b.id],
-            "Archive B profile capacity changed after both workers stopped",
+            "Stopping the final native live A client did not release its owner and provider slot",
         )
         _require(
             {
@@ -3508,6 +6420,12 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 live_response.close()
             except Exception:
                 cleanup_errors.append("native-live-response")
+        if churn_session is not None:
+            try:
+                churn_session.close()
+                churn_session = None
+            except Exception:
+                cleanup_errors.append("native-churn-response")
         try:
             from catchuparr.adapters.recorder_proxy import stop_managed_workers
 

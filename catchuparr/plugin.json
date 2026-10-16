@@ -1,7 +1,7 @@
 {
   "name": "Catchuparr",
-  "version": "0.5.1",
-  "description": "Local rolling catch-up archive and start-over for Dispatcharr",
+  "version": "0.6.0",
+  "description": "Local rolling catch-up archive, start-over and optional live connection sharing for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
   "fields": [
@@ -11,6 +11,13 @@
       "type": "text",
       "default": "",
       "help_text": "Use version: 1 with channel rules selected by numbers, names, groups, or enabled profiles. Named-profile rules provide inherited source filters and schedules; direct channel rules can override them regardless of order. Omitted source filters inherit, explicit include/exclude replaces the filter, and explicit priority replaces the whole map. A rule schedule replaces the whole week by default; schedule_mode: override_days changes only specified expanded days. Day precedence is explicit weekday, group, then daily. Timezone is YAML timezone, valid container TZ, then detected system zone. Validate and Apply the complete settings together; blank YAML selects no channels. Filtered sources may need another provider slot."
+    },
+    {
+      "id": "connection_sharing_config",
+      "label": "Recorder connection sharing (YAML)",
+      "type": "text",
+      "default": "",
+      "help_text": "Optional version: 1 YAML; blank disables sharing. Enabled per selected channel only. Defaults: 5 seconds for a stable live connection, 30 seconds after its last ordinary viewer leaves, and 60 seconds between switches. Add default.enabled: true or channel rules using the filter selectors. Cooldowns are strict integers from 0 to 3600; zero disables that cooldown. Sharing reuses only a compatible existing native live connection; it never opens an excluded source. Validate and Apply with the complete settings."
     },
     {
       "id": "archive_root",

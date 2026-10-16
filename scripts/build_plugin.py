@@ -21,6 +21,12 @@ REQUIRED_MODULES = (
     "logging_utils.py",
     "recorder_proxy.py",
     "runtime.py",
+    "sharing_authority_outbox.py",
+    "sharing_coordinator.py",
+    "sharing_episode.py",
+    "sharing_persistence.py",
+    "sharing_planner.py",
+    "sharing_runtime.py",
     "stats.py",
     "tasks.py",
     "views.py",
@@ -34,6 +40,9 @@ REQUIRED_MODULES = (
     "adapters/m3u.py",
     "adapters/xc.py",
     "adapters/recorder_proxy.py",
+    "adapters/sharing_borrow_route.py",
+    "adapters/sharing_native.py",
+    "adapters/sharing_reader.py",
     "engine/__init__.py",
     "engine/admission.py",
     "engine/leases.py",
@@ -41,6 +50,7 @@ REQUIRED_MODULES = (
     "engine/recorder.py",
     "engine/store.py",
 )
+REQUIRED_ASSETS = ("logo.png",)
 
 
 def build() -> Path:
@@ -51,8 +61,12 @@ def build() -> Path:
     missing = [name for name in REQUIRED_MODULES if not (PLUGIN / name).is_file()]
     if missing:
         raise RuntimeError(f"Required plugin modules are missing: {', '.join(missing)}")
+    missing_assets = [name for name in REQUIRED_ASSETS if not (PLUGIN / name).is_file()]
+    if missing_assets:
+        raise RuntimeError(f"Required plugin assets are missing: {', '.join(missing_assets)}")
     files = sorted(
-        p for p in PLUGIN.rglob("*") if p.is_file() and p.suffix in {".py", ".json"}
+        p for p in PLUGIN.rglob("*")
+        if p.is_file() and p.suffix in {".py", ".json", ".png"}
     )
     DIST.mkdir(exist_ok=True)
     result = DIST / f"catchuparr-{version}.zip"

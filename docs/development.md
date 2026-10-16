@@ -25,7 +25,7 @@ For the 0.5.1 named-profile inheritance prerelease, see [its candidate guide](ca
 The 453-test suite and full pinned AIO probes passed on Dispatcharr 0.31.0
 and 0.32.0. CI, isolated Dev verification and publication remain pending.
 
-Dispatcharr v0.31.0 and v0.32.0 accept a manual update at authenticated admin
+Dispatcharr v0.32.0 accepts a manual update at authenticated admin
 `POST /api/plugins/plugins/import/` with multipart field `file` and explicit
 `overwrite=true`; the response must contain `success: true` and the expected
 plugin key/version. `POST /api/plugins/plugins/reload/` refreshes web-process
@@ -34,7 +34,7 @@ the same package, then verify plugin status, recording and playback. Keep the
 previous ZIP for rollback. Both POST routes require an admin account in the
 inspected image.
 
-The inspected compatibility targets are Dispatcharr v0.31.0 and v0.32.0. Unknown versions are refused. Custom images must retain the inspected core signatures and pass request tests before enabling XC output.
+The minimum supported Dispatcharr version is v0.32.0; it is currently the only explicitly supported release. Earlier and unverified versions are refused. Custom images must retain the inspected core signatures and pass request tests before enabling XC output.
 
 Create a separate archive access token for each playback device. Session identity is scoped to the credential, not proof of physical device identity: copying a playlist to another player shares its slot. Playlist reloads for the same programme reuse its session; switching programmes replaces that credential's session while preserving its previous segment URLs for a 30-second grace period.
 
