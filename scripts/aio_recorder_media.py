@@ -13,23 +13,18 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+CRASH_CHILD_RESULT_PREFIX = "CATCHUPARR_SHARING_CRASH_CHILD_RESULT "
+
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
 
 
-def _crash_child_failure_diagnostic(result, expected_code, parsed_value):
+def _crash_child_failure_diagnostic(result, expected_code, parsed_value, stdout_shape):
     """Describe a child failure without exposing captured stdout or stderr."""
     if not isinstance(parsed_value, dict):
-        if not result.stdout.strip():
-            shape = "empty"
-        elif isinstance(parsed_value, list):
-            shape = "array"
-        elif parsed_value is not None:
-            shape = "scalar"
-        else:
-            shape = "invalid_json"
+        shape = stdout_shape
         keys = []
         exception_class = "unavailable"
     else:
@@ -60,6 +55,30 @@ def _crash_child_failure_diagnostic(result, expected_code, parsed_value):
         "known_result_keys": keys,
         "child_exception_class": exception_class,
     }
+
+
+def _parse_crash_child_result(stdout):
+    """Parse exactly one framed child receipt while ignoring unrelated startup output."""
+    if not isinstance(stdout, str):
+        return None, "invalid_output"
+    frames = [
+        line[len(CRASH_CHILD_RESULT_PREFIX):]
+        for line in stdout.splitlines()
+        if line.startswith(CRASH_CHILD_RESULT_PREFIX)
+    ]
+    if not frames:
+        return None, "no_receipt"
+    if len(frames) != 1:
+        return None, "multiple_receipts"
+    try:
+        value = json.loads(frames[0])
+    except (json.JSONDecodeError, TypeError):
+        return None, "invalid_receipt_json"
+    if isinstance(value, dict):
+        return value, "object"
+    if isinstance(value, list):
+        return None, "array"
+    return None, "scalar"
 
 
 def _require_with_failure_diagnostic(
@@ -550,14 +569,13 @@ def _run_registration_crash_recovery_probe(
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError(f"Owned crash-probe child failed: {type(exc).__name__}") from None
-        try:
-            value = json.loads(result.stdout)
-        except (json.JSONDecodeError, TypeError):
-            value = None
+        value, stdout_shape = _parse_crash_child_result(result.stdout)
         _require_with_failure_diagnostic(
             result.returncode == expected_code and isinstance(value, dict),
             f"Owned crash-probe child returned an unexpected result in {mode}",
-            lambda: _crash_child_failure_diagnostic(result, expected_code, value),
+            lambda: _crash_child_failure_diagnostic(
+                result, expected_code, value, stdout_shape,
+            ),
             diagnostic_label="CATCHUPARR_SHARING_CRASH_CHILD_FAILURE",
         )
         return value

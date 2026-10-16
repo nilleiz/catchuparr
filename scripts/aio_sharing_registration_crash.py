@@ -14,9 +14,11 @@ import sys
 import time
 from pathlib import Path
 
+_RESULT_PREFIX = "CATCHUPARR_SHARING_CRASH_CHILD_RESULT "
+
 
 def _emit(value: dict[str, object]) -> None:
-    sys.stdout.write(json.dumps(value, sort_keys=True) + "\n")
+    sys.stdout.write("\n" + _RESULT_PREFIX + json.dumps(value, sort_keys=True) + "\n")
     sys.stdout.flush()
 
 

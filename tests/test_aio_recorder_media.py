@@ -174,7 +174,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
             }),
         )
         diagnostic = probe._crash_child_failure_diagnostic(
-            result, 73, json.loads(result.stdout),
+            result, 73, json.loads(result.stdout), "object",
         )
         self.assertEqual({
             "exit_code": 70,
@@ -188,11 +188,29 @@ class RecorderMediaProbeTests(unittest.TestCase):
     def test_crash_child_failure_summary_classifies_non_object_json(self):
         result = SimpleNamespace(returncode=73, stdout='["private-token"]')
         diagnostic = probe._crash_child_failure_diagnostic(
-            result, 73, json.loads(result.stdout),
+            result, 73, json.loads(result.stdout), "array",
         )
         self.assertEqual("array", diagnostic["stdout_json_shape"])
         self.assertEqual([], diagnostic["known_result_keys"])
         self.assertNotIn("private-token", json.dumps(diagnostic))
+
+    def test_crash_child_parser_ignores_unframed_output_but_requires_one_receipt(self):
+        receipt = probe.CRASH_CHILD_RESULT_PREFIX + '{"native_registered":true}'
+        value, shape = probe._parse_crash_child_result(
+            "Django startup message with private value\n" + receipt + "\n"
+        )
+        self.assertEqual({"native_registered": True}, value)
+        self.assertEqual("object", shape)
+
+        value, shape = probe._parse_crash_child_result(receipt + "\n" + receipt)
+        self.assertIsNone(value)
+        self.assertEqual("multiple_receipts", shape)
+
+        diagnostic = probe._crash_child_failure_diagnostic(
+            SimpleNamespace(returncode=73, stdout="noise"), 73, None, shape,
+        )
+        self.assertEqual("multiple_receipts", diagnostic["stdout_json_shape"])
+        self.assertNotIn("private", json.dumps(diagnostic))
 
     def test_teardown_budget_accounts_for_sequential_shutdown_and_marker_ttl(self):
         self.assertEqual(

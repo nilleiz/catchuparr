@@ -25,7 +25,11 @@ class CrashProbeBootstrapTests(unittest.TestCase):
         self.assertEqual(70, result.returncode)
         self.assertEqual(
             {"error": True, "exception_class": "JSONDecodeError"},
-            json.loads(result.stdout),
+            json.loads(next(
+                line.split(" ", 1)[1]
+                for line in result.stdout.splitlines()
+                if line.startswith("CATCHUPARR_SHARING_CRASH_CHILD_RESULT ")
+            )),
         )
         self.assertNotIn("not-json-private-payload", result.stdout + result.stderr)
 
