@@ -4287,6 +4287,138 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and share_results[0].status in {"switch_requested", "media_stalled", "exited"},
             "The borrowed recorder did not finish its useful A input before returning",
         )
+
+        from apps.proxy.live_proxy.config_helper import ConfigHelper
+        from apps.proxy.live_proxy.services.channel_service import ChannelService
+
+        def wait_for_native_a_teardown(previous_borrow_client_id: str) -> None:
+            """Wait for the exact borrowed A owner and its reservation to release."""
+            shutdown_bound = _native_teardown_readiness_timeout(
+                float(ConfigHelper.channel_shutdown_delay()),
+                float(ConfigHelper.cleanup_check_interval()),
+                # StreamManager's native failure cleanup also publishes the
+                # channel_stopping marker for 60 seconds. Cover that exact
+                # source-defined phase as well as the normal 30-second owner
+                # release marker; do not infer completion from provider count.
+                stopping_marker_ttl=60,
+            )
+
+            def snapshot():
+                state = _redis_text(redis_client.hget(
+                    RedisKeys.channel_metadata(worker_id), ChannelMetadataField.STATE,
+                ))
+                profile_a_count = _profile_count(
+                    redis_client, profile_a.id, profile_connections_key,
+                )
+                provider_counts, provider_active = source_server.snapshot()
+                local_manager = native_server.client_managers.get(worker_id)
+                borrowed_hash = (
+                    f"live:channel:{worker_id}:clients:{previous_borrow_client_id}"
+                )
+                borrowed_absent = (
+                    not redis_client.exists(borrowed_hash)
+                    and not redis_client.sismember(
+                        RedisKeys.clients(worker_id), previous_borrow_client_id,
+                    )
+                    and redis_client.hget(
+                        f"catchuparr:sharing:private:{worker_id}",
+                        previous_borrow_client_id,
+                    ) is None
+                )
+                conditions = {
+                    "native_route_admits_new_clients": not (
+                        ChannelService.is_channel_unavailable_for_new_clients(worker_id)
+                    ),
+                    "redis_stopping_marker_absent": not redis_client.exists(
+                        RedisKeys.channel_stopping(worker_id),
+                    ),
+                    "metadata_not_stopping": state != _constant_text(ChannelState.STOPPING),
+                    "native_owner_absent": redis_client.get(
+                        RedisKeys.channel_owner(worker_id),
+                    ) is None,
+                    "native_clients_zero": int(
+                        redis_client.scard(RedisKeys.clients(worker_id)) or 0
+                    ) == 0,
+                    "native_managers_absent": (
+                        worker_id not in native_server.stream_managers
+                        and worker_id not in native_server._live_stream_managers
+                        and local_manager is None
+                    ),
+                    "source_a_inactive": provider_active["source-a.ts"] == 0,
+                    "profile_a_at_baseline": (
+                        profile_a_count == profile_baselines[profile_a.id]
+                    ),
+                    "previous_borrow_registration_absent": borrowed_absent,
+                }
+                return {
+                    "conditions": conditions,
+                    "metadata_state_stopping": (
+                        state == _constant_text(ChannelState.STOPPING)
+                    ),
+                    "metadata_state_error": (
+                        state == _constant_text(ChannelState.ERROR)
+                    ),
+                    "provider_a": {
+                        "active": provider_active["source-a.ts"],
+                        "requests": provider_counts["source-a.ts"],
+                    },
+                    "native": {
+                        "global_clients": int(
+                            redis_client.scard(RedisKeys.clients(worker_id)) or 0
+                        ),
+                        "owner_present": redis_client.get(
+                            RedisKeys.channel_owner(worker_id),
+                        ) is not None,
+                        "stream_manager_present": (
+                            worker_id in native_server.stream_managers
+                        ),
+                        "live_stream_manager_present": (
+                            worker_id in native_server._live_stream_managers
+                        ),
+                    },
+                    "profile_a": {
+                        "current": profile_a_count,
+                        "baseline": profile_baselines[profile_a.id],
+                    },
+                    "previous_borrow_registration_absent": borrowed_absent,
+                }
+
+            ready, last_snapshot = _wait_for_readiness_snapshot(
+                snapshot,
+                shutdown_bound,
+                monotonic=time.monotonic,
+                sleep=gevent_sleep,
+                poll_interval=0.1,
+            )
+            if ready:
+                return
+
+            def readiness_failure_diagnostic():
+                diagnostic = dict(last_snapshot)
+                manager = native_server.client_managers.get(worker_id)
+                diagnostic["native_local_clients"] = (
+                    int(manager.get_client_count()) if manager is not None else 0
+                )
+                diagnostic["native"]["stopping_marker_ttl_seconds"] = int(
+                    redis_client.ttl(RedisKeys.channel_stopping(worker_id))
+                )
+                diagnostic["native"]["last_disconnect_ttl_seconds"] = int(
+                    redis_client.ttl(RedisKeys.last_client_disconnect(worker_id))
+                )
+                return diagnostic
+
+            _require_with_failure_diagnostic(
+                False,
+                "Native A teardown did not finish after its last borrowed reader",
+                readiness_failure_diagnostic,
+                diagnostic_label="CATCHUPARR_NATIVE_REOPEN_DIAGNOSTIC",
+            )
+
+        # The native last-client disconnect releases profile capacity after
+        # its configured shutdown and cleanup phases. Wait for that exact
+        # teardown before asserting the provider/profile handoff to B. This
+        # readiness gate does not require the independent B source to stop.
+        wait_for_native_a_teardown(borrow_client_id)
         counts_after_share_return, active_after_share_return = source_server.snapshot()
         _require(
             counts_after_share_return["source-b.ts"]
@@ -4637,118 +4769,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and resumed_active["source-b.ts"] == 1,
             "Recorder did not resume the allowed B source after the paused episode",
         )
-        # Re-open an ordinary A viewer after the first successful return. The
-        # recorder should borrow A a second time, then explicit Pause must
-        # remove only its reader while leaving the ordinary viewer untouched.
-        from apps.proxy.live_proxy.config_helper import ConfigHelper
-        from apps.proxy.live_proxy.services.channel_service import ChannelService
-
-        def wait_for_native_a_reopen(previous_borrow_client_id: str) -> None:
-            """Wait for Dispatcharr's real last-client teardown to finish read-only."""
-            shutdown_bound = _native_teardown_readiness_timeout(
-                float(ConfigHelper.channel_shutdown_delay()),
-                float(ConfigHelper.cleanup_check_interval()),
-            )
-
-            def snapshot():
-                state = _redis_text(redis_client.hget(
-                    RedisKeys.channel_metadata(worker_id), ChannelMetadataField.STATE,
-                ))
-                profile_a_count = _profile_count(
-                    redis_client, profile_a.id, profile_connections_key,
-                )
-                provider_counts, provider_active = source_server.snapshot()
-                local_manager = native_server.client_managers.get(worker_id)
-                borrowed_hash = (
-                    f"live:channel:{worker_id}:clients:{previous_borrow_client_id}"
-                )
-                borrowed_absent = (
-                    not redis_client.exists(borrowed_hash)
-                    and not redis_client.sismember(
-                        RedisKeys.clients(worker_id), previous_borrow_client_id,
-                    )
-                    and redis_client.hget(
-                        f"catchuparr:sharing:private:{worker_id}",
-                        previous_borrow_client_id,
-                    ) is None
-                )
-                conditions = {
-                    "native_route_admits_new_clients": not (
-                        ChannelService.is_channel_unavailable_for_new_clients(worker_id)
-                    ),
-                    "redis_stopping_marker_absent": not redis_client.exists(
-                        RedisKeys.channel_stopping(worker_id),
-                    ),
-                    "metadata_not_stopping": state != _constant_text(ChannelState.STOPPING),
-                    "native_owner_absent": redis_client.get(
-                        RedisKeys.channel_owner(worker_id),
-                    ) is None,
-                    "native_clients_zero": int(
-                        redis_client.scard(RedisKeys.clients(worker_id)) or 0
-                    ) == 0,
-                    "native_managers_absent": (
-                        worker_id not in native_server.stream_managers
-                        and worker_id not in native_server._live_stream_managers
-                        and local_manager is None
-                    ),
-                    "source_a_inactive": provider_active["source-a.ts"] == 0,
-                    "profile_a_at_baseline": (
-                        profile_a_count == profile_baselines[profile_a.id]
-                    ),
-                    "previous_borrow_registration_absent": borrowed_absent,
-                }
-                return {
-                    "conditions": conditions,
-                    "metadata_state_stopping": (
-                        state == _constant_text(ChannelState.STOPPING)
-                    ),
-                    "provider_a": {
-                        "active": provider_active["source-a.ts"],
-                        "requests": provider_counts["source-a.ts"],
-                    },
-                    "native": {
-                        "global_clients": int(
-                            redis_client.scard(RedisKeys.clients(worker_id)) or 0
-                        ),
-                        "owner_present": redis_client.get(
-                            RedisKeys.channel_owner(worker_id),
-                        ) is not None,
-                    },
-                    "profile_a": {
-                        "current": profile_a_count,
-                        "baseline": profile_baselines[profile_a.id],
-                    },
-                    "previous_borrow_registration_absent": borrowed_absent,
-                }
-
-            ready, last_snapshot = _wait_for_readiness_snapshot(
-                snapshot,
-                shutdown_bound,
-                monotonic=time.monotonic,
-                sleep=gevent_sleep,
-                poll_interval=0.1,
-            )
-            if ready:
-                return
-
-            def readiness_failure_diagnostic():
-                diagnostic = dict(last_snapshot)
-                manager = native_server.client_managers.get(worker_id)
-                diagnostic["native_local_clients"] = (
-                    int(manager.get_client_count()) if manager is not None else 0
-                )
-                return diagnostic
-
-            _require_with_failure_diagnostic(
-                False,
-                "Native A teardown did not finish before the next ordinary viewer",
-                readiness_failure_diagnostic,
-                diagnostic_label="CATCHUPARR_NATIVE_REOPEN_DIAGNOSTIC",
-            )
-
+        # Re-open A after the same native teardown readiness gate used
+        # immediately after the first return.
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
         live_response = _open_after_readiness(
-            lambda: wait_for_native_a_reopen(no_source_client_id),
+            lambda: wait_for_native_a_teardown(no_source_client_id),
             lambda: client.get(
                 f"/proxy/ts/stream/{channel.uuid}",
                 HTTP_HOST="localhost",
@@ -4918,7 +4943,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # alive through Pause to prove cleanup leaves the native viewer intact.
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
         live_response = _open_after_readiness(
-            lambda: wait_for_native_a_reopen(second_borrow_client_id),
+            lambda: wait_for_native_a_teardown(second_borrow_client_id),
             lambda: client.get(
                 f"/proxy/ts/stream/{channel.uuid}",
                 HTTP_HOST="localhost",

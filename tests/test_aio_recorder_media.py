@@ -123,6 +123,14 @@ class RecorderMediaProbeTests(unittest.TestCase):
             probe._native_teardown_readiness_timeout(120, 1),
         )
 
+    def test_borrow_teardown_budget_covers_native_error_marker_ttl(self):
+        self.assertEqual(
+            186.0,
+            probe._native_teardown_readiness_timeout(
+                120, 1, stopping_marker_ttl=60,
+            ),
+        )
+
     def test_readiness_poll_observes_shutdown_then_marker_before_open(self):
         class FakeClock:
             now = 0.0
@@ -145,7 +153,11 @@ class RecorderMediaProbeTests(unittest.TestCase):
             else:
                 phase = "ready"
             clock.phases.append(phase)
-            return {"conditions": {"ready": phase == "ready"}, "phase": phase}
+            return {
+                "conditions": {"ready": phase == "ready"},
+                "phase": phase,
+                "independent_source_b_active": 1,
+            }
 
         ready, final = probe._wait_for_readiness_snapshot(
             read_native_state,
@@ -156,6 +168,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         )
         self.assertTrue(ready)
         self.assertEqual("ready", final["phase"])
+        self.assertEqual(1, final["independent_source_b_active"])
         self.assertIn("disconnect_delay", clock.phases)
         self.assertIn("stopping_marker_ttl", clock.phases)
         self.assertEqual(150, clock.now)
