@@ -25,18 +25,19 @@ def _require_with_failure_diagnostic(
     diagnostic_factory,
     *,
     emit=print,
+    diagnostic_label="CATCHUPARR_NO_SOURCE_PAUSE_DIAGNOSTIC",
 ) -> None:
     """Emit best-effort diagnostics without replacing the original gate error."""
     if condition:
         return
     try:
         diagnostic = diagnostic_factory()
-        emit("CATCHUPARR_NO_SOURCE_PAUSE_DIAGNOSTIC " + json.dumps(
+        emit(diagnostic_label + " " + json.dumps(
             diagnostic, sort_keys=True,
         ))
     except Exception as exc:
         try:
-            emit("CATCHUPARR_NO_SOURCE_PAUSE_DIAGNOSTIC " + json.dumps({
+            emit(diagnostic_label + " " + json.dumps({
                 "diagnostic_error": type(exc).__name__,
             }, sort_keys=True))
         except Exception:
@@ -4169,12 +4170,68 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and active_after_share_return["source-a.ts"] == 0,
             "Return did not use one allowed B connection after releasing borrowed A",
         )
-        _require(
-            _profile_count(redis_client, profile_a.id, profile_connections_key)
-            == profile_baselines[profile_a.id]
-            and _profile_count(redis_client, profile_b.id, profile_connections_key)
-            == profile_baselines[profile_b.id] + 1,
+        profile_a_return_count = _profile_count(
+            redis_client, profile_a.id, profile_connections_key,
+        )
+        profile_b_return_count = _profile_count(
+            redis_client, profile_b.id, profile_connections_key,
+        )
+        profile_return_conditions = {
+            "profile_a_at_baseline": (
+                profile_a_return_count == profile_baselines[profile_a.id]
+            ),
+            "profile_b_has_one_allowed_reservation": (
+                profile_b_return_count == profile_baselines[profile_b.id] + 1
+            ),
+        }
+
+        def borrow_return_diagnostic():
+            manager = native_server.client_managers.get(worker_id)
+            local_client_count = (
+                int(manager.get_client_count()) if manager is not None else 0
+            )
+            return {
+                "conditions": profile_return_conditions,
+                "profile_reservations": {
+                    "a": {
+                        "current": profile_a_return_count,
+                        "baseline": profile_baselines[profile_a.id],
+                    },
+                    "b": {
+                        "current": profile_b_return_count,
+                        "expected": profile_baselines[profile_b.id] + 1,
+                    },
+                },
+                "provider": {
+                    "a_active": active_after_share_return["source-a.ts"],
+                    "a_requests": counts_after_share_return["source-a.ts"],
+                    "b_active": active_after_share_return["source-b.ts"],
+                    "b_requests": counts_after_share_return["source-b.ts"],
+                    "b_expected_requests": share_source_baseline["source-b.ts"] + 1,
+                },
+                "native": {
+                    "global_clients": int(
+                        redis_client.scard(RedisKeys.clients(worker_id)) or 0
+                    ),
+                    "local_clients": local_client_count,
+                    "owner_present": redis_client.get(
+                        RedisKeys.channel_owner(worker_id),
+                    ) is not None,
+                    "disconnect_present": bool(redis_client.exists(
+                        RedisKeys.last_client_disconnect(worker_id),
+                    )),
+                },
+                "recorder": {
+                    "useful_segments": int(share_results[0].useful_segments),
+                    "status": str(share_results[0].status),
+                },
+            }
+
+        _require_with_failure_diagnostic(
+            all(profile_return_conditions.values()),
             "Borrow return did not release A and reserve only the allowed B profile",
+            borrow_return_diagnostic,
+            diagnostic_label="CATCHUPARR_BORROW_RETURN_DIAGNOSTIC",
         )
         # Remove all dedicated sources while an ordinary A viewer is present.
         # The new task must still borrow the existing A reader, close it at the

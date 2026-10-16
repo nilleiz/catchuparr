@@ -94,6 +94,22 @@ class RecorderMediaProbeTests(unittest.TestCase):
                 emit=fail_output,
             )
 
+    def test_failure_diagnostic_supports_separate_borrow_return_label(self):
+        emitted = []
+        with self.assertRaisesRegex(RuntimeError, "borrow return failed"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "borrow return failed",
+                lambda: {"profile_a_at_baseline": False},
+                emit=emitted.append,
+                diagnostic_label="CATCHUPARR_BORROW_RETURN_DIAGNOSTIC",
+            )
+        self.assertEqual(1, len(emitted))
+        self.assertTrue(emitted[0].startswith(
+            "CATCHUPARR_BORROW_RETURN_DIAGNOSTIC ",
+        ))
+        self.assertIn('"profile_a_at_baseline": false', emitted[0])
+
     def test_successful_gate_does_not_run_diagnostic(self):
         def unexpected_diagnostic():
             self.fail("successful gate must not read diagnostic state")
