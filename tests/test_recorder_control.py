@@ -9,7 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from catchuparr import recorder_control
+from catchuparr import configuration, recorder_control
+from catchuparr.configuration import SourceCatalog, apply_configuration, load_applied_state
 from catchuparr.recorder_control import (
     RecorderControlError,
     RecorderControlState,
@@ -20,6 +21,7 @@ from catchuparr.recorder_control import (
     pause_recorders,
     resume_recorders,
 )
+from catchuparr.sharing_authority_outbox import SharingAuthorityOutbox
 
 
 class _FakeDatabase:
@@ -254,6 +256,83 @@ class RecorderControlTests(unittest.TestCase):
         self.assertFalse(resumed.paused)
         self.assertEqual(configuration_generation, resumed.configuration_generation)
         self.assertEqual(2, self._read_json_state()["version"])
+
+    def test_pause_control_recovers_pending_authority_before_clearing_deny(self):
+        channel = "00000000-0000-0000-0000-000000000060"
+        catalog = SourceCatalog(
+            channels=({"uuid": channel, "number": "60", "name": "Synthetic Sharing Channel", "group": "Synthetic"},),
+            accounts=(), streams_by_channel={channel: ()},
+            profiles=({"id": "60", "name": "Synthetic Sharing Profile", "channel_uuids": (channel,)},),
+        )
+        settings = {
+            "filter_config": (
+                "version: 1\nprofile: all\nrules:\n"
+                "  - channels: {profile: Synthetic Sharing Profile}\n"
+            ),
+            "archive_root": str(self.root / "archive"),
+            "retention_hours": 24,
+            "max_storage_gib": 20,
+            "connection_sharing_config": "version: 1\ndefault:\n  enabled: true\n",
+        }
+        redis_hashes = {}
+
+        class Redis:
+            def hgetall(self, key):
+                return dict(redis_hashes.get(key, {}))
+
+        def drain(path, activation_id=None):
+            outbox = SharingAuthorityOutbox(
+                Path(path).with_name(configuration.SHARING_AUTHORITY_OUTBOX_NAME)
+            )
+
+            def publish(_redis, event):
+                key = f"catchuparr:sharing:current:{event.channel_uuid}"
+                current = redis_hashes.get(key, {})
+                if int(current.get("authority_revision", "0")) != event.expected_revision:
+                    return False
+                redis_hashes[key] = {
+                    "authority_revision": str(event.authority_revision),
+                    "configuration_generation": event.configuration_generation,
+                    "control_generation": str(event.control_generation),
+                    "catalog_generation": event.catalog_generation,
+                }
+                return True
+
+            result = outbox.drain(
+                Redis(), activation_id=activation_id,
+                read_prior=lambda *_args: None, publish=publish,
+                invalidate=lambda *_args: True,
+            )
+            return not result.pending_event_ids
+
+        with patch.object(
+            configuration, "_sharing_catalog_generation", return_value="synthetic-catalog-060",
+        ), patch.object(configuration, "_drain_sharing_authority_outbox", side_effect=drain):
+            apply_configuration(settings, catalog, self.active_path)
+
+        database = _FakeDatabase({"recording_enabled": True})
+        with (
+            database.patch(),
+            patch.object(configuration, "_sharing_catalog_generation", return_value="synthetic-catalog-060"),
+            patch.object(configuration, "_drain_sharing_authority_outbox", return_value=False),
+            self.assertRaisesRegex(RecorderControlError, "publication is pending"),
+        ):
+            pause_recorders(self.active_path)
+
+        self.assertTrue(control_deny_path(self.active_path).exists())
+        self.assertTrue(self._read_json_state()["paused"])
+        with (
+            patch.object(configuration, "_sharing_catalog_generation", return_value="synthetic-catalog-060"),
+            patch.object(configuration, "_drain_sharing_authority_outbox", side_effect=drain),
+        ):
+            _active, control = load_applied_state(self.active_path)
+
+        self.assertTrue(control.paused)
+        self.assertFalse(control_deny_path(self.active_path).exists())
+        outbox = SharingAuthorityOutbox(
+            self.active_path.with_name(configuration.SHARING_AUTHORITY_OUTBOX_NAME)
+        )
+        self.assertEqual((), outbox.pending())
 
     def test_database_failure_after_pause_keeps_durable_pause_and_rolls_back_setting(self):
         database = _FakeDatabase({"recording_enabled": True})

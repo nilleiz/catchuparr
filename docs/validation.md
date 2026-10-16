@@ -10,6 +10,32 @@ The initial 0.32.0 media run failed before 96,256 bytes; a later diagnostic-only
 run passed, but the original cause remains unknown. See the
 [0.5.1 candidate guide](candidate-0.5.1.md) and the 0.5.0 evidence below.
 
+## 0.6.0 optional live sharing candidate
+
+The 0.6.0 candidate remains unpublished. The full synthetic native AIO
+integration passed on the pinned Dispatcharr 0.32.0 image
+(`b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`) using
+source commit `2ce95f076754121460b06e29507c933cf7d71aae`. All six required
+integration gates passed: source catalog and Apply policy, route reuse and
+fenced cleanup, visible Stats, pause/resume/schedule cleanup with a live
+viewer, the registration-crash recovery probe, and full media/failover/drain
+phases. The AIO run also completed all 86 legacy tests with zero skips.
+
+The tested 40-entry plugin ZIP includes the existing icon, matches the source
+tree, and has SHA-256
+`4771f755c64a12894abe1b71ae8dedb9668a6daaf67d6de9781109a73aea5c41`.
+Required GitHub CI and publication remain pending. This synthetic server-side
+acceptance does not establish real-player acceptance or stable-release status.
+
+The native acceptance checklist covered existing-viewer borrowing without
+another provider request, no opening of excluded sources, ordinary-viewer
+preservation through Stop, exact client/process cleanup before fallback
+launch, cooldown deadlines, repeated borrow/return, Apply and Stop revocation,
+restart recovery, failure handling and acknowledgement retries. The complete
+checklist is in the [candidate guide](candidate-0.6.0.md). The pinned 0.32.0
+AIO passed it; required GitHub CI and publication remain outstanding.
+Synthetic server-side tests do not establish real-player acceptance.
+
 ## 0.5.1 named profile inheritance prerelease
 
 The candidate passed 453 unit tests, Ruff, Python compilation and package

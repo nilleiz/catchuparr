@@ -18,16 +18,22 @@ class PackageTest(unittest.TestCase):
             names = archive.namelist()
             self.assertIn("catchuparr/plugin.py", names)
             self.assertIn("catchuparr/plugin.json", names)
+            self.assertIn("catchuparr/logo.png", names)
             for module in REQUIRED_MODULES:
                 self.assertIn(f"catchuparr/{module}", names)
             self.assertFalse(any("__pycache__" in name for name in names))
             manifest = json.loads(archive.read("catchuparr/plugin.json"))
             self.assertEqual(manifest["name"], "Catchuparr")
-            self.assertEqual(manifest["version"], "0.5.1")
+            self.assertEqual(manifest["version"], "0.6.0")
             self.assertEqual(Plugin.version, manifest["version"])
-            self.assertEqual(Path(archive_path).name, "catchuparr-0.5.1.zip")
+            self.assertEqual(Path(archive_path).name, "catchuparr-0.6.0.zip")
+            self.assertEqual(
+                archive.read("catchuparr/logo.png"),
+                Path("docs/assets/catchuparr-icon-256.png").read_bytes(),
+            )
             field_ids = [field["id"] for field in manifest["fields"]]
             self.assertIn("filter_config", field_ids)
+            self.assertIn("connection_sharing_config", field_ids)
             self.assertIn("recording_enabled", field_ids)
             self.assertIn("log_level", field_ids)
             self.assertIn("public_base_url", field_ids)
@@ -67,6 +73,12 @@ class PackageTest(unittest.TestCase):
                 "catchuparr.logging_utils",
                 "catchuparr.recorder_proxy",
                 "catchuparr.runtime",
+                "catchuparr.sharing_authority_outbox",
+                "catchuparr.sharing_coordinator",
+                "catchuparr.sharing_episode",
+                "catchuparr.sharing_persistence",
+                "catchuparr.sharing_planner",
+                "catchuparr.sharing_runtime",
                 "catchuparr.stats",
                 "catchuparr.tasks",
                 "catchuparr.views",
@@ -78,6 +90,9 @@ class PackageTest(unittest.TestCase):
                 "catchuparr.xc_runtime",
                 "catchuparr.adapters.m3u",
                 "catchuparr.adapters.recorder_proxy",
+                "catchuparr.adapters.sharing_borrow_route",
+                "catchuparr.adapters.sharing_native",
+                "catchuparr.adapters.sharing_reader",
                 "catchuparr.adapters.xc",
                 "catchuparr.engine.admission",
                 "catchuparr.engine.leases",

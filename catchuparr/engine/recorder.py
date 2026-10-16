@@ -25,6 +25,34 @@ class RecorderAttemptResult:
     status: str
     useful_segments: int
     return_code: int | None
+    attempt_switch_id: str | None = None
+
+
+class RecorderAttemptSwitch:
+    """Signal one input attempt to end without stopping its recorder owner.
+
+    The lock serializes the switch request with each archive segment commit. Once
+    ``request()`` returns, this attempt cannot publish another segment.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._requested = threading.Event()
+        self.attempt_id = uuid.uuid4().hex
+
+    def request(self) -> None:
+        with self._lock:
+            self._requested.set()
+
+    def is_set(self) -> bool:
+        return self._requested.is_set()
+
+    def publish_if_current(self, publish: Callable[[], None]) -> bool:
+        with self._lock:
+            if self._requested.is_set():
+                return False
+            publish()
+            return True
 
 
 class FFmpegCopyRecorder:
@@ -105,6 +133,7 @@ class FFmpegCopyRecorder:
         anchor: float | None = None,
         *,
         require_useful_media: bool | None = None,
+        attempt_switch: RecorderAttemptSwitch | None = None,
     ) -> tuple[int, int]:
         if not list_path.exists():
             return offset, 0
@@ -155,13 +184,20 @@ class FFmpegCopyRecorder:
             if self._last_end_epoch is not None and abs(start - self._last_end_epoch) > 0.5:
                 discontinuity = True
             # The segment muxer emits a row only when that segment is closed.
-            self.store.add_segment(
-                self.channel_id, segment_path,
-                datetime.fromtimestamp(start, timezone.utc),
-                datetime.fromtimestamp(end, timezone.utc),
-                discontinuity=discontinuity,
-                fencing_token=self.fencing_token,
-            )
+            def publish_segment() -> None:
+                self.store.add_segment(
+                    self.channel_id, segment_path,
+                    datetime.fromtimestamp(start, timezone.utc),
+                    datetime.fromtimestamp(end, timezone.utc),
+                    discontinuity=discontinuity,
+                    fencing_token=self.fencing_token,
+                )
+
+            if attempt_switch is not None:
+                if not attempt_switch.publish_if_current(publish_segment):
+                    return offset + consumed, committed
+            else:
+                publish_segment()
             segment_path.unlink(missing_ok=True)
             self._last_end_epoch = end
             self._mark_next_discontinuity = False
@@ -175,6 +211,8 @@ class FFmpegCopyRecorder:
         startup_timeout: float = 60.0,
         media_idle_timeout: float = 120.0,
         poll_interval: float = 0.5,
+        attempt_switch: RecorderAttemptSwitch | None = None,
+        on_first_media: Callable[[float], bool] | None = None,
     ) -> RecorderAttemptResult:
         """Run a single source until it stops or useful media stalls.
 
@@ -183,6 +221,10 @@ class FFmpegCopyRecorder:
         """
         if startup_timeout <= 0 or media_idle_timeout <= 0 or poll_interval <= 0:
             raise ValueError("recorder attempt timeouts must be positive")
+        if attempt_switch is not None and not isinstance(attempt_switch, RecorderAttemptSwitch):
+            raise ValueError("attempt_switch must be a RecorderAttemptSwitch")
+        if on_first_media is not None and not callable(on_first_media):
+            raise ValueError("on_first_media must be callable")
         self.work_root.mkdir(parents=True, exist_ok=True)
         output_dir = self.work_root / f"{self.channel_id}-{uuid.uuid4().hex}"
         output_dir.mkdir()
@@ -194,6 +236,27 @@ class FFmpegCopyRecorder:
         last_useful_at = start_clock
         status = "exited"
         return_code = None
+        first_media_notified = False
+        first_media_at: float | None = None
+
+        def notify_first_media(committed: int) -> None:
+            nonlocal first_media_at, first_media_notified
+            if committed and not first_media_notified:
+                if first_media_at is None:
+                    # A retry acknowledges the first useful committed
+                    # segment, not a later wall-clock time.
+                    first_media_at = time.time()
+                if on_first_media is None:
+                    first_media_notified = True
+                    return
+                try:
+                    # The callback commits the sharing return authority. A
+                    # transient denial must be retried on a later committed
+                    # segment; publishing media alone is not its ACK.
+                    first_media_notified = on_first_media(first_media_at) is True
+                except Exception:
+                    first_media_notified = False
+
         try:
             process = subprocess.Popen(
                 self.command(output_dir),
@@ -202,12 +265,23 @@ class FFmpegCopyRecorder:
                 stderr=subprocess.DEVNULL,
             )
             while process.poll() is None and not stop_event.is_set():
+                if attempt_switch is not None and attempt_switch.is_set():
+                    status = "switch_requested"
+                    break
                 offset, committed = self._publish_csv_rows(
-                    list_path, offset, require_useful_media=True
+                    list_path, offset, require_useful_media=True,
+                    attempt_switch=attempt_switch,
                 )
                 if committed:
+                    # These rows are already committed under the switch
+                    # publication barrier. Count them even if the requester
+                    # sets the signal immediately after that commit.
                     useful += committed
                     last_useful_at = time.monotonic()
+                    notify_first_media(committed)
+                if attempt_switch is not None and attempt_switch.is_set():
+                    status = "switch_requested"
+                    break
                 now = time.monotonic()
                 if useful == 0 and now - start_clock >= startup_timeout:
                     status = "no_media"
@@ -219,6 +293,8 @@ class FFmpegCopyRecorder:
 
             if stop_event.is_set():
                 status = "stopped"
+            elif attempt_switch is not None and attempt_switch.is_set():
+                status = "switch_requested"
             if process.poll() is None:
                 if status == "exited":
                     status = "no_media" if useful == 0 else "media_stalled"
@@ -232,13 +308,27 @@ class FFmpegCopyRecorder:
                     process.kill()
                     process.wait()
             return_code = process.poll()
-            offset, committed = self._publish_csv_rows(
-                list_path, offset, require_useful_media=True
-            )
-            useful += committed
+            if status != "switch_requested":
+                offset, committed = self._publish_csv_rows(
+                    list_path, offset, require_useful_media=True,
+                    attempt_switch=attempt_switch,
+                )
+                useful += committed
+                notify_first_media(committed)
+            else:
+                # A new source attempt starts a fresh mux session. Do not flush
+                # any old-input rows after the switch was requested.
+                self._mark_next_discontinuity = True
             if status == "exited" and useful == 0:
                 status = "no_media"
-            return RecorderAttemptResult(status, useful, return_code)
+            return RecorderAttemptResult(
+                status, useful, return_code,
+                attempt_switch_id=(
+                    attempt_switch.attempt_id
+                    if status == "switch_requested" and attempt_switch is not None
+                    else None
+                ),
+            )
         finally:
             if process is not None and process.poll() is None:
                 process.kill()

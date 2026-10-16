@@ -1,6 +1,7 @@
 """Run through manage.py shell in an empty, disposable Dispatcharr AIO."""
 
 import inspect
+import json
 import os
 import signal
 import sqlite3
@@ -157,8 +158,12 @@ def probe_source_configuration(channel, root):
     active_path = root / "synthetic-active-settings.json"
     apply_configuration(settings, active_path=active_path)
     active = load_active_configuration(active_path)
-    require(active is not None and active.get("version") == 5,
-            "Apply must persist a v5 active snapshot")
+    from aio_051_configuration_probe import validate_active_v6_snapshot
+
+    validate_active_v6_snapshot(
+        active, json.loads(active_path.read_text(encoding="utf-8")),
+        (str(channel.uuid),),
+    )
     require(active["recording_schedule"] == {
         "timezone": "UTC",
         "channels": {
@@ -279,7 +284,19 @@ def probe_source_configuration(channel, root):
 def probe():
     if os.environ.get("CATCHUPARR_INTEGRATION_TEST") != "1":
         raise RuntimeError("This probe requires a disposable integration container")
+    probe_started = time.monotonic()
+
+    def phase(name, state):
+        print(json.dumps({
+            "probe": "aio_integration",
+            "phase": name,
+            "state": state,
+            "elapsed_seconds": round(time.monotonic() - probe_started, 1),
+        }, sort_keys=True), flush=True)
+
+    phase("runtime_setup", "started")
     sys.path.insert(0, "/data/plugins")
+    sys.path.insert(0, "/tmp")
     from apps.accounts.models import User
     from apps.channels.models import Channel, ChannelProfile, ChannelProfileMembership
     from apps.epg.models import EPGData, ProgramData
@@ -293,6 +310,7 @@ def probe():
     from catchuparr.engine.store import ArchiveStore
 
     native_server = require_native_stream_runtime()
+    phase("runtime_setup", "complete")
 
     # Refuse restored Dev/production databases, even if the flag was misapplied.
     require(not Channel.objects.exists(), "Integration database must have no channels")
@@ -375,11 +393,17 @@ def probe():
     require(runtime.validate_configuration(initial_settings)["valid"],
             "Synthetic YAML profile config did not validate")
     runtime.apply_configuration()
-    from catchuparr.configuration import load_active_configuration
+    from catchuparr.configuration import active_settings_path, load_active_configuration
 
     active = load_active_configuration()
-    require(active is not None and active.get("version") == 5,
-            "One Apply must persist a v5 active snapshot")
+    from aio_051_configuration_probe import validate_active_v6_snapshot
+
+    require(active is not None, "One Apply must make the active snapshot readable")
+    active_path = active_settings_path()
+    persisted = json.loads(active_path.read_text(encoding="utf-8"))
+    validate_active_v6_snapshot(
+        active, persisted, tuple(active.get("channel_uuids", "").splitlines()),
+    )
     require(
         active.get("recording_enabled") is True and active.get("log_level") == "INFO",
         "One Apply must activate the global recorder and logging settings",
@@ -433,6 +457,7 @@ def probe():
         store.add_segment(str(closed_channel.uuid), source,
                           closed_start + timedelta(seconds=offset),
                           closed_start + timedelta(seconds=offset + 10))
+    phase("archive_routes", "started")
     token_result = runtime.create_access_token(active)
     token = token_result["access_token"]
     encoded_token = quote(token, safe="")
@@ -653,16 +678,25 @@ def probe():
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", disabled_params,
     )).status_code == 403)
+    phase("archive_routes", "complete")
     try:
+        phase("source_configuration", "started")
         probe_source_configuration(channel, root)
+        phase("source_configuration", "complete")
         sys.path.insert(0, "/tmp")
         from aio_recorder_media import probe_actual_recorder_media
 
+        phase("recorder_media", "started")
         probe_actual_recorder_media(root)
+        phase("recorder_media", "complete")
         from aio_recorder_failover import probe_recorder_failover
 
+        phase("recorder_failover", "started")
         probe_recorder_failover(root)
+        phase("recorder_failover", "complete")
+        phase("native_runtime_drain", "started")
         require_native_runtime_drained(native_server)
+        phase("native_runtime_drain", "complete")
     finally:
         runtime.shutdown()
     print(f"AIO integration passed: Dispatcharr {__version__}")

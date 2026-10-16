@@ -1,10 +1,15 @@
+import ast
+import io
 import json
+import sys
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from scripts import aio_recorder_failover
 from scripts import aio_recorder_media as probe
 
 
@@ -36,6 +41,833 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_dead_recorder_failure_reports_safe_terminal_task_diagnostics(self):
+        thread = threading.Thread(target=lambda: None)
+        thread.start()
+        thread.join()
+        run = SimpleNamespace(
+            _lock=threading.Lock(),
+            thread=thread,
+            stop_event=threading.Event(),
+            failures=[
+                "task:ValueError", "SyntheticSecretTokenABC123",
+                "arbitrary:SyntheticSecretTokenABC123",
+            ],
+            result={"status": "sharing_cleanup_pending"},
+            results=[SimpleNamespace(
+                status="media_stalled", useful_segments=0, return_code=17,
+                attempt_switch_id=None,
+            )],
+            processes=[SimpleNamespace(poll=lambda: 17)],
+            input_headers=[{"X-Catchuparr-Borrow": "synthetic-bearer-secret"}],
+        )
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(
+            RuntimeError, "Synthetic recorder task ended before expected media was indexed",
+        ):
+            with patch.dict(
+                sys.modules,
+                {"aio_recorder_failover": SimpleNamespace(
+                    _segment_has_useful_av=lambda *_: True,
+                    _segment_tone_frequency=lambda *_: 880,
+                )},
+            ):
+                probe._wait_for_indexed_tone(
+                    run, object(), "synthetic-channel", "ffmpeg", "ffprobe",
+                    expected_hz=880, existing_ids=set(), minimum=1, timeout=1,
+                )
+        line = next(
+            line for line in output.getvalue().splitlines()
+            if line.startswith("CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC ")
+        )
+        diagnostic = json.loads(line.split(" ", 1)[1])
+        self.assertEqual("sharing_cleanup_pending", diagnostic["task_status"])
+        self.assertEqual(
+            ["ValueError", "other", "other"], diagnostic["failure_classes"],
+        )
+        self.assertEqual(
+            [{
+                "status": "media_stalled", "useful_segments": 0,
+                "return_code": 17, "switch_id_present": False,
+            }],
+            diagnostic["attempts"],
+        )
+        self.assertEqual([17], diagnostic["process_exit_codes"])
+        self.assertNotIn("synthetic-bearer-secret", line)
+        self.assertNotIn("SyntheticSecretTokenABC123", line)
+
+    def test_recorder_task_diagnostic_preserves_finite_task_statuses_only(self):
+        statuses = {
+            "control_unavailable", "legacy_job", "invalid_schedule",
+            "sharing_unavailable", "sharing_return_recovery_pending",
+            "sharing_authority_unavailable", "sharing_cleanup_pending",
+            "sharing_admission_uncertain", "recording_paused", "stale_control",
+            "disabled", "stale_configuration", "outside_schedule",
+            "no_permitted_sources", "proxy_integration_unsupported",
+            "already_running", "stopped", "no_media",
+        }
+        for status in statuses:
+            with self.subTest(status=status):
+                diagnostic = probe._recorder_task_early_exit_diagnostic(
+                    SimpleNamespace(result={"status": status})
+                )
+                self.assertEqual(status, diagnostic["task_status"])
+
+        diagnostic = probe._recorder_task_early_exit_diagnostic(
+            SimpleNamespace(result={"status": "SyntheticSecretTokenABC123"})
+        )
+        self.assertEqual("other", diagnostic["task_status"])
+
+    def test_early_exit_receipt_carries_first_supervisor_stop_context(self):
+        stop_event = aio_recorder_failover._ObservedRecorderStopEvent()
+        namespace = {
+            "__name__": "catchuparr.tasks",
+            "stop_event": stop_event,
+            "current_admission": {"status": "stale_control"},
+        }
+        tree = ast.parse(
+            "def supervise(current_admission=current_admission):\n    stop_event.set()\n"
+        )
+        ast.increment_lineno(tree, 265)
+        exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
+        namespace["supervise"]()
+        diagnostic = probe._recorder_task_early_exit_diagnostic(
+            SimpleNamespace(
+                result={"status": "stopped"},
+                stop_event=stop_event,
+                thread=SimpleNamespace(is_alive=lambda: False),
+            )
+        )
+        self.assertEqual("tasks.supervisor", diagnostic["stop_source"])
+        self.assertEqual("stale_control", diagnostic["supervisor_admission_status"])
+        self.assertEqual("admission_not_ready", diagnostic["supervisor_stop_reason"])
+
+    def test_allowed_source_wait_reports_existing_safe_task_exit_receipt(self):
+        now = [0.0]
+        run = SimpleNamespace(
+            result={"status": "sharing_return_recovery_pending"},
+            failures=["task:BorrowBindingLost", "SyntheticSecretTokenABC123"],
+            results=[SimpleNamespace(status="switch_requested", useful_segments=4,
+                                     return_code=0, attempt_switch_id="opaque")],
+            processes=[SimpleNamespace(poll=lambda: 0)],
+            input_headers=[{"X-Catchuparr-Borrow": "synthetic-bearer-secret"}],
+            stop_event=threading.Event(),
+            thread=SimpleNamespace(is_alive=lambda: True),
+        )
+        output = io.StringIO()
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with redirect_stdout(output), self.assertRaisesRegex(
+            RuntimeError,
+            "^Allowed B did not start after the observed native return deadline$",
+        ):
+            probe._wait_for_allowed_source_request(
+                run, lambda: [], 0, timeout=0.1, sleep=sleep,
+                monotonic=lambda: now[0],
+            )
+
+        line = next(
+            line for line in output.getvalue().splitlines()
+            if line.startswith("CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC ")
+        )
+        diagnostic = json.loads(line.split(" ", 1)[1])
+        self.assertEqual("sharing_return_recovery_pending", diagnostic["task_status"])
+        self.assertEqual(["BorrowBindingLost", "other"], diagnostic["failure_classes"])
+        self.assertEqual("switch_requested", diagnostic["attempts"][0]["status"])
+        self.assertNotIn("synthetic-bearer-secret", line)
+        self.assertNotIn("SyntheticSecretTokenABC123", line)
+
+    def test_allowed_source_wait_keeps_success_gate_without_diagnostic(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            timestamp = probe._wait_for_allowed_source_request(
+                SimpleNamespace(), lambda: [12.5], 0, timeout=1,
+                monotonic=lambda: 0.0,
+            )
+        self.assertEqual(12.5, timestamp)
+        self.assertEqual("", output.getvalue())
+
+    def test_crash_child_failure_summary_contains_only_safe_shape_fields(self):
+        result = SimpleNamespace(
+            returncode=70,
+            stdout=json.dumps({
+                "error": True,
+                "exception_class": "RuntimeError",
+                "private_payload": "synthetic-bearer-secret",
+            }),
+        )
+        diagnostic = probe._crash_child_failure_diagnostic(
+            result, 73, json.loads(result.stdout), "object",
+        )
+        self.assertEqual({
+            "exit_code": 70,
+            "expected_exit_code": 73,
+            "stdout_json_shape": "object",
+            "known_result_keys": ["error", "exception_class"],
+            "child_exception_class": "RuntimeError",
+        }, diagnostic)
+        self.assertNotIn("synthetic-bearer-secret", json.dumps(diagnostic))
+
+    def test_crash_child_failure_summary_classifies_non_object_json(self):
+        result = SimpleNamespace(returncode=73, stdout='["private-token"]')
+        diagnostic = probe._crash_child_failure_diagnostic(
+            result, 73, json.loads(result.stdout), "array",
+        )
+        self.assertEqual("array", diagnostic["stdout_json_shape"])
+        self.assertEqual([], diagnostic["known_result_keys"])
+        self.assertNotIn("private-token", json.dumps(diagnostic))
+
+    def test_crash_child_parser_ignores_unframed_output_but_requires_one_receipt(self):
+        receipt = probe.CRASH_CHILD_RESULT_PREFIX + '{"native_registered":true}'
+        value, shape = probe._parse_crash_child_result(
+            "Django startup message with private value\n" + receipt + "\n"
+        )
+        self.assertEqual({"native_registered": True}, value)
+        self.assertEqual("object", shape)
+
+        value, shape = probe._parse_crash_child_result(receipt + "\n" + receipt)
+        self.assertIsNone(value)
+        self.assertEqual("multiple_receipts", shape)
+
+        diagnostic = probe._crash_child_failure_diagnostic(
+            SimpleNamespace(returncode=73, stdout="noise"), 73, None, shape,
+        )
+        self.assertEqual("multiple_receipts", diagnostic["stdout_json_shape"])
+        self.assertNotIn("private", json.dumps(diagnostic))
+
+    def test_teardown_budget_accounts_for_sequential_shutdown_and_marker_ttl(self):
+        self.assertEqual(
+            156.0,
+            probe._native_teardown_readiness_timeout(120, 1),
+        )
+
+    def test_borrow_teardown_budget_adds_both_native_marker_phases(self):
+        self.assertEqual(
+            216.0,
+            probe._native_teardown_readiness_timeout(
+                120, 1, stopping_marker_ttl=90,
+            ),
+        )
+
+    def test_paused_native_teardown_waits_after_all_cleanup_acknowledgments(self):
+        conditions = {
+            "episode_closed": True,
+            "borrow_hash_absent": True,
+            "borrow_membership_absent": True,
+            "borrow_marker_absent": True,
+            "ledger_paused": True,
+            "grace_deadline_elapsed": True,
+            "task_completed_cleanly": True,
+        }
+        calls = []
+        result = probe._wait_for_native_teardown_after_pause(
+            conditions,
+            lambda: calls.append("native_release_wait"),
+            lambda: calls.append("final_seven_conditions") or {"all": True},
+        )
+        self.assertEqual(["native_release_wait", "final_seven_conditions"], calls)
+        self.assertEqual({"all": True}, result)
+
+        conditions["ledger_paused"] = False
+        with self.assertRaisesRegex(RuntimeError, "did not settle.*PAUSED"):
+            probe._wait_for_native_teardown_after_pause(
+                conditions,
+                lambda: calls.append("must_not_wait"),
+                lambda: calls.append("must_not_read_final_conditions"),
+            )
+        self.assertEqual(["native_release_wait", "final_seven_conditions"], calls)
+
+    def test_native_a_teardown_waits_for_owner_and_profile_but_not_source_b(self):
+        class FakeClock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, duration):
+                self.now += duration
+
+        clock = FakeClock()
+        snapshots = [
+            {
+                "conditions": probe._native_teardown_ready_conditions(
+                    route_available=False,
+                    stopping_marker_absent=False,
+                    metadata_not_stopping=False,
+                    owner_absent=False,
+                    clients_zero=True,
+                    managers_absent=False,
+                    source_inactive=True,
+                    profile_at_baseline=False,
+                    previous_borrow_absent=True,
+                ),
+                "source_b_active": 1,
+            },
+            {
+                "conditions": probe._native_teardown_ready_conditions(
+                    route_available=True,
+                    stopping_marker_absent=True,
+                    metadata_not_stopping=True,
+                    owner_absent=True,
+                    clients_zero=True,
+                    managers_absent=True,
+                    source_inactive=True,
+                    profile_at_baseline=True,
+                    previous_borrow_absent=True,
+                ),
+                "source_b_active": 1,
+            },
+        ]
+        ready, final = probe._wait_for_readiness_snapshot(
+            lambda: snapshots.pop(0),
+            2,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            poll_interval=1,
+        )
+        self.assertTrue(ready)
+        self.assertEqual(1, final["source_b_active"])
+        self.assertTrue(all(final["conditions"].values()))
+
+    def test_readiness_poll_observes_shutdown_then_marker_before_open(self):
+        class FakeClock:
+            now = 0.0
+            phases = []
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, duration):
+                self.now += duration
+
+        clock = FakeClock()
+        opens = []
+
+        def read_native_state():
+            if clock.now < 120:
+                phase = "disconnect_delay"
+            elif clock.now < 150:
+                phase = "stopping_marker_ttl"
+            else:
+                phase = "ready"
+            clock.phases.append(phase)
+            return {
+                "conditions": {"ready": phase == "ready"},
+                "phase": phase,
+                "independent_source_b_active": 1,
+            }
+
+        ready, final = probe._wait_for_readiness_snapshot(
+            read_native_state,
+            probe._native_teardown_readiness_timeout(120, 1),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            poll_interval=1,
+        )
+        self.assertTrue(ready)
+        self.assertEqual("ready", final["phase"])
+        self.assertEqual(1, final["independent_source_b_active"])
+        self.assertIn("disconnect_delay", clock.phases)
+        self.assertIn("stopping_marker_ttl", clock.phases)
+        self.assertEqual(150, clock.now)
+        result = probe._open_after_readiness(
+            lambda: self.assertTrue(ready),
+            lambda: opens.append("one ordinary GET") or "response",
+        )
+        self.assertEqual("response", result)
+        self.assertEqual(["one ordinary GET"], opens)
+
+    def test_unready_native_snapshot_stays_bounded_and_never_opens_viewer(self):
+        class FakeClock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, duration):
+                self.now += duration
+
+        clock = FakeClock()
+        reads = []
+        opens = []
+
+        def wait_for_ready():
+            ready, last = probe._wait_for_readiness_snapshot(
+                lambda: reads.append(clock.now) or {"conditions": {"ready": False}},
+                3,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                poll_interval=1,
+            )
+            self.assertFalse(ready)
+            self.assertEqual({"ready": False}, last["conditions"])
+            raise RuntimeError("bounded readiness timeout")
+
+        with self.assertRaisesRegex(RuntimeError, "bounded readiness timeout"):
+            probe._open_after_readiness(
+                wait_for_ready,
+                lambda: opens.append("must not run"),
+            )
+        self.assertEqual(3, clock.now)
+        self.assertEqual(4, len(reads))
+        self.assertEqual([], opens)
+
+    def test_readiness_failure_diagnostic_getter_error_is_guarded(self):
+        manager = SimpleNamespace(
+            get_client_count=lambda: (_ for _ in ()).throw(ValueError("bad count")),
+        )
+        emitted = []
+        with self.assertRaisesRegex(RuntimeError, "native readiness timeout"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "native readiness timeout",
+                lambda: {"local": int(manager.get_client_count())},
+                emit=emitted.append,
+                diagnostic_label="CATCHUPARR_NATIVE_REOPEN_DIAGNOSTIC",
+            )
+        self.assertIn('"diagnostic_error": "ValueError"', emitted[0])
+
+    def test_failure_diagnostic_read_error_preserves_original_gate_failure(self):
+        def broken_diagnostic():
+            raise ValueError("synthetic secret diagnostic data")
+
+        emitted = []
+        with self.assertRaisesRegex(RuntimeError, "original gate failure"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "original gate failure",
+                broken_diagnostic,
+                emit=emitted.append,
+            )
+        self.assertEqual(len(emitted), 1)
+        self.assertIn('"diagnostic_error": "ValueError"', emitted[0])
+        self.assertNotIn("synthetic secret", emitted[0])
+
+    def test_local_manager_count_error_preserves_original_gate_failure(self):
+        manager = SimpleNamespace(
+            get_client_count=lambda: (_ for _ in ()).throw(ValueError("bad count")),
+        )
+        emitted = []
+
+        def diagnostic_boundary():
+            return {"local": int(manager.get_client_count())}
+
+        with self.assertRaisesRegex(RuntimeError, "original gate failure"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "original gate failure",
+                diagnostic_boundary,
+                emit=emitted.append,
+            )
+        self.assertEqual(len(emitted), 1)
+        self.assertIn('"diagnostic_error": "ValueError"', emitted[0])
+
+    def test_successful_gate_does_not_read_local_manager_count(self):
+        manager = SimpleNamespace(
+            get_client_count=lambda: self.fail("diagnostic-only count was read"),
+        )
+        probe._require_with_failure_diagnostic(
+            True,
+            "unused",
+            lambda: {"local": manager.get_client_count()},
+        )
+
+    def test_failure_diagnostic_output_error_preserves_original_gate_failure(self):
+        def fail_output(_message):
+            raise OSError("synthetic output detail")
+
+        with self.assertRaisesRegex(RuntimeError, "original gate failure"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "original gate failure",
+                lambda: {"safe": True},
+                emit=fail_output,
+            )
+
+    def test_failure_diagnostic_supports_separate_borrow_return_label(self):
+        emitted = []
+        with self.assertRaisesRegex(RuntimeError, "borrow return failed"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "borrow return failed",
+                lambda: {"profile_a_at_baseline": False},
+                emit=emitted.append,
+                diagnostic_label="CATCHUPARR_BORROW_RETURN_DIAGNOSTIC",
+            )
+        self.assertEqual(1, len(emitted))
+        self.assertTrue(emitted[0].startswith(
+            "CATCHUPARR_BORROW_RETURN_DIAGNOSTIC ",
+        ))
+        self.assertIn('"profile_a_at_baseline": false', emitted[0])
+
+    def test_successful_gate_does_not_run_diagnostic(self):
+        def unexpected_diagnostic():
+            self.fail("successful gate must not read diagnostic state")
+
+        probe._require_with_failure_diagnostic(
+            True, "unused", unexpected_diagnostic,
+        )
+
+    def test_no_source_acceptance_keeps_seven_original_conditions(self):
+        conditions = {
+            "source_b_request_count_unchanged": True,
+            "source_a_active_zero": True,
+            "source_a_request_count_unchanged": True,
+            "native_global_clients_zero": True,
+            "native_owner_absent": True,
+            "profile_a_at_baseline": True,
+            "profile_b_at_baseline": True,
+        }
+        self.assertEqual(7, len(conditions))
+        self.assertTrue(all(conditions.values()))
+        # The local worker count is emitted only as diagnostic context.
+        diagnostic = {"conditions": conditions, "native_local_clients_zero": False}
+        self.assertTrue(all(diagnostic["conditions"].values()))
+
+    def test_source_removal_requires_both_live_a_and_released_b(self):
+        conditions = probe._source_removal_transition_conditions(
+            a_owner_preserved=True,
+            a_active=True,
+            a_client_preserved=True,
+            a_provider_preserved=True,
+            a_profile_preserved=True,
+            a_assignments_preserved=True,
+            b_worker_released=True,
+            b_native_resources_absent=True,
+            b_binding_preserved=True,
+            b_reservation_released=True,
+            b_private_markers_absent=True,
+            b_provider_inactive=True,
+            b_request_count_preserved=True,
+            b_profile_released=True,
+        )
+        self.assertTrue(all(conditions.values()))
+
+        disturbed_a = dict(conditions, ordinary_a_active=False)
+        self.assertFalse(all(disturbed_a.values()))
+        retained_b = dict(conditions, dedicated_b_reservation_released=False)
+        self.assertFalse(all(retained_b.values()))
+
+    def test_source_removal_fails_fast_when_a_drops_then_recovers(self):
+        healthy = probe._source_removal_transition_conditions(
+            a_owner_preserved=True,
+            a_active=True,
+            a_client_preserved=True,
+            a_provider_preserved=True,
+            a_profile_preserved=True,
+            a_assignments_preserved=True,
+            b_worker_released=False,
+            b_native_resources_absent=False,
+            b_binding_preserved=False,
+            b_reservation_released=False,
+            b_private_markers_absent=False,
+            b_provider_inactive=False,
+            b_request_count_preserved=True,
+            b_profile_released=False,
+        )
+        disturbed = dict(healthy, ordinary_a_active=False)
+        released = dict(
+            healthy,
+            dedicated_b_worker_released=True,
+            dedicated_b_native_resources_absent=True,
+            dedicated_b_binding_preserved=True,
+            dedicated_b_reservation_released=True,
+            dedicated_b_private_markers_absent=True,
+            dedicated_b_provider_inactive=True,
+            dedicated_b_profile_released=True,
+        )
+        snapshots = iter(({"conditions": disturbed}, {"conditions": released}))
+        now = [0.0]
+        ready, observed, reason = probe._wait_for_source_removal_transition(
+            lambda: next(snapshots), 5,
+            monotonic=lambda: now[0],
+            sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+        )
+        self.assertFalse(ready)
+        self.assertFalse(observed["conditions"]["ordinary_a_active"])
+        self.assertEqual("ordinary_a_changed", reason)
+        self.assertEqual(0.0, now[0])
+
+    def test_source_removal_waits_only_for_b_release_when_a_stays_healthy(self):
+        conditions = probe._source_removal_transition_conditions(
+            a_owner_preserved=True,
+            a_active=True,
+            a_client_preserved=True,
+            a_provider_preserved=True,
+            a_profile_preserved=True,
+            a_assignments_preserved=True,
+            b_worker_released=False,
+            b_native_resources_absent=False,
+            b_binding_preserved=False,
+            b_reservation_released=False,
+            b_private_markers_absent=False,
+            b_provider_inactive=False,
+            b_request_count_preserved=True,
+            b_profile_released=False,
+        )
+        released = dict(
+            conditions,
+            dedicated_b_worker_released=True,
+            dedicated_b_native_resources_absent=True,
+            dedicated_b_binding_preserved=True,
+            dedicated_b_reservation_released=True,
+            dedicated_b_private_markers_absent=True,
+            dedicated_b_provider_inactive=True,
+            dedicated_b_profile_released=True,
+        )
+        snapshots = iter(({"conditions": conditions}, {"conditions": released}))
+        now = [0.0]
+        ready, observed, reason = probe._wait_for_source_removal_transition(
+            lambda: next(snapshots), 5,
+            monotonic=lambda: now[0],
+            sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+        )
+        self.assertTrue(ready)
+        self.assertIsNone(reason)
+        self.assertTrue(all(observed["conditions"].values()))
+        self.assertGreater(now[0], 0.0)
+
+    def test_fresh_media_floor_uses_new_buffer_epoch(self):
+        class Buffer:
+            def __init__(self, index):
+                self.redis_client = SimpleNamespace(get=lambda _key: index)
+                self.buffer_index_key = "synthetic-index"
+
+        observed_floors = []
+        session = SimpleNamespace(
+            reader=SimpleNamespace(
+                read_after=lambda floor, **_kwargs: (
+                    observed_floors.append(floor) or b"fresh", floor + 1,
+                ),
+            ),
+        )
+        _old_media, _old_index = probe._read_after_current_buffer_head(
+            session, Buffer(1000), minimum_bytes=1, timeout=1,
+        )
+        _new_media, new_index = probe._read_after_current_buffer_head(
+            session, Buffer(1), minimum_bytes=1, timeout=1,
+        )
+        self.assertEqual([1000, 1], observed_floors)
+        self.assertEqual(2, new_index)
+
+    def test_source_removal_diagnostic_allowlists_ledger_states(self):
+        worker_states = frozenset({"active", "released", "failed"})
+        reservation_states = frozenset({"reserved", "released", "none"})
+        self.assertEqual("active", probe._allowlisted_state("active", worker_states))
+        self.assertEqual("released", probe._allowlisted_state("released", reservation_states))
+        self.assertEqual(
+            "unknown",
+            probe._allowlisted_state("SyntheticSecretValue123", worker_states),
+        )
+        self.assertEqual("unknown", probe._allowlisted_state(None, reservation_states))
+
+    def test_source_removal_binds_original_native_client_registration(self):
+        expected = {
+            "expected_client_id": "synthetic-client-a",
+            "connected_at": "100.0",
+            "expected_connected_at": "100.0",
+            "worker_id": "synthetic-native-worker",
+            "expected_worker_id": "synthetic-native-worker",
+        }
+        self.assertTrue(probe._native_client_identity_matches(
+            {"synthetic-client-a"}, **expected,
+        ))
+        self.assertFalse(probe._native_client_identity_matches(
+            {"synthetic-client-b"}, **expected,
+        ))
+        self.assertFalse(probe._native_client_identity_matches(
+            {"synthetic-client-a"}, **dict(expected, connected_at="101.0"),
+        ))
+        self.assertFalse(probe._native_client_identity_matches(
+            {"synthetic-client-a", "synthetic-recorder-client"}, **expected,
+        ))
+
+    def test_pending_return_freezes_attempts_after_join_including_pending_native_worker(self):
+        records = [{
+            "worker_id": "synthetic-b-first",
+            "stream_id": "synthetic-stream-b",
+            "capability_digest": "digest-first",
+            "reservation_id": "reservation-first",
+            "reservation_state": "released",
+        }]
+        pending_native_managers = set()
+
+        class Task:
+            def stop(self):
+                pass
+
+            def join(self, *, timeout, cooperative_sleep):
+                self.assert_join_args = (timeout, cooperative_sleep)
+                # A retry appears during shutdown after its profile reservation
+                # was released, while its native task manager is still pending.
+                records.append({
+                    "worker_id": "synthetic-b-retry",
+                    "stream_id": "synthetic-stream-b",
+                    "capability_digest": "digest-retry",
+                    "reservation_id": "reservation-retry",
+                    "reservation_state": "none",
+                })
+                pending_native_managers.add("synthetic-b-retry")
+
+        ids, bindings, valid = probe._stop_join_and_freeze_attempt_bindings(
+            Task(), lambda: list(records), baseline_worker_ids={"synthetic-old-b"},
+            stream_id="synthetic-stream-b", cooperative_sleep=lambda _delay: None,
+        )
+        self.assertTrue(valid)
+        self.assertEqual(("synthetic-b-first", "synthetic-b-retry"), ids)
+        self.assertEqual("reservation-retry", bindings["synthetic-b-retry"]["reservation_id"])
+        self.assertEqual({"synthetic-b-retry"}, pending_native_managers)
+
+        unchanged, _by_worker = probe._attempt_records_match_frozen_bindings(
+            records, baseline_worker_ids={"synthetic-old-b"},
+            stream_id="synthetic-stream-b", attempt_ids=ids, bindings=bindings,
+        )
+        self.assertTrue(unchanged)
+        records.append({
+            "worker_id": "synthetic-b-late",
+            "stream_id": "synthetic-stream-b",
+            "capability_digest": "digest-late",
+            "reservation_id": "reservation-late",
+        })
+        unchanged, _by_worker = probe._attempt_records_match_frozen_bindings(
+            records, baseline_worker_ids={"synthetic-old-b"},
+            stream_id="synthetic-stream-b", attempt_ids=ids, bindings=bindings,
+        )
+        self.assertFalse(unchanged)
+
+    def test_pending_return_uses_original_profile_baseline_during_async_drain(self):
+        original_baseline = 0
+        intermediate_count = 1
+        settled_count = 0
+        self.assertFalse(probe._profile_count_matches_original_baseline(
+            intermediate_count, original_baseline,
+        ))
+        self.assertTrue(probe._profile_count_matches_original_baseline(
+            settled_count, original_baseline,
+        ))
+
+    def test_dedicated_preparation_does_not_apply_or_start_when_return_gate_fails(self):
+        effects = []
+
+        def fail_return_gate():
+            raise RuntimeError("synthetic RETURN profile mismatch")
+
+        with self.assertRaisesRegex(RuntimeError, "RETURN profile mismatch"):
+            probe._run_after_required_gate(
+                fail_return_gate,
+                lambda: effects.append("Apply and start B"),
+            )
+        self.assertEqual([], effects)
+
+    def test_dedicated_replacement_waits_for_native_release_after_profile_returns(self):
+        pending_manager = {
+            "conditions": {
+                "attempt_released": True,
+                "attempt_credentials_absent": True,
+                "native_manager_absent": False,
+                "native_owner_absent": True,
+                "native_clients_absent": True,
+                "native_stopping_marker_absent": True,
+                "provider_b_inactive": True,
+                "provider_b_requests_stable": True,
+                "profile_b_at_original_baseline": True,
+            },
+        }
+        full_release = {
+            "conditions": {
+                **pending_manager["conditions"],
+                "native_manager_absent": True,
+            },
+        }
+        snapshots = iter((pending_manager, full_release))
+        now = [0.0]
+        effects = []
+        result = probe._run_after_readiness_ack(
+            lambda: next(snapshots),
+            lambda: effects.append("start dedicated B") or "started",
+            5,
+            message="old B release pending",
+            diagnostic_label="SYNTHETIC_RELEASE_GATE",
+            monotonic=lambda: now[0],
+            sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+            poll_interval=0.1,
+        )
+        self.assertEqual("started", result)
+        self.assertEqual(["start dedicated B"], effects)
+        self.assertGreater(now[0], 0)
+
+    def test_live_failover_provider_exposes_pre_response_request_boundary(self):
+        source = object.__new__(aio_recorder_failover._SyntheticFailoverSourceServer)
+        source._lock = threading.Lock()
+        source.request_started_at = {"source-b.ts": [123.5]}
+        source.request_start_callback = None
+        source.request_start_callback_errors = []
+        source.request_callback_finished = threading.Event()
+        observed = []
+
+        def callback(name, number, started):
+            observed.append((name, number, started))
+            return True
+
+        self.assertEqual([123.5], source.request_times("source-b.ts"))
+        source.install_request_start_callback(callback)
+        self.assertIs(source.request_start_callback, callback)
+        self.assertTrue(source._run_request_start_callback(
+            source.request_start_callback, "source-b.ts", 1, 123.5,
+        ))
+        self.assertTrue(source.request_callback_finished.is_set())
+        self.assertEqual([("source-b.ts", 1, 123.5)], observed)
+        self.assertTrue(source.clear_request_start_callback(callback))
+        self.assertIsNone(source.request_start_callback)
+
+    def test_synthetic_provider_waits_for_boundary_callback_and_rejects_failed_boundary(self):
+        source = object.__new__(probe._SyntheticSourceServer)
+        source._counts_lock = threading.Lock()
+        source.request_start_callback_errors = []
+        source.request_callback_finished = threading.Event()
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+
+        def blocked(*_args):
+            callback_entered.set()
+            self.assertTrue(release_callback.wait(2))
+            return True
+
+        worker = threading.Thread(
+            target=source._run_request_start_callback,
+            args=(blocked, "source-b.ts", 1, 1.0),
+        )
+        worker.start()
+        self.assertTrue(callback_entered.wait(2))
+        self.assertFalse(source.request_callback_finished.is_set())
+        release_callback.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(source.request_callback_finished.is_set())
+
+        source.request_callback_finished.clear()
+        def fail(*_args):
+            raise RuntimeError("synthetic boundary denial")
+        self.assertFalse(source._run_request_start_callback(fail, "source-b.ts", 1, 1.0))
+        self.assertTrue(source.request_callback_finished.is_set())
+        self.assertEqual(1, len(source.request_start_callback_errors))
+
+        source.request_callback_finished.clear()
+        self.assertTrue(
+            source._run_request_start_callback(
+                lambda *_args: False, "unrelated", 2, 2.0,
+            ),
+        )
+        self.assertFalse(source.request_callback_finished.is_set())
+        self.assertTrue(
+            source._run_request_start_callback(
+                lambda *_args: True, "source-b.ts", 3, 3.0,
+            ),
+        )
+        self.assertTrue(source.request_callback_finished.is_set())
+
     def test_private_worker_stop_does_not_count_a_provider_reconnect(self):
         before = {"source-b.ts": 4}
         probe._assert_private_worker_stop_request_count(
@@ -569,6 +1401,378 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertIs(found_client_manager, client_manager)
         self.assertEqual(redis.reads, 2)
 
+    def test_native_active_accepts_current_task_borrow_added_after_one_client_sample(self):
+        class BorrowRedis:
+            def __init__(self):
+                self.member_reads = 0
+
+            def get(self, _key):
+                return b"native-owner"
+
+            def smembers(self, _key):
+                self.member_reads += 1
+                if self.member_reads == 1:
+                    return {b"ordinary-client"}
+                return {b"ordinary-client", b"catchuparr-client-borrow"}
+
+            def hget(self, key, field):
+                if key == "metadata" and field == "state":
+                    return b"ACTIVE"
+                if key == "clients:ordinary-client" and field == "connected_at":
+                    return b"100.5"
+                if key == "clients:ordinary-client" and field == "worker_id":
+                    return b"native-owner"
+                return None
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker: "owner")
+            channel_metadata = staticmethod(lambda _worker: "metadata")
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        redis = BorrowRedis()
+        client_manager = SimpleNamespace(get_client_count=lambda: 1)
+        manager = SimpleNamespace(running=True)
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            stream_managers={"worker": manager},
+            client_managers={"worker": client_manager},
+        )
+        ordinary_identity = probe._wait_for_native_client_count(
+            redis, server, Keys, "worker", 1, expected_local=1, timeout=1,
+            return_identity=True,
+        )
+
+        task = SimpleNamespace(
+            _lock=threading.Lock(),
+            input_headers=[{"X-Catchuparr-Borrow": "opaque-capability"}],
+        )
+        checks = []
+
+        def decode(_token):
+            return SimpleNamespace(channel_uuid="synthetic-channel", nonce="borrow")
+
+        def verified(worker, client_id):
+            checks.append((worker, client_id))
+            return worker == "worker" and client_id == "catchuparr-client-borrow"
+
+        def verified_ids():
+            return probe._verified_task_borrow_client_ids(
+                task,
+                worker_id="worker",
+                channel_uuid="synthetic-channel",
+                decode_capability=decode,
+                is_server_verified=verified,
+            )
+        owner, found_manager, found_client_manager = probe._wait_for_native_active(
+            redis,
+            server,
+            "worker",
+            redis_keys=Keys,
+            metadata_field=Fields,
+            channel_state=States,
+            timeout=1,
+            expected_ordinary_identity=ordinary_identity,
+            verified_borrow_client_ids=verified_ids,
+        )
+
+        self.assertEqual("native-owner", owner)
+        self.assertIs(found_manager, manager)
+        self.assertIs(found_client_manager, client_manager)
+        self.assertEqual([("worker", "catchuparr-client-borrow")], checks)
+        self.assertEqual(2, redis.member_reads)
+
+    def test_native_active_reconciles_borrow_added_after_membership_snapshot(self):
+        class BorrowRedis:
+            def __init__(self):
+                self.member_reads = 0
+
+            def get(self, _key):
+                return b"native-owner"
+
+            def smembers(self, _key):
+                self.member_reads += 1
+                if self.member_reads <= 2:
+                    return {b"ordinary-client"}
+                return {b"ordinary-client", b"catchuparr-client-borrow"}
+
+            def hget(self, key, field):
+                if key == "metadata" and field == "state":
+                    return b"ACTIVE"
+                if key == "clients:ordinary-client" and field == "connected_at":
+                    return b"100.5"
+                if key == "clients:ordinary-client" and field == "worker_id":
+                    return b"native-owner"
+                return None
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker: "owner")
+            channel_metadata = staticmethod(lambda _worker: "metadata")
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        redis = BorrowRedis()
+        manager = SimpleNamespace(running=True)
+        client_manager = SimpleNamespace(get_client_count=lambda: 1)
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            stream_managers={"worker": manager},
+            client_managers={"worker": client_manager},
+        )
+        ordinary_identity = probe._wait_for_native_client_count(
+            redis, server, Keys, "worker", 1, expected_local=1, timeout=1,
+            return_identity=True,
+        )
+        owner, _, _ = probe._wait_for_native_active(
+            redis, server, "worker", redis_keys=Keys,
+            metadata_field=Fields, channel_state=States, timeout=1,
+            expected_ordinary_identity=ordinary_identity,
+            verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+        )
+        self.assertEqual("native-owner", owner)
+        self.assertEqual(3, redis.member_reads)
+
+    def test_native_active_rejects_any_extra_client_beyond_exact_borrow(self):
+        class BorrowRedis:
+            def get(self, _key):
+                return b"native-owner"
+
+            def scard(self, _key):
+                return 3
+
+            def smembers(self, _key):
+                return {
+                    b"ordinary-client",
+                    b"catchuparr-client-borrow",
+                    b"unrelated-client",
+                }
+
+            def hget(self, _key, _field):
+                return b"ACTIVE"
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker: "owner")
+            channel_metadata = staticmethod(lambda _worker: "metadata")
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        client_manager = SimpleNamespace(get_client_count=lambda: 1)
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            stream_managers={"worker": SimpleNamespace(running=True)},
+            client_managers={"worker": client_manager},
+        )
+        with self.assertRaisesRegex(RuntimeError, "unverified client"):
+            probe._wait_for_native_active(
+                BorrowRedis(), server, "worker", redis_keys=Keys,
+                metadata_field=Fields, channel_state=States, timeout=1,
+                verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+            )
+
+    def test_native_active_keeps_the_same_ordinary_registration_while_waiting(self):
+        class BorrowRedis:
+            def __init__(self):
+                self.member_reads = 0
+                self.state_reads = 0
+                self.client_count_reads = 0
+
+            def get(self, _key):
+                return b"native-owner"
+
+            def smembers(self, _key):
+                self.member_reads += 1
+                if self.member_reads <= 2:
+                    return {b"ordinary-a"}
+                return {b"ordinary-b", b"catchuparr-client-borrow"}
+
+            def scard(self, _key):
+                self.client_count_reads += 1
+                return 1
+
+            def hget(self, key, field):
+                if key == "metadata" and field == "state":
+                    self.state_reads += 1
+                    return b"CONNECTING"
+                if field == "connected_at":
+                    return b"100.5" if key.endswith("ordinary-a") else b"101.5"
+                if field == "worker_id":
+                    return b"native-owner"
+                return None
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker: "owner")
+            channel_metadata = staticmethod(lambda _worker: "metadata")
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        redis = BorrowRedis()
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            stream_managers={"worker": SimpleNamespace(running=True)},
+            client_managers={"worker": SimpleNamespace(get_client_count=lambda: 1)},
+        )
+        with self.assertRaisesRegex(RuntimeError, "ordinary client registration changed"):
+            ordinary_identity = probe._wait_for_native_client_count(
+                redis, server, Keys, "worker", 1, expected_local=1, timeout=1,
+                return_identity=True,
+            )
+            probe._wait_for_native_active(
+                redis, server, "worker", redis_keys=Keys,
+                metadata_field=Fields, channel_state=States, timeout=1,
+                expected_ordinary_identity=ordinary_identity,
+                verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+            )
+        self.assertEqual(0, redis.state_reads)
+
+    def test_native_active_rejects_unrelated_member_before_reconciling_borrow(self):
+        class BorrowRedis:
+            def __init__(self):
+                self.member_reads = 0
+
+            def get(self, _key):
+                return b"native-owner"
+
+            def smembers(self, _key):
+                self.member_reads += 1
+                if self.member_reads == 1:
+                    return {b"ordinary-client"}
+                return {b"ordinary-client", b"unrelated-client"}
+
+            def hget(self, key, field):
+                if key == "clients:ordinary-client" and field == "connected_at":
+                    return b"100.5"
+                if key == "clients:ordinary-client" and field == "worker_id":
+                    return b"native-owner"
+                return b"ACTIVE"
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker: "owner")
+            channel_metadata = staticmethod(lambda _worker: "metadata")
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        redis = BorrowRedis()
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            stream_managers={"worker": SimpleNamespace(running=True)},
+            client_managers={"worker": SimpleNamespace(get_client_count=lambda: 1)},
+        )
+        ordinary_identity = probe._wait_for_native_client_count(
+            redis, server, Keys, "worker", 1, return_identity=True, timeout=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "unverified client"):
+            probe._wait_for_native_active(
+                redis, server, "worker", redis_keys=Keys,
+                metadata_field=Fields, channel_state=States, timeout=1,
+                expected_ordinary_identity=ordinary_identity,
+                verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+            )
+        self.assertEqual(2, redis.member_reads)
+
+    def test_native_active_does_not_retry_while_local_parent_client_is_detached(self):
+        class BorrowRedis:
+            def __init__(self):
+                self.member_reads = 0
+
+            def get(self, _key):
+                return b"native-owner"
+
+            def smembers(self, _key):
+                self.member_reads += 1
+                return {b"ordinary-client"}
+
+            def hget(self, key, field):
+                if key == "clients:ordinary-client" and field == "connected_at":
+                    return b"100.5"
+                if key == "clients:ordinary-client" and field == "worker_id":
+                    return b"native-owner"
+                return b"ACTIVE"
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker: "owner")
+            channel_metadata = staticmethod(lambda _worker: "metadata")
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        local_counts = iter((1, 2))
+        redis = BorrowRedis()
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            stream_managers={"worker": SimpleNamespace(running=True)},
+            client_managers={
+                "worker": SimpleNamespace(get_client_count=lambda: next(local_counts)),
+            },
+        )
+        ordinary_identity = probe._wait_for_native_client_count(
+            redis, server, Keys, "worker", 1, return_identity=True, timeout=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "unverified client"):
+            probe._wait_for_native_active(
+                redis, server, "worker", redis_keys=Keys,
+                metadata_field=Fields, channel_state=States, timeout=1,
+                expected_ordinary_identity=ordinary_identity,
+                verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+            )
+        self.assertEqual(2, redis.member_reads)
+
+    def test_task_borrow_identity_requires_its_channel_and_server_verification(self):
+        task = SimpleNamespace(
+            _lock=threading.Lock(),
+            input_headers=[
+                {"X-Catchuparr-Borrow": "valid"},
+                {"X-Catchuparr-Borrow": "wrong-channel"},
+            ],
+        )
+        decoded = {
+            "valid": SimpleNamespace(channel_uuid="channel", nonce="nonce-1"),
+            "wrong-channel": SimpleNamespace(channel_uuid="other", nonce="nonce-2"),
+        }
+        verified_calls = []
+
+        def verify(worker, client_id):
+            verified_calls.append((worker, client_id))
+            return True
+
+        result = probe._verified_task_borrow_client_ids(
+            task,
+            worker_id="worker",
+            channel_uuid="channel",
+            decode_capability=decoded.__getitem__,
+            is_server_verified=verify,
+        )
+        self.assertEqual({"catchuparr-client-nonce-1"}, set(result))
+        self.assertEqual([("worker", "catchuparr-client-nonce-1")], verified_calls)
+
     def test_native_client_wait_waits_for_one_registered_local_and_redis_client(self):
         local_counts = iter((0, 1))
         redis_counts = iter((0, 1))
@@ -629,6 +1833,188 @@ class RecorderMediaProbeTests(unittest.TestCase):
         probe._wait_for_native_client_count(
             ClientRedis(), server, Keys, "worker", 1, timeout=1,
         )
+
+    def test_native_client_wait_separates_global_borrow_from_parent_local_count(self):
+        manager = SimpleNamespace(get_client_count=lambda: 1)
+        server = SimpleNamespace(client_managers={"worker": manager})
+
+        class ClientRedis:
+            @staticmethod
+            def scard(_key):
+                return 2
+
+        class Keys:
+            @staticmethod
+            def clients(_worker_id):
+                return "clients"
+
+        probe._wait_for_native_client_count(
+            ClientRedis(), server, Keys, "worker", 2,
+            expected_local=1, timeout=1,
+        )
+
+    def test_native_client_wait_rejects_global_borrow_missing_from_redis(self):
+        manager = SimpleNamespace(get_client_count=lambda: 1)
+        server = SimpleNamespace(client_managers={"worker": manager})
+
+        class ClientRedis:
+            @staticmethod
+            def scard(_key):
+                return 1
+
+        class Keys:
+            @staticmethod
+            def clients(_worker_id):
+                return "clients"
+
+        with self.assertRaisesRegex(RuntimeError, "bounded state"):
+            probe._wait_for_native_client_count(
+                ClientRedis(), server, Keys, "worker", 2,
+                expected_local=1, timeout=0.01,
+            )
+
+    def test_identity_capture_accepts_current_task_borrow_before_first_sample(self):
+        class Keys:
+            clients = staticmethod(lambda _worker: "clients")
+            channel_owner = staticmethod(lambda _worker: "owner")
+            channel_metadata = staticmethod(lambda _worker: "metadata")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        class Redis:
+            def smembers(self, _key):
+                return {b"ordinary-client", b"catchuparr-client-borrow"}
+
+            def get(self, _key):
+                return b"native-owner"
+
+            def hget(self, key, field):
+                if key == "metadata" and field == "state":
+                    return b"ACTIVE"
+                values = {
+                    ("clients:ordinary-client", "connected_at"): b"100.5",
+                    ("clients:ordinary-client", "worker_id"): b"native-owner",
+                }
+                return values.get((key, field))
+
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            stream_managers={"worker": SimpleNamespace(running=True)},
+            client_managers={"worker": SimpleNamespace(get_client_count=lambda: 1)},
+        )
+        identity = probe._wait_for_native_client_count(
+            Redis(), server, Keys, "worker", 1, expected_local=1,
+            return_identity=True,
+            verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+        )
+        self.assertEqual(
+            {"client_id": "ordinary-client", "connected_at": "100.5", "worker_id": "native-owner"},
+            identity,
+        )
+        owner, _, _ = probe._wait_for_native_active(
+            Redis(), server, "worker", redis_keys=Keys,
+            metadata_field=Fields, channel_state=States, timeout=1,
+            expected_ordinary_identity=identity,
+            verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+        )
+        self.assertEqual("native-owner", owner)
+
+    def test_identity_capture_rejects_unverified_extra_before_returning_identity(self):
+        class Keys:
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Redis:
+            def smembers(self, _key):
+                return {b"ordinary-client", b"unrelated-client"}
+
+            def hget(self, key, field):
+                if key.endswith("ordinary-client") and field == "connected_at":
+                    return b"100.5"
+                if key.endswith("ordinary-client") and field == "worker_id":
+                    return b"native-owner"
+                return None
+
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            client_managers={"worker": SimpleNamespace(get_client_count=lambda: 1)},
+        )
+        with self.assertRaisesRegex(RuntimeError, "unverified client"):
+            probe._wait_for_native_client_count(
+                Redis(), server, Keys, "worker", 1, expected_local=1,
+                return_identity=True,
+                verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+            )
+
+    def test_identity_capture_latches_ordinary_before_borrow_reconciliation(self):
+        class Keys:
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Redis:
+            def __init__(self):
+                self.reads = 0
+
+            def smembers(self, _key):
+                self.reads += 1
+                if self.reads == 1:
+                    return {b"ordinary-a"}
+                return {b"ordinary-b", b"catchuparr-client-borrow"}
+
+            def hget(self, key, field):
+                if field == "connected_at":
+                    return b"100.5" if key.endswith("ordinary-a") else b"101.5"
+                if field == "worker_id":
+                    return b"native-owner"
+                return None
+
+        redis = Redis()
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            client_managers={"worker": SimpleNamespace(get_client_count=lambda: 1)},
+        )
+        with self.assertRaisesRegex(RuntimeError, "ordinary client registration changed"):
+            probe._wait_for_native_client_count(
+                redis, server, Keys, "worker", 1, expected_local=1,
+                return_identity=True,
+                verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+            )
+        self.assertEqual(2, redis.reads)
+
+    def test_identity_capture_rejects_local_disconnect_after_latching_ordinary(self):
+        class Keys:
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Redis:
+            def __init__(self):
+                self.reads = 0
+
+            def smembers(self, _key):
+                self.reads += 1
+                return {b"ordinary-client"}
+
+            def hget(self, key, field):
+                if key.endswith("ordinary-client") and field == "connected_at":
+                    return b"100.5"
+                if key.endswith("ordinary-client") and field == "worker_id":
+                    return b"native-owner"
+                return None
+
+        counts = iter((1, 0, 1))
+        redis = Redis()
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            client_managers={"worker": SimpleNamespace(get_client_count=lambda: next(counts))},
+        )
+        with self.assertRaisesRegex(RuntimeError, "ordinary client detached"):
+            probe._wait_for_native_client_count(
+                redis, server, Keys, "worker", 1, expected_local=1,
+                return_identity=True,
+                verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+            )
+        self.assertEqual(2, redis.reads)
 
     def test_native_active_wait_does_not_accept_connecting(self):
         redis = _FakeRedis(state_after_reads=10**9)

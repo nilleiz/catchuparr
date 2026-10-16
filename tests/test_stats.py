@@ -170,7 +170,7 @@ class StatsProjectionTests(unittest.TestCase):
             "apps.timeshift.stats": types.ModuleType("apps.timeshift.stats"),
             "apps.timeshift.stats_views": types.ModuleType("apps.timeshift.stats_views"),
         }
-        modules["version"].__version__ = "0.31.0"
+        modules["version"].__version__ = "0.32.0"
         modules["apps"].__path__ = []
         modules["apps.proxy"].__path__ = []
         modules["apps.proxy.live_proxy"].__path__ = []
@@ -577,8 +577,8 @@ class StatsProjectionTests(unittest.TestCase):
         }
         with mock.patch.object(
             stats,
-            "_is_recorder_client",
-            side_effect=lambda channel, client: client == "recorder",
+            "_is_recorder_client_on_redis",
+            side_effect=lambda _redis, _channel, client: client == "recorder",
         ):
             result = stats._visible_basic_channel_info(channel_status, "42", native)
         self.assertEqual(13, native["client_count"])

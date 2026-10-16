@@ -36,6 +36,7 @@ SYNTHETIC_SOURCE_TONES = {
 TONE_MATCH_TOLERANCE_HZ = 45
 TONE_SAMPLE_RATE = 48_000
 FAILOVER_DIAGNOSTIC_PREFIX = "CATCHUPARR_AIO_FAILOVER_TIMEOUT "
+RECORDER_EXIT_DIAGNOSTIC_PREFIX = "CATCHUPARR_AIO_RECORDER_EXIT "
 FAILOVER_DIAGNOSTIC_MAX_BYTES = 8192
 _SOURCE_ROLE_NAMES = {
     "b": "Synthetic Source B",
@@ -403,6 +404,86 @@ def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
     print(FAILOVER_DIAGNOSTIC_PREFIX + payload, file=sys.stderr, flush=True)
 
 
+def _recorder_task_exit_diagnostic(run) -> dict[str, object]:
+    """Summarize an exited synthetic task using only bounded allowlisted fields."""
+    lock = getattr(run, "_lock", None)
+    if lock is None:
+        results = list(getattr(run, "results", ()))
+        failures = list(getattr(run, "failures", ()))
+        processes = list(getattr(run, "processes", ()))
+    else:
+        with lock:
+            results = list(getattr(run, "results", ()))
+            failures = list(getattr(run, "failures", ()))
+            processes = list(getattr(run, "processes", ()))
+
+    allowed_statuses = {
+        "stopped", "switch_requested", "media_stalled", "exited", "no_media",
+        "already_running", "no_permitted_sources", "proxy_integration_unsupported",
+        "sharing_return_recovery_pending", "sharing_authority_unavailable",
+        "sharing_cleanup_pending", "sharing_admission_uncertain", "recording_paused",
+        "sharing_unavailable", "control_unavailable", "legacy_job", "stale_control",
+        "disabled", "stale_configuration", "invalid_schedule", "outside_schedule",
+    }
+    allowed_exception_classes = {
+        "AssertionError", "AttributeError", "BorrowBindingLost", "CalledProcessError",
+        "ConnectionError", "FileExistsError", "ImportError", "KeyError", "OSError",
+        "PermissionError", "RecorderAttemptAdmissionUncertain", "RecorderControlError",
+        "RecorderLeaseError", "RedisError", "RuntimeError", "ScheduleError",
+        "TimeoutError", "TimeoutExpired", "TypeError", "ValueError",
+    }
+    task_result = getattr(run, "result", None)
+    task_status = task_result.get("status") if isinstance(task_result, dict) else None
+    if not isinstance(task_status, str) or task_status not in allowed_statuses:
+        task_status = "unavailable"
+    failure_classes = []
+    for failure in failures[:16]:
+        name = failure[len("task:"):] if isinstance(failure, str) and failure.startswith("task:") else failure
+        failure_classes.append(name if isinstance(name, str) and name in allowed_exception_classes else "other")
+    process_exit_codes = []
+    for process in processes[:16]:
+        try:
+            code = process.poll()
+        except Exception:
+            code = None
+        process_exit_codes.append(code if type(code) is int else None)
+    thread = getattr(run, "thread", None)
+    stop_event = getattr(run, "stop_event", None)
+    return {
+        "task_status": task_status,
+        "failure_classes": failure_classes,
+        "attempts": _recorder_attempt_summary(results),
+        "process_exit_codes": process_exit_codes,
+        "stop_requested": bool(stop_event is not None and stop_event.is_set()),
+        "stop_set_source": (
+            getattr(stop_event, "first_set_source", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
+        "first_supervisor_admission_status": (
+            getattr(stop_event, "first_supervisor_admission_status", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
+        "first_supervisor_stop_reason": (
+            getattr(stop_event, "first_supervisor_stop_reason", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
+        "expected_generation_present": isinstance(getattr(run, "expected_generation", None), str),
+        "expected_control_generation_present": type(getattr(run, "expected_control_generation", None)) is int,
+        "thread_alive": bool(thread is not None and thread.is_alive()),
+    }
+
+
+def _emit_recorder_exit_diagnostic(run) -> None:
+    try:
+        payload = json.dumps(_recorder_task_exit_diagnostic(run), sort_keys=True, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
+            payload = '{"diagnostic":"omitted"}'
+        print(RECORDER_EXIT_DIAGNOSTIC_PREFIX + payload, file=sys.stderr, flush=True)
+    except Exception:
+        # Diagnostics must never replace the original task-exit failure.
+        pass
+
+
 def _cleanup_failed_recorder_run(run: _RecorderTaskRun) -> None:
     """Keep the existing bounded stop/join cleanup for wait failures."""
     run.stop()
@@ -499,6 +580,10 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
         self._finite_claimed: set[str] = set()
         self._request_counts = {name: 0 for name in payloads}
         self._active_counts = {name: 0 for name in payloads}
+        self.request_started_at = {name: [] for name in payloads}
+        self.request_start_callback = None
+        self.request_start_callback_errors = []
+        self.request_callback_finished = threading.Event()
         self._stall_started_counts = {name: 0 for name in payloads}
         self._stall_durations = {name: 0.0 for name in payloads}
         self._stall_null_bytes = {name: 0 for name in payloads}
@@ -518,6 +603,10 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
                     else:
                         mode = owner._modes[name]
                     owner._request_counts[name] = owner._request_counts.get(name, 0) + 1
+                    started_at = time.time()
+                    owner.request_started_at.setdefault(name, []).append(started_at)
+                    request_number = owner._request_counts[name]
+                    callback = owner.request_start_callback
                     finite_repeats = owner._finite_repeats.get(name, 0)
                     finite_already_claimed = name in owner._finite_claimed
                     finite_mode = mode in {"finite", "stall"}
@@ -529,6 +618,16 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
                     if should_serve:
                         owner._active_counts[name] = owner._active_counts.get(name, 0) + 1
                         owner._sockets.add(self.connection)
+
+                if callback is not None and not owner._run_request_start_callback(
+                    callback, name, request_number, started_at,
+                ):
+                    if should_serve:
+                        with owner._lock:
+                            owner._active_counts[name] -= 1
+                            owner._sockets.discard(self.connection)
+                    self.send_error(500)
+                    return
 
                 if not should_serve:
                     self.send_error(404 if mode == "missing" else 503)
@@ -615,6 +714,40 @@ class _SyntheticFailoverSourceServer(ThreadingHTTPServer):
     def snapshot(self) -> tuple[dict[str, int], dict[str, int]]:
         with self._lock:
             return dict(self._request_counts), dict(self._active_counts)
+
+    def request_times(self, source_name: str) -> list[float]:
+        with self._lock:
+            return list(self.request_started_at.get(source_name, ()))
+
+    def install_request_start_callback(self, callback) -> None:
+        """Publish a one-shot boundary callback against the handler's lock."""
+        with self._lock:
+            self.request_callback_finished.clear()
+            self.request_start_callback_errors.clear()
+            self.request_start_callback = callback
+
+    def clear_request_start_callback(self, callback=None) -> bool:
+        """Disarm only the callback that the caller installed."""
+        with self._lock:
+            if callback is not None and self.request_start_callback is not callback:
+                return False
+            self.request_start_callback = None
+            return True
+
+    def _run_request_start_callback(
+        self, callback, name: str, request_number: int, started_at: float,
+    ) -> bool:
+        """Run and record a request boundary check before any HTTP response."""
+        try:
+            completed = callback(name, request_number, started_at) is True
+        except Exception as exc:
+            with self._lock:
+                self.request_start_callback_errors.append(exc)
+            self.request_callback_finished.set()
+            return False
+        if completed:
+            self.request_callback_finished.set()
+        return True
 
     def stall_snapshot(self) -> dict[str, dict[str, float | int]]:
         with self._lock:
@@ -884,6 +1017,93 @@ def _verified_segments(
     return result
 
 
+def _classify_stop_set_source(module_name, function_name) -> str:
+    if module_name == "catchuparr.tasks":
+        return {
+            "supervise": "tasks.supervisor",
+            "run_prepared_borrow": "tasks.borrow_runner",
+            "acknowledge_return_media": "tasks.return_ack",
+            "run": "tasks.recorder_loop",
+        }.get(function_name, "tasks.other")
+    if module_name in {"aio_recorder_failover", "scripts.aio_recorder_failover"}:
+        return "probe.harness_cleanup" if function_name in {"stop", "join", "join_after_supervisor"} else "probe.other"
+    return "other"
+
+
+def _safe_supervisor_admission_status(module_name, function_name, frame_locals) -> str:
+    if module_name != "catchuparr.tasks" or function_name != "supervise":
+        return "unavailable"
+    admission = frame_locals.get("current_admission")
+    status = admission.get("status") if isinstance(admission, dict) else None
+    allowed = {
+        "ready", "recording_paused", "stale_configuration", "stale_control",
+        "outside_schedule", "invalid_schedule", "disabled", "control_unavailable",
+    }
+    return status if isinstance(status, str) and status in allowed else "other"
+
+
+_SUPERVISOR_STOP_REASONS_BY_LINE = {
+    267: "admission_or_lease_renewal",
+    273: "stats_capability_refresh",
+    305: "attempt_renewal",
+    313: "candidate_currentness",
+    317: "exception",
+}
+
+
+def _safe_supervisor_stop_reason(module_name, function_name, line_number, frame_locals):
+    if module_name != "catchuparr.tasks" or function_name != "supervise":
+        return "unavailable"
+    reason = _SUPERVISOR_STOP_REASONS_BY_LINE.get(line_number)
+    if reason is None:
+        return "other"
+    if reason == "admission_or_lease_renewal":
+        admission = frame_locals.get("current_admission")
+        status = admission.get("status") if isinstance(admission, dict) else None
+        if status == "ready":
+            return "lease_renewal"
+        allowed = {
+            "recording_paused", "stale_configuration", "stale_control",
+            "outside_schedule", "invalid_schedule", "disabled", "control_unavailable",
+        }
+        return (
+            "admission_not_ready"
+            if isinstance(status, str) and status in allowed else "other"
+        )
+    return reason
+
+
+class _ObservedRecorderStopEvent(threading.Event):
+    """Record the first finite stop source for this disposable integration run."""
+
+    def __init__(self):
+        super().__init__()
+        self.first_set_source = "not_set"
+        self.first_supervisor_admission_status = "unavailable"
+        self.first_supervisor_stop_reason = "unavailable"
+        self._source_lock = threading.Lock()
+
+    def set(self):
+        with self._source_lock:
+            if not self.is_set() and self.first_set_source == "not_set":
+                try:
+                    caller = sys._getframe(1)
+                    module_name = caller.f_globals.get("__name__")
+                    function_name = caller.f_code.co_name
+                    self.first_set_source = _classify_stop_set_source(module_name, function_name)
+                    self.first_supervisor_admission_status = _safe_supervisor_admission_status(
+                        module_name, function_name, caller.f_locals,
+                    )
+                    self.first_supervisor_stop_reason = _safe_supervisor_stop_reason(
+                        module_name, function_name, caller.f_lineno, caller.f_locals,
+                    )
+                except Exception:
+                    self.first_set_source = "other"
+                    self.first_supervisor_admission_status = "unavailable"
+                    self.first_supervisor_stop_reason = "unavailable"
+            super().set()
+
+
 class _RecorderTaskRun:
     """Run the real recorder task with bounded engine timeouts and stop control."""
 
@@ -891,11 +1111,14 @@ class _RecorderTaskRun:
         self.channel_uuid = str(channel_uuid)
         self.startup_timeout = float(startup_timeout)
         self.media_idle_timeout = float(media_idle_timeout)
-        self.stop_event = threading.Event()
+        self.stop_event = _ObservedRecorderStopEvent()
         self.results: list[object] = []
         self.result: dict | None = None
         self.failures: list[str] = []
         self.processes: list[object] = []
+        # Keep synthetic route credentials in memory solely for replay-denial
+        # checks. They are never printed, serialized, or included in receipts.
+        self.input_headers: list[dict[str, str]] = []
         self._lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self._patchers = []
@@ -944,7 +1167,11 @@ class _RecorderTaskRun:
                 self.processes.append(process)
             return process
 
-        def bounded_run_candidate(recorder, stop_event, **_native_timeouts):
+        def bounded_run_candidate(recorder, stop_event, **native_timeouts):
+            headers = getattr(recorder, "input_headers", None)
+            if isinstance(headers, dict):
+                with self._lock:
+                    self.input_headers.append(dict(headers))
             try:
                 result = original_run_candidate(
                     recorder,
@@ -952,6 +1179,11 @@ class _RecorderTaskRun:
                     startup_timeout=self.startup_timeout,
                     media_idle_timeout=self.media_idle_timeout,
                     poll_interval=POLL_INTERVAL,
+                    **{
+                        key: native_timeouts[key]
+                        for key in ("attempt_switch", "on_first_media")
+                        if key in native_timeouts
+                    },
                 )
             except Exception as exc:
                 with self._lock:
@@ -1134,7 +1366,9 @@ def _wait_for_source_segments(
     deadline = time.monotonic() + timeout
     last_verified: dict[str, list] = {}
     while time.monotonic() < deadline:
-        _require(run.thread is not None and run.thread.is_alive(), "Recorder task ended before media was indexed")
+        if run.thread is None or not run.thread.is_alive():
+            _emit_recorder_exit_diagnostic(run)
+            raise RuntimeError("Recorder task ended before media was indexed")
         last_verified = _verified_segments(store, channel_uuid, ffmpeg, ffprobe)
         identified = last_verified.get(source_name, [])
         if len(identified) >= minimum:

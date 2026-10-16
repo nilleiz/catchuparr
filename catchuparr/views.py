@@ -21,6 +21,7 @@ _ROUTE_NAMES = frozenset(
         "catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive",
         "catchuparr-segment", "catchuparr-recorder",
         "catchuparr-native-archive", "catchuparr-native-segment",
+        "catchuparr-sharing-borrow",
     }
 )
 
@@ -74,6 +75,11 @@ def install_routes() -> None:
             "catchuparr/native/segment/<str:channel_id>/<str:segment_id>",
             _native_segment_route,
             name="catchuparr-native-segment",
+        ),
+        path(
+            "catchuparr/sharing/<str:channel_uuid>",
+            sharing_borrow_view,
+            name="catchuparr-sharing-borrow",
         ),
     ]
     existing_names = {getattr(route, "name", None) for route in root_urls.urlpatterns}
@@ -161,6 +167,59 @@ def _no_cache(response):
     response["Cache-Control"] = "private, no-store"
     response["Referrer-Policy"] = "no-referrer"
     return response
+
+
+def sharing_borrow_view(request, channel_uuid: str):
+    """Serve a one-use signed native-buffer input to the recorder process."""
+    from django.http import HttpResponse, StreamingHttpResponse
+
+    if getattr(request, "method", "GET") != "GET":
+        response = HttpResponse("Method not allowed", status=405)
+        response["Allow"] = "GET"
+        return _no_cache(response)
+    try:
+        from .adapters.sharing_borrow_route import decode_borrow_capability
+        from .sharing_runtime import (
+            BorrowedSessionStream,
+            open_borrow_session,
+            retain_open_cleanup_pending,
+        )
+
+        token = getattr(request, "headers", {}).get("X-Catchuparr-Borrow", "")
+        signed = decode_borrow_capability(token)
+        if signed.channel_uuid != channel_uuid:
+            raise ValueError("borrow route channel mismatch")
+        session = open_borrow_session(signed)
+    except Exception as exc:
+        from .adapters.sharing_borrow_route import BorrowOpenCleanupPending
+
+        if isinstance(exc, BorrowOpenCleanupPending):
+            # Keep the exact manager/ACK/reconciliation handle reachable until
+            # its durable non-authorizing episode and cleanup are acknowledged.
+            retain_open_cleanup_pending(exc)
+            try:
+                cleanup_complete = exc.retry_cleanup() is True
+            except Exception:
+                cleanup_complete = False
+            if not cleanup_complete and not exc.cleanup_pending_persisted:
+                # Do not discard the only cleanup owner as an ordinary stale
+                # ticket when SQLite could not record the pending operation.
+                return _no_cache(HttpResponse("Unavailable", status=503))
+        # Do not log a bearer capability, lease value, client address, or native
+        # identity. The caller sees one generic denial for all stale bindings.
+        logger.info(
+            "sharing_borrow_denied",
+            extra={"reason": type(exc).__name__, "dependency": getattr(exc, "name", "")},
+        )
+        return _no_cache(HttpResponse("Not found", status=404))
+    stream = BorrowedSessionStream(session)
+    try:
+        return _no_cache(StreamingHttpResponse(
+            stream, content_type="video/mp2t", status=200,
+        ))
+    except Exception:
+        stream.close()
+        raise
 
 
 def _trace_component(value: str) -> str:

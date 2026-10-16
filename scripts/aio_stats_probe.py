@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -18,6 +19,12 @@ from urllib.parse import parse_qs, urlsplit
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def _synthetic_visible_client_ids() -> set[str]:
+    """Use fresh client IDs for each probe against native manager dedup state."""
+    invocation = uuid.uuid4().hex
+    return {f"synthetic-visible-{invocation}-{index:02d}" for index in range(11)}
 
 
 def _execution_context_key():
@@ -692,7 +699,7 @@ def probe_actual_recorder_stats(*, channel_id, redis_client, native_server,
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {AccessToken.for_user(admin)}")
     added = []
-    visible_ids = {f"synthetic-visible-{index:02d}" for index in range(11)}
+    visible_ids = _synthetic_visible_client_ids()
     before_clients = set(client_ids)
     before_a = redis_client.get(profile_connections_key(profile_a.id))
     before_b = redis_client.get(profile_connections_key(profile_b.id))

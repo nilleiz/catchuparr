@@ -1,0 +1,1110 @@
+import json
+import math
+import multiprocessing
+import tempfile
+import threading
+import unittest
+from dataclasses import replace
+from pathlib import Path
+
+from catchuparr.sharing_persistence import (
+    SharingIntentLedger,
+    SharingOperationFenceAcknowledgement,
+    StaleSharingIntent,
+)
+from catchuparr.sharing_planner import (
+    BorrowTarget,
+    SharingAction,
+    SharingObservation,
+    SharingPhase,
+    SharingSettings,
+    observe,
+)
+
+CHANNEL = "00000000-0000-0000-0000-000000000007"
+IDENTITY = (
+    CHANNEL,
+    "native-worker-7",
+    "owner-lock-7",
+    "owner-lock-7",
+    "stream-7",
+    "account-7",
+    "m3u-profile-7",
+    "input-profile-7",
+)
+
+
+def target():
+    return BorrowTarget(
+        channel_uuid=IDENTITY[0],
+        worker_uuid=IDENTITY[1],
+        owner_lock_value=IDENTITY[2],
+        metadata_owner=IDENTITY[3],
+        stream_id=IDENTITY[4],
+        account_id=IDENTITY[5],
+        m3u_profile_id=IDENTITY[6],
+        input_profile_id=IDENTITY[7],
+        ordinary_client_ids=("viewer-synthetic-1",),
+        owner_heartbeat_healthy=True,
+        assigned_stream_matches=True,
+        account_active=True,
+        profile_active=True,
+        media_compatible=True,
+        useful_buffer_available=True,
+        native_state_healthy=True,
+    )
+
+
+def pending_attach():
+    start = observe(
+        None,
+        SharingObservation(
+            channel_uuid=CHANNEL,
+            now=100,
+            configuration_generation="config-a",
+            control_generation=3,
+            recorder_fence=11,
+            lease_is_current=True,
+            settings=SharingSettings(True, 5, 30, 60),
+            target=target(),
+        ),
+    )
+    ready = observe(
+        start.state,
+        SharingObservation(
+            channel_uuid=CHANNEL,
+            now=105,
+            configuration_generation="config-a",
+            control_generation=3,
+            recorder_fence=11,
+            lease_is_current=True,
+            settings=SharingSettings(True, 5, 30, 60),
+            target=target(),
+        ),
+    )
+    assert ready.action is SharingAction.ATTACH_BORROW
+    return ready.state
+
+
+def _claim_from_process(database_path, token, barrier, results):
+    ledger = SharingIntentLedger(Path(database_path), clock=lambda: 105.0)
+
+    calls = [0]
+    def validate(_token):
+        calls[0] += 1
+        if calls[0] == 1 and barrier is not None:
+            barrier.wait(timeout=10)
+        return True
+
+    ran, _ = ledger.run_if_current(
+        token, fresh_validate=validate,
+        side_effect=lambda _token: results.put("effect"),
+    )
+    results.put("ran" if ran else "denied")
+
+
+def _save_new_epoch_while_effect_pending(database_path, state, expected_revision, results):
+    ledger = SharingIntentLedger(Path(database_path), clock=lambda: 105.0)
+    try:
+        ledger.save(
+            state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=expected_revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+    except StaleSharingIntent:
+        results.put("blocked")
+    else:
+        results.put("incorrectly-admitted")
+
+
+class SharingPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.now = [105.0]
+        self.ledger = SharingIntentLedger(
+            Path(self.directory.name) / "archive.sqlite3",
+            clock=lambda: self.now[0],
+        )
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def save_attach(self):
+        state = pending_attach()
+        return self.ledger.save(
+            state,
+            action=SharingAction.ATTACH_BORROW,
+            expected_revision=None,
+            target_identity=IDENTITY,
+            target_admitted=True,
+            not_before=105.0,
+        )
+
+    def test_persists_exact_admitted_intent_with_monotonic_revision(self):
+        saved = self.save_attach()
+        self.assertEqual(1, saved.revision)
+        self.assertEqual(1, saved.intent.revision)
+        self.assertEqual(state_epoch := saved.state.intent_epoch, saved.intent.intent_epoch)
+        self.assertEqual(1, state_epoch)
+        self.assertEqual(SharingAction.ATTACH_BORROW, saved.intent.action)
+        self.assertEqual(IDENTITY, saved.intent.target_identity)
+        self.assertTrue(saved.intent.target_admitted)
+        self.assertEqual(105.0, saved.intent.not_before)
+        self.assertEqual(saved, self.ledger.read(CHANNEL))
+
+    def test_stale_revision_cannot_overwrite_newer_intent(self):
+        original = self.save_attach()
+        newer_state = replace(original.state, intent_epoch=original.state.intent_epoch + 1)
+        newer = self.ledger.save(
+            newer_state,
+            action=SharingAction.ATTACH_BORROW,
+            expected_revision=original.revision,
+            target_identity=IDENTITY,
+            target_admitted=True,
+            not_before=106.0,
+        )
+        self.assertEqual(2, newer.revision)
+        with self.assertRaises(StaleSharingIntent):
+            self.ledger.save(
+                original.state,
+                action=SharingAction.ATTACH_BORROW,
+                expected_revision=original.revision,
+                target_identity=IDENTITY,
+                target_admitted=True,
+                not_before=105.0,
+            )
+
+    def test_same_action_with_new_epoch_fences_old_completion(self):
+        first = self.save_attach()
+        second_state = replace(first.state, intent_epoch=first.state.intent_epoch + 1)
+        second = self.ledger.save(
+            second_state,
+            action=SharingAction.ATTACH_BORROW,
+            expected_revision=first.revision,
+            target_identity=IDENTITY,
+            target_admitted=True,
+            not_before=105.0,
+        )
+        effects = []
+        ran, result = self.ledger.run_if_current(
+            first.intent,
+            fresh_validate=lambda _token: True,
+            side_effect=lambda token: effects.append(token),
+        )
+        self.assertFalse(ran)
+        self.assertIsNone(result)
+        self.assertEqual([], effects)
+        ran, _ = self.ledger.run_if_current(
+            second.intent,
+            fresh_validate=lambda token: token == second.intent,
+            side_effect=lambda token: effects.append(token.action.value),
+        )
+        self.assertTrue(ran)
+        self.assertEqual(["attach_borrow"], effects)
+
+    def test_unknown_effect_outcome_blocks_new_intent_until_exact_cleanup_ack(self):
+        saved = self.save_attach()
+        operation_id = "a" * 32
+        dispatched_resources = []
+
+        def dispatch(token):
+            attempt = self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            self.assertEqual(attempt.status, "dispatching")
+            dispatched_resources.append(attempt.operation_id)
+            raise RuntimeError("synthetic lost dispatch ACK")
+
+        with self.assertRaisesRegex(RuntimeError, "lost dispatch ACK"):
+            self.ledger.run_if_current(
+                saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+            )
+        self.assertEqual(dispatched_resources, [operation_id])
+        pending = self.ledger.mark_effect_cleanup_pending(operation_id)
+        self.assertEqual(pending.status, "cleanup_pending")
+
+        newer_state = replace(saved.state, intent_epoch=saved.state.intent_epoch + 1)
+        with self.assertRaisesRegex(StaleSharingIntent, "exact cleanup ACK"):
+            self.ledger.save(
+                newer_state, action=SharingAction.ATTACH_BORROW,
+                expected_revision=saved.revision, target_identity=IDENTITY,
+                target_admitted=True, not_before=105.0,
+            )
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+        process = context.Process(
+            target=_save_new_epoch_while_effect_pending,
+            args=(str(self.ledger.database_path), newer_state, saved.revision, results),
+        )
+        process.start()
+        process.join(15)
+        self.assertEqual(0, process.exitcode)
+        self.assertEqual("blocked", results.get(timeout=2))
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=lambda attempt: attempt.operation_id == operation_id,
+            exact_resources_absent=lambda attempt: False,
+        ))
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), (pending,))
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            exact_resources_absent=lambda attempt: True,
+        ))
+        def acknowledge_fence(attempt):
+            return SharingOperationFenceAcknowledgement(
+                attempt.operation_id, attempt.revision,
+                f"native-fence-{attempt.operation_id}-{attempt.revision}",
+            )
+
+        self.assertTrue(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=acknowledge_fence,
+            exact_resources_absent=lambda attempt: True,
+        ))
+        closed = self.ledger.effect_attempt(operation_id)
+        self.assertIsNotNone(self.ledger.operation_fence_acknowledgement(
+            operation_id, closed.revision - 1,
+        ))
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
+        next_saved = self.ledger.save(
+            newer_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=saved.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        self.assertEqual(next_saved.revision, saved.revision + 1)
+
+    def test_acknowledged_effect_stays_blocking_until_exact_resource_cleanup(self):
+        saved = self.save_attach()
+        operation_id = "b" * 32
+        receipt = None
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            return self.ledger.acknowledge_effect_attempt(
+                operation_id, resource_id="resource-synthetic-1",
+            )
+
+        ran, receipt = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+        )
+        self.assertTrue(ran)
+        self.assertEqual(receipt.status, "active")
+        self.assertEqual(receipt.resource_id, "resource-synthetic-1")
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=lambda attempt: attempt.resource_id == "resource-synthetic-1",
+            exact_resources_absent=lambda _attempt: False,
+        ))
+        self.assertEqual(len(self.ledger.pending_effect_attempts(CHANNEL)), 1)
+
+    def test_acknowledged_resource_requires_persisted_operation_fence_before_absence(self):
+        saved = self.save_attach()
+        operation_id = "f" * 32
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            return self.ledger.acknowledge_effect_attempt(
+                operation_id, resource_id="resource-acknowledged-synthetic",
+            )
+
+        ran, attempt = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+        )
+        self.assertTrue(ran)
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id, exact_resources_absent=lambda _attempt: True,
+        ))
+        self.assertIsNone(self.ledger.operation_fence_acknowledgement(
+            operation_id, attempt.revision,
+        ))
+        callback_attempts = []
+
+        def fence_exact_attempt(current):
+            callback_attempts.append(current)
+            return SharingOperationFenceAcknowledgement(
+                current.operation_id, current.revision,
+                f"native-fence-{current.operation_id}-{current.revision}",
+            )
+
+        self.assertTrue(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=fence_exact_attempt,
+            exact_resources_absent=lambda current: (
+                current.resource_id == "resource-acknowledged-synthetic"
+            ),
+        ))
+        self.assertEqual(len(callback_attempts), 1)
+        self.assertEqual(callback_attempts[0].status, "active")
+        self.assertIsNotNone(self.ledger.operation_fence_acknowledgement(
+            operation_id, attempt.revision,
+        ))
+        reopened = SharingIntentLedger(self.ledger.database_path, clock=lambda: self.now[0])
+        self.assertEqual(
+            reopened.operation_fence_acknowledgement(operation_id, attempt.revision),
+            self.ledger.operation_fence_acknowledgement(operation_id, attempt.revision),
+        )
+
+    def test_stale_or_mismatched_operation_fence_ack_cannot_close_resource(self):
+        saved = self.save_attach()
+        operation_id = "9" * 32
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            return self.ledger.acknowledge_effect_attempt(
+                operation_id, resource_id="resource-fence-stale-synthetic",
+            )
+
+        ran, attempt = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+        )
+        self.assertTrue(ran)
+        absence_probes = []
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=lambda current: SharingOperationFenceAcknowledgement(
+                "different-operation", current.revision, "wrong-fence-synthetic",
+            ),
+            exact_resources_absent=lambda _current: absence_probes.append(True) or True,
+        ))
+        self.assertEqual(absence_probes, [])
+
+        def stale_revision_fence(current):
+            self.ledger.mark_effect_cleanup_pending(current.operation_id)
+            return SharingOperationFenceAcknowledgement(
+                current.operation_id, current.revision,
+                f"stale-fence-{current.operation_id}-{current.revision}",
+            )
+
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=stale_revision_fence,
+            exact_resources_absent=lambda _current: absence_probes.append(True) or True,
+        ))
+        self.assertEqual(absence_probes, [])
+        current = self.ledger.effect_attempt(operation_id)
+        self.assertEqual(current.status, "cleanup_pending")
+        self.assertEqual(current.revision, attempt.revision + 1)
+        self.assertIsNone(self.ledger.operation_fence_acknowledgement(
+            operation_id, current.revision,
+        ))
+
+    def test_explicit_stop_can_supersede_pending_effect_without_starting_new_source(self):
+        saved = self.save_attach()
+        operation_id = "c" * 32
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+
+        ran, _ = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=dispatch,
+        )
+        self.assertTrue(ran)
+        self.ledger.mark_effect_cleanup_pending(operation_id)
+        stopped = replace(
+            saved.state, phase=SharingPhase.STOPPED, pending_action=None,
+            intent_epoch=saved.state.intent_epoch + 1,
+            control_generation=saved.state.control_generation + 1,
+        )
+        stop_intent = self.ledger.save(
+            stopped, action=SharingAction.STOP, expected_revision=saved.revision,
+            not_before=105.0,
+        )
+        self.assertEqual(stop_intent.intent.action, SharingAction.STOP)
+        stop_effects = []
+        ran, _ = self.ledger.run_if_current(
+            stop_intent.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: stop_effects.append("stop"),
+        )
+        self.assertTrue(ran)
+        self.assertEqual(stop_effects, ["stop"])
+
+    def test_dispatching_effect_cannot_close_on_absence_before_delayed_launch(self):
+        saved = self.save_attach()
+        operation_id = "e" * 32
+        dispatch_started = threading.Event()
+        allow_external_effect = threading.Event()
+        cancellation_lock = threading.Lock()
+        cancelled = {"value": False}
+        launched_resources = []
+        failures = []
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            dispatch_started.set()
+            if not allow_external_effect.wait(5):
+                raise RuntimeError("synthetic dispatch barrier timed out")
+            with cancellation_lock:
+                if cancelled["value"]:
+                    raise RuntimeError("synthetic native dispatch fence cancelled operation")
+                launched_resources.append(operation_id)
+            raise RuntimeError("synthetic lost launch ACK")
+
+        def run_dispatch():
+            try:
+                self.ledger.run_if_current(
+                    saved.intent, fresh_validate=lambda _token: True,
+                    side_effect=dispatch,
+                )
+            except RuntimeError as exc:
+                failures.append(str(exc))
+
+        worker = threading.Thread(target=run_dispatch)
+        worker.start()
+        self.assertTrue(dispatch_started.wait(5))
+        absence_probes = []
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            exact_resources_absent=lambda _attempt: absence_probes.append(True) or True,
+        ))
+        self.assertEqual(absence_probes, [])
+        pending = self.ledger.mark_effect_cleanup_pending(operation_id)
+        self.assertEqual(pending.status, "cleanup_pending")
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL)[0].status, "cleanup_pending")
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id, exact_resources_absent=lambda _attempt: True,
+        ))
+        def cancel_at_native_boundary(_attempt):
+            with cancellation_lock:
+                cancelled["value"] = True
+            return SharingOperationFenceAcknowledgement(
+                _attempt.operation_id, _attempt.revision,
+                f"native-fence-{_attempt.operation_id}-{_attempt.revision}",
+            )
+
+        self.assertTrue(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=cancel_at_native_boundary,
+            exact_resources_absent=lambda _attempt: not launched_resources,
+        ))
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
+        allow_external_effect.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(launched_resources, [])
+        self.assertEqual(failures, ["synthetic native dispatch fence cancelled operation"])
+
+    def test_acknowledged_operation_cannot_reconnect_after_cleanup_pending(self):
+        saved = self.save_attach()
+        operation_id = "8" * 32
+        operation_lock = threading.Lock()
+        cleanup_started = threading.Event()
+        allow_reconnect = threading.Event()
+        operation_fenced = {"value": False}
+        resources = []
+        failures = []
+
+        def dispatch(token):
+            self.ledger.begin_effect_attempt(
+                token, operation_id=operation_id, target_identity=IDENTITY,
+            )
+            resources.append("resource-first-synthetic")
+            acknowledged = self.ledger.acknowledge_effect_attempt(
+                operation_id, resource_id="resource-first-synthetic",
+            )
+            cleanup_started.set()
+            if not allow_reconnect.wait(5):
+                raise RuntimeError("synthetic reconnect barrier timed out")
+            with operation_lock:
+                if operation_fenced["value"]:
+                    raise RuntimeError("synthetic operation fence blocks reconnect")
+                resources.append("resource-reconnected-synthetic")
+            return acknowledged
+
+        def run_dispatch():
+            try:
+                self.ledger.run_if_current(
+                    saved.intent, fresh_validate=lambda _token: True,
+                    side_effect=dispatch,
+                )
+            except RuntimeError as exc:
+                failures.append(str(exc))
+
+        worker = threading.Thread(target=run_dispatch)
+        worker.start()
+        self.assertTrue(cleanup_started.wait(5))
+        pending = self.ledger.mark_effect_cleanup_pending(operation_id)
+        self.assertEqual(pending.status, "cleanup_pending")
+        self.assertEqual(pending.resource_id, "resource-first-synthetic")
+        self.assertFalse(self.ledger.reconcile_effect_attempt(
+            operation_id, exact_resources_absent=lambda _attempt: resources.clear() or True,
+        ))
+
+        def cancel_and_reap(attempt):
+            with operation_lock:
+                operation_fenced["value"] = True
+            return SharingOperationFenceAcknowledgement(
+                attempt.operation_id, attempt.revision,
+                f"native-fence-{attempt.operation_id}-{attempt.revision}",
+            )
+
+        def clean_after_fence(_attempt):
+            with operation_lock:
+                resources.clear()
+                return operation_fenced["value"] and not resources
+
+        self.assertTrue(self.ledger.reconcile_effect_attempt(
+            operation_id,
+            operation_fence_acknowledged=cancel_and_reap,
+            exact_resources_absent=clean_after_fence,
+        ))
+        allow_reconnect.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(resources, [])
+        self.assertEqual(failures, ["synthetic operation fence blocks reconnect"])
+        self.assertEqual(self.ledger.pending_effect_attempts(CHANNEL), ())
+
+    def test_deadline_and_fresh_external_validation_gate_side_effect(self):
+        saved = self.save_attach()
+        effects = []
+        self.now[0] = 104.99
+        ran, _ = self.ledger.run_if_current(
+            saved.intent,
+            fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("early"),
+        )
+        self.assertFalse(ran)
+        self.now[0] = 105.0
+        ran, _ = self.ledger.run_if_current(
+            saved.intent,
+            fresh_validate=lambda token: token.recorder_fence == 11,
+            side_effect=lambda _token: effects.append("current"),
+        )
+        self.assertTrue(ran)
+        ran, _ = self.ledger.run_if_current(
+            saved.intent,
+            fresh_validate=lambda _token: False,
+            side_effect=lambda _token: effects.append("stale external state"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual(["current"], effects)
+
+    def test_duplicate_exact_token_is_durably_consumed_after_first_dispatch(self):
+        saved = self.save_attach()
+        effects = []
+        for index in range(2):
+            ran, _ = self.ledger.run_if_current(
+                saved.intent, fresh_validate=lambda _token: True,
+                side_effect=lambda _token: effects.append("effect"),
+            )
+            self.assertEqual(index == 0, ran)
+        self.assertEqual(["effect"], effects)
+
+    def test_same_logical_intent_resaved_at_new_revision_cannot_dispatch_twice(self):
+        first = self.save_attach()
+        effects = []
+        ran, _ = self.ledger.run_if_current(
+            first.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("first"),
+        )
+        self.assertTrue(ran)
+        second = self.ledger.save(
+            first.state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=first.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        self.assertEqual(first.intent.intent_epoch, second.intent.intent_epoch)
+        self.assertNotEqual(first.revision, second.revision)
+        ran, _ = self.ledger.run_if_current(
+            second.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("duplicate"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual(["first"], effects)
+
+    def test_coalesced_revision_update_during_callback_cannot_redrive_intent(self):
+        first = self.save_attach()
+        effects = []
+        def callback(_token):
+            effects.append("effect")
+            self.ledger.save(
+                first.state, action=SharingAction.ATTACH_BORROW,
+                expected_revision=first.revision, target_identity=IDENTITY,
+                target_admitted=True, not_before=105.0,
+            )
+        ran, _ = self.ledger.run_if_current(
+            first.intent, fresh_validate=lambda _token: True, side_effect=callback,
+        )
+        self.assertTrue(ran)
+        current = self.ledger.read(CHANNEL)
+        self.assertNotEqual(first.revision, current.revision)
+        ran, _ = self.ledger.run_if_current(
+            current.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("duplicate"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual(["effect"], effects)
+
+    def test_explicit_new_intent_epoch_can_dispatch_with_fresh_proof(self):
+        first = self.save_attach()
+        effects = []
+        ran, _ = self.ledger.run_if_current(
+            first.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append(1),
+        )
+        self.assertTrue(ran)
+        retry_state = replace(first.state, intent_epoch=first.state.intent_epoch + 1)
+        retry = self.ledger.save(
+            retry_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=first.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        ran, _ = self.ledger.run_if_current(
+            retry.intent, fresh_validate=lambda token: token.intent_epoch == 2,
+            side_effect=lambda _token: effects.append(2),
+        )
+        self.assertTrue(ran)
+        self.assertEqual([1, 2], effects)
+
+    def test_cross_process_revision_update_cannot_redrive_claimed_logical_intent(self):
+        first = self.save_attach()
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+        first_process = context.Process(
+            target=_claim_from_process,
+            args=(str(self.ledger.database_path), first.intent, None, results),
+        )
+        first_process.start()
+        first_process.join(15)
+        self.assertEqual(0, first_process.exitcode)
+        self.assertEqual(["effect", "ran"], [results.get(timeout=2), results.get(timeout=2)])
+        second = self.ledger.save(
+            first.state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=first.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        second_process = context.Process(
+            target=_claim_from_process,
+            args=(str(self.ledger.database_path), second.intent, None, results),
+        )
+        second_process.start()
+        second_process.join(15)
+        self.assertEqual(0, second_process.exitcode)
+        self.assertEqual(["denied"], [results.get(timeout=2)])
+
+    def test_old_revision_claims_migrate_to_conservative_epoch_tombstones(self):
+        saved = self.save_attach()
+        with self.ledger._connect() as db:
+            db.execute("""INSERT INTO sharing_intent_claims
+                (channel_uuid, revision, intent_epoch, action, claim_nonce, claimed_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (CHANNEL, saved.revision, saved.intent.intent_epoch, saved.intent.action.value,
+                 "synthetic-old-claim", 105.0))
+            db.execute("DROP TABLE sharing_logical_intent_claims")
+            db.execute("DROP TABLE sharing_legacy_intent_claims")
+            db.execute("DROP TABLE sharing_schema_meta")
+        migrated = SharingIntentLedger(self.ledger.database_path, clock=lambda: 105.0)
+        with migrated._connect() as db:
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM sharing_legacy_intent_claims").fetchone()[0])
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM sharing_intent_claims").fetchone()[0])
+        ran, _ = migrated.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: self.fail("migrated consumed claim ran again"),
+        )
+        self.assertFalse(ran)
+        retry = replace(saved.state, intent_epoch=saved.state.intent_epoch + 1)
+        current = migrated.save(
+            retry, action=SharingAction.ATTACH_BORROW, expected_revision=saved.revision,
+            target_identity=IDENTITY, target_admitted=True, not_before=105.0,
+        )
+        ran, _ = migrated.run_if_current(
+            current.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: "fresh epoch",
+        )
+        self.assertTrue(ran)
+
+    def test_two_os_processes_cannot_claim_the_same_intent(self):
+        saved = self.save_attach()
+        context = multiprocessing.get_context("fork")
+        barrier, results = context.Barrier(2), context.Queue()
+        processes = [context.Process(target=_claim_from_process,
+                                     args=(str(self.ledger.database_path), saved.intent, barrier, results))
+                     for _ in range(2)]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(15)
+        self.assertEqual([0, 0], [process.exitcode for process in processes])
+        outcomes = [results.get(timeout=2) for _ in range(3)]
+        self.assertEqual(1, outcomes.count("effect"))
+        self.assertEqual(1, outcomes.count("ran"))
+        self.assertEqual(1, outcomes.count("denied"))
+
+    def test_crashed_durable_claim_fails_closed_without_retry(self):
+        saved = self.save_attach()
+        with self.ledger._connect() as db:
+            db.execute("""INSERT INTO sharing_intent_claims
+                (channel_uuid, revision, intent_epoch, action, claim_nonce, claimed_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (CHANNEL, saved.revision, saved.intent.intent_epoch, saved.intent.action.value,
+                 "synthetic-crashed-claim", 105.0))
+        effects = []
+        ran, _ = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("effect"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual([], effects)
+
+    def test_clock_rollback_during_fresh_validation_blocks_dispatch(self):
+        saved = self.save_attach()
+        effects = []
+        def rollback(_token):
+            self.now[0] = 104.0
+            return True
+        ran, _ = self.ledger.run_if_current(
+            saved.intent, fresh_validate=rollback,
+            side_effect=lambda _token: effects.append("effect"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual([], effects)
+        self.now[0] = 105.0
+        ran, _ = self.ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("effect"),
+        )
+        self.assertTrue(ran)
+        self.assertEqual(["effect"], effects)
+
+    def test_clock_rollback_after_durable_claim_blocks_final_dispatch(self):
+        saved = self.save_attach()
+        values = iter((105.0, 105.0, 105.0, 105.0, 104.0))
+        self.ledger.clock = lambda: next(values)
+        effects = []
+        ran, _ = self.ledger.run_if_current(
+            saved.intent,
+            fresh_validate=lambda _token: True,
+            side_effect=lambda _token: effects.append("effect"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual([], effects)
+
+    def test_superseding_stop_after_claim_prevents_attach_dispatch(self):
+        saved = self.save_attach()
+        stopped = replace(saved.state, phase=SharingPhase.STOPPED, pending_action=None,
+                          intent_epoch=saved.state.intent_epoch + 1)
+        effects = []
+        validations = [0]
+        def supersede(_token):
+            validations[0] += 1
+            if validations[0] == 2:
+                self.ledger.save(stopped, action=SharingAction.STOP,
+                                 expected_revision=saved.revision, not_before=105.0)
+            return True
+        ran, _ = self.ledger.run_if_current(
+            saved.intent, fresh_validate=supersede,
+            side_effect=lambda _token: effects.append("stale attach"),
+        )
+        self.assertFalse(ran)
+        self.assertEqual([], effects)
+        self.assertEqual(SharingAction.STOP, self.ledger.read(CHANNEL).intent.action)
+
+    def test_corrupt_nested_snapshot_fields_fail_closed(self):
+        mutators = (
+            lambda snapshot: snapshot.update(candidate_identity="abcdefgh"),
+            lambda snapshot: snapshot.update(candidate_since=float("nan")),
+            lambda snapshot: snapshot.update(candidate_connection_identity=[CHANNEL, "short"]),
+            lambda snapshot: snapshot.update(last_switch_at=True),
+            lambda snapshot: snapshot.update(control_generation=True),
+            lambda snapshot: snapshot.update(candidate_connection_identity=["other-channel", *IDENTITY[1:]]),
+            lambda snapshot: snapshot.update(candidate_identity=[*IDENTITY[:4], "other-stream", *IDENTITY[5:]]),
+        )
+        for index, mutate in enumerate(mutators):
+            with self.subTest(index=index):
+                path = Path(self.directory.name) / f"corrupt-{index}.sqlite3"
+                ledger = SharingIntentLedger(path, clock=lambda: 105.0)
+                saved = ledger.save(pending_attach(), action=SharingAction.ATTACH_BORROW,
+                                   expected_revision=None, target_identity=IDENTITY,
+                                   target_admitted=True, not_before=105.0)
+                snapshot = saved.state.to_snapshot()
+                mutate(snapshot)
+                raw = json.dumps(snapshot, allow_nan=True, separators=(",", ":"))
+                with ledger._connect() as db:
+                    db.execute("UPDATE sharing_runtime SET state_json=? WHERE channel_uuid=?", (raw, CHANNEL))
+                with self.assertRaises(ValueError):
+                    ledger.read(CHANNEL)
+
+    def test_corrupt_target_disagreement_fails_closed(self):
+        saved = self.save_attach()
+        wrong = list(IDENTITY)
+        wrong[-1] = "different-input-profile"
+        with self.ledger._connect() as db:
+            db.execute("UPDATE sharing_runtime SET target_identity_json=? WHERE channel_uuid=?",
+                       (json.dumps(wrong), CHANNEL))
+        with self.assertRaises(ValueError):
+            self.ledger.read(CHANNEL)
+        self.assertEqual(1, saved.revision)
+
+    def test_attach_intent_requires_wait_live_candidate_phase(self):
+        saved = self.save_attach()
+        snapshot = saved.state.to_snapshot()
+        snapshot["phase"] = SharingPhase.DEDICATED.value
+        with self.ledger._connect() as db:
+            db.execute("UPDATE sharing_runtime SET state_json=? WHERE channel_uuid=?",
+                       (json.dumps(snapshot), CHANNEL))
+        with self.assertRaises(ValueError):
+            self.ledger.read(CHANNEL)
+
+    def test_recovery_discards_mismatched_advisory_candidate_pair(self):
+        saved = self.save_attach()
+        snapshot = saved.state.to_snapshot()
+        wrong = list(IDENTITY)
+        wrong[4] = "other-stream"
+        snapshot["candidate_identity"] = wrong
+        snapshot["last_switch_at"] = 101.0
+        with self.ledger._connect() as db:
+            db.execute("UPDATE sharing_runtime SET state_json=? WHERE channel_uuid=?",
+                       (json.dumps(snapshot), CHANNEL))
+        recovered = self.ledger.recover(
+            CHANNEL, configuration_generation="config-a", control_generation=3,
+            recorder_fence=12, now=106, expected_revision=saved.revision,
+            recovery_is_current=lambda *_args: True,
+        )
+        self.assertIsNone(recovered.state.candidate_identity)
+        self.assertIsNone(recovered.state.candidate_connection_identity)
+        self.assertIsNone(recovered.state.candidate_since)
+        self.assertEqual(101.0, recovered.state.last_switch_at)
+
+    def test_recovery_rejects_stale_revision_fence_and_control(self):
+        saved = self.save_attach()
+        for revision, control, fence in ((saved.revision + 1, 3, 12),
+                                         (saved.revision, 2, 12),
+                                         (saved.revision, 3, 10)):
+            with self.subTest(revision=revision, control=control, fence=fence):
+                with self.assertRaises(StaleSharingIntent):
+                    self.ledger.recover(
+                        CHANNEL, configuration_generation="config-a", control_generation=control,
+                        recorder_fence=fence, now=106, expected_revision=revision,
+                        recovery_is_current=lambda *_args: True,
+                    )
+        self.assertEqual(saved, self.ledger.read(CHANNEL))
+
+    def test_recovery_requires_fresh_owner_admission(self):
+        saved = self.save_attach()
+        with self.assertRaises(StaleSharingIntent):
+            self.ledger.recover(
+                CHANNEL, configuration_generation="config-a", control_generation=3,
+                recorder_fence=12, now=106, expected_revision=saved.revision,
+                recovery_is_current=lambda *_args: False,
+            )
+        self.assertEqual(saved, self.ledger.read(CHANNEL))
+
+    def test_recovery_keeps_cooldown_clocks_but_drops_borrow_and_pending_authority(self):
+        saved = self.save_attach()
+        persisted = dict(self.ledger.read(CHANNEL).state.to_snapshot())
+        # The persisted candidate is still only a planner suggestion; recovery
+        # retains its cooldown clock but never restores borrowed authority.
+        borrowed_state = replace(
+            saved.state,
+            last_switch_at=101.0,
+        )
+        self.ledger.save(
+            borrowed_state,
+            action=SharingAction.ATTACH_BORROW,
+            expected_revision=saved.revision,
+            target_identity=IDENTITY,
+            target_admitted=True,
+            not_before=105.0,
+        )
+        recovered = self.ledger.recover(
+            CHANNEL,
+            configuration_generation="config-a",
+            control_generation=3,
+            recorder_fence=12,
+            now=106,
+            expected_revision=2,
+            recovery_is_current=lambda *_args: True,
+        )
+        self.assertIsNone(recovered.intent)
+        self.assertEqual(SharingPhase.DEDICATED, recovered.state.phase)
+        self.assertIsNone(recovered.state.borrowed_identity)
+        self.assertIsNone(recovered.state.pending_action)
+        self.assertGreater(recovered.state.intent_epoch, borrowed_state.intent_epoch)
+        self.assertEqual(borrowed_state.last_switch_at, recovered.state.last_switch_at)
+        self.assertNotEqual(IDENTITY, persisted.get("borrowed_identity"))
+
+    def test_recovery_rebinds_only_pending_return_intent_after_worker_restart(self):
+        saved = self.save_attach()
+        pending_state = replace(
+            saved.state,
+            phase=SharingPhase.WAIT_RETURN,
+            candidate_identity=None,
+            candidate_connection_identity=None,
+            candidate_since=None,
+            borrowed_identity=None,
+            last_viewer_left_at=100.0,
+            last_switch_at=95.0,
+            pending_action=SharingAction.RETURN_TO_ALLOWED,
+            intent_epoch=saved.state.intent_epoch + 1,
+        )
+        pending = self.ledger.save(
+            pending_state, action=SharingAction.RETURN_TO_ALLOWED,
+            expected_revision=saved.revision, not_before=155.0,
+        )
+        recovered = self.ledger.recover(
+            CHANNEL, configuration_generation="config-a", control_generation=3,
+            recorder_fence=12, now=110.0, expected_revision=pending.revision,
+            recovery_is_current=lambda *_args: True,
+        )
+        self.assertEqual(SharingAction.RETURN_TO_ALLOWED, recovered.intent.action)
+        self.assertEqual(SharingPhase.WAIT_RETURN, recovered.state.phase)
+        self.assertIsNone(recovered.state.borrowed_identity)
+        self.assertEqual(100.0, recovered.state.last_viewer_left_at)
+        self.assertEqual(95.0, recovered.state.last_switch_at)
+        self.assertEqual(155.0, recovered.intent.not_before)
+        self.assertGreater(recovered.intent.intent_epoch, pending.intent.intent_epoch)
+        self.assertEqual(12, recovered.state.recorder_fence)
+
+    def test_recovery_rejects_malformed_return_before_rebinding_row(self):
+        saved = self.save_attach()
+        pending_state = replace(
+            saved.state, phase=SharingPhase.WAIT_RETURN,
+            candidate_identity=None, candidate_connection_identity=None,
+            candidate_since=None, last_viewer_left_at=100.0,
+            pending_action=SharingAction.RETURN_TO_ALLOWED,
+            intent_epoch=saved.state.intent_epoch + 1,
+        )
+        pending = self.ledger.save(
+            pending_state, action=SharingAction.RETURN_TO_ALLOWED,
+            expected_revision=saved.revision, not_before=130.0,
+        )
+        with self.ledger._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE sharing_runtime SET not_before=? WHERE channel_uuid=?",
+                (math.inf, CHANNEL),
+            )
+            db.commit()
+        with self.ledger._database() as db:
+            before = dict(db.execute(
+                "SELECT * FROM sharing_runtime WHERE channel_uuid=?", (CHANNEL,),
+            ).fetchone())
+
+        with self.assertRaisesRegex(ValueError, "inconsistent|finite"):
+            self.ledger.recover(
+                CHANNEL, configuration_generation="config-a", control_generation=3,
+                recorder_fence=12, now=110.0, expected_revision=pending.revision,
+                recovery_is_current=lambda *_args: True,
+            )
+
+        with self.ledger._database() as db:
+            after = dict(db.execute(
+                "SELECT * FROM sharing_runtime WHERE channel_uuid=?", (CHANNEL,),
+            ).fetchone())
+        self.assertEqual(before, after)
+
+    def test_recovery_cancels_return_intent_after_control_change(self):
+        saved = self.save_attach()
+        pending_state = replace(
+            saved.state, phase=SharingPhase.WAIT_RETURN,
+            candidate_identity=None, candidate_connection_identity=None,
+            candidate_since=None, last_viewer_left_at=100.0,
+            pending_action=SharingAction.RETURN_TO_ALLOWED,
+            intent_epoch=saved.state.intent_epoch + 1,
+        )
+        pending = self.ledger.save(
+            pending_state, action=SharingAction.RETURN_TO_ALLOWED,
+            expected_revision=saved.revision, not_before=130.0,
+        )
+        recovered = self.ledger.recover(
+            CHANNEL, configuration_generation="config-a", control_generation=4,
+            recorder_fence=12, now=110.0, expected_revision=pending.revision,
+            recovery_is_current=lambda *_args: True,
+        )
+        self.assertIsNone(recovered.intent)
+        self.assertEqual(SharingPhase.DEDICATED, recovered.state.phase)
+        self.assertIsNone(recovered.state.borrowed_identity)
+        ran, _ = self.ledger.run_if_current(
+            saved.intent,
+            fresh_validate=lambda _token: True,
+            side_effect=lambda _token: self.fail("pre-restart intent ran"),
+        )
+        self.assertFalse(ran)
+
+    def test_corrupt_persisted_action_fails_closed(self):
+        saved = self.save_attach()
+        with self.ledger._connect() as db:
+            db.execute(
+                "UPDATE sharing_runtime SET action=? WHERE channel_uuid=?",
+                ("unknown-action", CHANNEL),
+            )
+        with self.assertRaises(ValueError):
+            self.ledger.read(CHANNEL)
+        self.assertEqual(1, saved.revision)
+
+    def test_state_only_write_clears_pending_intent(self):
+        saved = self.save_attach()
+        cleared_state = replace(saved.state, pending_action=None)
+        cleared = self.ledger.save(
+            cleared_state,
+            action=None,
+            expected_revision=saved.revision,
+        )
+        self.assertIsNone(cleared.intent)
+        ran, _ = self.ledger.run_if_current(
+            saved.intent,
+            fresh_validate=lambda _token: True,
+            side_effect=lambda _token: self.fail("cleared intent ran"),
+        )
+        self.assertFalse(ran)
+
+    def test_explicit_stop_is_persisted_even_without_planner_pending_action(self):
+        stopped = replace(
+            pending_attach(),
+            phase=SharingPhase.STOPPED,
+            pending_action=None,
+        )
+        saved = self.ledger.save(
+            stopped,
+            action=SharingAction.STOP,
+            expected_revision=None,
+            not_before=105.0,
+        )
+        self.assertEqual(SharingAction.STOP, saved.intent.action)
+        ran, result = self.ledger.run_if_current(
+            saved.intent,
+            fresh_validate=lambda token: token.action is SharingAction.STOP,
+            side_effect=lambda token: token.action.value,
+        )
+        self.assertTrue(ran)
+        self.assertEqual("stop", result)
+
+    def test_nonborrow_target_is_rejected_before_persisting_any_intent(self):
+        for action, phase, pending in (
+            (SharingAction.RETURN_TO_ALLOWED, SharingPhase.FAILED, SharingAction.RETURN_TO_ALLOWED),
+            (SharingAction.PAUSE_NO_ALLOWED_SOURCE, SharingPhase.FAILED,
+             SharingAction.PAUSE_NO_ALLOWED_SOURCE),
+            (SharingAction.STOP, SharingPhase.STOPPED, None),
+        ):
+            with self.subTest(action=action):
+                ledger = SharingIntentLedger(
+                    Path(self.directory.name) / f"invalid-{action.value}.sqlite3",
+                    clock=lambda: self.now[0],
+                )
+                current = ledger.save(
+                    pending_attach(), action=SharingAction.ATTACH_BORROW,
+                    expected_revision=None, target_identity=IDENTITY,
+                    target_admitted=True, not_before=105.0,
+                )
+                before = ledger.read(CHANNEL)
+                invalid_state = replace(current.state, phase=phase, pending_action=pending)
+                with self.assertRaises(ValueError):
+                    ledger.save(
+                        invalid_state, action=action, expected_revision=current.revision,
+                        target_identity=IDENTITY, target_admitted=False, not_before=105.0,
+                    )
+                self.assertEqual(before, ledger.read(CHANNEL))
+
+
+if __name__ == "__main__":
+    unittest.main()
