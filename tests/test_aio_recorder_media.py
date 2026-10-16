@@ -1365,6 +1365,65 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertIs(found_client_manager, client_manager)
         self.assertEqual([("worker", "catchuparr-client-borrow")], checks)
 
+    def test_native_active_reconciles_borrow_added_after_membership_snapshot(self):
+        class BorrowRedis:
+            def __init__(self):
+                self.client_count_reads = 0
+                self.member_reads = 0
+
+            def get(self, _key):
+                return b"native-owner"
+
+            def scard(self, _key):
+                self.client_count_reads += 1
+                return 1
+
+            def smembers(self, _key):
+                self.member_reads += 1
+                if self.member_reads == 1:
+                    return {b"ordinary-client"}
+                return {b"ordinary-client", b"catchuparr-client-borrow"}
+
+            def hget(self, key, field):
+                if key == "metadata" and field == "state":
+                    return b"ACTIVE"
+                if key == "clients:ordinary-client" and field == "connected_at":
+                    return b"100.5"
+                if key == "clients:ordinary-client" and field == "worker_id":
+                    return b"native-owner"
+                return None
+
+        class Keys:
+            channel_owner = staticmethod(lambda _worker: "owner")
+            channel_metadata = staticmethod(lambda _worker: "metadata")
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Fields:
+            STATE = "state"
+
+        class States:
+            ACTIVE = "ACTIVE"
+
+        redis = BorrowRedis()
+        manager = SimpleNamespace(running=True)
+        client_manager = SimpleNamespace(get_client_count=lambda: 1)
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            stream_managers={"worker": manager},
+            client_managers={"worker": client_manager},
+        )
+        probe._wait_for_native_client_count(
+            redis, server, Keys, "worker", 1, expected_local=1, timeout=1,
+        )
+        owner, _, _ = probe._wait_for_native_active(
+            redis, server, "worker", redis_keys=Keys,
+            metadata_field=Fields, channel_state=States, timeout=1,
+            verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+        )
+        self.assertEqual("native-owner", owner)
+        self.assertEqual(2, redis.member_reads)
+        self.assertEqual(1, redis.client_count_reads)
+
     def test_native_active_rejects_any_extra_client_beyond_exact_borrow(self):
         class BorrowRedis:
             def get(self, _key):

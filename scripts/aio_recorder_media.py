@@ -1423,24 +1423,37 @@ def _wait_for_native_active(
         _require(manager is not None, "Native recorder parent stream manager is absent")
         _require(client_manager is not None, "Native recorder parent client manager is absent")
         local_clients = int(client_manager.get_client_count())
-        global_clients = int(redis_client.scard(clients_key) or 0)
         if verified_borrow_client_ids is None:
+            global_clients = int(redis_client.scard(clients_key) or 0)
             _require(
                 local_clients == 1 and global_clients == 1,
                 "Native recorder parent client detached before ACTIVE readiness",
             )
         else:
+            # SMEMBERS is the authoritative complete membership observation.
+            # Do not compare it with a separately sampled SCARD: an atomic
+            # borrow registration can occur between those two Redis reads.
             client_ids = {
                 _redis_text(value) for value in redis_client.smembers(clients_key)
             }
             verified_borrow_ids = {
                 _redis_text(value) for value in verified_borrow_client_ids()
             }
+            if verified_borrow_ids - client_ids:
+                # The server verifier saw an atomic registration that committed
+                # after this membership snapshot. Reconcile inside the existing
+                # bounded ACTIVE deadline with a fresh complete set read.
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Native recorder did not reach ACTIVE before its bounded timeout"
+                    )
+                time.sleep(min(0.01, remaining))
+                continue
             current_borrow_ids = client_ids & verified_borrow_ids
             ordinary_ids = client_ids - current_borrow_ids
             _require(
                 local_clients == 1
-                and global_clients == len(client_ids)
                 and len(client_ids) in (1, 2)
                 and len(ordinary_ids) == 1
                 and len(current_borrow_ids) == len(verified_borrow_ids)
