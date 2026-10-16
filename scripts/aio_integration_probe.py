@@ -558,6 +558,8 @@ def probe():
     time_key = "utc" if __version__ == "0.32.0" else "start"
     xc_params = {"username": user.username, "password": xc_password,
                  "stream": str(channel.id), "duration": "1"}
+    params = {"access_token": token, "channel_id": str(channel.uuid),
+              "utc": str(start.timestamp()), "duration": "12"}
     first_xc = timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php",
         dict(xc_params, stream=str(closed_channel.id),
@@ -566,10 +568,46 @@ def probe():
     ))
     require(first_xc.status_code == 206,
             f"XC before first HLS request must migrate legacy sessions: {first_xc.status_code}")
+    from catchuparr.xc_runtime import _ts_service
+
+    first_xc_service = _ts_service(root, timeshift)
+    with first_xc_service._connect() as database:
+        first_xc_leases = database.execute(
+            "SELECT lease_id FROM ts_playback_sessions WHERE user_id=? AND channel_id=?",
+            (str(user.id), str(closed_channel.uuid)),
+        ).fetchall()
+    require(len(first_xc_leases) == 1,
+            "Synthetic XC response must own exactly one stream-limit session")
+    blocked_no_guide = views.archive_view(request(
+        "/catchuparr/archive", dict(params, channel_id=str(no_guide_channel.uuid))
+    ))
+    require(
+        blocked_no_guide.status_code == 403
+        and blocked_no_guide.content.strip() == b"stream limit exceeded",
+        "One-slot limit must block HLS while the synthetic XC response is active",
+    )
     try:
         require(b"".join(first_xc.streaming_content) == b"\x47" + bytes([2]) * 187)
     finally:
         first_xc.close()
+    for (lease_id,) in first_xc_leases:
+        with first_xc_service._connect() as database:
+            still_active = database.execute(
+                "SELECT 1 FROM ts_playback_sessions WHERE lease_id=? AND user_id=? "
+                "AND channel_id=?",
+                (lease_id, str(user.id), str(closed_channel.uuid)),
+            ).fetchone()
+        if still_active is not None:
+            require(first_xc_service.end_user_session(
+                user.id, str(closed_channel.uuid), lease_id,
+            ), "Finished synthetic XC session did not close")
+    with first_xc_service._connect() as database:
+        remaining_first_xc = database.execute(
+            "SELECT COUNT(*) FROM ts_playback_sessions WHERE user_id=? AND channel_id=?",
+            (str(user.id), str(closed_channel.uuid)),
+        ).fetchone()[0]
+    require(remaining_first_xc == 0,
+            "Synthetic XC disconnect left a stream-limit session behind")
 
     require(views.m3u_view(request("/catchuparr/m3u")).status_code == 401)
     playlist = views.m3u_view(request("/catchuparr/m3u", {"access_token": token}))
@@ -580,8 +618,6 @@ def probe():
     require('catchup-timezone="UTC"' in text)
     require("duration={duration}" in text)
     require(str(channel.uuid) in text and str(private_channel.uuid) not in text)
-    params = {"access_token": token, "channel_id": str(channel.uuid),
-              "utc": str(start.timestamp()), "duration": "12"}
     expired = views.archive_view(request(
         "/catchuparr/archive",
         dict(params, utc=str((start - timedelta(hours=2)).timestamp())),
@@ -851,8 +887,6 @@ def probe():
     finally:
         continuous_xc.close()
         redis_client.delete(continuous_recorder_lease)
-    from catchuparr.xc_runtime import _ts_service
-
     continuous_service = _ts_service(root, timeshift)
     with sqlite3.connect(root / "archive.sqlite3") as database:
         continuous_leases = database.execute(
