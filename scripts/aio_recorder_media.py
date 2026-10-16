@@ -107,7 +107,15 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
         "already_running", "no_permitted_sources", "proxy_integration_unsupported",
         "sharing_return_recovery_pending", "sharing_authority_unavailable",
         "sharing_cleanup_pending", "sharing_admission_uncertain", "recording_paused",
-        "stale_control", "disabled", "stale_configuration", "outside_schedule",
+        "sharing_unavailable", "control_unavailable", "legacy_job", "stale_control",
+        "disabled", "stale_configuration", "invalid_schedule", "outside_schedule",
+    }
+    allowed_exception_classes = {
+        "AssertionError", "AttributeError", "BorrowBindingLost", "CalledProcessError",
+        "ConnectionError", "FileExistsError", "ImportError", "KeyError", "OSError",
+        "PermissionError", "RecorderAttemptAdmissionUncertain", "RecorderControlError",
+        "RecorderLeaseError", "RedisError", "RuntimeError", "ScheduleError",
+        "TimeoutError", "TimeoutExpired", "TypeError", "ValueError",
     }
 
     def safe_status(value):
@@ -133,8 +141,15 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
     )
     failure_classes = []
     for failure in failures:
-        last_part = failure.rsplit(":", 1)[-1] if isinstance(failure, str) else ""
-        failure_classes.append(last_part if last_part.isidentifier() else "other")
+        if isinstance(failure, str):
+            class_name = (
+                failure[len("task:"):] if failure.startswith("task:") else failure
+            )
+        else:
+            class_name = ""
+        failure_classes.append(
+            class_name if class_name in allowed_exception_classes else "other"
+        )
 
     process_exit_codes = []
     for process in processes:

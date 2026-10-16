@@ -48,7 +48,10 @@ class RecorderMediaProbeTests(unittest.TestCase):
             _lock=threading.Lock(),
             thread=thread,
             stop_event=threading.Event(),
-            failures=["task:ValueError"],
+            failures=[
+                "task:ValueError", "SyntheticSecretTokenABC123",
+                "arbitrary:SyntheticSecretTokenABC123",
+            ],
             result={"status": "sharing_cleanup_pending"},
             results=[SimpleNamespace(
                 status="media_stalled", useful_segments=0, return_code=17,
@@ -78,7 +81,9 @@ class RecorderMediaProbeTests(unittest.TestCase):
         )
         diagnostic = json.loads(line.split(" ", 1)[1])
         self.assertEqual("sharing_cleanup_pending", diagnostic["task_status"])
-        self.assertEqual(["ValueError"], diagnostic["failure_classes"])
+        self.assertEqual(
+            ["ValueError", "other", "other"], diagnostic["failure_classes"],
+        )
         self.assertEqual(
             [{
                 "status": "media_stalled", "useful_segments": 0,
@@ -88,6 +93,29 @@ class RecorderMediaProbeTests(unittest.TestCase):
         )
         self.assertEqual([17], diagnostic["process_exit_codes"])
         self.assertNotIn("synthetic-bearer-secret", line)
+        self.assertNotIn("SyntheticSecretTokenABC123", line)
+
+    def test_recorder_task_diagnostic_preserves_finite_task_statuses_only(self):
+        statuses = {
+            "control_unavailable", "legacy_job", "invalid_schedule",
+            "sharing_unavailable", "sharing_return_recovery_pending",
+            "sharing_authority_unavailable", "sharing_cleanup_pending",
+            "sharing_admission_uncertain", "recording_paused", "stale_control",
+            "disabled", "stale_configuration", "outside_schedule",
+            "no_permitted_sources", "proxy_integration_unsupported",
+            "already_running", "stopped", "no_media",
+        }
+        for status in statuses:
+            with self.subTest(status=status):
+                diagnostic = probe._recorder_task_early_exit_diagnostic(
+                    SimpleNamespace(result={"status": status})
+                )
+                self.assertEqual(status, diagnostic["task_status"])
+
+        diagnostic = probe._recorder_task_early_exit_diagnostic(
+            SimpleNamespace(result={"status": "SyntheticSecretTokenABC123"})
+        )
+        self.assertEqual("other", diagnostic["task_status"])
 
     def test_teardown_budget_accounts_for_sequential_shutdown_and_marker_ttl(self):
         self.assertEqual(
