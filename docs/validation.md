@@ -27,14 +27,14 @@ tree, and has SHA-256
 Required GitHub CI and publication remain pending. This synthetic server-side
 acceptance does not establish real-player acceptance or stable-release status.
 
-The release gate must demonstrate existing-viewer borrowing without another
-provider request, no opening of excluded sources, ordinary-viewer preservation
-through Stop, exact client/process cleanup before fallback launch, cooldown
-deadlines, repeated borrow/return, Apply and Stop revocation, restart recovery,
-failure handling and acknowledgement retries. The complete checklist is in the
-[candidate guide](candidate-0.6.0.md). The pinned 0.32.0 AIO passed this
-checklist; required GitHub CI and publication remain outstanding. Synthetic
-server-side tests do not establish real-player acceptance.
+The native acceptance checklist covered existing-viewer borrowing without
+another provider request, no opening of excluded sources, ordinary-viewer
+preservation through Stop, exact client/process cleanup before fallback
+launch, cooldown deadlines, repeated borrow/return, Apply and Stop revocation,
+restart recovery, failure handling and acknowledgement retries. The complete
+checklist is in the [candidate guide](candidate-0.6.0.md). The pinned 0.32.0
+AIO passed it; required GitHub CI and publication remain outstanding.
+Synthetic server-side tests do not establish real-player acceptance.
 
 ## 0.5.1 named profile inheritance prerelease
 
