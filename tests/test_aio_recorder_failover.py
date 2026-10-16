@@ -39,6 +39,46 @@ class _SyntheticArchiveStore:
 
 
 class RecorderFailoverMediaTests(unittest.TestCase):
+    def test_thread_database_cleanup_runs_on_normal_and_exceptional_exit(self):
+        cleanup_threads = []
+
+        def cleanup():
+            cleanup_threads.append(threading.get_ident())
+
+        def run_case(callback):
+            owner_thread = []
+            failures = []
+
+            def invoke():
+                owner_thread.append(threading.get_ident())
+                try:
+                    probe._run_with_thread_database_cleanup(callback)
+                except Exception as exc:
+                    failures.append(exc)
+
+            with patch.object(probe, "_close_current_thread_database_connections", cleanup):
+                thread = threading.Thread(target=invoke)
+                thread.start()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(cleanup_threads[-1], owner_thread[0])
+            return failures
+
+        with self.subTest("normal exit"):
+            result = []
+            run_case(lambda: result.append("complete"))
+            self.assertEqual(result, ["complete"])
+
+        with self.subTest("exception exit"):
+            def fail():
+                raise RuntimeError("synthetic task failure")
+
+            failures = run_case(fail)
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0], RuntimeError)
+            self.assertEqual(str(failures[0]), "synthetic task failure")
+        self.assertEqual(len(cleanup_threads), 2)
+
     def test_failover_configuration_forces_global_sharing_off(self):
         original = {
             "filter_config": "version: 1\nrules: []\n",
