@@ -141,6 +141,86 @@ def _source_removal_transition_conditions(
     }
 
 
+def _stop_join_and_freeze_attempt_bindings(
+    task,
+    read_records,
+    *,
+    baseline_worker_ids: set[str],
+    stream_id: str,
+    cooperative_sleep=time.sleep,
+):
+    """Stop a recorder task, then freeze every exact attempt it created.
+
+    Attempts observed before stop are retained as evidence, but the final set
+    is read only after join so a retry created during shutdown cannot escape
+    the cleanup oracle.
+    """
+    def matching(records):
+        return [
+            record for record in records
+            if record.get("stream_id") == stream_id
+            and record.get("worker_id")
+            and str(record.get("worker_id")) not in baseline_worker_ids
+        ]
+
+    before = matching(read_records())
+    task.stop()
+    task.join(timeout=25, cooperative_sleep=cooperative_sleep)
+    after = matching(read_records())
+    by_worker = {}
+    for record in (*before, *after):
+        worker_id = str(record["worker_id"])
+        binding = (
+            record.get("capability_digest"),
+            record.get("reservation_id"),
+        )
+        if (not all(isinstance(value, str) and value for value in binding)
+                or (worker_id in by_worker and by_worker[worker_id] != binding)):
+            return (), {}, False
+        by_worker[worker_id] = binding
+    return tuple(sorted(by_worker)), {
+        worker: {
+            "capability_digest": by_worker[worker][0],
+            "reservation_id": by_worker[worker][1],
+        }
+        for worker in sorted(by_worker)
+    }, bool(by_worker)
+
+
+def _attempt_records_match_frozen_bindings(
+    records,
+    *,
+    baseline_worker_ids: set[str],
+    stream_id: str,
+    attempt_ids: tuple[str, ...],
+    bindings: dict,
+):
+    """Require an unchanged frozen attempt set and all exact credentials."""
+    matching = [
+        record for record in records
+        if record.get("stream_id") == stream_id
+        and record.get("worker_id")
+        and str(record.get("worker_id")) not in baseline_worker_ids
+    ]
+    current_ids = {str(record["worker_id"]) for record in matching}
+    if current_ids != set(attempt_ids):
+        return False, {}
+    by_worker = {str(record["worker_id"]): record for record in matching}
+    exact = all(
+        by_worker[worker].get("capability_digest")
+        == bindings[worker]["capability_digest"]
+        and by_worker[worker].get("reservation_id")
+        == bindings[worker]["reservation_id"]
+        for worker in attempt_ids
+    )
+    return exact, by_worker
+
+
+def _profile_count_matches_original_baseline(current_count: int, original_baseline: int) -> bool:
+    """Do not let an intermediate async reservation become the expected value."""
+    return current_count == original_baseline
+
+
 def _wait_for_source_removal_transition(
     snapshot_reader,
     timeout_seconds: float,
@@ -5318,9 +5398,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             if record.get("stream_id") == str(stream_b.id)
             and record.get("worker_id")
         }
-        restart_b_profile_baseline = _profile_count(
-            redis_client, profile_b.id, profile_connections_key,
-        )
+        # Compare against the original pre-probe baseline. Sampling during
+        # asynchronous cleanup could capture a still-live B reservation as
+        # the expected value and hide its later leak.
+        restart_b_profile_baseline = profile_baselines[profile_b.id]
         source_server.set_mode("source-b.ts", "unavailable")
         restart_b_request_baseline = len(source_server.request_times("source-b.ts"))
         live_session.close()
@@ -5358,55 +5439,37 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             _require(time.monotonic() < b_unavailable_deadline,
                      "Task did not attempt B while the RETURN intent was pending")
             gevent_sleep(0.05)
-        restart_b_attempt_records = [
-            record for record in _worker_records(redis_client, worker_id)
-            if record.get("stream_id") == str(stream_b.id)
-            and record.get("worker_id")
-            and str(record.get("worker_id")) not in restart_b_worker_ids_before
-        ]
-        restart_b_attempt_ids = tuple(sorted({
-            str(record.get("worker_id")) for record in restart_b_attempt_records
-        }))
-        _require(
-            bool(restart_b_attempt_ids)
-            and all(
-                isinstance(record.get("capability_digest"), str)
-                and record.get("capability_digest")
-                and isinstance(record.get("reservation_id"), str)
-                and record.get("reservation_id")
-                for record in restart_b_attempt_records
-            ),
-            "Pending RETURN did not expose exact B attempt cleanup bindings",
+        (
+            restart_b_attempt_ids,
+            restart_b_attempt_bindings,
+            restart_b_attempts_bound,
+        ) = _stop_join_and_freeze_attempt_bindings(
+            run_share,
+            lambda: _worker_records(redis_client, worker_id),
+            baseline_worker_ids=restart_b_worker_ids_before,
+            stream_id=str(stream_b.id),
+            cooperative_sleep=gevent_sleep,
         )
-        restart_b_attempt_bindings = {
-            str(record["worker_id"]): {
-                "capability_digest": str(record["capability_digest"]),
-                "reservation_id": str(record["reservation_id"]),
-            }
-            for record in restart_b_attempt_records
-        }
-        run_share.stop()
-        run_share.join(timeout=25, cooperative_sleep=gevent_sleep)
+        _require(
+            restart_b_attempts_bound,
+            "Pending RETURN did not expose stable exact B attempt bindings after task join",
+        )
         restart_b_request_count_after_stop = len(
             source_server.request_times("source-b.ts"),
         )
 
         def restart_b_cleanup_snapshot():
-            current_records = {
-                str(record.get("worker_id")): record
-                for record in _worker_records(redis_client, worker_id)
-                if record.get("worker_id")
-                and str(record.get("worker_id")) in restart_b_attempt_ids
-            }
-            records = [current_records.get(worker) for worker in restart_b_attempt_ids]
-            exact_bindings = all(
-                record is not None
-                and record.get("capability_digest")
-                == restart_b_attempt_bindings[worker]["capability_digest"]
-                and record.get("reservation_id")
-                == restart_b_attempt_bindings[worker]["reservation_id"]
-                for worker, record in zip(restart_b_attempt_ids, records)
+            attempt_set_unchanged, current_records = (
+                _attempt_records_match_frozen_bindings(
+                    _worker_records(redis_client, worker_id),
+                    baseline_worker_ids=restart_b_worker_ids_before,
+                    stream_id=str(stream_b.id),
+                    attempt_ids=restart_b_attempt_ids,
+                    bindings=restart_b_attempt_bindings,
+                )
             )
+            records = [current_records.get(worker) for worker in restart_b_attempt_ids]
+            exact_bindings = attempt_set_unchanged
             ledger_released = bool(records) and all(
                 record is not None
                 and record.get("state") in {"failed", "released"}
@@ -5440,6 +5503,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 "conditions": {
                     "attempt_ledger_released": ledger_released,
                     "attempt_binding_preserved": exact_bindings,
+                    "attempt_set_unchanged_after_join": attempt_set_unchanged,
                     "attempt_markers_absent": private_markers_absent,
                     "native_resources_absent": native_resources_absent,
                     "provider_b_inactive": provider_active["source-b.ts"] == 0,
@@ -5450,8 +5514,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                         == restart_b_request_count_after_stop
                     ),
                     "profile_b_at_baseline": (
-                        _profile_count(redis_client, profile_b.id, profile_connections_key)
-                        == restart_b_profile_baseline
+                        _profile_count_matches_original_baseline(
+                            _profile_count(
+                                redis_client, profile_b.id,
+                                profile_connections_key,
+                            ),
+                            restart_b_profile_baseline,
+                        )
                     ),
                 },
                 "worker_states": [
