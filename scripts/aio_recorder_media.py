@@ -420,6 +420,31 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
     }
 
 
+def _wait_for_allowed_source_request(
+    run,
+    request_times_reader,
+    request_baseline: int,
+    *,
+    timeout: float,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> float:
+    """Wait for the existing allowed-source request gate and report task state on failure."""
+    message = "Allowed B did not start after the observed native return deadline"
+    deadline = monotonic() + timeout
+    request_times = request_times_reader()
+    while len(request_times) <= request_baseline and monotonic() < deadline:
+        sleep(0.05)
+        request_times = request_times_reader()
+    _require_with_failure_diagnostic(
+        len(request_times) > request_baseline,
+        message,
+        lambda: _recorder_task_early_exit_diagnostic(run),
+        diagnostic_label="CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC",
+    )
+    return request_times[request_baseline]
+
+
 def _assert_private_worker_stop_request_count(before: dict, after: dict) -> None:
     """A cooperative stop must not open another provider request."""
     _require(
@@ -4736,14 +4761,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             return True
 
         source_server.install_request_start_callback(verify_first_b_effect)
-        b_request_deadline = time.monotonic() + 150
-        b_request_times = source_server.request_times("source-b.ts")
-        while len(b_request_times) <= share_b_request_baseline:
-            _require(time.monotonic() < b_request_deadline,
-                     "Allowed B did not start after the observed native return deadline")
-            gevent_sleep(0.05)
-            b_request_times = source_server.request_times("source-b.ts")
-        first_return_request_at = b_request_times[share_b_request_baseline]
+        first_return_request_at = _wait_for_allowed_source_request(
+            run_share,
+            lambda: source_server.request_times("source-b.ts"),
+            share_b_request_baseline,
+            timeout=150,
+            sleep=gevent_sleep,
+        )
         callback_deadline = time.monotonic() + 5
         while not source_server.request_callback_finished.is_set():
             _require(time.monotonic() < callback_deadline,
