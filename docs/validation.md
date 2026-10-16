@@ -40,6 +40,10 @@ Synthetic server-side tests do not establish real-player acceptance.
 
 Version 0.6.1 replaces per-channel sharing YAML with global sharing settings, migrates uniform prior values and requires explicit confirmation for conflicts. Its initial attach skips the live stability delay while later switches preserve the configured timing and guards. Focused unit tests cover these changes; required GitHub CI and publication remain pending. See the [0.6.1 candidate guide](candidate-0.6.1.md).
 
+## 0.6.2 continuous catch-up candidate
+
+Version 0.6.2 keeps M3U/XMLTV HLS sessions bounded to 24 hours while allowing playback through multiple programme boundaries without later EPG metadata. XC follows contiguous indexed TS segments within Dispatcharr's configured duration bound, stops at actual gaps and waits at most 10 seconds at the live edge. Focused synthetic tests cover continuation, appends, missing EPG, seeks, gaps and finite stop behavior. Required GitHub CI and real-player acceptance remain pending. See the [0.6.2 candidate guide](candidate-0.6.2.md).
+
 ## 0.5.1 named profile inheritance prerelease
 
 The candidate passed 453 unit tests, Ruff, Python compilation and package

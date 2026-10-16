@@ -274,6 +274,17 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
         if window is None:
             return False
         start, end = window
+        maximum_value = getattr(timeshift_views, "MAX_DURATION_MINUTES", None)
+        if maximum_value is None:
+            maximum_value = _timeshift_helper("MAX_DURATION_MINUTES", 480)
+        maximum = _positive_duration_constant(maximum_value, 480)
+        requested_minutes = _client_duration_minutes(duration_hint, maximum)
+        coverage_end = (
+            start + timedelta(minutes=requested_minutes)
+            if requested_minutes is not None
+            else start + timedelta(seconds=6)
+        )
+        end = min(end, coverage_end)
         now = datetime.now(timezone.utc)
         if start > now:
             return False
@@ -391,7 +402,7 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
 
 
 def _local_playback_window(timeshift_views, channel, timestamp, duration_hint):
-    """Resolve the exact requested local window without provider lag padding."""
+    """Resolve a bounded XC window that can cross into later programmes."""
     parser = getattr(timeshift_views, "parse_catchup_timestamp", None)
     if parser is None:
         return None
@@ -410,24 +421,11 @@ def _local_playback_window(timeshift_views, channel, timestamp, duration_hint):
     if maximum_value is None:
         maximum_value = _timeshift_helper("MAX_DURATION_MINUTES", 480)
     maximum = _positive_duration_constant(maximum_value, 480)
-    minutes = _client_duration_minutes(duration_hint, maximum)
-    if minutes is not None:
-        return start, start + timedelta(minutes=minutes)
-
-    # For URL shapes without a usable duration, use the guide's actual end.
-    # Provider playback keeps using Dispatcharr's padded resolver unchanged.
-    programme_info = getattr(timeshift_views, "get_programme_info", None)
-    if programme_info is None:
-        programme_info = _timeshift_helper("get_programme_info")
-    if programme_info is not None:
-        try:
-            info = programme_info(channel, timestamp)
-        except Exception:
-            info = None
-        end = _programme_end_utc(info)
-        if end is not None and end > start:
-            return start, min(end, start + timedelta(minutes=maximum))
-    return None
+    if duration_hint is not None and _client_duration_minutes(duration_hint, maximum) is None:
+        return None
+    # The URL duration identifies the selected programme. Keep the local
+    # resource open through later programmes, bounded by Dispatcharr's limit.
+    return start, start + timedelta(minutes=maximum)
 
 
 def _timeshift_helper(name, default=None):

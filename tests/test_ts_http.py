@@ -1,5 +1,7 @@
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -64,6 +66,62 @@ class ArchiveTSPlaybackTests(unittest.TestCase):
             older_than_utc=self.start + timedelta(days=1), max_bytes=0
         )
         self.assertCountEqual(removed, paths)
+
+    def test_live_stream_follows_new_segments_across_multiple_programme_boundaries(self):
+        self.add_segment("programme-a.ts", 0, b"programme-a")
+        response = self.request(
+            end=self.start + timedelta(hours=8), live=True, live_follow_seconds=1,
+        )
+        self.assertNotIn("Content-Length", response.headers)
+
+        def append_following():
+            time.sleep(0.05)
+            self.add_segment("programme-b.ts", 6, b"programme-b")
+            time.sleep(0.05)
+            self.add_segment("programme-c.ts", 12, b"programme-c")
+
+        writer = threading.Thread(target=append_following)
+        writer.start()
+        try:
+            body = b"".join(response.body)
+        finally:
+            writer.join(timeout=2)
+            response.close()
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(
+            body, b"programme-aprogramme-bprogramme-c",
+        )
+
+    def test_live_stream_stops_at_real_gap(self):
+        self.add_segment("first.ts", 0, b"first")
+        gap_response = self.request(
+            end=self.start + timedelta(hours=8), live=True, live_follow_seconds=1,
+        )
+        writer = threading.Thread(
+            target=lambda: (
+                time.sleep(0.05),
+                self.add_segment("after-gap.ts", 18, b"after-gap"),
+            )
+        )
+        writer.start()
+        try:
+            self.assertEqual(b"".join(gap_response.body), b"first")
+        finally:
+            writer.join(timeout=2)
+            gap_response.close()
+
+    def test_live_stream_has_bounded_idle_wait_when_recorder_has_stopped(self):
+        self.add_segment("first.ts", 0, b"first")
+        idle_response = self.request(
+            end=self.start + timedelta(hours=8), live=True, live_follow_seconds=0.05,
+        )
+        before = time.monotonic()
+        try:
+            self.assertEqual(b"".join(idle_response.body), b"first")
+        finally:
+            idle_response.close()
+        self.assertLess(time.monotonic() - before, 0.5)
 
     def test_range_reads_join_adjacent_segment_bytes(self):
         self.add_segment("first.ts", 0, b"abcdef")

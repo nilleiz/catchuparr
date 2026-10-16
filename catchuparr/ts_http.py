@@ -126,6 +126,8 @@ class ArchiveTSPlaybackService:
     ``max_lease_span_seconds``. Responses read immutable segment files in
     bounded chunks. Full responses and byte ranges crossing a gap or explicit
     discontinuity are rejected because raw TS concatenation is not safe there.
+    Live full responses follow newly indexed contiguous segments for a bounded
+    idle interval and stop at real gaps.
 
     ``allow_new_session`` receives the number of other local sessions for the
     user and, when supported, the hashed device key. Runtime callers should
@@ -245,7 +247,7 @@ class ArchiveTSPlaybackService:
         method: str = "GET",
         range_header: str | None = None,
         live: bool = False,
-        live_follow_seconds: float = 1.0,
+        live_follow_seconds: float = 10.0,
     ) -> TSHTTPResponse | StreamingTSHTTPResponse:
         """Token-authenticated standalone entry point."""
         if self.tokens is None or not token:
@@ -280,7 +282,7 @@ class ArchiveTSPlaybackService:
         method: str = "GET",
         range_header: str | None = None,
         live: bool = False,
-        live_follow_seconds: float = 1.0,
+        live_follow_seconds: float = 10.0,
     ) -> TSHTTPResponse | StreamingTSHTTPResponse:
         """Serve local TS for a user already authenticated by Dispatcharr."""
         method = method.upper()
@@ -290,7 +292,7 @@ class ArchiveTSPlaybackService:
             return _error(400, "invalid playback session")
         if not isinstance(device_key, str) or not _SESSION_ID_RE.fullmatch(device_key):
             return _error(400, "invalid playback device")
-        if not isinstance(live_follow_seconds, (int, float)) or not 0 <= live_follow_seconds <= 10:
+        if not isinstance(live_follow_seconds, (int, float)) or not 0 <= live_follow_seconds <= 60:
             return _error(400, "invalid live follow timeout")
         user = str(user_id).strip()
         channel = str(channel_id).strip()
@@ -343,6 +345,7 @@ class ArchiveTSPlaybackService:
                 break
             time.sleep(min(0.1, remaining))
             segments = self.store.segments(channel, start, end)
+        segments = [item for item in segments if item.end_utc.timestamp() <= end]
         if not segments:
             finish_response()
             return _error(404, "no archived segments in requested range")
@@ -443,13 +446,17 @@ class ArchiveTSPlaybackService:
             "ETag": f'"{etag}"',
             "X-Content-Type-Options": "nosniff",
         }
+        follow_live_edge = (
+            method == "GET" and live and range_header is None and selected is None
+        )
         if selected is None:
             status, start_offset, end_offset = 200, 0, size - 1
         else:
             status, start_offset, end_offset = 206, selected.start, selected.end
             headers["Content-Range"] = f"bytes {selected.start}-{selected.end}/{size}"
         length = max(0, end_offset - start_offset + 1)
-        headers["Content-Length"] = str(length)
+        if not follow_live_edge:
+            headers["Content-Length"] = str(length)
         if method == "HEAD" or length == 0:
             finish_response()
             return TSHTTPResponse(status, headers)
@@ -488,6 +495,82 @@ class ArchiveTSPlaybackService:
                                 remaining -= len(chunk)
                                 yield chunk
                     virtual_offset += file_size
+                if follow_live_edge and live_follow_seconds:
+                    high_water = max(
+                        (item.end_utc.timestamp() for item in segments), default=start
+                    )
+                    seen_ids = {item.id for item in segments}
+                    follow_deadline = time.monotonic() + live_follow_seconds
+                    end_dt = datetime.fromtimestamp(end, timezone.utc)
+                    while high_water < end and time.monotonic() < follow_deadline:
+                        if time.monotonic() >= cancellation_check_at:
+                            if not self._response_stream_active(lease_id):
+                                raise OSError("playback session was stopped")
+                            cancellation_check_at = time.monotonic() + 0.5
+                        try:
+                            candidates = self.store.segments(
+                                channel,
+                                datetime.fromtimestamp(
+                                    max(start, high_water - 0.25), timezone.utc
+                                ),
+                                end_dt,
+                            )
+                        except (OSError, RuntimeError, sqlite3.Error):
+                            break
+                        following = sorted(
+                            (
+                                item for item in candidates
+                                if item.id not in seen_ids
+                                and item.end_utc.timestamp() > high_water
+                                and item.end_utc.timestamp() <= end
+                            ),
+                            key=lambda item: (item.start_utc, item.id),
+                        )
+                        if not following:
+                            time.sleep(min(0.1, max(0.0, follow_deadline - time.monotonic())))
+                            continue
+                        segment = following[0]
+                        if (
+                            segment.start_utc.timestamp() > high_water + 0.25
+                            or segment.discontinuity
+                        ):
+                            break
+                        if not self._renew_lease(
+                            user, channel, lease_id, device_key, segment
+                        ):
+                            raise OSError("playback lease expired during TS stream")
+                        try:
+                            path = Path(segment.path).resolve(strict=True)
+                            path.relative_to(Path(self.store.root).resolve(strict=True))
+                            file_size = path.stat().st_size
+                        except (OSError, ValueError):
+                            break
+                        with path.open("rb") as source:
+                            remaining = file_size
+                            while remaining:
+                                if time.monotonic() >= cancellation_check_at:
+                                    if not self._response_stream_active(lease_id):
+                                        raise OSError("playback session was stopped")
+                                    cancellation_check_at = time.monotonic() + 0.5
+                                if time.monotonic() >= renew_at:
+                                    if (
+                                        not self._renew_lease(
+                                            user, channel, lease_id, device_key, segment
+                                        )
+                                        or not self._renew_response_stream(
+                                            response_stream_id, lease_id
+                                        )
+                                    ):
+                                        raise OSError("playback lease expired during TS stream")
+                                    renew_at = time.monotonic() + renewal_interval
+                                chunk = source.read(min(_TS_STREAM_CHUNK_BYTES, remaining))
+                                if not chunk:
+                                    raise OSError("archive segment changed during TS stream")
+                                remaining -= len(chunk)
+                                yield chunk
+                        seen_ids.add(segment.id)
+                        high_water = max(high_water, segment.end_utc.timestamp())
+                        follow_deadline = time.monotonic() + live_follow_seconds
             finally:
                 finish_response(retain_live_session=live)
 
@@ -726,6 +809,7 @@ class ArchiveTSPlaybackService:
         if (
             segment.end_utc.timestamp() <= float(row["start_utc"])
             or segment.start_utc.timestamp() >= float(row["end_utc"])
+            or segment.end_utc.timestamp() > float(row["end_utc"])
         ):
             return False
         if not self.store.renew_playback(lease_id, ttl_seconds=self.lease_ttl_seconds):

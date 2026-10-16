@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 logger = logging.getLogger(__name__)
 ARCHIVE_FINALIZATION_GRACE_SECONDS = 120
+MAX_ARCHIVE_PLAYBACK_SECONDS = 24 * 60 * 60
 _ROUTE_NAMES = frozenset(
     {
         "catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive",
@@ -549,16 +550,13 @@ def archive_view(request):
     service = _archive_service(request, user, config)
     requested_end_epoch = start_epoch + duration_seconds
     continuation_end_epoch = None
-    authorized = (
+    if (
         service.authorize_user_channel(str(user.id), channel)
         and service.catchup_enabled(str(user.id), channel)
-    )
-    if authorized:
+    ):
         programme_end_epoch, next_programme_end_epoch = _archive_epg_bounds(
             channel, start_epoch, service.store
         )
-        if programme_end_epoch is None:
-            return finish(_no_cache(HttpResponse("No matching EPG programme", status=404)), "missing_epg")
     end_epoch, continuation_end_epoch = _archive_playback_window(
         start_epoch,
         duration_seconds,
@@ -571,8 +569,9 @@ def archive_view(request):
             service, str(user.id), channel, end_epoch, now_epoch
         ),
         request_identity_end=requested_end_epoch,
-        programme_end_utc=programme_end_epoch,
-        continuation_end_utc=continuation_end_epoch,
+        programme_end_utc=None,
+        continuation_end_utc=None,
+        continuous=True,
     )
     if request.method == "GET" and response.status == 200 and getattr(response, "body", None):
         try:
@@ -670,31 +669,9 @@ def _archive_playback_window(
     programme_end_epoch: float | None,
     next_programme_end_epoch: float | None,
 ) -> tuple[float, float | None]:
-    """Bound a shifted TiviMate window to one EPG programme at a time."""
-    requested_end = start_epoch + duration_seconds
-    if programme_end_epoch is None or programme_end_epoch <= start_epoch:
-        return requested_end, None
-    initial_end = min(requested_end, programme_end_epoch)
-    if next_programme_end_epoch is None:
-        return initial_end, None
-    if requested_end < programme_end_epoch and not math.isclose(
-        requested_end, programme_end_epoch, rel_tol=0.0, abs_tol=1.0
-    ):
-        return initial_end, None
-    if math.isclose(requested_end, programme_end_epoch, rel_tol=0.0, abs_tol=1.0):
-        continuation_end = min(
-            next_programme_end_epoch,
-            start_epoch + 24 * 60 * 60,
-        )
-        return initial_end, continuation_end if continuation_end > programme_end_epoch else None
-    continuation_end = min(
-        requested_end,
-        next_programme_end_epoch,
-        start_epoch + 24 * 60 * 60,
-    )
-    if continuation_end <= programme_end_epoch:
-        return initial_end, None
-    return initial_end, continuation_end
+    """Keep one bounded archive session across programme and guide changes."""
+    del duration_seconds, programme_end_epoch, next_programme_end_epoch
+    return start_epoch + MAX_ARCHIVE_PLAYBACK_SECONDS, None
 
 
 def _epg_epoch(value):
@@ -715,23 +692,32 @@ def _epg_epoch(value):
 
 
 def _archive_window_live(service, user_id, channel_id, end_epoch, now_epoch):
-    """Wait briefly for a final indexed segment after the EPG boundary."""
+    """Keep a playlist appendable only while the recorder edge is fresh."""
     from .engine.store import TIMELINE_GAP_TOLERANCE_SECONDS
 
-    if end_epoch > now_epoch:
-        return True
-    if now_epoch >= end_epoch + ARCHIVE_FINALIZATION_GRACE_SECONDS:
-        return False
     if not (
         service.authorize_user_channel(user_id, channel_id)
         and service.catchup_enabled(user_id, channel_id)
     ):
         return False
+    if end_epoch <= now_epoch:
+        if now_epoch >= end_epoch + ARCHIVE_FINALIZATION_GRACE_SECONDS:
+            return False
+        tail = service.store.segments(
+            channel_id,
+            end_epoch - ARCHIVE_FINALIZATION_GRACE_SECONDS,
+            end_epoch,
+        )
+        return not tail or max(
+            segment.end_utc.timestamp() for segment in tail
+        ) < end_epoch - TIMELINE_GAP_TOLERANCE_SECONDS
     tail = service.store.segments(
-        channel_id, end_epoch - ARCHIVE_FINALIZATION_GRACE_SECONDS, end_epoch
+        channel_id,
+        now_epoch - ARCHIVE_FINALIZATION_GRACE_SECONDS,
+        now_epoch + TIMELINE_GAP_TOLERANCE_SECONDS,
     )
-    return not tail or max(segment.end_utc.timestamp() for segment in tail) < (
-        end_epoch - TIMELINE_GAP_TOLERANCE_SECONDS
+    return bool(tail) and max(segment.end_utc.timestamp() for segment in tail) >= (
+        now_epoch - ARCHIVE_FINALIZATION_GRACE_SECONDS
     )
 
 
@@ -862,8 +848,6 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
     programme_end_epoch, next_programme_end_epoch = _archive_epg_bounds(
         channel, start_epoch, store
     )
-    if programme_end_epoch is None:
-        return _no_cache(HttpResponse("No matching EPG programme", status=404))
     end_epoch, continuation_end_epoch = _archive_playback_window(
         start_epoch,
         duration_seconds,
@@ -877,10 +861,7 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
         try:
             candidates = store.segments(channel, start_epoch, end_epoch)
             manifest = service._manifest_segments(
-                channel,
-                "[]",
-                candidates,
-                programme_end=programme_end_epoch,
+                channel, "[]", candidates, playback_end=end_epoch,
             )
         except (OSError, RuntimeError, sqlite3.Error):
             return _no_cache(HttpResponse(status=503))
@@ -897,8 +878,9 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
         end_epoch,
         live=_archive_window_live(service, str(user.id), channel, end_epoch, now_epoch),
         request_identity_end=requested_end_epoch,
-        programme_end_utc=programme_end_epoch,
-        continuation_end_utc=continuation_end_epoch,
+        programme_end_utc=None,
+        continuation_end_utc=None,
+        continuous=True,
     )
     if request.method == "GET" and response.status == 200 and response.body:
         _record_native_playback(

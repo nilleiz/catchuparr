@@ -102,7 +102,24 @@ class ViewBoundaryTests(unittest.TestCase):
         tail.clear()
         self.assertFalse(_archive_window_live(service, "viewer", "news", 1000, 1120))
 
-    def test_shifted_tivimate_windows_stop_at_the_actual_epg_programme_end(self):
+    def test_future_window_stays_live_only_while_indexed_edge_is_fresh(self):
+        now = datetime.now(timezone.utc).timestamp()
+        tail = [SimpleNamespace(end_utc=datetime.fromtimestamp(now - 5, timezone.utc))]
+        service = SimpleNamespace(
+            authorize_user_channel=lambda *_: True,
+            catchup_enabled=lambda *_: True,
+            store=SimpleNamespace(segments=lambda *_: list(tail)),
+        )
+
+        self.assertTrue(_archive_window_live(
+            service, "viewer", "news", now + 3600, now
+        ))
+        tail.clear()
+        self.assertFalse(_archive_window_live(
+            service, "viewer", "news", now + 3600, now
+        ))
+
+    def test_shifted_tivimate_windows_are_bounded_across_epg_programmes(self):
         programme_start = datetime(2026, 10, 7, 15, 15, tzinfo=timezone.utc)
         programme_end = datetime(2026, 10, 7, 16, 0, tzinfo=timezone.utc)
         next_end = datetime(2026, 10, 7, 16, 45, tzinfo=timezone.utc)
@@ -166,33 +183,20 @@ class ViewBoundaryTests(unittest.TestCase):
         start_1515 = programme_start.timestamp()
         start_1528 = datetime(2026, 10, 7, 15, 28, tzinfo=timezone.utc).timestamp()
         start_1544 = datetime(2026, 10, 7, 15, 44, tzinfo=timezone.utc).timestamp()
-        self.assertEqual(
-            _archive_playback_window(
-                start_1515, 2700, programme_end.timestamp(), next_end.timestamp()
-            ),
-            (programme_end.timestamp(), next_end.timestamp()),
-        )
-        self.assertEqual(
-            _archive_playback_window(
-                start_1528, 2700, programme_end.timestamp(), next_end.timestamp()
-            ),
-            (
-                programme_end.timestamp(),
-                datetime(2026, 10, 7, 16, 13, tzinfo=timezone.utc).timestamp(),
-            ),
-        )
-        self.assertEqual(
-            _archive_playback_window(
-                start_1544, 2700, programme_end.timestamp(), next_end.timestamp()
-            ),
-            (programme_end.timestamp(), datetime(2026, 10, 7, 16, 29, tzinfo=timezone.utc).timestamp()),
-        )
+        for start in (start_1515, start_1528, start_1544):
+            with self.subTest(start=start):
+                self.assertEqual(
+                    _archive_playback_window(
+                        start, 2700, programme_end.timestamp(), next_end.timestamp()
+                    ),
+                    (start + 24 * 60 * 60, None),
+                )
 
-    def test_missing_epg_keeps_the_requested_archive_window(self):
+    def test_missing_epg_keeps_a_bounded_archive_window(self):
         start = datetime(2026, 10, 7, 15, 44, tzinfo=timezone.utc).timestamp()
-        self.assertEqual(_archive_playback_window(start, 2700, None, None), (start + 2700, None))
+        self.assertEqual(_archive_playback_window(start, 2700, None, None), (start + 86400, None))
 
-    def test_archive_request_without_matching_epg_returns_404(self):
+    def test_archive_request_without_matching_epg_uses_bounded_window(self):
         class FakeResponse:
             def __init__(self, content="", status=200):
                 self.content = content
@@ -221,15 +225,22 @@ class ViewBoundaryTests(unittest.TestCase):
             authorize_user_channel=lambda *_: True,
             catchup_enabled=lambda *_: True,
             store=SimpleNamespace(),
+            playlist=Mock(return_value=SimpleNamespace(status=200, body=b"playlist")),
         )
         with patch.dict("sys.modules", {"django": django, "django.http": django_http}):
             with patch("catchuparr.views._authenticate", return_value=(
                 user, SimpleNamespace(retention_hours=48), "token"
             )), patch("catchuparr.views._archive_service", return_value=service), patch(
                 "catchuparr.views._archive_epg_bounds", return_value=(None, None)
+            ), patch("catchuparr.views._archive_window_live", return_value=False), patch(
+                "catchuparr.views._to_django_response", return_value=FakeResponse(status=200)
             ):
                 response = archive_view(request)
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            service.playlist.call_args.args[2:4],
+            (float(request.GET["utc"]), float(request.GET["utc"]) + 86400),
+        )
 
     def test_historical_xmltv_snapshot_remains_playable_after_guide_refresh(self):
         class FakeResponse:
@@ -304,12 +315,16 @@ class ViewBoundaryTests(unittest.TestCase):
         )):
             response = archive_view(request)
         self.assertEqual(response.status_code, 200)
+        expected_end = start.timestamp() + 24 * 60 * 60
         self.assertEqual(service.playlist.call_args.args[2:4], (
-            start.timestamp(), end.timestamp()
+            start.timestamp(), expected_end
         ))
-        self.assertEqual(live_check.call_args.args[3], end.timestamp())
+        self.assertEqual(live_check.call_args.args[3], expected_end)
+        self.assertIsNone(service.playlist.call_args.kwargs["programme_end_utc"])
+        self.assertIsNone(service.playlist.call_args.kwargs["continuation_end_utc"])
+        self.assertTrue(service.playlist.call_args.kwargs["continuous"])
 
-    def test_full_length_initial_programme_can_continue_after_boundary(self):
+    def test_full_length_initial_programme_continues_across_multiple_boundaries(self):
         start = datetime(2026, 10, 7, 15, 15, tzinfo=timezone.utc).timestamp()
         programme_end = start + 45 * 60
         following_end = programme_end + 45 * 60
@@ -317,7 +332,7 @@ class ViewBoundaryTests(unittest.TestCase):
             _archive_playback_window(
                 start, 45 * 60, programme_end, following_end
             ),
-            (programme_end, following_end),
+            (start + 24 * 60 * 60, None),
         )
 
     def test_shifted_archive_continuation_is_capped_at_24_hours(self):
@@ -328,7 +343,7 @@ class ViewBoundaryTests(unittest.TestCase):
             _archive_playback_window(
                 start, 24 * 60 * 60, programme_end, next_end
             ),
-            (programme_end, start + 24 * 60 * 60),
+            (start + 24 * 60 * 60, None),
         )
 
     def test_playlist_trace_reports_times_without_logging_segment_urls(self):
@@ -406,7 +421,7 @@ class ViewBoundaryTests(unittest.TestCase):
                 self.assertIn("channel=invalid", logs.output[0])
                 self.assertNotIn("secret", logs.output[0])
 
-    def test_archive_trace_distinguishes_missing_epg_and_service_denial(self):
+    def test_archive_trace_allows_missing_epg_and_reports_service_denial(self):
         class FakeResponse:
             def __init__(self, content="", status=200):
                 self.content = content
@@ -434,16 +449,19 @@ class ViewBoundaryTests(unittest.TestCase):
             authorize_user_channel=lambda *_: True,
             catchup_enabled=lambda *_: True,
             store=SimpleNamespace(),
+            playlist=Mock(return_value=HTTPResponse(200, {}, b"playlist")),
         )
         with patch.dict("sys.modules", {"django": django, "django.http": django_http}), patch.dict(
             "os.environ", {"CATCHUPARR_TRACE_REQUESTS": "1"}
         ), patch("catchuparr.views._authenticate", return_value=(user, config, "token-secret")), patch(
             "catchuparr.views._archive_service", return_value=service
-        ), patch("catchuparr.views._archive_epg_bounds", return_value=(None, None)):
+        ), patch("catchuparr.views._archive_epg_bounds", return_value=(None, None)), patch(
+            "catchuparr.views._archive_window_live", return_value=False
+        ), patch("catchuparr.views._to_django_response", return_value=FakeResponse(status=200)):
             with self.assertLogs("catchuparr.views", level="WARNING") as logs:
                 response = archive_view(request)
-        self.assertEqual(response.status_code, 404)
-        self.assertIn("status=404 reason=missing_epg", logs.output[0])
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("status=200 reason=ok", logs.output[0])
         self.assertNotIn("token-secret", logs.output[0])
 
         service.authorize_user_channel = lambda *_: False

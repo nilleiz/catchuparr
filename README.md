@@ -16,9 +16,9 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The package version is **0.6.1 prerelease candidate**. It is not published.
+- The package version is **0.6.2 prerelease candidate**. It is not published.
   The pinned 0.32.0 native AIO acceptance passed for 0.6.0; required GitHub CI
-  and publication remain gates. See [candidate 0.6.1](docs/candidate-0.6.1.md)
+  and publication remain gates. See [candidate 0.6.2](docs/candidate-0.6.2.md)
   and the [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.32.0**. The compatibility
   guard currently accepts the pinned 0.32.0 release; earlier and unverified
@@ -234,6 +234,18 @@ acceptance passed; the 0.6.1 global settings and migration changes have focused
 unit coverage. Required GitHub CI and publication remain pending. Synthetic
 tests do not establish real-player acceptance. See
 [candidate 0.6.1](docs/candidate-0.6.1.md) for the remaining gates.
+
+## Continuous catch-up playback (0.6.2 candidate)
+
+Catch-up playback can continue across programme boundaries using the same
+authenticated archive session. M3U/XMLTV HLS playback does not require later
+EPG rows and can append newly indexed segments for up to 24 hours from the
+requested start. XC playback follows contiguous indexed TS segments within the
+Dispatcharr duration limit. XC stops at a real archive gap and waits no longer
+than 10 seconds for a next segment after the current edge. HLS marks the
+playlist finished after the indexed edge is stale for 120 seconds or the
+24-hour bound is reached. This candidate has focused synthetic coverage only;
+CI and real-player acceptance remain pending.
 
 ## Access tokens and playback
 

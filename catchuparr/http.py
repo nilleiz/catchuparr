@@ -499,10 +499,8 @@ class ArchiveHTTPService:
             with closing(self._connect()) as db:
                 db.execute(
                     "UPDATE http_playback_sessions SET end_utc=MAX(end_utc,?),expires_at=?,"
-                    "manifest_json=CASE WHEN terminal=1 THEN manifest_json ELSE ? END,"
-                    "terminal=MAX(terminal,?),"
-                    "programme_end_utc=COALESCE(programme_end_utc,?),"
-                    "continuation_end_utc=COALESCE(continuation_end_utc,?) "
+                    "manifest_json=?,terminal=?,"
+                    "programme_end_utc=?,continuation_end_utc=? "
                     "WHERE lease_id=?",
                     (
                         end, now + self.lease_ttl_seconds, manifest_json, int(terminal),
@@ -594,6 +592,7 @@ class ArchiveHTTPService:
             if (
                 segment.end_utc.timestamp() <= float(row["start_utc"])
                 or segment.start_utc.timestamp() >= float(row["end_utc"])
+                or segment.end_utc.timestamp() > float(row["end_utc"])
                 or (
                     row["programme_end_utc"] is not None
                     and segment.end_utc.timestamp() > float(row["programme_end_utc"])
@@ -786,6 +785,7 @@ class ArchiveHTTPService:
         request_identity_end: datetime | str | int | float | None = None,
         programme_end_utc: datetime | str | int | float | None = None,
         continuation_end_utc: datetime | str | int | float | None = None,
+        continuous: bool = False,
     ) -> HTTPResponse:
         """Render an authenticated playlist for indexed segments in a range.
 
@@ -843,7 +843,7 @@ class ArchiveHTTPService:
         with self._admission_lock(user_id):
             return self._playlist_locked(
                 token, user_id, channel_id, start, end, request_key, device_key, live,
-                programme_end, continuation_end,
+                programme_end, continuation_end, continuous,
             )
 
     def _playlist_locked(
@@ -858,6 +858,7 @@ class ArchiveHTTPService:
         live: bool,
         requested_programme_end: float | None,
         requested_continuation_end: float | None,
+        continuous: bool,
     ) -> HTTPResponse:
         acquisition = None
         try:
@@ -868,17 +869,23 @@ class ArchiveHTTPService:
             )
             lease_id = acquisition.lease_id
             state = self._session_state(lease_id)
-            programme_end = (
-                state["programme_end_utc"]
-                if state is not None and state["programme_end_utc"] is not None
-                else requested_programme_end
-            )
+            if continuous:
+                # Ignore EPG boundaries retained by older session rows.
+                programme_end = requested_programme_end
+            else:
+                programme_end = (
+                    state["programme_end_utc"]
+                    if state is not None and state["programme_end_utc"] is not None
+                    else requested_programme_end
+                )
             effective_end = min(end, float(programme_end)) if programme_end is not None else end
             continuation_end = None
-            terminal = bool(state is not None and state["terminal"])
             effective_live = bool(live)
-            if terminal:
+            terminal = bool(state is not None and state["terminal"])
+            if terminal and not (continuous and effective_live):
                 effective_live = False
+            if continuous and effective_live:
+                terminal = False
             segments = self.store.segments(channel_id, start, effective_end)
             manifest = self._manifest_segments(
                 channel_id,
@@ -886,6 +893,7 @@ class ArchiveHTTPService:
                 segments,
                 allow_append=not terminal,
                 programme_end=programme_end,
+                playback_end=effective_end,
             )
         except _PermissionDenied:
             return _error(403, "stream limit exceeded")
@@ -928,7 +936,7 @@ class ArchiveHTTPService:
             committed = self._commit_acquisition(
                 acquisition, user_id, channel_id, request_key, device_key, start,
                 effective_end, manifest_json, programme_end, continuation_end,
-                terminal=not effective_live,
+                terminal=terminal or not effective_live,
             )
         except (OSError, RuntimeError, sqlite3.Error):
             self._rollback_acquisition(acquisition)
@@ -966,6 +974,7 @@ class ArchiveHTTPService:
         *,
         allow_append: bool = True,
         programme_end: float | None = None,
+        playback_end: float | None = None,
     ):
         try:
             stored = json.loads(manifest_json or "[]")
@@ -986,7 +995,10 @@ class ArchiveHTTPService:
                 raise sqlite3.DatabaseError("invalid persisted HLS manifest range") from exc
             if end <= start or not isinstance(segment_id, str):
                 raise sqlite3.DatabaseError("invalid persisted HLS manifest range")
-            if programme_end is not None and end.timestamp() > programme_end:
+            if (
+                (programme_end is not None and end.timestamp() > programme_end)
+                or (playback_end is not None and end.timestamp() > playback_end)
+            ):
                 continue
             relative_path = Path(str(relative_path))
             if relative_path.is_absolute() or ".." in relative_path.parts:
@@ -1008,7 +1020,10 @@ class ArchiveHTTPService:
                 continue
             candidate_start = candidate.start_utc.timestamp()
             candidate_end = candidate.end_utc.timestamp()
-            if programme_end is not None and candidate_end > programme_end:
+            if (
+                (programme_end is not None and candidate_end > programme_end)
+                or (playback_end is not None and candidate_end > playback_end)
+            ):
                 continue
             if high_water is not None and candidate_start < high_water:
                 # EVENT playlists are append-only; a late segment may not be
