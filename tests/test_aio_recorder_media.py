@@ -37,6 +37,105 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_teardown_budget_accounts_for_sequential_shutdown_and_marker_ttl(self):
+        self.assertEqual(
+            156.0,
+            probe._native_teardown_readiness_timeout(120, 1),
+        )
+
+    def test_readiness_poll_observes_shutdown_then_marker_before_open(self):
+        class FakeClock:
+            now = 0.0
+            phases = []
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, duration):
+                self.now += duration
+
+        clock = FakeClock()
+        opens = []
+
+        def read_native_state():
+            if clock.now < 120:
+                phase = "disconnect_delay"
+            elif clock.now < 150:
+                phase = "stopping_marker_ttl"
+            else:
+                phase = "ready"
+            clock.phases.append(phase)
+            return {"conditions": {"ready": phase == "ready"}, "phase": phase}
+
+        ready, final = probe._wait_for_readiness_snapshot(
+            read_native_state,
+            probe._native_teardown_readiness_timeout(120, 1),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            poll_interval=1,
+        )
+        self.assertTrue(ready)
+        self.assertEqual("ready", final["phase"])
+        self.assertIn("disconnect_delay", clock.phases)
+        self.assertIn("stopping_marker_ttl", clock.phases)
+        self.assertEqual(150, clock.now)
+        result = probe._open_after_readiness(
+            lambda: self.assertTrue(ready),
+            lambda: opens.append("one ordinary GET") or "response",
+        )
+        self.assertEqual("response", result)
+        self.assertEqual(["one ordinary GET"], opens)
+
+    def test_unready_native_snapshot_stays_bounded_and_never_opens_viewer(self):
+        class FakeClock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, duration):
+                self.now += duration
+
+        clock = FakeClock()
+        reads = []
+        opens = []
+
+        def wait_for_ready():
+            ready, last = probe._wait_for_readiness_snapshot(
+                lambda: reads.append(clock.now) or {"conditions": {"ready": False}},
+                3,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                poll_interval=1,
+            )
+            self.assertFalse(ready)
+            self.assertEqual({"ready": False}, last["conditions"])
+            raise RuntimeError("bounded readiness timeout")
+
+        with self.assertRaisesRegex(RuntimeError, "bounded readiness timeout"):
+            probe._open_after_readiness(
+                wait_for_ready,
+                lambda: opens.append("must not run"),
+            )
+        self.assertEqual(3, clock.now)
+        self.assertEqual(4, len(reads))
+        self.assertEqual([], opens)
+
+    def test_readiness_failure_diagnostic_getter_error_is_guarded(self):
+        manager = SimpleNamespace(
+            get_client_count=lambda: (_ for _ in ()).throw(ValueError("bad count")),
+        )
+        emitted = []
+        with self.assertRaisesRegex(RuntimeError, "native readiness timeout"):
+            probe._require_with_failure_diagnostic(
+                False,
+                "native readiness timeout",
+                lambda: {"local": int(manager.get_client_count())},
+                emit=emitted.append,
+                diagnostic_label="CATCHUPARR_NATIVE_REOPEN_DIAGNOSTIC",
+            )
+        self.assertIn('"diagnostic_error": "ValueError"', emitted[0])
+
     def test_failure_diagnostic_read_error_preserves_original_gate_failure(self):
         def broken_diagnostic():
             raise ValueError("synthetic secret diagnostic data")

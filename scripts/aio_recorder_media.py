@@ -45,6 +45,48 @@ def _require_with_failure_diagnostic(
     raise RuntimeError(message)
 
 
+def _native_teardown_readiness_timeout(
+    shutdown_delay: float,
+    cleanup_interval: float,
+    *,
+    stopping_marker_ttl: float = 30.0,
+    monitor_allowance: float = 5.0,
+) -> float:
+    """Budget sequential native disconnect, cleanup, and stop-marker phases."""
+    return max(
+        stopping_marker_ttl + monitor_allowance,
+        float(shutdown_delay) + float(cleanup_interval)
+        + stopping_marker_ttl + monitor_allowance,
+    )
+
+
+def _wait_for_readiness_snapshot(
+    snapshot_reader,
+    timeout_seconds: float,
+    *,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_interval: float = 0.1,
+):
+    """Poll a read-only boolean snapshot until ready or its explicit bound."""
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        snapshot = snapshot_reader()
+        conditions = snapshot.get("conditions", {})
+        if conditions and all(conditions.values()):
+            return True, snapshot
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, snapshot
+        sleep(min(poll_interval, remaining))
+
+
+def _open_after_readiness(wait_for_ready, open_request):
+    """Issue exactly one request, only after the read-only readiness gate."""
+    wait_for_ready()
+    return open_request()
+
+
 def _assert_private_worker_stop_request_count(before: dict, after: dict) -> None:
     """A cooperative stop must not open another provider request."""
     _require(
@@ -4518,14 +4560,12 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
 
         def wait_for_native_a_reopen(previous_borrow_client_id: str) -> None:
             """Wait for Dispatcharr's real last-client teardown to finish read-only."""
-            shutdown_bound = max(
-                35.0,
-                float(ConfigHelper.channel_shutdown_delay())
-                + float(ConfigHelper.cleanup_check_interval()) + 5.0,
+            shutdown_bound = _native_teardown_readiness_timeout(
+                float(ConfigHelper.channel_shutdown_delay()),
+                float(ConfigHelper.cleanup_check_interval()),
             )
-            deadline = time.monotonic() + shutdown_bound
-            last_snapshot = None
-            while time.monotonic() < deadline:
+
+            def snapshot():
                 state = _redis_text(redis_client.hget(
                     RedisKeys.channel_metadata(worker_id), ChannelMetadataField.STATE,
                 ))
@@ -4534,10 +4574,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 )
                 provider_counts, provider_active = source_server.snapshot()
                 local_manager = native_server.client_managers.get(worker_id)
-                local_clients = (
-                    int(local_manager.get_client_count())
-                    if local_manager is not None else 0
-                )
                 borrowed_hash = (
                     f"live:channel:{worker_id}:clients:{previous_borrow_client_id}"
                 )
@@ -4576,7 +4612,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     ),
                     "previous_borrow_registration_absent": borrowed_absent,
                 }
-                last_snapshot = {
+                return {
                     "conditions": conditions,
                     "metadata_state_stopping": (
                         state == _constant_text(ChannelState.STOPPING)
@@ -4589,7 +4625,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                         "global_clients": int(
                             redis_client.scard(RedisKeys.clients(worker_id)) or 0
                         ),
-                        "local_clients": local_clients,
                         "owner_present": redis_client.get(
                             RedisKeys.channel_owner(worker_id),
                         ) is not None,
@@ -4600,23 +4635,40 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     },
                     "previous_borrow_registration_absent": borrowed_absent,
                 }
-                if all(conditions.values()):
-                    return
-                gevent_sleep(0.1)
+
+            ready, last_snapshot = _wait_for_readiness_snapshot(
+                snapshot,
+                shutdown_bound,
+                monotonic=time.monotonic,
+                sleep=gevent_sleep,
+                poll_interval=0.1,
+            )
+            if ready:
+                return
+
+            def readiness_failure_diagnostic():
+                diagnostic = dict(last_snapshot)
+                manager = native_server.client_managers.get(worker_id)
+                diagnostic["native_local_clients"] = (
+                    int(manager.get_client_count()) if manager is not None else 0
+                )
+                return diagnostic
 
             _require_with_failure_diagnostic(
                 False,
                 "Native A teardown did not finish before the next ordinary viewer",
-                lambda: last_snapshot or {"snapshot_available": False},
+                readiness_failure_diagnostic,
                 diagnostic_label="CATCHUPARR_NATIVE_REOPEN_DIAGNOSTIC",
             )
 
-        wait_for_native_a_reopen(no_source_client_id)
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
-        live_response = client.get(
-            f"/proxy/ts/stream/{channel.uuid}",
-            HTTP_HOST="localhost",
-            HTTP_USER_AGENT="Synthetic second-cycle ordinary viewer",
+        live_response = _open_after_readiness(
+            lambda: wait_for_native_a_reopen(no_source_client_id),
+            lambda: client.get(
+                f"/proxy/ts/stream/{channel.uuid}",
+                HTTP_HOST="localhost",
+                HTTP_USER_AGENT="Synthetic second-cycle ordinary viewer",
+            ),
         )
         _require(live_response.status_code == 200,
                  "Second-cycle ordinary A viewer could not open")
@@ -4779,12 +4831,14 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         # The replacement task now borrows a fresh ordinary A viewer. Keep it
         # alive through Pause to prove cleanup leaves the native viewer intact.
-        wait_for_native_a_reopen(second_borrow_client_id)
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
-        live_response = client.get(
-            f"/proxy/ts/stream/{channel.uuid}",
-            HTTP_HOST="localhost",
-            HTTP_USER_AGENT="Synthetic post-restart ordinary viewer",
+        live_response = _open_after_readiness(
+            lambda: wait_for_native_a_reopen(second_borrow_client_id),
+            lambda: client.get(
+                f"/proxy/ts/stream/{channel.uuid}",
+                HTTP_HOST="localhost",
+                HTTP_USER_AGENT="Synthetic post-restart ordinary viewer",
+            ),
         )
         _require(live_response.status_code == 200,
                  "Post-restart ordinary A viewer could not open")
