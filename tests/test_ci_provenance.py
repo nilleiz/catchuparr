@@ -24,6 +24,8 @@ REPOSITORY = "example/catchuparr"
 WORKFLOW_ID = 1234
 SOURCE_SHA = "a" * 40
 SOURCE_TREE = "b" * 40
+BASE_SHA = "d" * 40
+MERGE_SHA = "c" * 40
 ARCHIVE_NAME = "catchuparr-0.6.0.zip"
 
 
@@ -52,6 +54,11 @@ def _run() -> dict:
         "head_sha": SOURCE_SHA,
         "repository": {"full_name": REPOSITORY},
         "head_repository": {"full_name": REPOSITORY},
+        "pull_requests": [{
+            "number": 12,
+            "head": {"sha": SOURCE_SHA, "repo": {"full_name": REPOSITORY}},
+            "base": {"sha": BASE_SHA, "repo": {"full_name": REPOSITORY}},
+        }],
         "jobs": [
             {"name": "test-and-package", "conclusion": "success"},
             {"name": "AIO integration (0.32.0)", "conclusion": "success"},
@@ -68,12 +75,20 @@ def _provenance(archive: bytes, inventory: dict[str, str]) -> dict:
         "workflow_ref": f"{REPOSITORY}/{WORKFLOW_PATH}@refs/pull/12/merge",
         "run_id": 4567,
         "run_attempt": 1,
-        "source_sha": SOURCE_SHA,
+        "source_sha": MERGE_SHA,
         "source_tree": SOURCE_TREE,
         "artifact_name": ARTIFACT_NAME,
         "archive_name": ARCHIVE_NAME,
         "archive_sha256": hashlib.sha256(archive).hexdigest(),
         "package_inventory": inventory,
+    }
+
+
+def _tested_commit(*, parents: tuple[str, str] = (BASE_SHA, SOURCE_SHA)) -> dict:
+    return {
+        "sha": MERGE_SHA,
+        "tree": {"sha": SOURCE_TREE},
+        "parents": [{"sha": parent} for parent in parents],
     }
 
 
@@ -111,7 +126,7 @@ class CIProvenanceTest(unittest.TestCase):
         archive, inventory = _make_archive()
         result = validate_provenance(
             _provenance(archive, inventory), repository=REPOSITORY,
-            workflow_id=WORKFLOW_ID, run=_run(), source_tree=SOURCE_TREE,
+            workflow_id=WORKFLOW_ID, run=_run(), tested_commit=_tested_commit(), source_tree=SOURCE_TREE,
             expected_inventory=inventory, archive_name=ARCHIVE_NAME,
             archive_bytes=archive,
         )
@@ -127,7 +142,7 @@ class CIProvenanceTest(unittest.TestCase):
             ("workflow_ref", "attacker/catchuparr/.github/workflows/ci.yml@refs/pull/1/merge"),
             ("run_id", 9999),
             ("run_attempt", 2),
-            ("source_sha", "c" * 40),
+            ("source_sha", "e" * 40),
             ("source_tree", "d" * 40),
             ("artifact_name", "untrusted-artifact"),
         ):
@@ -137,7 +152,7 @@ class CIProvenanceTest(unittest.TestCase):
                 with self.assertRaises(ProvenanceError):
                     validate_provenance(
                         changed, repository=REPOSITORY, workflow_id=WORKFLOW_ID,
-                        run=_run(), source_tree=SOURCE_TREE,
+                        run=_run(), tested_commit=_tested_commit(), source_tree=SOURCE_TREE,
                         expected_inventory=inventory, archive_name=ARCHIVE_NAME,
                         archive_bytes=archive,
                     )
@@ -162,7 +177,7 @@ class CIProvenanceTest(unittest.TestCase):
         with self.assertRaises(ProvenanceError):
             validate_provenance(
                 provenance, repository=REPOSITORY, workflow_id=WORKFLOW_ID,
-                run=run, source_tree=SOURCE_TREE, expected_inventory=inventory,
+                run=run, tested_commit=_tested_commit(), source_tree=SOURCE_TREE, expected_inventory=inventory,
                 archive_name=ARCHIVE_NAME, archive_bytes=archive,
             )
 
@@ -178,6 +193,7 @@ class CIProvenanceTest(unittest.TestCase):
                 validate_provenance(
                     provenance, repository=REPOSITORY, workflow_id=WORKFLOW_ID,
                     run=_run(), source_tree=SOURCE_TREE,
+                    tested_commit=_tested_commit(),
                     expected_inventory=inventory, archive_name=ARCHIVE_NAME,
                     archive_bytes=archive,
                 )
@@ -231,6 +247,28 @@ class CIProvenanceTest(unittest.TestCase):
                 with self.assertRaisesRegex(ProvenanceError, "rerun the full pull-request CI"):
                     reuse_ci_artifact(root, output, REPOSITORY, "synthetic-token")
             self.assertFalse(output.exists())
+
+    def test_pr_run_head_may_differ_from_tested_merge_commit(self):
+        archive, inventory = _make_archive()
+        result = validate_provenance(
+            _provenance(archive, inventory), repository=REPOSITORY,
+            workflow_id=WORKFLOW_ID, run=_run(), tested_commit=_tested_commit(),
+            source_tree=SOURCE_TREE, expected_inventory=inventory,
+            archive_name=ARCHIVE_NAME, archive_bytes=archive,
+        )
+        self.assertNotEqual(_run()["head_sha"], result["source_sha"])
+
+    def test_rejects_tested_merge_with_spoofed_parents(self):
+        archive, inventory = _make_archive()
+        for parents in ((BASE_SHA, "e" * 40), ("f" * 40, SOURCE_SHA), (SOURCE_SHA,)):
+            with self.subTest(parents=parents), self.assertRaises(ProvenanceError):
+                validate_provenance(
+                    _provenance(archive, inventory), repository=REPOSITORY,
+                    workflow_id=WORKFLOW_ID, run=_run(),
+                    tested_commit=_tested_commit(parents=parents), source_tree=SOURCE_TREE,
+                    expected_inventory=inventory, archive_name=ARCHIVE_NAME,
+                    archive_bytes=archive,
+                )
 
 
 if __name__ == "__main__":
