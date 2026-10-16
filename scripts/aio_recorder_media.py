@@ -59,12 +59,12 @@ def assert_applied_global_sharing(
         "last_viewer_return_seconds": last_viewer_return_seconds,
         "min_switch_interval_seconds": min_switch_interval_seconds,
     }
-    _require(active.get("settings", {}).get("connection_sharing_enabled") is enabled,
+    _require(active.get("connection_sharing_enabled") is enabled,
              "Applied global sharing enable setting differs from the requested GUI value")
     _require(
         all(
-            type(active.get("settings", {}).get(key)) is type(value)
-            and active.get("settings", {}).get(key) == value
+            type(active.get(key)) is type(value)
+            and active.get(key) == value
             for key, value in expected.items()
         ),
         "Applied global sharing delays differ from the requested GUI values",

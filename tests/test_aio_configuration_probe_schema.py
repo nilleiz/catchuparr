@@ -1,6 +1,7 @@
 import unittest
 from copy import deepcopy
 
+from catchuparr.configuration import _active_configuration_view
 from catchuparr.sharing_planner import (
     BorrowTarget,
     SharingAction,
@@ -39,17 +40,20 @@ class ActiveConfigurationProbeSchemaTests(unittest.TestCase):
             "last_viewer_return_seconds": 30,
             "min_switch_interval_seconds": 60,
         }
-        self.active = {
-            "version": 7,
-            "settings": deepcopy(self.defaults),
-            "connection_sharing": {
-                channel: deepcopy(self.runtime_defaults) for channel in self.channels
-            },
-        }
         self.persisted = {
             "version": 7,
             "settings": deepcopy(self.defaults),
+            "channel_uuids": list(self.channels),
+            "channel_profile_ids": [],
+            "source_policies": {},
+            "recording_schedule": {
+                "timezone": "UTC",
+                "channels": {channel: {"mode": "continuous"} for channel in self.channels},
+            },
+            "configuration_origins": {},
         }
+        # Match load_active_configuration's real flattened view shape.
+        self.active = _active_configuration_view(self.persisted)
 
     def test_accepts_v7_global_snapshot_and_runtime_expansion(self):
         validate_active_v7_snapshot(self.active, self.persisted, self.channels)
@@ -82,9 +86,10 @@ class ActiveConfigurationProbeSchemaTests(unittest.TestCase):
         )
         for field, malformed in malformed_values:
             with self.subTest(field=field):
-                self.active["settings"] = deepcopy(self.defaults)
+                for key, value in self.defaults.items():
+                    self.active[key] = value
                 self.persisted["settings"] = deepcopy(self.defaults)
-                self.active["settings"][field] = malformed
+                self.active[field] = malformed
                 with self.assertRaisesRegex(RuntimeError, "global sharing defaults"):
                     validate_active_v7_snapshot(self.active, self.persisted, self.channels)
 
@@ -123,7 +128,7 @@ class ActiveConfigurationProbeSchemaTests(unittest.TestCase):
             "last_viewer_return_seconds": draft["last_viewer_return_seconds"],
             "min_switch_interval_seconds": draft["min_switch_interval_seconds"],
         }
-        active = {"settings": draft, "connection_sharing": {channel: runtime}}
+        active = {"version": 7, **draft, "connection_sharing": {channel: runtime}}
         assert_applied_global_sharing(
             active, channel, enabled=True, live_stability_seconds=1,
             last_viewer_return_seconds=2, min_switch_interval_seconds=60,
