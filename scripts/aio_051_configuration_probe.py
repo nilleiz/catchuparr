@@ -18,60 +18,74 @@ def should_run_probe(namespace_name):
     return namespace_name in {"__main__", "django.core.management.commands.shell"}
 
 
-_ACTIVE_SCHEMA_VERSION = 6
+_ACTIVE_SCHEMA_VERSION = 7
 _SHARING_DEFAULTS = {
-    "enabled": False,
+    "connection_sharing_enabled": False,
     "live_stability_seconds": 5,
     "last_viewer_return_seconds": 30,
     "min_switch_interval_seconds": 60,
 }
 
 
-def validate_active_v6_snapshot(active, persisted, channel_uuids):
+def validate_active_v7_snapshot(active, persisted, channel_uuids):
     """Keep this compatibility probe tied to the current persisted schema."""
     expected_channels = set(channel_uuids)
     require(
         isinstance(active, dict)
         and type(active.get("version")) is int
         and active.get("version") == _ACTIVE_SCHEMA_VERSION,
-        "Apply did not persist a version 6 active snapshot",
+        "Apply did not persist a version 7 active snapshot",
     )
     require(
         isinstance(persisted, dict)
         and type(persisted.get("version")) is int
         and persisted.get("version") == _ACTIVE_SCHEMA_VERSION,
-        "raw active snapshot did not persist schema version 6",
+        "raw active snapshot did not persist schema version 7",
+    )
+    # load_active_configuration returns a flattened runtime view; only the raw
+    # persisted document retains the nested settings object.
+    active_settings = active
+    persisted_settings = persisted.get("settings")
+
+    def has_exact_defaults(settings):
+        return isinstance(settings, dict) and all(
+            type(settings.get(key)) is type(expected)
+            and settings.get(key) == expected
+            for key, expected in _SHARING_DEFAULTS.items()
+        )
+
+    require(
+        has_exact_defaults(active_settings),
+        "v7 active settings must expose strict global sharing defaults",
+    )
+    require(
+        has_exact_defaults(persisted_settings),
+        "raw v7 snapshot must preserve strict global sharing defaults",
+    )
+    require(
+        "connection_sharing" not in persisted,
+        "raw v7 snapshot must not persist per-channel sharing settings",
     )
     active_sharing = active.get("connection_sharing")
-    persisted_sharing = persisted.get("connection_sharing")
-
-    def valid_disabled_map(sharing):
-        if not isinstance(sharing, dict) or set(sharing) != expected_channels:
-            return False
-        for value in sharing.values():
-            if not isinstance(value, dict) or set(value) != set(_SHARING_DEFAULTS):
-                return False
-            if type(value.get("enabled")) is not bool or value["enabled"] is not False:
-                return False
-            for name in (
-                "live_stability_seconds", "last_viewer_return_seconds",
-                "min_switch_interval_seconds",
-            ):
-                if type(value.get(name)) is not int or value[name] != _SHARING_DEFAULTS[name]:
-                    return False
-        return True
-
     require(
-        valid_disabled_map(active_sharing),
-        "v6 active snapshot must resolve strict disabled sharing defaults for every selected channel",
+        isinstance(active_sharing, dict) and set(active_sharing) == expected_channels,
+        "v7 active runtime view must expand global sharing over every selected channel",
     )
+    expected_runtime = {
+        "enabled": False,
+        "live_stability_seconds": 5,
+        "last_viewer_return_seconds": 30,
+        "min_switch_interval_seconds": 60,
+    }
     require(
-        valid_disabled_map(persisted_sharing),
-        "raw v6 snapshot must preserve strict disabled sharing defaults for every selected channel",
-    )
-    require(
-        persisted_sharing == active_sharing,
-        "raw v6 sharing snapshot differs from the active configuration view",
+        all(
+            isinstance(value, dict)
+            and set(value) == set(expected_runtime)
+            and all(type(value.get(key)) is type(expected) and value.get(key) == expected
+                    for key, expected in expected_runtime.items())
+            for value in active_sharing.values()
+        ),
+        "v7 runtime expansion differs from the global sharing defaults",
     )
 
 
@@ -277,15 +291,15 @@ def probe():
                     "Validate and Apply previews diverged")
             require(ACTIVE_CONFIG_VERSION == _ACTIVE_SCHEMA_VERSION,
                     "configuration probe must be updated when the active schema changes")
-            validate_active_v6_snapshot(
+            validate_active_v7_snapshot(
                 active, persisted, (str(channel_a.uuid), str(channel_b.uuid)),
             )
             require(active["recording_schedule"]["channels"] == {
                 str(channel_a.uuid): expected_direct_schedule,
                 str(channel_b.uuid): expected_base_schedule,
-            }, "v6 active snapshot did not retain effective schedules")
+            }, "v7 active snapshot did not retain effective schedules")
             require(active["source_policies"][str(channel_a.uuid)]["priorities"]
-                    == [[str(account_b.id), 20]], "v6 snapshot did not retain replacement priorities")
+                    == [[str(account_b.id), 20]], "v7 snapshot did not retain replacement priorities")
             previews = {row["channel_uuid"]: row for row in validated["channels"]}
             require(persisted["configuration_origins"] == {
                 key: value["configuration_origin"] for key, value in previews.items()
@@ -307,7 +321,7 @@ def probe():
                 "real Django ORM source catalog fixtures",
                 "named profile with number and name exceptions independent of YAML order",
                 "whole-map filter and priority replacement plus final invalid-policy rejection",
-                "Validate/Apply effective preview, origins, and v6 snapshot parity",
+                "Validate/Apply effective preview, origins, and v7 snapshot parity",
                 "whole-week replacement, group/day precedence, explicit empty days, overnight start-day ownership",
             ],
             "provider_connections": 0,

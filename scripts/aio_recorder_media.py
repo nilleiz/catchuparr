@@ -21,6 +21,69 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def global_sharing_draft(
+    settings: dict, *, enabled: bool, live_stability_seconds: int,
+    last_viewer_return_seconds: int, min_switch_interval_seconds: int,
+) -> dict:
+    """Build settings through the current global Dispatcharr GUI fields."""
+    values = {
+        "connection_sharing_enabled": enabled,
+        "live_stability_seconds": live_stability_seconds,
+        "last_viewer_return_seconds": last_viewer_return_seconds,
+        "min_switch_interval_seconds": min_switch_interval_seconds,
+    }
+    if type(enabled) is not bool or any(
+        type(values[name]) is not int or not 0 <= values[name] <= 3600
+        for name in (
+            "live_stability_seconds", "last_viewer_return_seconds",
+            "min_switch_interval_seconds",
+        )
+    ):
+        raise ValueError("global sharing settings are outside the plugin GUI schema")
+    result = dict(settings)
+    result.update(values)
+    result.pop("connection_sharing_config", None)
+    return result
+
+
+def assert_applied_global_sharing(
+    active: dict, channel_uuid: str, *, enabled: bool,
+    live_stability_seconds: int, last_viewer_return_seconds: int,
+    min_switch_interval_seconds: int,
+) -> None:
+    """Check both persisted GUI values and the runtime-expanded channel view."""
+    _require(isinstance(active, dict), "Applied active configuration is unavailable")
+    expected = {
+        "connection_sharing_enabled": enabled,
+        "live_stability_seconds": live_stability_seconds,
+        "last_viewer_return_seconds": last_viewer_return_seconds,
+        "min_switch_interval_seconds": min_switch_interval_seconds,
+    }
+    _require(active.get("connection_sharing_enabled") is enabled,
+             "Applied global sharing enable setting differs from the requested GUI value")
+    _require(
+        all(
+            type(active.get(key)) is type(value)
+            and active.get(key) == value
+            for key, value in expected.items()
+        ),
+        "Applied global sharing delays differ from the requested GUI values",
+    )
+    runtime = active.get("connection_sharing", {}).get(channel_uuid)
+    _require(isinstance(runtime, dict), "Applied sharing runtime view omitted the channel")
+    expected_runtime = {
+        "enabled": enabled,
+        "live_stability_seconds": live_stability_seconds,
+        "last_viewer_return_seconds": last_viewer_return_seconds,
+        "min_switch_interval_seconds": min_switch_interval_seconds,
+    }
+    _require(
+        set(runtime) == set(expected_runtime)
+        and all(type(runtime.get(key)) is type(value) and runtime.get(key) == value
+                for key, value in expected_runtime.items()),
+             "Applied channel runtime sharing values differ from the GUI settings")
+
+
 def _crash_child_failure_diagnostic(result, expected_code, parsed_value, stdout_shape):
     """Describe a child failure without exposing captured stdout or stderr."""
     if not isinstance(parsed_value, dict):
@@ -547,14 +610,9 @@ def _run_registration_crash_recovery_probe(
     from catchuparr.sharing_episode import BorrowEpisodeLedger
     from catchuparr.sharing_runtime import RecorderBorrowCoordinator
 
-    shared_settings = dict(settings)
-    shared_settings["connection_sharing_config"] = (
-        "version: 1\n"
-        "default:\n"
-        "  enabled: true\n"
-        "  live_stability_seconds: 0\n"
-        "  last_viewer_return_seconds: 0\n"
-        "  min_switch_interval_seconds: 0\n"
+    shared_settings = global_sharing_draft(
+        settings, enabled=True, live_stability_seconds=0,
+        last_viewer_return_seconds=0, min_switch_interval_seconds=0,
     )
     lease = None
     restore_settings = True
@@ -777,9 +835,9 @@ def _run_registration_crash_recovery_probe(
         _require(applied.get("applied") is True, "Crash-recovery sharing Apply failed")
         active = load_active_configuration(active_path)
         _require(active is not None, "Crash-recovery sharing snapshot is unavailable")
-        _require(
-            active.get("connection_sharing", {}).get(channel_uuid, {}).get("enabled") is True,
-            "Crash-recovery sharing defaults were not enabled for the synthetic channel",
+        assert_applied_global_sharing(
+            active, channel_uuid, enabled=True, live_stability_seconds=0,
+            last_viewer_return_seconds=0, min_switch_interval_seconds=0,
         )
         _, control = load_applied_state(active_path)
         provider_before = source_server.snapshot()
@@ -4609,16 +4667,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # after the applied switch cooldown.
         from aio_stats_probe import stats_options_draft
 
-        sharing_settings = stats_options_draft(settings_b, hide_recorders=True)
-        sharing_settings["connection_sharing_config"] = (
-            "version: 1\n"
-            "default:\n"
-            "  enabled: true\n"
-            "  live_stability_seconds: 0\n"
-            "  last_viewer_return_seconds: 2\n"
-            "  min_switch_interval_seconds: 60\n"
-            "rules:\n"
-            "  - channels: {profile: all}\n"
+        sharing_settings = global_sharing_draft(
+            stats_options_draft(settings_b, hide_recorders=True),
+            enabled=True, live_stability_seconds=1,
+            last_viewer_return_seconds=2, min_switch_interval_seconds=60,
         )
         current_plugin_config = PluginConfig.objects.get(key="catchuparr")
         current_plugin_config.settings = dict(sharing_settings)
@@ -4630,6 +4682,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         active_sharing = load_active_configuration(active_path)
         _require(active_sharing is not None, "Applied sharing configuration was not readable")
+        assert_applied_global_sharing(
+            active_sharing, worker_id, enabled=True, live_stability_seconds=1,
+            last_viewer_return_seconds=2, min_switch_interval_seconds=60,
+        )
         _require(
             active_sharing["connection_sharing"][worker_id]["enabled"] is True
             and [str(item.get("id")) for item in ranked_source_candidates(
@@ -5107,11 +5163,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             old_dedicated_b_worker = str(old_dedicated_b["worker_id"])
             old_dedicated_b_digest = str(old_dedicated_b["capability_digest"])
             old_dedicated_b_reservation = str(old_dedicated_b["reservation_id"])
-            dedicated_settings = dict(sharing_settings)
-            dedicated_settings["connection_sharing_config"] = (
-                "version: 1\n"
-                "default:\n"
-                "  enabled: false\n"
+            dedicated_settings = global_sharing_draft(
+                sharing_settings, enabled=False, live_stability_seconds=1,
+                last_viewer_return_seconds=2, min_switch_interval_seconds=60,
             )
             dedicated_plugin = PluginConfig.objects.get(key="catchuparr")
             dedicated_plugin.settings = dict(dedicated_settings)
@@ -5122,6 +5176,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 "Unified Apply rejected the sharing-off B preparation phase",
             )
             active_dedicated = load_active_configuration(active_path)
+            assert_applied_global_sharing(
+                active_dedicated, worker_id, enabled=False, live_stability_seconds=1,
+                last_viewer_return_seconds=2, min_switch_interval_seconds=60,
+            )
             _require(
                 active_dedicated is not None
                 and active_dedicated["connection_sharing"][worker_id]["enabled"] is False
@@ -5415,6 +5473,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(applied_no_source.get("applied") is True,
                  "Unified Apply rejected the no-allowed-source policy")
         active_no_source = load_active_configuration(active_path)
+        assert_applied_global_sharing(
+            active_no_source, worker_id, enabled=True, live_stability_seconds=1,
+            last_viewer_return_seconds=2, min_switch_interval_seconds=60,
+        )
         _require(
             active_no_source is not None
             and active_no_source["connection_sharing"][worker_id]["enabled"] is True
@@ -5791,6 +5853,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         applied_resume = catchuparr_runtime.apply_configuration(sharing_settings)
         _require(applied_resume.get("applied") is True,
                  "Unified Apply rejected restoring the B-only source policy")
+        active_resume = load_active_configuration(active_path)
+        assert_applied_global_sharing(
+            active_resume, worker_id, enabled=True, live_stability_seconds=1,
+            last_viewer_return_seconds=2, min_switch_interval_seconds=60,
+        )
         run_no_source.join_after_supervisor(timeout=30, cooperative_sleep=gevent_sleep)
         share_b_request_baseline = len(source_server.request_times("source-b.ts"))
         run_share = _RecorderTaskRun(

@@ -362,6 +362,120 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
             (event.event_id,), tuple(item.event_id for item in outbox.pending(activation)),
         )
 
+    def test_configuration_drain_rehydrates_latest_committed_head_before_pending_event(self):
+        from catchuparr.configuration import (
+            SHARING_AUTHORITY_OUTBOX_NAME,
+            _drain_sharing_authority_outbox,
+        )
+
+        active_path = self.database.with_name("active-synthetic-recovery.json")
+        outbox_path = active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME)
+        outbox = SharingAuthorityOutbox(outbox_path, clock=lambda: self.now[0])
+        # Build committed durable history through revision 3.
+        for revision in range(1, 4):
+            activation = f"activation-recovery-{revision}"
+            event = outbox.stage(activation, (self.target,))[0]
+            outbox.commit_activation(activation)
+            result = outbox.drain(
+                self.redis,
+                read_prior=lambda *_args: SharingAuthorityPriorObservation("absent"),
+                publish=self.publish,
+                invalidate=lambda *_args: self.fail("an absent episode needs no invalidation"),
+            )
+            self.assertEqual((event.event_id,), result.completed_event_ids)
+
+        # Stage and durably commit revision 4, then simulate loss of the
+        # current-authority hash while unrelated current lease state remains.
+        activation = "activation-recovery-pending"
+        pending = outbox.stage(activation, (self.target,))[0]
+        outbox.commit_activation(activation)
+        lease_key = "catchuparr:sharing:episode:lease-preservation-synthetic"
+        self.redis.hashes[lease_key] = {"phase": "active", "lease_value": "keep"}
+        self.redis.hashes.pop(f"catchuparr:sharing:current:{self.target.channel_uuid}")
+
+        calls = []
+
+        def strict_publish(redis, channel, **kwargs):
+            calls.append((kwargs["expected_revision"], kwargs["authority_revision"]))
+            event = type("PublishEvent", (), {
+                "channel_uuid": channel,
+                "expected_revision": kwargs["expected_revision"],
+                "authority_revision": kwargs["authority_revision"],
+                "configuration_generation": kwargs["configuration_generation"],
+                "control_generation": kwargs["control_generation"],
+                "catalog_generation": kwargs["catalog_generation"],
+            })()
+            return self.publish(redis, event)
+
+        core = types.ModuleType("core")
+        core.__path__ = []
+        core_utils = types.ModuleType("core.utils")
+        core_utils.RedisClient = types.SimpleNamespace(get_client=lambda: self.redis)
+        with (
+            patch.dict(sys.modules, {"core": core, "core.utils": core_utils}),
+            patch(
+                "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+                return_value=SharingAuthorityPriorObservation("absent"),
+            ),
+            patch(
+                "catchuparr.adapters.sharing_native.publish_current_authority",
+                side_effect=strict_publish,
+            ),
+        ):
+            self.assertTrue(_drain_sharing_authority_outbox(active_path, activation))
+
+        self.assertEqual([(0, 3), (3, 4)], calls)
+        self.assertEqual("4", self.redis.hgetall(
+            f"catchuparr:sharing:current:{self.target.channel_uuid}"
+        )["authority_revision"])
+        self.assertEqual({"phase": "active", "lease_value": "keep"}, self.redis.hgetall(lease_key))
+        self.assertEqual("complete", outbox.latest_for_channel(self.target.channel_uuid).status)
+        self.assertEqual(pending.authority_revision, 4)
+
+    def test_rehydration_preserves_a_newer_redis_authority(self):
+        from catchuparr.configuration import _rehydrate_sharing_authority_head
+
+        event = self.stage()
+        newer_key = f"catchuparr:sharing:current:{event.channel_uuid}"
+        self.redis.hashes[newer_key] = {
+            "authority_revision": "9",
+            "configuration_generation": "newer-config-synthetic",
+            "control_generation": "9",
+            "catalog_generation": "newer-catalog-synthetic",
+        }
+        publish = Mock()
+        self.assertTrue(_rehydrate_sharing_authority_head(self.redis, event, publish))
+        publish.assert_not_called()
+        self.assertEqual("newer-config-synthetic", self.redis.hashes[newer_key]["configuration_generation"])
+
+    def test_rehydration_rejects_incomplete_hashes_even_when_their_revision_is_newer(self):
+        from catchuparr.configuration import _rehydrate_sharing_authority_head
+
+        event = self.stage()
+        key = f"catchuparr:sharing:current:{event.channel_uuid}"
+        for fields in (
+            {"authority_revision": "1"},
+            {"authority_revision": "9", "configuration_generation": "newer"},
+        ):
+            with self.subTest(fields=fields):
+                self.redis.hashes[key] = dict(fields)
+                publish = Mock()
+                self.assertFalse(_rehydrate_sharing_authority_head(self.redis, event, publish))
+                publish.assert_not_called()
+                self.assertEqual(fields, self.redis.hashes[key])
+
+    def test_invalid_completed_durable_history_blocks_rehydration(self):
+        event = self.stage()
+        self.assertEqual((event.event_id,), self.drain().completed_event_ids)
+        with self.outbox._db() as db:
+            db.execute(
+                "UPDATE sharing_authority_outbox SET expected_revision=4 WHERE event_id=?",
+                (event.event_id,),
+            )
+            db.commit()
+        with self.assertRaisesRegex(ValueError, "not contiguous"):
+            self.outbox.committed_authority_heads()
+
 
 if __name__ == "__main__":
     unittest.main()

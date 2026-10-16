@@ -397,6 +397,37 @@ def _make_runtime_timeout_diagnostic_callback(
     return build
 
 
+def _failover_configuration_settings(settings: Mapping[str, object]) -> dict[str, object]:
+    """Force synthetic failover fixtures to use the sharing-off baseline."""
+    return {
+        **settings,
+        "connection_sharing_enabled": False,
+        "live_stability_seconds": 0,
+        "last_viewer_return_seconds": 0,
+        "min_switch_interval_seconds": 0,
+        "connection_sharing_migration_confirmed": True,
+    }
+
+
+def _close_current_thread_database_connections() -> None:
+    """Return this native thread's Django connections to the configured pool."""
+    try:
+        from django.db import connections
+
+        connections.close_all()
+    except Exception:
+        # Cleanup must not mask the request/task outcome being observed.
+        pass
+
+
+def _run_with_thread_database_cleanup(callback, *args, **kwargs):
+    """Run a thread entrypoint and release its thread-local ORM connections."""
+    try:
+        return callback(*args, **kwargs)
+    finally:
+        _close_current_thread_database_connections()
+
+
 def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
     payload = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
     if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
@@ -803,6 +834,7 @@ class _ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
+            _close_current_thread_database_connections()
             with self._active_lock:
                 self._active_requests -= 1
                 self._request_sockets.discard(request)
@@ -1213,7 +1245,8 @@ class _RecorderTaskRun:
 
         def invoke() -> None:
             try:
-                self.result = tasks.record_channel.run(
+                self.result = _run_with_thread_database_cleanup(
+                    tasks.record_channel.run,
                     self.channel_uuid,
                     self.expected_generation,
                     self.expected_control_generation,
@@ -1626,7 +1659,7 @@ def probe_recorder_failover(root: Path) -> None:
             "Native default StreamProfile was not set to Redirect",
         )
 
-        settings = {
+        settings = _failover_configuration_settings({
             "filter_config": (
                 "version: 1\n"
                 f"profile: {profile_name}\n"
@@ -1641,10 +1674,33 @@ def probe_recorder_failover(root: Path) -> None:
             "archive_root": str(archive_root),
             "retention_hours": 1,
             "max_storage_gib": 1,
-        }
-        apply_configuration(settings, active_path=active_path)
+        })
+        apply_result = apply_configuration(settings, active_path=active_path)
+        _require(
+            isinstance(apply_result, dict) and apply_result.get("applied") is True,
+            "Failover probe configuration was not applied",
+        )
         active = load_active_configuration(active_path)
         _require(active is not None, "Applied failover policy could not be read")
+        _require(
+            active.get("connection_sharing_enabled") is False
+            and all(
+                active.get(field) == 0
+                for field in (
+                    "live_stability_seconds",
+                    "last_viewer_return_seconds",
+                    "min_switch_interval_seconds",
+                )
+            )
+            and all(
+                item.get("enabled") is False
+                and item.get("live_stability_seconds") == 0
+                and item.get("last_viewer_return_seconds") == 0
+                and item.get("min_switch_interval_seconds") == 0
+                for item in active.get("connection_sharing", {}).values()
+            ),
+            "Failover probe did not apply sharing-off settings",
+        )
         expected_ids = [str(streams[label].id) for label in ("a", "b", "d")]
         for channel in channels.values():
             candidates = ranked_source_candidates(str(channel.uuid), active)

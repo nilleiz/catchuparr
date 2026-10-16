@@ -591,7 +591,7 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
     )
     deadline = _later_deadline(
         since,
-        observation.settings.live_stability_seconds,
+        (0 if current.last_switch_at is None else observation.settings.live_stability_seconds),
         current.last_switch_at,
         observation.settings.min_switch_interval_seconds,
     )
@@ -605,7 +605,9 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
         candidate_state,
         SharingAction.ATTACH_BORROW,
         SharingPhase.WAIT_LIVE,
-        "eligible existing live connection is stable",
+        ("initial eligible viewer connection attaches immediately"
+         if current.last_switch_at is None
+         else "eligible existing live connection is stable"),
     )
 
 
@@ -805,7 +807,8 @@ def _completion_deadline(
             return None
         return _later_deadline(
             state.candidate_since,
-            observation.settings.live_stability_seconds,
+            (0 if state.last_switch_at is None
+             else observation.settings.live_stability_seconds),
             state.last_switch_at,
             observation.settings.min_switch_interval_seconds,
         )

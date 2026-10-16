@@ -58,10 +58,10 @@ def attach_state():
     first = observe(None, SharingObservation(
         channel_uuid=CHANNEL, now=100, configuration_generation="config-synthetic",
         control_generation=2, recorder_fence=7, lease_is_current=True,
-        settings=SharingSettings(True, 5, 30, 60), target=target(),
+        settings=SharingSettings(True, 5, 30, 60), target=None,
     ))
     ready = observe(first.state, SharingObservation(
-        channel_uuid=CHANNEL, now=105, configuration_generation="config-synthetic",
+        channel_uuid=CHANNEL, now=100, configuration_generation="config-synthetic",
         control_generation=2, recorder_fence=7, lease_is_current=True,
         settings=SharingSettings(True, 5, 30, 60), target=target(),
     ))
@@ -367,15 +367,65 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         reloaded = self.intent_ledger.read(CHANNEL)
         self.assertEqual(270.0, reloaded.state.last_switch_at)
         self.assertEqual("dedicated", reloaded.state.phase.value)
-        next_observation = SharingObservation(
-            channel_uuid=CHANNEL, now=275.0,
-            configuration_generation="config-synthetic", control_generation=2,
-            recorder_fence=8, lease_is_current=True,
-            settings=SharingSettings(True, 5, 30, 60), target=target(),
-        )
-        decision = observe(reloaded.state, next_observation)
-        self.assertEqual(SharingAction.WAIT, decision.action)
-        self.assertEqual(330.0, decision.deadline)
+        # A viewer can return while the allowed-source operation is active.
+        # The pending RETURN cannot be replaced by ATTACH before useful media
+        # proves the return, but after that exact ACK the same viewer is
+        # observed again and admitted only after the normal switch interval.
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        coordinator.lease_value = LEASE
+        coordinator.state_record = pending
+        coordinator.assigned_sources = ()
+        coordinator.catalog_generation = "catalog-synthetic"
+        native_observation = SimpleNamespace(target=target())
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant", return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation", return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime.observe_native_connection", return_value=native_observation),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=275.0),
+        ):
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+        self.assertIsNone(self.intent_ledger.read(CHANNEL).intent)
+
+        # The attach token remains fenced until the original switch cooldown
+        # expires.
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant", return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation", return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime.observe_native_connection", return_value=native_observation),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=329.0),
+        ):
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+        self.assertIsNone(self.intent_ledger.read(CHANNEL).intent)
+
+        # After the cooldown, poll prepares the exact opening for the same
+        # ordinary viewer without creating a second upstream attempt.
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant", return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation", return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime.observe_native_connection", return_value=native_observation),
+            patch("catchuparr.sharing_runtime.prepare_borrow_opening", return_value=(True, "synthetic-opening")),
+            patch("catchuparr.sharing_runtime._django_secret", return_value=b"synthetic-secret"),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=331.0),
+        ):
+            self.assertEqual("synthetic-opening", coordinator.poll(
+                active=coordinator.active, control_generation=2,
+            ))
+        admitted = self.intent_ledger.read(CHANNEL).intent
+        self.assertEqual(SharingAction.ATTACH_BORROW, admitted.action)
+        self.assertEqual(331.0, admitted.not_before)
 
 
     def test_failure_cleanup_bypasses_return_and_switch_cooldowns(self):

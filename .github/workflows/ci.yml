@@ -1,16 +1,18 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
-  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   aio-integration:
     name: AIO integration (${{ matrix.version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     permissions:
       contents: read
     strategy:
@@ -48,8 +50,12 @@ jobs:
         run: python scripts/build_plugin.py
       - name: Check package layout
         run: python -m unittest tests.test_package -v
+      - name: Record package provenance
+        run: python scripts/ci_provenance.py record --package-root catchuparr --dist-dir dist --output dist/ci-provenance.json
       - uses: actions/upload-artifact@v4
         with:
           name: catchuparr-plugin
-          path: dist/catchuparr-*.zip
+          path: |
+            dist/catchuparr-*.zip
+            dist/ci-provenance.json
           if-no-files-found: error
