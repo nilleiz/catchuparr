@@ -448,6 +448,34 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         publish.assert_not_called()
         self.assertEqual("newer-config-synthetic", self.redis.hashes[newer_key]["configuration_generation"])
 
+    def test_rehydration_rejects_incomplete_hashes_even_when_their_revision_is_newer(self):
+        from catchuparr.configuration import _rehydrate_sharing_authority_head
+
+        event = self.stage()
+        key = f"catchuparr:sharing:current:{event.channel_uuid}"
+        for fields in (
+            {"authority_revision": "1"},
+            {"authority_revision": "9", "configuration_generation": "newer"},
+        ):
+            with self.subTest(fields=fields):
+                self.redis.hashes[key] = dict(fields)
+                publish = Mock()
+                self.assertFalse(_rehydrate_sharing_authority_head(self.redis, event, publish))
+                publish.assert_not_called()
+                self.assertEqual(fields, self.redis.hashes[key])
+
+    def test_invalid_completed_durable_history_blocks_rehydration(self):
+        event = self.stage()
+        self.assertEqual((event.event_id,), self.drain().completed_event_ids)
+        with self.outbox._db() as db:
+            db.execute(
+                "UPDATE sharing_authority_outbox SET expected_revision=4 WHERE event_id=?",
+                (event.event_id,),
+            )
+            db.commit()
+        with self.assertRaisesRegex(ValueError, "not contiguous"):
+            self.outbox.committed_authority_heads()
+
 
 if __name__ == "__main__":
     unittest.main()

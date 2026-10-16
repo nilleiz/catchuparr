@@ -25,8 +25,8 @@ from .native_output_security import ensure_native_key, native_key_id_valid
 from .runtime import PLUGIN_KEY, parse_settings
 
 ACTIVE_CONFIG_NAME = ".catchuparr-active-settings.json"
-ACTIVE_CONFIG_VERSION = 6
-SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, 4, 5, ACTIVE_CONFIG_VERSION})
+ACTIVE_CONFIG_VERSION = 7
+SUPPORTED_ACTIVE_CONFIG_VERSIONS = frozenset({2, 3, 4, 5, 6, ACTIVE_CONFIG_VERSION})
 RESET_REQUIRED_NAME = ".catchuparr-configuration-reset-required"
 ACTIVATION_STATE_NAME = ".catchuparr-configuration-activation.json"
 ACTIVATION_BACKUP_NAME = ".catchuparr-configuration-activation-previous.json"
@@ -34,6 +34,12 @@ ACTIVATION_COMMIT_NAME = ".catchuparr-configuration-activation-commit.json"
 ACTIVATION_UNCERTAIN_NAME = ".catchuparr-configuration-activation-uncertain.json"
 ACTIVATION_STATE_VERSION = 1
 SHARING_AUTHORITY_OUTBOX_NAME = ".catchuparr-sharing-authority.sqlite3"
+GLOBAL_SHARING_DEFAULTS = {
+    "connection_sharing_enabled": False,
+    "live_stability_seconds": 5,
+    "last_viewer_return_seconds": 30,
+    "min_switch_interval_seconds": 60,
+}
 
 
 @dataclass(frozen=True)
@@ -155,8 +161,89 @@ def _group_name(channel) -> str:
     return str(getattr(value, "name", "") or "")
 
 
+def _sharing_values(settings: dict) -> dict[str, Any]:
+    enabled = settings.get(
+        "connection_sharing_enabled", GLOBAL_SHARING_DEFAULTS["connection_sharing_enabled"]
+    )
+    if type(enabled) is not bool:
+        raise ValueError("connection_sharing_enabled must be boolean")
+    values = {"connection_sharing_enabled": enabled}
+    for name in (
+        "live_stability_seconds", "last_viewer_return_seconds",
+        "min_switch_interval_seconds",
+    ):
+        value = settings.get(name, GLOBAL_SHARING_DEFAULTS[name])
+        if type(value) is not int or not 0 <= value <= 3600:
+            raise ValueError(f"{name} must be an integer from 0 to 3600")
+        values[name] = value
+    confirmed = settings.get("connection_sharing_migration_confirmed", False)
+    if type(confirmed) is not bool:
+        raise ValueError("connection_sharing_migration_confirmed must be boolean")
+    return values
+
+
+def _sharing_by_channel(channel_uuids, values):
+    return {
+        channel: {
+            "enabled": values["connection_sharing_enabled"],
+            "live_stability_seconds": values["live_stability_seconds"],
+            "last_viewer_return_seconds": values["last_viewer_return_seconds"],
+            "min_switch_interval_seconds": values["min_switch_interval_seconds"],
+        }
+        for channel in channel_uuids
+    }
+
+
+def _resolve_global_sharing(settings, channel_uuids, catalog, previous_active):
+    """Migrate legacy channel values, requiring explicit selection on conflicts."""
+    requested = _sharing_values(settings)
+    if settings.get("connection_sharing_migration_confirmed", False):
+        return requested
+
+    legacy_values = None
+    if previous_active is not None and previous_active.get("version", 0) == 6:
+        old_map = previous_active.get("connection_sharing", {})
+        legacy_values = list(old_map.values())
+    elif previous_active is None:
+        raw_legacy = settings.get("connection_sharing_config", "")
+        if raw_legacy is None:
+            raw_legacy = ""
+        if not isinstance(raw_legacy, str):
+            raise ValueError("connection_sharing_config must be text")
+        if raw_legacy.strip():
+            from .source_rules import compile_connection_sharing_config
+
+            legacy = compile_connection_sharing_config(
+                raw_legacy, catalog.channels, catalog.profiles, channel_uuids,
+            )
+            legacy_values = list(legacy.values())
+    if not legacy_values:
+        return requested
+
+    def normalized(item):
+        return (
+            item.get("enabled"), item.get("live_stability_seconds"),
+            item.get("last_viewer_return_seconds"), item.get("min_switch_interval_seconds"),
+        )
+
+    distinct = {normalized(item) for item in legacy_values}
+    if len(distinct) != 1:
+        raise ValueError(
+            "Legacy per-channel sharing settings differ. Select the global values and "
+            "confirm the migration before validating or applying."
+        )
+    enabled, stability, return_seconds, switch_seconds = next(iter(distinct))
+    return {
+        "connection_sharing_enabled": enabled,
+        "live_stability_seconds": stability,
+        "last_viewer_return_seconds": return_seconds,
+        "min_switch_interval_seconds": switch_seconds,
+    }
+
+
 def compile_draft(
-    settings: dict, catalog: SourceCatalog | None = None
+    settings: dict, catalog: SourceCatalog | None = None,
+    previous_active: dict | None = None,
 ) -> tuple[dict[str, Any], SourceCatalog, list[dict[str, Any]]]:
     """Validate base fields and compile YAML filters into stable catalog IDs."""
     if any(key in settings for key in ("channel_uuids", "source_rules")):
@@ -183,19 +270,10 @@ def compile_draft(
         catalog.profiles,
         catalog.streams_by_channel,
     )
-    from .source_rules import compile_connection_sharing_config
-
-    raw_sharing_config = settings.get("connection_sharing_config", "")
-    if raw_sharing_config is None:
-        raw_sharing_config = ""
-    if not isinstance(raw_sharing_config, str):
-        raise ValueError("connection_sharing_config must be text")
-    connection_sharing = compile_connection_sharing_config(
-        raw_sharing_config,
-        catalog.channels,
-        catalog.profiles,
-        compiled.channel_uuids,
+    sharing_global = _resolve_global_sharing(
+        settings, compiled.channel_uuids, catalog, previous_active,
     )
+    connection_sharing = _sharing_by_channel(compiled.channel_uuids, sharing_global)
     encoded = {
         channel_uuid: {
             "include_account_ids": (
@@ -222,6 +300,7 @@ def compile_draft(
     ]
     parsed_settings["recording_enabled"] = recording_enabled
     parsed_settings["log_level"] = log_level
+    parsed_settings.update(sharing_global)
     return {
         "settings": parsed_settings,
         "channel_uuids": list(compiled.channel_uuids),
@@ -241,8 +320,12 @@ def compile_draft(
     }, catalog, previews
 
 
-def validate_configuration(settings: dict, catalog: SourceCatalog | None = None) -> dict[str, Any]:
-    active, _, previews = compile_draft(settings, catalog)
+def validate_configuration(
+    settings: dict, catalog: SourceCatalog | None = None,
+    active_path: Path | None = None,
+) -> dict[str, Any]:
+    previous_active = load_active_configuration(active_path or active_settings_path())
+    active, _, previews = compile_draft(settings, catalog, previous_active)
     return {
         "valid": True,
         "channels": previews,
@@ -322,7 +405,11 @@ def _apply_configuration_locked(
     catalog: SourceCatalog | None,
     path: Path,
 ) -> tuple[dict[str, Any], "_PreparedActivation"]:
-    active, _, previews = compile_draft(settings, catalog)
+    try:
+        previous_active = _load_active_configuration_locked(path)
+    except ValueError:
+        previous_active = None
+    active, _, previews = compile_draft(settings, catalog, previous_active)
     document = {
         "version": ACTIVE_CONFIG_VERSION,
         "settings": active["settings"],
@@ -331,7 +418,6 @@ def _apply_configuration_locked(
         "source_policies": active["source_policies"],
         "recording_schedule": active["recording_schedule"],
         "configuration_origins": active["configuration_origins"],
-        "connection_sharing": active["connection_sharing"],
     }
     _prevalidate_archive_root(document["settings"]["archive_root"])
     try:
@@ -910,12 +996,21 @@ def _rehydrate_sharing_authority_head(redis, head, publish):
     if not values:
         expected_revision = 0
     else:
+        if set(values) != {
+            "authority_revision", "configuration_generation",
+            "control_generation", "catalog_generation",
+        }:
+            return False
         try:
             revision_text = values["authority_revision"]
-            if not revision_text.isdecimal():
+            control_text = values["control_generation"]
+            if (not revision_text.isdecimal() or int(revision_text) < 1
+                    or not control_text.isdecimal()):
                 return False
             expected_revision = int(revision_text)
         except (KeyError, ValueError):
+            return False
+        if not values["configuration_generation"] or not values["catalog_generation"]:
             return False
         if expected_revision >= head.authority_revision:
             # A newer projection belongs to another committed transition and
@@ -1605,8 +1700,13 @@ def _active_configuration_view(data: dict[str, Any]) -> dict[str, Any]:
         }
     else:
         recording_schedule = data["recording_schedule"]
-    if data["version"] >= 6:
+    if data["version"] == 6:
         connection_sharing = data["connection_sharing"]
+    elif data["version"] >= 7:
+        connection_sharing = _sharing_by_channel(
+            channel_ids,
+            {name: data["settings"][name] for name in GLOBAL_SHARING_DEFAULTS},
+        )
     else:
         from .source_rules import CONNECTION_SHARING_DEFAULTS
 
@@ -1753,7 +1853,7 @@ def _validate_active_document(data: dict[str, Any]) -> None:
         expected_fields.add("recording_schedule")
     if version >= 5:
         expected_fields.add("configuration_origins")
-    if version >= 6:
+    if version == 6:
         expected_fields.add("connection_sharing")
     if set(data) != expected_fields:
         raise ValueError("Active Catchuparr configuration fields are invalid")
@@ -1774,8 +1874,12 @@ def _validate_active_document(data: dict[str, Any]) -> None:
                 "native_output_catchup", "native_output_key_id",
             }
         )
+    if version >= 7:
+        allowed_settings.update(GLOBAL_SHARING_DEFAULTS)
     if set(settings) - allowed_settings:
         raise ValueError("Active Catchuparr settings contain unknown fields")
+    if version >= 7 and not set(GLOBAL_SHARING_DEFAULTS) <= set(settings):
+        raise ValueError("Active Catchuparr global sharing settings are incomplete")
     channel_uuids = data.get("channel_uuids")
     if not isinstance(channel_uuids, list):
         raise ValueError("Active Catchuparr channel IDs are invalid")
@@ -1808,7 +1912,7 @@ def _validate_active_document(data: dict[str, Any]) -> None:
                 or any(not isinstance(value, str) for value in origin["schedule_days"].values())
             ):
                 raise ValueError("Active Catchuparr configuration origins are invalid")
-    if version >= 6:
+    if version == 6:
         from .source_rules import CONNECTION_SHARING_DEFAULTS
 
         sharing = data.get("connection_sharing")
@@ -1829,6 +1933,16 @@ def _validate_active_document(data: dict[str, Any]) -> None:
                     raise ValueError(
                         f"Active Catchuparr connection sharing {field_name} is invalid"
                     )
+    if version >= 7:
+        if type(settings.get("connection_sharing_enabled")) is not bool:
+            raise ValueError("Active Catchuparr connection_sharing_enabled is invalid")
+        for field_name in (
+            "live_stability_seconds", "last_viewer_return_seconds",
+            "min_switch_interval_seconds",
+        ):
+            value = settings.get(field_name)
+            if type(value) is not int or not 0 <= value <= 3600:
+                raise ValueError(f"Active Catchuparr {field_name} is invalid")
     profile_ids = data.get("channel_profile_ids")
     if (
         not isinstance(profile_ids, list)

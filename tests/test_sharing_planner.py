@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from catchuparr.sharing_planner import (
     BorrowTarget,
@@ -127,51 +128,61 @@ def resolve_transition(state, action, *, succeeded, now):
 
 
 class SharingPlannerTests(unittest.TestCase):
-    def test_live_target_stability_and_event_burst_coalesce_one_intent(self):
+    def test_initial_attach_uses_eligible_viewer_without_waiting_for_stability(self):
         initial = observation(100, candidate=target(allowed=False))
         decision = observe(None, initial)
-        self.assertEqual(SharingAction.WAIT, decision.action)
-        self.assertEqual(105, decision.deadline)
-
-        state = decision.state
-        for now in (101, 102, 103, 104):
-            burst = observe(state, observation(now, candidate=target(allowed=False)))
-            self.assertEqual(SharingAction.WAIT, burst.action)
-            self.assertEqual(105, burst.deadline)
-            state = burst.state
-
-        ready = observe(state, observation(105, candidate=target(allowed=False)))
-        self.assertEqual(SharingAction.ATTACH_BORROW, ready.action)
-        duplicate = observe(ready.state, observation(105, candidate=target(allowed=False)))
+        self.assertEqual(SharingAction.ATTACH_BORROW, decision.action)
+        self.assertIsNone(decision.deadline)
+        self.assertIn("immediately", decision.reason)
+        duplicate = observe(decision.state, observation(100, candidate=target(allowed=False)))
         self.assertEqual(SharingAction.NOOP, duplicate.action)
-        self.assertEqual(ready.state.pending_action, duplicate.state.pending_action)
+        self.assertEqual(decision.state.pending_action, duplicate.state.pending_action)
 
         borrowed = resolve_transition(
-            ready.state, SharingAction.ATTACH_BORROW, succeeded=True, now=105
+            decision.state, SharingAction.ATTACH_BORROW, succeeded=True, now=100
         )
         self.assertEqual(SharingPhase.BORROWED, borrowed.phase)
         self.assertEqual(target(allowed=False).connection_identity, borrowed.borrowed_identity)
-        self.assertEqual(105, borrowed.last_switch_at)
+        self.assertEqual(100, borrowed.last_switch_at)
 
     def test_target_identity_change_restarts_live_stability(self):
-        first = observe(None, observation(100, candidate=target()))
+        current = replace(
+            observe(None, observation(90, candidate=None)).state,
+            last_switch_at=90,
+        )
+        first = observe(
+            current,
+            observation(100, candidate=target(), settings=SharingSettings(True, 5, 30, 0)),
+        )
         self.assertEqual(105, first.deadline)
         changed = observe(
             first.state,
-            observation(104, candidate=target(worker="native-worker-2", owner="native-owner-2")),
+            observation(
+                104, candidate=target(worker="native-worker-2", owner="native-owner-2"),
+                settings=SharingSettings(True, 5, 30, 0),
+            ),
         )
         self.assertEqual(SharingAction.WAIT, changed.action)
         self.assertEqual(109, changed.deadline)
 
     def test_viewer_churn_keeps_live_stability_for_the_same_native_connection(self):
-        first = observe(None, observation(100, candidate=target(clients=("viewer-1",))))
+        state = replace(
+            observe(None, observation(90, candidate=None)).state,
+            last_switch_at=90,
+        )
+        settings = SharingSettings(True, 5, 30, 0)
+        first = observe(
+            state, observation(100, candidate=target(clients=("viewer-1",)), settings=settings),
+        )
         more_viewers = observe(
-            first.state,
-            observation(102, candidate=target(clients=("viewer-1", "viewer-2"))),
+            first.state, observation(
+                102, candidate=target(clients=("viewer-1", "viewer-2")), settings=settings,
+            ),
         )
         fewer_viewers = observe(
-            more_viewers.state,
-            observation(104, candidate=target(clients=("viewer-2",))),
+            more_viewers.state, observation(
+                104, candidate=target(clients=("viewer-2",)), settings=settings,
+            ),
         )
         self.assertEqual(SharingAction.WAIT, more_viewers.action)
         self.assertEqual(105, more_viewers.deadline)
@@ -179,7 +190,7 @@ class SharingPlannerTests(unittest.TestCase):
         self.assertEqual(105, fewer_viewers.deadline)
         stable = observe(
             fewer_viewers.state,
-            observation(105, candidate=target(clients=("viewer-2",))),
+            observation(105, candidate=target(clients=("viewer-2",)), settings=settings),
         )
         self.assertEqual(SharingAction.ATTACH_BORROW, stable.action)
 
@@ -371,27 +382,33 @@ class SharingPlannerTests(unittest.TestCase):
         self.assertEqual(SharingPhase.DEDICATED, no_viewers.state.phase)
 
     def test_stale_lease_cannot_advance_or_emit_pending_transition(self):
-        pending = observe(None, observation(100, candidate=target()))
         stale = observe(
-            pending.state,
-            observation(105, candidate=target(), lease=False),
+            None,
+            observation(100, candidate=target(), lease=False),
         )
         self.assertEqual(SharingAction.NOOP, stale.action)
-        self.assertEqual(pending.state, stale.state)
+        current = observe(
+            stale.state,
+            observation(105, candidate=target(), lease=False),
+        )
+        self.assertEqual(SharingAction.NOOP, current.action)
         current = observe(stale.state, observation(105, candidate=target()))
         self.assertEqual(SharingAction.ATTACH_BORROW, current.action)
 
     def test_configuration_or_control_generation_change_restarts_live_stability(self):
-        pending = observe(None, observation(100, candidate=target()))
+        pending = observe(
+            replace(observe(None, observation(90, candidate=None)).state, last_switch_at=90),
+            observation(100, candidate=target(), settings=SharingSettings(True, 5, 30, 0)),
+        )
         applied = observe(
             pending.state,
-            observation(104, candidate=target(), generation="config-b"),
+            observation(104, candidate=target(), generation="config-b", settings=SharingSettings(True, 5, 30, 0)),
         )
         self.assertEqual(SharingAction.WAIT, applied.action)
         self.assertEqual(109, applied.deadline)
         controlled = observe(
             applied.state,
-            observation(106, candidate=target(), generation="config-b", control=4),
+            observation(106, candidate=target(), generation="config-b", control=4, settings=SharingSettings(True, 5, 30, 0)),
         )
         self.assertEqual(SharingAction.WAIT, controlled.action)
         self.assertEqual(111, controlled.deadline)
@@ -417,8 +434,8 @@ class SharingPlannerTests(unittest.TestCase):
         self.assertEqual(SharingPhase.DEDICATED, restored.phase)
         self.assertIsNone(restored.borrowed_identity)
         resumed = observe(restored, observation(104, candidate=target(), fence=12))
-        self.assertEqual(SharingAction.WAIT, resumed.action)
-        self.assertEqual(105, resumed.deadline)
+        self.assertEqual(SharingAction.ATTACH_BORROW, resumed.action)
+        self.assertIsNone(resumed.deadline)
 
         fast = SharingSettings(True, live_stability_seconds=0)
         attach = observe(None, observation(200, candidate=target(), settings=fast))
@@ -678,76 +695,55 @@ class SharingPlannerTests(unittest.TestCase):
     def test_attach_and_return_recheck_deadlines_at_completion_and_on_clock_rollback(self):
         settings = SharingSettings(True, 5, 30, 60)
         attach = observe(None, observation(100, candidate=target(), settings=settings))
-        self.assertEqual(SharingAction.WAIT, attach.action)
-        due_attach = observe(
-            attach.state,
-            observation(105, candidate=target(), settings=settings),
-        )
-        self.assertEqual(SharingAction.ATTACH_BORROW, due_attach.action)
+        self.assertEqual(SharingAction.ATTACH_BORROW, attach.action)
+        self.assertIsNone(attach.deadline)
 
         early_attach = _resolve_transition(
-            due_attach.state,
-            due_attach.action,
+            attach.state,
+            attach.action,
             succeeded=True,
-            now=104,
-            current_state=due_attach.state,
-            current_observation=observation(104, candidate=target(), settings=settings),
+            now=100,
+            current_state=attach.state,
+            current_observation=observation(100, candidate=target(), settings=settings),
         )
-        self.assertIs(due_attach.state, early_attach)
-        rollback_attach = _resolve_transition(
-            due_attach.state,
-            due_attach.action,
-            succeeded=True,
-            now=105,
-            current_state=due_attach.state,
-            current_observation=observation(104, candidate=target(), settings=settings),
-        )
-        self.assertIs(due_attach.state, rollback_attach)
-        attached = _resolve_transition(
-            due_attach.state,
-            due_attach.action,
-            succeeded=True,
-            now=105,
-            current_state=due_attach.state,
-            current_observation=observation(105, candidate=target(), settings=settings),
-        )
-        self.assertEqual(SharingPhase.BORROWED, attached.phase)
+        self.assertEqual(SharingPhase.BORROWED, early_attach.phase)
+        attached = early_attach
 
         left = observe(
             attached,
-            observation(106, candidate=target(clients=()), settings=settings),
+            observation(101, candidate=target(clients=()), settings=settings),
         )
         self.assertEqual(SharingAction.WAIT, left.action)
         due_return = observe(
             left.state,
-            observation(165, candidate=target(clients=()), settings=settings),
+            observation(160, candidate=target(clients=()), settings=settings),
         )
         self.assertEqual(SharingAction.RETURN_TO_ALLOWED, due_return.action)
         early_return = _resolve_transition(
             due_return.state,
             due_return.action,
             succeeded=True,
-            now=164,
+            now=159,
             current_state=due_return.state,
-            current_observation=observation(164, candidate=target(clients=()), settings=settings),
+            current_observation=observation(159, candidate=target(clients=()), settings=settings),
         )
         self.assertIs(due_return.state, early_return)
         rollback_return = _resolve_transition(
             due_return.state,
             due_return.action,
             succeeded=True,
-            now=165,
+            now=160,
             current_state=due_return.state,
-            current_observation=observation(164, candidate=target(clients=()), settings=settings),
+            current_observation=observation(159, candidate=target(clients=()), settings=settings),
         )
         self.assertIs(due_return.state, rollback_return)
         returned = _resolve_transition(
             due_return.state,
             due_return.action,
             succeeded=True,
-            now=165,
+            now=160,
             current_state=due_return.state,
-            current_observation=observation(165, candidate=target(clients=()), settings=settings),
+            current_observation=observation(160, candidate=target(clients=()), settings=settings),
         )
         self.assertEqual(SharingPhase.DEDICATED, returned.phase)
 
@@ -764,7 +760,7 @@ class SharingPlannerTests(unittest.TestCase):
         due_pause = observe(
             no_source_pause.state,
             observation(
-                165,
+                160,
                 candidate=target(clients=()),
                 settings=settings,
                 dedicated_source_available=False,
@@ -775,10 +771,10 @@ class SharingPlannerTests(unittest.TestCase):
             due_pause.state,
             due_pause.action,
             succeeded=True,
-            now=164,
+            now=159,
             current_state=due_pause.state,
             current_observation=observation(
-                164,
+                159,
                 candidate=target(clients=()),
                 settings=settings,
                 dedicated_source_available=False,
@@ -789,10 +785,10 @@ class SharingPlannerTests(unittest.TestCase):
             due_pause.state,
             due_pause.action,
             succeeded=True,
-            now=165,
+            now=160,
             current_state=due_pause.state,
             current_observation=observation(
-                165,
+                160,
                 candidate=target(clients=()),
                 settings=settings,
                 dedicated_source_available=False,

@@ -298,18 +298,20 @@ class SharingAuthorityOutbox:
                 "SELECT acknowledged_revision FROM sharing_authority_revisions "
                 "WHERE channel_uuid=?", (channel_uuid,),
             ).fetchone()
-        if not rows or state is None:
+        if not rows:
             return None
+        if state is None:
+            raise ValueError("completed authority history has no acknowledged revision")
         expected = 0
         head = None
         for row in rows:
             event = self._event(row)
             if event.expected_revision != expected or event.authority_revision <= expected:
-                return None
+                raise ValueError("completed authority history is not contiguous")
             expected = event.authority_revision
             head = event
         if int(state["acknowledged_revision"]) != expected:
-            return None
+            raise ValueError("acknowledged authority revision differs from completed history")
         return head
 
     def committed_authority_heads(self) -> tuple[SharingAuthorityOutboxEvent, ...]:
