@@ -165,7 +165,7 @@ class NativeArchiveParityTests(unittest.TestCase):
             "channel-synthetic",
             "[]",
             self.candidates,
-            programme_end=self.requested_end + 60,
+            playback_end=self.requested_end,
         )
         self.service.playlist.assert_not_called()
 
