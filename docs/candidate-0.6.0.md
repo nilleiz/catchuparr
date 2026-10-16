@@ -7,9 +7,10 @@ reader client. It does not initialize an upstream channel, reserve another
 provider slot, or create a source assignment for borrowing. Sharing is off by
 default and only applies to channels selected by the applied channel filter.
 
-This is a candidate record. Required CI and complete end-to-end acceptance on
-the pinned Dispatcharr 0.32.0 release are not yet approved. The candidate has not
-been published. Do not infer native runtime acceptance from local unit tests.
+This is a candidate record. Full synthetic native acceptance passed on the
+pinned Dispatcharr 0.32.0 AIO. Required GitHub CI and publication are pending;
+the candidate has not been published. Real-player acceptance is separate and
+is not established by the AIO probe.
 
 ## Enable and configure
 
@@ -62,17 +63,17 @@ does not make assignments. If no source is available, recording waits paused.
   recorder launches another source. Stop does not stop the ordinary viewer's
   native channel.
 
-## Release acceptance still required
+## Acceptance evidence and publication status
 
-Before publication, run the required CI workflow and the pinned 0.32.0 AIO probe.
-The native probe must cover borrowing a source outside the allowlist without a
-new provider request, retaining unrelated viewers through Stop, exact cleanup
+The pinned 0.32.0 native probe has passed. It covered borrowing a source outside
+the allowlist without a new provider request, retaining unrelated viewers
+through Stop, exact cleanup
 at the first fallback provider request, first-viewer reuse, grace and switch
 deadlines, repeated borrow/return cycles, Apply and Stop revocation, restart
 recovery, stale capabilities, failure and acknowledgement retry. Verify that
 the tested source tree and ZIP are identical and that the archive contains the
-Dispatcharr icon. See the [validation record](validation.md) for current
-evidence and pending gates.
+Dispatcharr icon. Before publication, the required GitHub CI workflow must pass.
+See the [validation record](validation.md) for current evidence and pending gates.
 
 The plugin icon is the existing 256-pixel repository asset. Dispatcharr loads
 the optional `logo.png` placed beside the plugin entry point; the release ZIP

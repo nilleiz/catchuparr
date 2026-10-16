@@ -17,8 +17,8 @@ assignments, cloud storage or a transcoding service.
 ## Version and compatibility
 
 - The package version is **0.6.0 prerelease candidate**. It is not published.
-  Required CI, the pinned AIO job and final native sharing acceptance are
-  still gates. See [candidate 0.6.0](docs/candidate-0.6.0.md)
+  The pinned 0.32.0 native AIO acceptance passed; required GitHub CI and
+  publication remain gates. See [candidate 0.6.0](docs/candidate-0.6.0.md)
   and the [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.32.0**. The compatibility
   guard currently accepts the pinned 0.32.0 release; earlier and unverified
@@ -347,11 +347,12 @@ ruff check .
 python3 scripts/build_plugin.py
 ```
 
-Release CI runs the pinned Dispatcharr 0.32.0 AIO integration job. For 0.6.0,
-native sharing must pass that job, including ordinary-viewer retention,
-first-viewer borrowing, cooldown timing, Stop and Apply revocation, restart
-recovery, exact client cleanup, source switching, and retryable
-acknowledgements. The current candidate has not yet cleared those gates.
+Release CI runs the pinned Dispatcharr 0.32.0 AIO integration job. The 0.6.0
+candidate passed its full synthetic native AIO integration, including
+ordinary-viewer retention, first-viewer borrowing, cooldown timing, Stop and
+Apply revocation, restart recovery, exact client cleanup, source switching,
+and retryable acknowledgements. Required GitHub CI and publication are pending.
+The synthetic server checks do not establish real-player acceptance.
 
 See the [changelog](CHANGELOG.md), [release roadmap](docs/roadmap.md),
 [validation record](docs/validation.md) and
