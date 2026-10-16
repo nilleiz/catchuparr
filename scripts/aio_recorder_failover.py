@@ -409,6 +409,25 @@ def _failover_configuration_settings(settings: Mapping[str, object]) -> dict[str
     }
 
 
+def _close_current_thread_database_connections() -> None:
+    """Return this native thread's Django connections to the configured pool."""
+    try:
+        from django.db import connections
+
+        connections.close_all()
+    except Exception:
+        # Cleanup must not mask the request/task outcome being observed.
+        pass
+
+
+def _run_with_thread_database_cleanup(callback, *args, **kwargs):
+    """Run a thread entrypoint and release its thread-local ORM connections."""
+    try:
+        return callback(*args, **kwargs)
+    finally:
+        _close_current_thread_database_connections()
+
+
 def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
     payload = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
     if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
@@ -815,6 +834,7 @@ class _ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
+            _close_current_thread_database_connections()
             with self._active_lock:
                 self._active_requests -= 1
                 self._request_sockets.discard(request)
@@ -1225,7 +1245,8 @@ class _RecorderTaskRun:
 
         def invoke() -> None:
             try:
-                self.result = tasks.record_channel.run(
+                self.result = _run_with_thread_database_cleanup(
+                    tasks.record_channel.run,
                     self.channel_uuid,
                     self.expected_generation,
                     self.expected_control_generation,
