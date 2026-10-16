@@ -9,13 +9,17 @@ from unittest.mock import patch
 
 from scripts.ci_provenance import (
     ARTIFACT_NAME,
+    REQUIRED_AIO_STEP,
     WORKFLOW_PATH,
     ProvenanceError,
     _archive_inventory,
     _artifact_contents,
+    _bind_run_to_merged_pr,
     _compare_archive_to_source,
     _trusted_run,
+    changed_paths,
     package_inventory,
+    requires_aio,
     reuse_ci_artifact,
     validate_provenance,
 )
@@ -26,6 +30,7 @@ SOURCE_SHA = "a" * 40
 SOURCE_TREE = "b" * 40
 BASE_SHA = "d" * 40
 MERGE_SHA = "c" * 40
+PR_MERGE_SHA = "e" * 40
 ARCHIVE_NAME = "catchuparr-0.6.0.zip"
 
 
@@ -61,7 +66,11 @@ def _run() -> dict:
         }],
         "jobs": [
             {"name": "test-and-package", "conclusion": "success"},
-            {"name": "AIO integration (0.32.0)", "conclusion": "success"},
+            {
+                "name": "AIO integration (0.32.0)",
+                "conclusion": "success",
+                "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
+            },
         ],
     }
 
@@ -98,6 +107,19 @@ def _ci_artifact(provenance: dict, archive_name: str, package: bytes) -> bytes:
         artifact.writestr("ci-provenance.json", json.dumps(provenance))
         artifact.writestr(archive_name, package)
     return output.getvalue()
+
+
+def _merged_pr(**changes) -> dict:
+    value = {
+        "number": 12,
+        "state": "closed",
+        "merged": True,
+        "merge_commit_sha": PR_MERGE_SHA,
+        "head": {"sha": SOURCE_SHA, "repo": {"full_name": REPOSITORY}},
+        "base": {"sha": BASE_SHA, "repo": {"full_name": REPOSITORY}},
+    }
+    value.update(changes)
+    return value
 
 
 class CIProvenanceTest(unittest.TestCase):
@@ -173,6 +195,9 @@ class CIProvenanceTest(unittest.TestCase):
         self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
         run = _run()
         run["jobs"][1]["conclusion"] = "failure"
+        self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
+        run = _run()
+        run["jobs"][1]["steps"][0]["conclusion"] = "skipped"
         self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
         run = _run()
         run["workflow_id"] = WORKFLOW_ID + 1
@@ -300,6 +325,7 @@ class CIProvenanceTest(unittest.TestCase):
         old_provenance["archive_name"] = old_name
         current_run = _run()
         current_run["id"] = 4568
+        current_run["pull_requests"] = []
         current_provenance = _provenance(package, inventory)
         current_provenance["run_id"] = current_run["id"]
         old_artifact = _ci_artifact(old_provenance, old_name, package)
@@ -315,6 +341,7 @@ class CIProvenanceTest(unittest.TestCase):
                     return {"id": WORKFLOW_ID, "path": WORKFLOW_PATH, "state": "active"}
                 if path.startswith(f"actions/workflows/{WORKFLOW_ID}/runs?"):
                     older = dict(_run(), id=4567)
+                    older["pull_requests"] = []
                     return {"workflow_runs": [older, current_run]}
                 if path == "actions/runs/4567/jobs?per_page=100":
                     return {"jobs": _run()["jobs"]}
@@ -323,6 +350,10 @@ class CIProvenanceTest(unittest.TestCase):
                 if path.startswith("actions/runs/") and path.endswith("/artifacts?per_page=100"):
                     artifact_id = 101 if "/4567/" in path else 102
                     return {"artifacts": [{"id": artifact_id, "name": ARTIFACT_NAME, "expired": False}]}
+                if path == "pulls/12":
+                    return _merged_pr()
+                if path == f"git/commits/{PR_MERGE_SHA}":
+                    return {"sha": PR_MERGE_SHA, "tree": {"sha": SOURCE_TREE}}
                 if path == f"git/commits/{MERGE_SHA}":
                     return _tested_commit()
                 raise AssertionError(f"Unexpected API path: {path}")
@@ -338,11 +369,106 @@ class CIProvenanceTest(unittest.TestCase):
             (package_root / "logo.png").write_bytes(b"synthetic-logo-bytes")
             output = Path(directory) / "dist"
             with patch("scripts.ci_provenance.GitHubAPI", API), patch(
-                "scripts.ci_provenance._release_tree", return_value=(MERGE_SHA, SOURCE_TREE)
+                "scripts.ci_provenance._release_tree", return_value=(PR_MERGE_SHA, SOURCE_TREE)
             ):
                 result = reuse_ci_artifact(package_root, output, REPOSITORY, "synthetic-token")
             self.assertEqual(result["run_id"], current_run["id"])
             self.assertTrue((output / ARCHIVE_NAME).is_file())
+
+    def test_recovered_merged_pr_metadata_binds_run_and_release(self):
+        run = _run()
+        run["pull_requests"] = []
+
+        class API:
+            repository = REPOSITORY
+
+            def __init__(self, pr, merge_tree=SOURCE_TREE):
+                self.pr = pr
+                self.merge_tree = merge_tree
+
+            def get_json(self, path):
+                if path == "pulls/12":
+                    return self.pr
+                if path == f"git/commits/{PR_MERGE_SHA}":
+                    return {"sha": PR_MERGE_SHA, "tree": {"sha": self.merge_tree}}
+                raise AssertionError(f"Unexpected API path: {path}")
+
+        archive, inventory = _make_archive()
+        provenance = _provenance(archive, inventory)
+        _bind_run_to_merged_pr(API(_merged_pr()), run, provenance, SOURCE_TREE)
+        self.assertEqual(run["pull_requests"][0]["number"], 12)
+        validate_provenance(
+            provenance, repository=REPOSITORY, workflow_id=WORKFLOW_ID,
+            run=run, tested_commit=_tested_commit(), source_tree=SOURCE_TREE,
+            expected_inventory=inventory, archive_name=ARCHIVE_NAME,
+            archive_bytes=archive,
+        )
+
+        spoofed = _merged_pr(head={"sha": "f" * 40, "repo": {"full_name": REPOSITORY}})
+        with self.assertRaises(ProvenanceError):
+            _bind_run_to_merged_pr(API(spoofed), _run(), provenance, SOURCE_TREE)
+
+        wrong_base = _merged_pr(base={"sha": "f" * 40, "repo": {"full_name": REPOSITORY}})
+        spoofed_run = _run()
+        spoofed_run["pull_requests"] = []
+        _bind_run_to_merged_pr(API(wrong_base), spoofed_run, provenance, SOURCE_TREE)
+        with self.assertRaises(ProvenanceError):
+            validate_provenance(
+                provenance, repository=REPOSITORY, workflow_id=WORKFLOW_ID,
+                run=spoofed_run, tested_commit=_tested_commit(), source_tree=SOURCE_TREE,
+                expected_inventory=inventory, archive_name=ARCHIVE_NAME,
+                archive_bytes=archive,
+            )
+
+        unmerged = _merged_pr(merged=False)
+        with self.assertRaises(ProvenanceError):
+            _bind_run_to_merged_pr(API(unmerged), _run(), provenance, SOURCE_TREE)
+
+        with self.assertRaises(ProvenanceError):
+            _bind_run_to_merged_pr(API(_merged_pr(), merge_tree="f" * 40), _run(), provenance, SOURCE_TREE)
+
+
+class CIChangeClassificationTest(unittest.TestCase):
+    def test_infrastructure_allowlist_skips_native_probe(self):
+        self.assertFalse(requires_aio([
+            "scripts/ci_provenance.py",
+            "tests/test_ci_provenance.py",
+            "docs/ci-workflow.md",
+            "docs/nested/example.md",
+            "README.md",
+            "CHANGELOG.md",
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+        ]))
+
+    def test_runtime_or_unknown_paths_require_native_probe(self):
+        for paths in (
+            ["catchuparr/plugin.py"],
+            ["scripts/ci_provenance.py", "tests/test_ci_provenance.py", "tests/test_runtime.py"],
+            ["docs/example.png"],
+            [".github/workflows/ci.yaml"],
+            ["docs/../catchuparr/plugin.py"],
+            [],
+            None,
+        ):
+            with self.subTest(paths=paths):
+                self.assertTrue(requires_aio(paths))
+
+    def test_dispatch_and_invalid_or_failed_diff_force_full_probe(self):
+        sha = "a" * 40
+        self.assertIsNone(changed_paths("workflow_dispatch", sha, sha))
+        self.assertIsNone(changed_paths("pull_request", "invalid", sha))
+        with patch("scripts.ci_provenance.subprocess.run", side_effect=OSError):
+            self.assertIsNone(changed_paths("pull_request", sha, "b" * 40))
+
+    def test_changed_paths_uses_nul_delimited_git_diff(self):
+        sha = "a" * 40
+        fake = type("Result", (), {"stdout": b"README.md\0docs/ci-workflow.md\0"})()
+        with patch("scripts.ci_provenance.subprocess.run", return_value=fake) as run:
+            self.assertEqual(changed_paths("pull_request", sha, "b" * 40), [
+                "README.md", "docs/ci-workflow.md",
+            ])
+        self.assertEqual(run.call_args.args[0][-2:], [sha, "b" * 40])
 
 
 if __name__ == "__main__":
