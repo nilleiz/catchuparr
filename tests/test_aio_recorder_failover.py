@@ -1,4 +1,5 @@
 import array
+import ast
 import contextlib
 import http.client
 import io
@@ -38,6 +39,68 @@ class _SyntheticArchiveStore:
 
 
 class RecorderFailoverMediaTests(unittest.TestCase):
+    def test_supervisor_stop_reason_map_covers_actual_static_stop_sites(self):
+        tree = ast.parse((Path(__file__).parents[1] / "catchuparr/tasks.py").read_text())
+        record_channel = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "record_channel"
+        )
+        supervise = next(
+            node for node in ast.walk(record_channel)
+            if isinstance(node, ast.FunctionDef) and node.name == "supervise"
+        )
+        stop_lines = {
+            node.lineno for node in ast.walk(supervise)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "stop_event"
+        }
+        self.assertEqual(stop_lines, set(probe._SUPERVISOR_STOP_REASONS_BY_LINE))
+        self.assertEqual(
+            probe._safe_supervisor_stop_reason(
+                "catchuparr.tasks", "supervise", 267,
+                {"current_admission": {"status": "ready"}},
+            ),
+            "lease_renewal",
+        )
+        self.assertEqual(
+            probe._safe_supervisor_stop_reason(
+                "catchuparr.tasks", "supervise", 267,
+                {"current_admission": {"status": "stale_control"}},
+            ),
+            "admission_not_ready",
+        )
+        self.assertEqual(
+            probe._safe_supervisor_stop_reason(
+                "catchuparr.tasks", "supervise", 273, {},
+            ),
+            "stats_capability_refresh",
+        )
+        self.assertEqual(
+            probe._safe_supervisor_stop_reason(
+                "catchuparr.tasks", "supervise", 305, {},
+            ),
+            "attempt_renewal",
+        )
+        self.assertEqual(
+            probe._safe_supervisor_stop_reason(
+                "catchuparr.tasks", "supervise", 313, {},
+            ),
+            "candidate_currentness",
+        )
+        self.assertEqual(
+            probe._safe_supervisor_stop_reason(
+                "catchuparr.tasks", "supervise", 317, {},
+            ),
+            "exception",
+        )
+        self.assertEqual(
+            probe._safe_supervisor_stop_reason("untrusted", "supervise", 267, {}),
+            "unavailable",
+        )
+
     def test_stall_source_keeps_one_http_response_open_with_null_tail(self):
         payload = b"b" * (188 * 64)
         server = probe._SyntheticFailoverSourceServer(
@@ -161,6 +224,8 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         ])
         self.assertEqual(diagnostic["process_exit_codes"], [7])
         self.assertEqual(diagnostic["stop_set_source"], "unavailable")
+        self.assertEqual(diagnostic["first_supervisor_admission_status"], "unavailable")
+        self.assertEqual(diagnostic["first_supervisor_stop_reason"], "unavailable")
         for private_value in ("synthetic.invalid", "password", "private-token", "synthetic-generation"):
             self.assertNotIn(private_value, serialized)
 
@@ -187,12 +252,15 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             "event": event,
             "current_admission": {"status": "stale_configuration"},
         }
-        exec("def supervise(current_admission=current_admission):\n    event.set()\n", namespace)
+        tree = ast.parse("def supervise(current_admission=current_admission):\n    event.set()\n")
+        ast.increment_lineno(tree, 265)
+        exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
         self.assertEqual("tasks.supervisor", event.first_set_source)
         self.assertEqual(
             "stale_configuration", event.first_supervisor_admission_status,
         )
+        self.assertEqual("admission_not_ready", event.first_supervisor_stop_reason)
 
     def test_concurrent_stop_setters_preserve_first_caller_atomically(self):
         event = probe._ObservedRecorderStopEvent()

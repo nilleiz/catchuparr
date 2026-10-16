@@ -1,3 +1,4 @@
+import ast
 import io
 import json
 import sys
@@ -124,10 +125,11 @@ class RecorderMediaProbeTests(unittest.TestCase):
             "stop_event": stop_event,
             "current_admission": {"status": "stale_control"},
         }
-        exec(
-            "def supervise(current_admission=current_admission):\n    stop_event.set()\n",
-            namespace,
+        tree = ast.parse(
+            "def supervise(current_admission=current_admission):\n    stop_event.set()\n"
         )
+        ast.increment_lineno(tree, 265)
+        exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
         diagnostic = probe._recorder_task_early_exit_diagnostic(
             SimpleNamespace(
@@ -138,6 +140,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         )
         self.assertEqual("tasks.supervisor", diagnostic["stop_source"])
         self.assertEqual("stale_control", diagnostic["supervisor_admission_status"])
+        self.assertEqual("admission_not_ready", diagnostic["supervisor_stop_reason"])
 
     def test_allowed_source_wait_reports_existing_safe_task_exit_receipt(self):
         now = [0.0]
