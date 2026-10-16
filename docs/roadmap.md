@@ -21,7 +21,8 @@ Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidat
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | User acceptance complete; final parity correction passed four focused native 0.32.0 cases; required release workflow remains pending; not yet published |
 | 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Implemented in the prerelease candidate; the 453-test suite and full pinned AIO probes passed; CI and isolated Dev verification remain pending |
-| 0.6.0 | Optional sharing of compatible live connections | High | Full synthetic native acceptance passed on pinned Dispatcharr 0.32.0; required GitHub CI pending; not published; real-player acceptance not established |
+| 0.6.0 | Optional sharing of compatible live connections | High | Historical candidate; full synthetic native acceptance passed on pinned Dispatcharr 0.32.0 |
+| 0.6.1 | Global sharing controls, legacy settings migration and immediate initial attach | Medium | Focused unit coverage; required GitHub CI and publication pending; real-player acceptance not established |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.
@@ -33,8 +34,8 @@ not published separately.
 
 A single native Plugin Settings text field contains the YAML filter document.
 Archive path, retention, storage limit, playback user, public token-link base
-URL, recording-enabled state and log level remain separate fields in the same
-settings form. Validate previews the complete draft; one Apply validates and
+URL, recording-enabled state, log level and global connection-sharing controls
+remain separate fields in the same settings form. Validate previews the complete draft; one Apply validates and
 activates all its fields
 as one configuration generation. Saving a draft does not change active
 recordings. Pause and Resume remain immediate operational actions. UUIDs remain
@@ -407,21 +408,25 @@ using a source outside that list while Catchuparr borrows the existing stream.
 If no compatible viewed stream exists, Catchuparr uses only allowed assigned
 sources; without one, it remains paused.
 
-Sharing remains disabled by default and is configured in its own version 1 YAML
-field. The applied per-channel defaults are 5 seconds of stable native live
+Sharing remains disabled by default. The historical per-channel YAML settings
+are replaced in 0.6.1 by global controls. Uniform legacy values migrate
+automatically; conflicting channel values require explicit global confirmation.
+New snapshots persist only global values and runtime expands those values
+across selected channels. The defaults remain 5 seconds of stable native live
 state, 30 seconds after the last ordinary viewer leaves and a 60-second minimum
-between successful switches. Each integer setting accepts 0 through 3600;
-zero disables only its associated cooldown. Explicit Stop, invalid authority
-and recorder failure use prompt cleanup. Normal return waits for both the
-viewer grace and remaining switch interval.
+between later switches. Each integer setting accepts 0 through 3600; zero
+disables only its associated delay. Initial attach to an eligible existing
+viewer is immediate. Explicit Stop, invalid authority and recorder failure use
+prompt cleanup. Normal return waits for both the viewer grace and remaining
+switch interval.
 
 The candidate adds fenced episode and operation records, one-use signed borrow
 capabilities, exact reader registration and cleanup, restart reconciliation,
 and an FFmpeg attempt switch signal. A switch must reap the previous attempt
 and acknowledge exact reader cleanup before another source can launch. The
 release is not published. Full pinned 0.32.0 AIO acceptance passed; required
-GitHub CI remains open. Real-player acceptance is separate; see the [0.6.0 candidate guide](candidate-0.6.0.md)
-and [validation record](validation.md).
+GitHub CI remains open. Real-player acceptance is separate; see the
+[0.6.1 candidate guide](candidate-0.6.1.md) and [validation record](validation.md).
 
 ## Deferred validation
 
