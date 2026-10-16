@@ -277,6 +277,53 @@ class SharingAuthorityOutbox:
             return None
         return SharingAuthorityEventRecord(self._event(row), row["status"])
 
+    def committed_authority_head(self, channel_uuid: str) -> SharingAuthorityOutboxEvent | None:
+        """Return the acknowledged head only when durable history is contiguous.
+
+        This is used to rehydrate a missing/older Redis projection. It exposes
+        only committed, completed events and never the prior episode snapshot.
+        """
+        if not isinstance(channel_uuid, str) or not channel_uuid:
+            raise ValueError("channel_uuid is required")
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT event_id,activation_id,channel_uuid,expected_revision,authority_revision,"
+                "configuration_generation,control_generation,catalog_generation "
+                "FROM sharing_authority_outbox WHERE channel_uuid=? "
+                "AND status='complete' AND committed=1 "
+                "ORDER BY authority_revision,rowid",
+                (channel_uuid,),
+            ).fetchall()
+            state = db.execute(
+                "SELECT acknowledged_revision FROM sharing_authority_revisions "
+                "WHERE channel_uuid=?", (channel_uuid,),
+            ).fetchone()
+        if not rows or state is None:
+            return None
+        expected = 0
+        head = None
+        for row in rows:
+            event = self._event(row)
+            if event.expected_revision != expected or event.authority_revision <= expected:
+                return None
+            expected = event.authority_revision
+            head = event
+        if int(state["acknowledged_revision"]) != expected:
+            return None
+        return head
+
+    def committed_authority_heads(self) -> tuple[SharingAuthorityOutboxEvent, ...]:
+        """Return validated acknowledged heads for channels with durable history."""
+        with self._db() as db:
+            channels = db.execute(
+                "SELECT DISTINCT channel_uuid FROM sharing_authority_outbox "
+                "WHERE status='complete' AND committed=1 ORDER BY channel_uuid"
+            ).fetchall()
+        return tuple(
+            head for row in channels
+            if (head := self.committed_authority_head(row["channel_uuid"])) is not None
+        )
+
     def drain(
         self,
         redis: Any,

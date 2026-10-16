@@ -821,8 +821,6 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
         return True
     try:
         outbox = _sharing_authority_outbox(path)
-        if not outbox.pending(activation_id):
-            return True
         from core.utils import RedisClient
 
         from .adapters.sharing_native import (
@@ -836,6 +834,17 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
         redis = RedisClient.get_client()
         if redis is None:
             return False
+
+        # Redis may lose its current-authority hashes independently of the
+        # durable SQLite outbox. Rehydrate only the newest fully acknowledged
+        # committed head, using the observed Redis revision as strict CAS input.
+        # Prior episode snapshots are intentionally not replayed here.
+        for head in outbox.committed_authority_heads():
+            if not _rehydrate_sharing_authority_head(redis, head, publish_current_authority):
+                return False
+
+        if not outbox.pending(activation_id):
+            return True
 
         def publish(client, event):
             return publish_current_authority(
@@ -876,6 +885,56 @@ def _drain_sharing_authority_outbox(path: Path, activation_id: str | None = None
         return not result.pending_event_ids
     except Exception:
         return False
+
+
+def _rehydrate_sharing_authority_head(redis, head, publish):
+    """Repair an absent/older projection from durable committed authority only."""
+    key = f"catchuparr:sharing:current:{head.channel_uuid}"
+    key_type = getattr(redis, "type", None)
+    if callable(key_type):
+        kind = key_type(key)
+        if isinstance(kind, bytes):
+            kind = kind.decode("utf-8", errors="strict")
+        if kind not in {"none", "hash"}:
+            return False
+    raw = redis.hgetall(key) or {}
+    values = {}
+    for name, value in raw.items():
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", errors="strict")
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="strict")
+        if not isinstance(name, str) or not isinstance(value, str):
+            return False
+        values[name] = value
+    if not values:
+        expected_revision = 0
+    else:
+        try:
+            revision_text = values["authority_revision"]
+            if not revision_text.isdecimal():
+                return False
+            expected_revision = int(revision_text)
+        except (KeyError, ValueError):
+            return False
+        if expected_revision >= head.authority_revision:
+            # A newer projection belongs to another committed transition and
+            # must never be overwritten. An equal revision must be exact.
+            if expected_revision > head.authority_revision:
+                return True
+            return (
+                values.get("configuration_generation") == head.configuration_generation
+                and values.get("control_generation") == str(head.control_generation)
+                and values.get("catalog_generation") == head.catalog_generation
+            )
+    return publish(
+        redis, head.channel_uuid,
+        configuration_generation=head.configuration_generation,
+        control_generation=head.control_generation,
+        catalog_generation=head.catalog_generation,
+        expected_revision=expected_revision,
+        authority_revision=head.authority_revision,
+    ) is True
 
 
 def _read_file_bytes(path: Path) -> bytes | None:
