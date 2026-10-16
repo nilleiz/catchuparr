@@ -628,6 +628,56 @@ class RecorderMediaProbeTests(unittest.TestCase):
             settled_count, original_baseline,
         ))
 
+    def test_dedicated_preparation_does_not_apply_or_start_when_return_gate_fails(self):
+        effects = []
+
+        def fail_return_gate():
+            raise RuntimeError("synthetic RETURN profile mismatch")
+
+        with self.assertRaisesRegex(RuntimeError, "RETURN profile mismatch"):
+            probe._run_after_required_gate(
+                fail_return_gate,
+                lambda: effects.append("Apply and start B"),
+            )
+        self.assertEqual([], effects)
+
+    def test_dedicated_replacement_waits_for_native_release_after_profile_returns(self):
+        pending_manager = {
+            "conditions": {
+                "attempt_released": True,
+                "attempt_credentials_absent": True,
+                "native_manager_absent": False,
+                "native_owner_absent": True,
+                "native_clients_absent": True,
+                "native_stopping_marker_absent": True,
+                "provider_b_inactive": True,
+                "provider_b_requests_stable": True,
+                "profile_b_at_original_baseline": True,
+            },
+        }
+        full_release = {
+            "conditions": {
+                **pending_manager["conditions"],
+                "native_manager_absent": True,
+            },
+        }
+        snapshots = iter((pending_manager, full_release))
+        now = [0.0]
+        effects = []
+        result = probe._run_after_readiness_ack(
+            lambda: next(snapshots),
+            lambda: effects.append("start dedicated B") or "started",
+            5,
+            message="old B release pending",
+            diagnostic_label="SYNTHETIC_RELEASE_GATE",
+            monotonic=lambda: now[0],
+            sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+            poll_interval=0.1,
+        )
+        self.assertEqual("started", result)
+        self.assertEqual(["start dedicated B"], effects)
+        self.assertGreater(now[0], 0)
+
     def test_live_failover_provider_exposes_pre_response_request_boundary(self):
         source = object.__new__(aio_recorder_failover._SyntheticFailoverSourceServer)
         source._lock = threading.Lock()

@@ -221,6 +221,34 @@ def _profile_count_matches_original_baseline(current_count: int, original_baseli
     return current_count == original_baseline
 
 
+def _run_after_required_gate(gate, action):
+    """Run a side effect only after the required gate returns successfully."""
+    gate()
+    return action()
+
+
+def _run_after_readiness_ack(
+    snapshot_reader,
+    action,
+    timeout_seconds: float,
+    *,
+    message: str,
+    diagnostic_label: str,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_interval: float = 0.1,
+):
+    """Do not begin a replacement attempt before its release snapshot is ACKed."""
+    ready, snapshot = _wait_for_readiness_snapshot(
+        snapshot_reader, timeout_seconds,
+        monotonic=monotonic, sleep=sleep, poll_interval=poll_interval,
+    )
+    _require_with_failure_diagnostic(
+        ready, message, lambda: snapshot, diagnostic_label=diagnostic_label,
+    )
+    return action()
+
+
 def _wait_for_source_removal_transition(
     snapshot_reader,
     timeout_seconds: float,
@@ -2727,7 +2755,10 @@ def _probe_running_recorder_controls(
     from catchuparr import runtime, tasks
     from catchuparr.configuration import load_active_configuration
     from catchuparr.recorder_control import load_recorder_control
-    from catchuparr.recorder_proxy import CAPABILITY_PREFIX, configuration_generation
+    from catchuparr.recorder_proxy import (
+        CAPABILITY_PREFIX,
+        configuration_generation,
+    )
     from catchuparr.schedule import schedule_from_snapshot, schedule_is_active
 
     def require_live_a(
@@ -3346,7 +3377,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
 
     from catchuparr import runtime as catchuparr_runtime
     from catchuparr import tasks as catchuparr_tasks
-    from catchuparr.adapters.recorder_proxy import _release_worker_reservation
+    from catchuparr.adapters.recorder_proxy import (
+        _release_worker_reservation,
+        reservation_credential_marker_key,
+    )
     from catchuparr.configuration import (
         active_settings_path,
         apply_configuration,
@@ -4694,86 +4728,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Return did not use one allowed B connection after releasing borrowed A",
         )
 
-        # Establish the dedicated B fixture under sharing-OFF before opening
-        # the next ordinary A viewer. With sharing left enabled, live_stability
-        # is zero and the long A startup/validation path can legitimately let
-        # the supervisor migrate B onto A before the source-removal assertion.
-        # This Apply boundary keeps the later B-active prerequisite stable
-        # without changing its gate or extending any recorder deadline.
-        dedicated_settings = dict(sharing_settings)
-        dedicated_settings["connection_sharing_config"] = (
-            "version: 1\n"
-            "default:\n"
-            "  enabled: false\n"
-        )
-        dedicated_plugin = PluginConfig.objects.get(key="catchuparr")
-        dedicated_plugin.settings = dict(dedicated_settings)
-        dedicated_plugin.save(update_fields=("settings",))
-        applied_dedicated = catchuparr_runtime.apply_configuration(dedicated_settings)
-        _require(
-            applied_dedicated.get("applied") is True,
-            "Unified Apply rejected the sharing-off B preparation phase",
-        )
-        active_dedicated = load_active_configuration(active_path)
-        _require(
-            active_dedicated is not None
-            and active_dedicated["connection_sharing"][worker_id]["enabled"] is False
-            and [str(item.get("id")) for item in ranked_source_candidates(
-                worker_id, active_dedicated,
-            )] == [str(stream_b.id)],
-            "Sharing-off preparation did not preserve the assigned B fallback",
-        )
-        run_share.stop()
-        run_share.join(timeout=30, cooperative_sleep=gevent_sleep)
-        _require(
-            source_server.snapshot()[1]["source-b.ts"] == 0
-            and _profile_count(
-                redis_client, profile_b.id, profile_connections_key,
-            ) == profile_baselines[profile_b.id],
-            "Prior sharing supervisor did not release B before dedicated preparation",
-        )
-        dedicated_b_request_baseline = len(
-            source_server.request_times("source-b.ts"),
-        )
-        dedicated_b_segment_baseline = {
-            segment.id for segment in store.segments(worker_id)
-        }
-        run_dedicated_b = _RecorderTaskRun(
-            worker_id, startup_timeout=45, media_idle_timeout=25,
-        )
-        run_dedicated_b.start()
-        harnesses.append(run_dedicated_b)
-        dedicated_b_segments = _wait_for_indexed_tone(
-            run_dedicated_b, store, worker_id, ffmpeg, ffprobe,
-            expected_hz=880, existing_ids=dedicated_b_segment_baseline,
-            minimum=1, timeout=90, cooperative_sleep=gevent_sleep,
-        )
-        _require(bool(dedicated_b_segments),
-                 "Sharing-off B preparation did not index fresh B media")
-        dedicated_b_counts, dedicated_b_active = source_server.snapshot()
-        dedicated_b_records = [
-            record for record in _worker_records(redis_client, worker_id)
-            if record.get("state") == "active"
-            and record.get("reservation_state") == "reserved"
-            and record.get("stream_id") == str(stream_b.id)
-            and record.get("profile_id") == str(profile_b.id)
-        ]
-        _require(
-            dedicated_b_counts["source-b.ts"] == dedicated_b_request_baseline + 1
-            and dedicated_b_active["source-b.ts"] == 1
-            and dedicated_b_active["source-a.ts"] == 0
-            and _profile_count(
-                redis_client, profile_b.id, profile_connections_key,
-            ) == profile_baselines[profile_b.id] + 1
-            and len(dedicated_b_records) == 1
-            and dedicated_b_records[0].get("capability_digest")
-            and dedicated_b_records[0].get("reservation_id"),
-            "Sharing-off preparation did not establish one exact active B worker",
-        )
-        # The source-removal phase below joins this task after its enabled
-        # no-source Apply, while the exact active B bindings are captured.
-        run_share = run_dedicated_b
-
         profile_a_return_count = _profile_count(
             redis_client, profile_a.id, profile_connections_key,
         )
@@ -4831,12 +4785,212 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 },
             }
 
-        _require_with_failure_diagnostic(
-            all(profile_return_conditions.values()),
-            "Borrow return did not release A and reserve only the allowed B profile",
-            borrow_return_diagnostic,
-            diagnostic_label="CATCHUPARR_BORROW_RETURN_DIAGNOSTIC",
+        def require_borrow_return_gate():
+            _require_with_failure_diagnostic(
+                all(profile_return_conditions.values()),
+                "Borrow return did not release A and reserve only the allowed B profile",
+                borrow_return_diagnostic,
+                diagnostic_label="CATCHUPARR_BORROW_RETURN_DIAGNOSTIC",
+            )
+
+        def prepare_dedicated_b():
+            # Establish the dedicated B fixture under sharing-OFF before opening
+            # the next ordinary A viewer. With sharing left enabled, live_stability
+            # is zero and the long A startup/validation path can legitimately let
+            # the supervisor migrate B onto A before the source-removal assertion.
+            # This Apply boundary keeps the later B-active prerequisite stable
+            # without changing its gate or extending any recorder deadline.
+            old_dedicated_b_records = [
+                record for record in _worker_records(redis_client, worker_id)
+                if record.get("state") == "active"
+                and record.get("reservation_state") == "reserved"
+                and record.get("stream_id") == str(stream_b.id)
+                and record.get("profile_id") == str(profile_b.id)
+            ]
+            _require(
+                len(old_dedicated_b_records) == 1
+                and old_dedicated_b_records[0].get("worker_id")
+                and old_dedicated_b_records[0].get("capability_digest")
+                and old_dedicated_b_records[0].get("reservation_id"),
+                "Sharing-enabled B phase lacked one exact active worker before reconfiguration",
+            )
+            old_dedicated_b = old_dedicated_b_records[0]
+            old_dedicated_b_worker = str(old_dedicated_b["worker_id"])
+            old_dedicated_b_digest = str(old_dedicated_b["capability_digest"])
+            old_dedicated_b_reservation = str(old_dedicated_b["reservation_id"])
+            dedicated_settings = dict(sharing_settings)
+            dedicated_settings["connection_sharing_config"] = (
+                "version: 1\n"
+                "default:\n"
+                "  enabled: false\n"
+            )
+            dedicated_plugin = PluginConfig.objects.get(key="catchuparr")
+            dedicated_plugin.settings = dict(dedicated_settings)
+            dedicated_plugin.save(update_fields=("settings",))
+            applied_dedicated = catchuparr_runtime.apply_configuration(dedicated_settings)
+            _require(
+                applied_dedicated.get("applied") is True,
+                "Unified Apply rejected the sharing-off B preparation phase",
+            )
+            active_dedicated = load_active_configuration(active_path)
+            _require(
+                active_dedicated is not None
+                and active_dedicated["connection_sharing"][worker_id]["enabled"] is False
+                and [str(item.get("id")) for item in ranked_source_candidates(
+                    worker_id, active_dedicated,
+                )] == [str(stream_b.id)],
+                "Sharing-off preparation did not preserve the assigned B fallback",
+            )
+            run_share.stop()
+            run_share.join(timeout=30, cooperative_sleep=gevent_sleep)
+            old_dedicated_b_request_count = len(
+                source_server.request_times("source-b.ts"),
+            )
+
+            def old_dedicated_b_cleanup_snapshot():
+                matching = [
+                    record for record in _worker_records(redis_client, worker_id)
+                    if record.get("worker_id") == old_dedicated_b_worker
+                ]
+                record = matching[0] if len(matching) == 1 else None
+                counts, active_counts = source_server.snapshot()
+                return {
+                    "conditions": {
+                        "attempt_binding_preserved": bool(
+                            record
+                            and record.get("capability_digest") == old_dedicated_b_digest
+                            and record.get("reservation_id") == old_dedicated_b_reservation
+                        ),
+                        "attempt_released": bool(
+                            record
+                            and record.get("state") in {"failed", "released"}
+                            and record.get("reservation_state") in {"none", "released"}
+                        ),
+                        "attempt_credentials_absent": (
+                            not redis_client.exists(CAPABILITY_PREFIX + old_dedicated_b_digest)
+                            and not redis_client.exists(
+                                reservation_credential_marker_key(
+                                    old_dedicated_b_reservation,
+                                ),
+                            )
+                        ),
+                        "native_manager_absent": (
+                            old_dedicated_b_worker not in native_server.stream_managers
+                            and old_dedicated_b_worker not in native_server._live_stream_managers
+                            and old_dedicated_b_worker not in native_server.client_managers
+                        ),
+                        "native_owner_absent": (
+                            redis_client.get(
+                                RedisKeys.channel_owner(old_dedicated_b_worker),
+                            ) is None
+                        ),
+                        "native_clients_absent": (
+                            int(redis_client.scard(
+                                RedisKeys.clients(old_dedicated_b_worker),
+                            ) or 0) == 0
+                        ),
+                        "native_stopping_marker_absent": not redis_client.exists(
+                            RedisKeys.channel_stopping(old_dedicated_b_worker),
+                        ),
+                        "provider_b_inactive": active_counts["source-b.ts"] == 0,
+                        "provider_b_requests_stable": (
+                            counts["source-b.ts"] == old_dedicated_b_request_count
+                            and len(source_server.request_times("source-b.ts"))
+                            == old_dedicated_b_request_count
+                        ),
+                        "profile_b_at_original_baseline": (
+                            _profile_count(
+                                redis_client, profile_b.id, profile_connections_key,
+                            ) == profile_baselines[profile_b.id]
+                        ),
+                    },
+                    "worker_state": _allowlisted_state(
+                        record.get("state") if record else None,
+                        frozenset({
+                            "issued", "reserving", "reserved", "starting", "active",
+                            "releasing", "released", "release_failed", "failed",
+                        }),
+                    ),
+                    "reservation_state": _allowlisted_state(
+                        record.get("reservation_state") if record else None,
+                        frozenset({
+                            "none", "reserving", "reserved", "releasing",
+                            "released", "release_failed",
+                        }),
+                    ),
+                }
+
+            old_dedicated_b_timeout = _native_teardown_readiness_timeout(
+                float(ConfigHelper.channel_shutdown_delay()),
+                float(ConfigHelper.cleanup_check_interval()),
+                stopping_marker_ttl=90,
+            )
+            def start_dedicated_b_after_ack():
+                request_baseline = len(
+                    source_server.request_times("source-b.ts"),
+                )
+                segment_baseline = {
+                    segment.id for segment in store.segments(worker_id)
+                }
+                run = _RecorderTaskRun(
+                    worker_id, startup_timeout=45, media_idle_timeout=25,
+                )
+                run.start()
+                harnesses.append(run)
+                return run, request_baseline, segment_baseline
+
+            (
+                run_dedicated_b,
+                dedicated_b_request_baseline,
+                dedicated_b_segment_baseline,
+            ) = _run_after_readiness_ack(
+                old_dedicated_b_cleanup_snapshot,
+                start_dedicated_b_after_ack,
+                old_dedicated_b_timeout,
+                message=(
+                    "Prior B attempt had not received exact native/profile release acknowledgment"
+                ),
+                diagnostic_label="CATCHUPARR_DEDICATED_B_PREPARATION_DIAGNOSTIC",
+                monotonic=time.monotonic,
+                sleep=gevent_sleep,
+                poll_interval=0.1,
+            )
+            dedicated_b_segments = _wait_for_indexed_tone(
+                run_dedicated_b, store, worker_id, ffmpeg, ffprobe,
+                expected_hz=880, existing_ids=dedicated_b_segment_baseline,
+                minimum=1, timeout=90, cooperative_sleep=gevent_sleep,
+            )
+            _require(bool(dedicated_b_segments),
+                     "Sharing-off B preparation did not index fresh B media")
+            dedicated_b_counts, dedicated_b_active = source_server.snapshot()
+            dedicated_b_records = [
+                record for record in _worker_records(redis_client, worker_id)
+                if record.get("state") == "active"
+                and record.get("reservation_state") == "reserved"
+                and record.get("stream_id") == str(stream_b.id)
+                and record.get("profile_id") == str(profile_b.id)
+            ]
+            _require(
+                dedicated_b_counts["source-b.ts"] == dedicated_b_request_baseline + 1
+                and dedicated_b_active["source-b.ts"] == 1
+                and dedicated_b_active["source-a.ts"] == 0
+                and _profile_count(
+                    redis_client, profile_b.id, profile_connections_key,
+                ) == profile_baselines[profile_b.id] + 1
+                and len(dedicated_b_records) == 1
+                and dedicated_b_records[0].get("capability_digest")
+                and dedicated_b_records[0].get("reservation_id"),
+                "Sharing-off preparation did not establish one exact active B worker",
+            )
+            # The source-removal phase below joins this task after its enabled
+            # no-source Apply, while the exact active B bindings are captured.
+            return run_dedicated_b
+
+        run_dedicated_b = _run_after_required_gate(
+            require_borrow_return_gate, prepare_dedicated_b,
         )
+        run_share = run_dedicated_b
+
         # Remove all dedicated sources while an ordinary A viewer is present.
         # The new task must still borrow the existing A reader, close it at the
         # native grace deadline, persist PAUSED, and resume on B after Apply
@@ -4950,8 +5104,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         no_source_b_requests = len(source_server.request_times("source-b.ts"))
         no_source_b_reservation_id = no_source_b_record.get("reservation_id")
         no_source_b_capability_digest = no_source_b_record.get("capability_digest")
-        from catchuparr.adapters.recorder_proxy import reservation_credential_marker_key
-
         _require(
             isinstance(no_source_b_reservation_id, str) and no_source_b_reservation_id
             and isinstance(no_source_b_capability_digest, str)
