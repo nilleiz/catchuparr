@@ -23,8 +23,11 @@ from the release commit SHA; their tree identities must match. The
 Before release publication, the workflow downloads that run's CI artifact and
 checks its run identity and attempt. For a pull-request run, the artifact's
 tested synthetic merge commit must have exactly the base and head commits
-recorded for that run as its parents. The workflow then compares that tested
-commit's tree with the release checkout. This also permits a squash merge when
+recorded for that run as its parents. If GitHub omits pull request metadata from
+the run record after merge, the workflow loads the pull request identified by
+the provenance workflow ref and verifies its repository, head, base, merged
+state, and merge tree against the release checkout. It then compares the tested
+commit tree with the release checkout. This also permits a squash merge when
 the resulting release tree is identical. The workflow checks the artifact
 checksum, package file inventory, and every packaged file byte against the
 release checkout. Existing version, changelog, main-branch, tag, and release

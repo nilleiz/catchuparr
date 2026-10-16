@@ -13,6 +13,7 @@ from scripts.ci_provenance import (
     ProvenanceError,
     _archive_inventory,
     _artifact_contents,
+    _bind_run_to_merged_pr,
     _compare_archive_to_source,
     _trusted_run,
     package_inventory,
@@ -26,6 +27,7 @@ SOURCE_SHA = "a" * 40
 SOURCE_TREE = "b" * 40
 BASE_SHA = "d" * 40
 MERGE_SHA = "c" * 40
+PR_MERGE_SHA = "e" * 40
 ARCHIVE_NAME = "catchuparr-0.6.0.zip"
 
 
@@ -98,6 +100,19 @@ def _ci_artifact(provenance: dict, archive_name: str, package: bytes) -> bytes:
         artifact.writestr("ci-provenance.json", json.dumps(provenance))
         artifact.writestr(archive_name, package)
     return output.getvalue()
+
+
+def _merged_pr(**changes) -> dict:
+    value = {
+        "number": 12,
+        "state": "closed",
+        "merged": True,
+        "merge_commit_sha": PR_MERGE_SHA,
+        "head": {"sha": SOURCE_SHA, "repo": {"full_name": REPOSITORY}},
+        "base": {"sha": BASE_SHA, "repo": {"full_name": REPOSITORY}},
+    }
+    value.update(changes)
+    return value
 
 
 class CIProvenanceTest(unittest.TestCase):
@@ -300,6 +315,7 @@ class CIProvenanceTest(unittest.TestCase):
         old_provenance["archive_name"] = old_name
         current_run = _run()
         current_run["id"] = 4568
+        current_run["pull_requests"] = []
         current_provenance = _provenance(package, inventory)
         current_provenance["run_id"] = current_run["id"]
         old_artifact = _ci_artifact(old_provenance, old_name, package)
@@ -315,6 +331,7 @@ class CIProvenanceTest(unittest.TestCase):
                     return {"id": WORKFLOW_ID, "path": WORKFLOW_PATH, "state": "active"}
                 if path.startswith(f"actions/workflows/{WORKFLOW_ID}/runs?"):
                     older = dict(_run(), id=4567)
+                    older["pull_requests"] = []
                     return {"workflow_runs": [older, current_run]}
                 if path == "actions/runs/4567/jobs?per_page=100":
                     return {"jobs": _run()["jobs"]}
@@ -323,6 +340,10 @@ class CIProvenanceTest(unittest.TestCase):
                 if path.startswith("actions/runs/") and path.endswith("/artifacts?per_page=100"):
                     artifact_id = 101 if "/4567/" in path else 102
                     return {"artifacts": [{"id": artifact_id, "name": ARTIFACT_NAME, "expired": False}]}
+                if path == "pulls/12":
+                    return _merged_pr()
+                if path == f"git/commits/{PR_MERGE_SHA}":
+                    return {"sha": PR_MERGE_SHA, "tree": {"sha": SOURCE_TREE}}
                 if path == f"git/commits/{MERGE_SHA}":
                     return _tested_commit()
                 raise AssertionError(f"Unexpected API path: {path}")
@@ -338,11 +359,63 @@ class CIProvenanceTest(unittest.TestCase):
             (package_root / "logo.png").write_bytes(b"synthetic-logo-bytes")
             output = Path(directory) / "dist"
             with patch("scripts.ci_provenance.GitHubAPI", API), patch(
-                "scripts.ci_provenance._release_tree", return_value=(MERGE_SHA, SOURCE_TREE)
+                "scripts.ci_provenance._release_tree", return_value=(PR_MERGE_SHA, SOURCE_TREE)
             ):
                 result = reuse_ci_artifact(package_root, output, REPOSITORY, "synthetic-token")
             self.assertEqual(result["run_id"], current_run["id"])
             self.assertTrue((output / ARCHIVE_NAME).is_file())
+
+    def test_recovered_merged_pr_metadata_binds_run_and_release(self):
+        run = _run()
+        run["pull_requests"] = []
+
+        class API:
+            repository = REPOSITORY
+
+            def __init__(self, pr, merge_tree=SOURCE_TREE):
+                self.pr = pr
+                self.merge_tree = merge_tree
+
+            def get_json(self, path):
+                if path == "pulls/12":
+                    return self.pr
+                if path == f"git/commits/{PR_MERGE_SHA}":
+                    return {"sha": PR_MERGE_SHA, "tree": {"sha": self.merge_tree}}
+                raise AssertionError(f"Unexpected API path: {path}")
+
+        archive, inventory = _make_archive()
+        provenance = _provenance(archive, inventory)
+        _bind_run_to_merged_pr(API(_merged_pr()), run, provenance, SOURCE_TREE)
+        self.assertEqual(run["pull_requests"][0]["number"], 12)
+        validate_provenance(
+            provenance, repository=REPOSITORY, workflow_id=WORKFLOW_ID,
+            run=run, tested_commit=_tested_commit(), source_tree=SOURCE_TREE,
+            expected_inventory=inventory, archive_name=ARCHIVE_NAME,
+            archive_bytes=archive,
+        )
+
+        spoofed = _merged_pr(head={"sha": "f" * 40, "repo": {"full_name": REPOSITORY}})
+        with self.assertRaises(ProvenanceError):
+            _bind_run_to_merged_pr(API(spoofed), _run(), provenance, SOURCE_TREE)
+
+        wrong_base = _merged_pr(base={"sha": "f" * 40, "repo": {"full_name": REPOSITORY}})
+        spoofed_run = _run()
+        spoofed_run["pull_requests"] = []
+        _bind_run_to_merged_pr(API(wrong_base), spoofed_run, provenance, SOURCE_TREE)
+        with self.assertRaises(ProvenanceError):
+            validate_provenance(
+                provenance, repository=REPOSITORY, workflow_id=WORKFLOW_ID,
+                run=spoofed_run, tested_commit=_tested_commit(), source_tree=SOURCE_TREE,
+                expected_inventory=inventory, archive_name=ARCHIVE_NAME,
+                archive_bytes=archive,
+            )
+
+        unmerged = _merged_pr(merged=False)
+        with self.assertRaises(ProvenanceError):
+            _bind_run_to_merged_pr(API(unmerged), _run(), provenance, SOURCE_TREE)
+
+        with self.assertRaises(ProvenanceError):
+            _bind_run_to_merged_pr(API(_merged_pr(), merge_tree="f" * 40), _run(), provenance, SOURCE_TREE)
 
 
 if __name__ == "__main__":

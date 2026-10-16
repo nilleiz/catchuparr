@@ -292,6 +292,40 @@ def _same_repository(candidate: object, trusted: object) -> bool:
     return (ids_match or urls_match or full_names_match) and names_match
 
 
+def _bind_run_to_merged_pr(
+    api: GitHubAPI, run: dict, provenance: dict, release_tree: str,
+) -> None:
+    """Recover PR metadata omitted from merged workflow-run records and bind it."""
+    workflow_ref = provenance.get("workflow_ref")
+    prefix = f"{api.repository}/{WORKFLOW_PATH}@refs/pull/"
+    match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)/merge", workflow_ref or "")
+    if match is None:
+        raise ProvenanceError("CI provenance does not identify a pull request")
+    number = int(match.group(1))
+    pr = api.get_json(f"pulls/{number}")
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    if (
+        pr.get("number") != number
+        or pr.get("state") != "closed"
+        or pr.get("merged") is not True
+        or not isinstance(head.get("sha"), str)
+        or head["sha"].lower() != str(run.get("head_sha", "")).lower()
+        or not _same_repository(head.get("repo"), run.get("head_repository"))
+        or not _same_repository(base.get("repo"), run.get("repository"))
+    ):
+        raise ProvenanceError("Pull request identity does not match the trusted CI run")
+    merge_sha = pr.get("merge_commit_sha")
+    if not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_sha):
+        raise ProvenanceError("Merged pull request commit identity is missing")
+    merged_commit = _run_commit(api, merge_sha)
+    merged_tree = merged_commit.get("tree")
+    merged_tree_sha = merged_tree.get("sha") if isinstance(merged_tree, dict) else None
+    if not isinstance(merged_tree_sha, str) or merged_tree_sha.lower() != release_tree.lower():
+        raise ProvenanceError("Merged pull request tree differs from the release tree")
+    run["pull_requests"] = [{"number": number, "head": head, "base": base}]
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
         return None
@@ -487,6 +521,7 @@ def reuse_ci_artifact(package_root: Path, output_dir: Path, repository: str, tok
                 if candidate_provenance.get("archive_name") != archive_name:
                     continue
                 provenance, package_bytes = _artifact_contents(data_zip, archive_name)
+                _bind_run_to_merged_pr(api, run, provenance, release_tree)
                 tested_commit = _run_commit(api, str(provenance.get("source_sha", "")))
                 tree_obj = tested_commit.get("tree")
                 tree = tree_obj.get("sha", "").lower() if isinstance(tree_obj, dict) else ""
