@@ -24,7 +24,8 @@ included here to explain the feature history leading to 0.4.0.
 
 ### Notes
 
-- Requires Dispatcharr 0.32.0 or newer. The plugin icon remains included.
+- Requires Dispatcharr 0.32.0; unverified versions are refused. The plugin icon
+  remains included.
 - Required GitHub CI and publication are pending for this candidate.
 
 ## [0.6.0] - Prerelease
