@@ -182,10 +182,17 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             probe._classify_stop_set_source("SyntheticSecretTokenABC123", "private"),
         )
         event = probe._ObservedRecorderStopEvent()
-        namespace = {"__name__": "catchuparr.tasks", "event": event}
-        exec("def supervise():\n    event.set()\n", namespace)
+        namespace = {
+            "__name__": "catchuparr.tasks",
+            "event": event,
+            "current_admission": {"status": "stale_configuration"},
+        }
+        exec("def supervise(current_admission=current_admission):\n    event.set()\n", namespace)
         namespace["supervise"]()
         self.assertEqual("tasks.supervisor", event.first_set_source)
+        self.assertEqual(
+            "stale_configuration", event.first_supervisor_admission_status,
+        )
 
     def test_concurrent_stop_setters_preserve_first_caller_atomically(self):
         event = probe._ObservedRecorderStopEvent()

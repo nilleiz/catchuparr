@@ -474,6 +474,14 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
     return {
         "thread_alive": bool(thread is not None and thread.is_alive()),
         "stop_requested": bool(stop_event is not None and stop_event.is_set()),
+        "stop_source": (
+            getattr(stop_event, "first_set_source", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
+        "supervisor_admission_status": (
+            getattr(stop_event, "first_supervisor_admission_status", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
         "task_status": task_status,
         "failure_classes": failure_classes,
         "attempts": attempt_summaries,

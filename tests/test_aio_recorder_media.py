@@ -117,6 +117,28 @@ class RecorderMediaProbeTests(unittest.TestCase):
         )
         self.assertEqual("other", diagnostic["task_status"])
 
+    def test_early_exit_receipt_carries_first_supervisor_stop_context(self):
+        stop_event = aio_recorder_failover._ObservedRecorderStopEvent()
+        namespace = {
+            "__name__": "catchuparr.tasks",
+            "stop_event": stop_event,
+            "current_admission": {"status": "stale_control"},
+        }
+        exec(
+            "def supervise(current_admission=current_admission):\n    stop_event.set()\n",
+            namespace,
+        )
+        namespace["supervise"]()
+        diagnostic = probe._recorder_task_early_exit_diagnostic(
+            SimpleNamespace(
+                result={"status": "stopped"},
+                stop_event=stop_event,
+                thread=SimpleNamespace(is_alive=lambda: False),
+            )
+        )
+        self.assertEqual("tasks.supervisor", diagnostic["stop_source"])
+        self.assertEqual("stale_control", diagnostic["supervisor_admission_status"])
+
     def test_allowed_source_wait_reports_existing_safe_task_exit_receipt(self):
         now = [0.0]
         run = SimpleNamespace(
