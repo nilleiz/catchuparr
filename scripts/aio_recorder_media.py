@@ -115,6 +115,7 @@ def _source_removal_transition_conditions(
     a_assignments_preserved: bool,
     b_worker_released: bool,
     b_native_resources_absent: bool,
+    b_binding_preserved: bool,
     b_reservation_released: bool,
     b_private_markers_absent: bool,
     b_provider_inactive: bool,
@@ -131,12 +132,75 @@ def _source_removal_transition_conditions(
         "ordinary_a_assignments_preserved": a_assignments_preserved,
         "dedicated_b_worker_released": b_worker_released,
         "dedicated_b_native_resources_absent": b_native_resources_absent,
+        "dedicated_b_binding_preserved": b_binding_preserved,
         "dedicated_b_reservation_released": b_reservation_released,
         "dedicated_b_private_markers_absent": b_private_markers_absent,
         "dedicated_b_provider_inactive": b_provider_inactive,
         "dedicated_b_request_count_preserved": b_request_count_preserved,
         "dedicated_b_profile_released": b_profile_released,
     }
+
+
+def _wait_for_source_removal_transition(
+    snapshot_reader,
+    timeout_seconds: float,
+    *,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_interval: float = 0.1,
+):
+    """Fail fast on any A change; wait only for the independent B cleanup ACK."""
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        snapshot = snapshot_reader()
+        conditions = snapshot.get("conditions", {})
+        a_conditions = {
+            key: value for key, value in conditions.items()
+            if key.startswith("ordinary_a_")
+        }
+        b_conditions = {
+            key: value for key, value in conditions.items()
+            if key.startswith("dedicated_b_")
+        }
+        if not a_conditions or not b_conditions or not all(a_conditions.values()):
+            return False, snapshot, "ordinary_a_changed"
+        if all(b_conditions.values()):
+            return True, snapshot, None
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, snapshot, "dedicated_b_release_timeout"
+        sleep(min(poll_interval, remaining))
+
+
+def _read_after_current_buffer_head(session, buffer, *, minimum_bytes: int, timeout: float):
+    """Read only chunks published after the newly admitted buffer's current head."""
+    floor = _current_buffer_head(buffer)
+    return session.reader.read_after(floor, minimum_bytes=minimum_bytes, timeout=timeout)
+
+
+def _current_buffer_head(buffer) -> int:
+    return int(buffer.redis_client.get(buffer.buffer_index_key) or 0)
+
+
+def _allowlisted_state(value, allowed: frozenset[str]) -> str:
+    """Keep free-form ledger contents out of probe diagnostics."""
+    return value if isinstance(value, str) and value in allowed else "unknown"
+
+
+def _native_client_identity_matches(
+    client_ids,
+    *,
+    expected_client_id: str,
+    connected_at,
+    expected_connected_at: str,
+    worker_id,
+    expected_worker_id: str,
+) -> bool:
+    return (
+        set(client_ids) == {expected_client_id}
+        and connected_at == expected_connected_at
+        and worker_id == expected_worker_id
+    )
 
 
 def _wait_for_readiness_snapshot(
@@ -4616,9 +4680,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # The new task must still borrow the existing A reader, close it at the
         # native grace deadline, persist PAUSED, and resume on B after Apply
         # restores an allowed source.
-        no_source_buffer_floor = int(
-            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
-        )
         no_source_response = client.get(
             f"/proxy/ts/stream/{channel.uuid}",
             HTTP_HOST="localhost",
@@ -4626,12 +4687,34 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         _require(no_source_response.status_code == 200,
                  "No-source ordinary A viewer could not open")
-        live_session, live_reader = _create_native_live_reader_session(
+        live_session, no_source_native_buffer = _create_native_live_reader_session(
             no_source_response, native_server, worker_id,
         )
         live_reader = live_session.reader
         _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+        )
+        no_source_a_client_ids = {
+            _redis_text(client_id)
+            for client_id in redis_client.smembers(RedisKeys.clients(worker_id))
+        }
+        _require(
+            len(no_source_a_client_ids) == 1,
+            "Ordinary A viewer did not have one exact native registration",
+        )
+        no_source_a_client_id = next(iter(no_source_a_client_ids))
+        no_source_a_client_key = (
+            f"live:channel:{worker_id}:clients:{no_source_a_client_id}"
+        )
+        no_source_a_connected_at = _redis_text(
+            redis_client.hget(no_source_a_client_key, "connected_at"),
+        )
+        no_source_a_client_worker = _redis_text(
+            redis_client.hget(no_source_a_client_key, "worker_id"),
+        )
+        _require(
+            no_source_a_connected_at and no_source_a_client_worker,
+            "Ordinary A client registration did not expose its stable identity fields",
         )
         no_source_native_owner, no_source_native_manager, no_source_client_manager = (
             _wait_for_native_active(
@@ -4640,8 +4723,27 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 channel_state=ChannelState, timeout=45,
             )
         )
-        no_source_first_media, _no_source_first_index = live_reader.read_after(
-            no_source_buffer_floor, minimum_bytes=188 * 100, timeout=20,
+        _require(
+            _native_client_identity_matches(
+                {
+                    _redis_text(client_id)
+                    for client_id in redis_client.smembers(RedisKeys.clients(worker_id))
+                },
+                expected_client_id=no_source_a_client_id,
+                connected_at=_redis_text(redis_client.hget(
+                    no_source_a_client_key, "connected_at",
+                )),
+                expected_connected_at=no_source_a_connected_at,
+                worker_id=_redis_text(redis_client.hget(
+                    no_source_a_client_key, "worker_id",
+                )),
+                expected_worker_id=no_source_a_client_worker,
+            ),
+            "Ordinary A registration changed before reaching ACTIVE",
+        )
+        no_source_first_media, _no_source_first_index = _read_after_current_buffer_head(
+            live_session, no_source_native_buffer,
+            minimum_bytes=188 * 100, timeout=20,
         )
         _verify_audio_video_tone(
             ffmpeg, ffprobe, no_source_first_media, 440,
@@ -4659,7 +4761,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             no_source_a_active["source-a.ts"] == 1
             and no_source_a_profile_count == profile_baselines[profile_a.id] + 1
             and no_source_native_manager.running
-            and no_source_client_manager.get_client_count() == 1,
+            and no_source_client_manager.get_client_count() == 1
+            and no_source_a_connected_at
+            and no_source_a_client_worker,
             "Ordinary A viewer did not reach ACTIVE with its exact provider reservation",
         )
         live_dedicated_b_records = [
@@ -4685,6 +4789,18 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         no_source_b_requests = len(source_server.request_times("source-b.ts"))
         no_source_b_reservation_id = no_source_b_record.get("reservation_id")
         no_source_b_capability_digest = no_source_b_record.get("capability_digest")
+        from catchuparr.adapters.recorder_proxy import reservation_credential_marker_key
+
+        _require(
+            isinstance(no_source_b_reservation_id, str) and no_source_b_reservation_id
+            and isinstance(no_source_b_capability_digest, str)
+            and no_source_b_capability_digest
+            and redis_client.exists(
+                reservation_credential_marker_key(no_source_b_reservation_id),
+            )
+            and redis_client.exists(CAPABILITY_PREFIX + no_source_b_capability_digest),
+            "Dedicated B worker did not expose complete active reservation bindings",
+        )
         no_source_settings = dict(sharing_settings)
         no_source_settings["filter_config"] = (
             "version: 1\n"
@@ -4712,8 +4828,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             float(ConfigHelper.cleanup_check_interval()),
             stopping_marker_ttl=90,
         )
-        from catchuparr.adapters.recorder_proxy import reservation_credential_marker_key
-
         def no_source_transition_snapshot():
             current_counts, current_active = source_server.snapshot()
             current_a_profile = _profile_count(
@@ -4737,13 +4851,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 and (no_source_b_reservation_id is None
                      or b_record.get("reservation_id") == no_source_b_reservation_id)
             )
+            b_binding_preserved = bool(
+                b_record
+                and b_record.get("reservation_id") == no_source_b_reservation_id
+                and b_record.get("capability_digest") == no_source_b_capability_digest
+            )
             markers_absent = (
-                (not no_source_b_capability_digest
-                 or not redis_client.exists(CAPABILITY_PREFIX + no_source_b_capability_digest))
-                and (not no_source_b_reservation_id
-                     or not redis_client.exists(
-                         reservation_credential_marker_key(no_source_b_reservation_id),
-                     ))
+                not redis_client.exists(CAPABILITY_PREFIX + no_source_b_capability_digest)
+                and not redis_client.exists(
+                    reservation_credential_marker_key(no_source_b_reservation_id),
+                )
             )
             state = _redis_text(redis_client.hget(
                 metadata_key, ChannelMetadataField.STATE,
@@ -4766,6 +4883,22 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     and client_manager is no_source_client_manager
                     and client_manager is not None
                     and int(client_manager.get_client_count()) == 1
+                    and bool(redis_client.exists(no_source_a_client_key))
+                    and _native_client_identity_matches(
+                        {
+                            _redis_text(client_id)
+                            for client_id in redis_client.smembers(RedisKeys.clients(worker_id))
+                        },
+                        expected_client_id=no_source_a_client_id,
+                        connected_at=_redis_text(redis_client.hget(
+                            no_source_a_client_key, "connected_at",
+                        )),
+                        expected_connected_at=no_source_a_connected_at,
+                        worker_id=_redis_text(redis_client.hget(
+                            no_source_a_client_key, "worker_id",
+                        )),
+                        expected_worker_id=no_source_a_client_worker,
+                    )
                 ),
                 a_provider_preserved=(
                     current_active["source-a.ts"] == 1
@@ -4799,6 +4932,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                         ChannelMetadataField.STATE,
                     )) != _constant_text(ChannelState.STOPPING)
                 ),
+                b_binding_preserved=b_binding_preserved,
                 b_reservation_released=b_reservation_released,
                 b_private_markers_absent=markers_absent,
                 b_provider_inactive=current_active["source-b.ts"] == 0,
@@ -4822,21 +4956,35 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 },
                 "a_profile": current_a_profile,
                 "b_profile": current_b_profile,
-                "b_worker_state": b_record.get("state") if b_record else "unresolved",
+                "b_worker_state": _allowlisted_state(
+                    b_record.get("state") if b_record else None,
+                    frozenset({
+                        "issued", "reserving", "reserved", "starting", "active",
+                        "releasing", "released", "release_failed", "failed",
+                    }),
+                ),
                 "b_reservation_state": (
-                    b_record.get("reservation_state") if b_record else "unresolved"
+                    _allowlisted_state(
+                        b_record.get("reservation_state") if b_record else None,
+                        frozenset({
+                            "none", "reserving", "reserved", "releasing",
+                            "released", "release_failed",
+                        }),
+                    )
                 ),
                 "native_a_active": conditions["ordinary_a_active"],
             }
 
-        no_source_ready, no_source_last_snapshot = _wait_for_readiness_snapshot(
+        no_source_ready, no_source_last_snapshot, no_source_wait_reason = (
+            _wait_for_source_removal_transition(
             no_source_transition_snapshot, no_source_release_timeout,
             monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
+            )
         )
         _require_with_failure_diagnostic(
             no_source_ready,
             "Removing dedicated sources disturbed live A or retained B's reservation",
-            lambda: no_source_last_snapshot,
+            lambda: dict(no_source_last_snapshot, wait_reason=no_source_wait_reason),
             diagnostic_label="CATCHUPARR_NO_SOURCE_TRANSITION_DIAGNOSTIC",
         )
         no_source_counts, no_source_active = source_server.snapshot()
@@ -5069,9 +5217,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # Re-open A after the same native teardown readiness gate used
         # immediately after the first return.
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
-        second_cycle_buffer_floor = int(
-            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
-        )
         live_response = _open_after_readiness(
             lambda: wait_for_native_a_teardown(no_source_client_id),
             lambda: client.get(
@@ -5082,7 +5227,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         _require(live_response.status_code == 200,
                  "Second-cycle ordinary A viewer could not open")
-        live_session, live_reader = _create_native_live_reader_session(
+        live_session, second_cycle_native_buffer = _create_native_live_reader_session(
             live_response, native_server, worker_id,
         )
         live_reader = live_session.reader
@@ -5094,8 +5239,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             metadata_field=ChannelMetadataField,
             channel_state=ChannelState, timeout=45,
         )
-        second_cycle_first_media, _second_cycle_media_index = live_reader.read_after(
-            second_cycle_buffer_floor, minimum_bytes=188 * 100, timeout=20,
+        second_cycle_first_media, _second_cycle_media_index = _read_after_current_buffer_head(
+            live_session, second_cycle_native_buffer,
+            minimum_bytes=188 * 100, timeout=20,
         )
         _verify_audio_video_tone(
             ffmpeg, ffprobe, second_cycle_first_media, 440,
@@ -5166,6 +5312,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         return_ledger = SharingIntentLedger(
             archive_root / ".catchuparr-sharing.sqlite3",
         )
+        restart_b_worker_ids_before = {
+            str(record.get("worker_id"))
+            for record in _worker_records(redis_client, worker_id)
+            if record.get("stream_id") == str(stream_b.id)
+            and record.get("worker_id")
+        }
+        restart_b_profile_baseline = _profile_count(
+            redis_client, profile_b.id, profile_connections_key,
+        )
         source_server.set_mode("source-b.ts", "unavailable")
         restart_b_request_baseline = len(source_server.request_times("source-b.ts"))
         live_session.close()
@@ -5203,8 +5358,143 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             _require(time.monotonic() < b_unavailable_deadline,
                      "Task did not attempt B while the RETURN intent was pending")
             gevent_sleep(0.05)
+        restart_b_attempt_records = [
+            record for record in _worker_records(redis_client, worker_id)
+            if record.get("stream_id") == str(stream_b.id)
+            and record.get("worker_id")
+            and str(record.get("worker_id")) not in restart_b_worker_ids_before
+        ]
+        restart_b_attempt_ids = tuple(sorted({
+            str(record.get("worker_id")) for record in restart_b_attempt_records
+        }))
+        _require(
+            bool(restart_b_attempt_ids)
+            and all(
+                isinstance(record.get("capability_digest"), str)
+                and record.get("capability_digest")
+                and isinstance(record.get("reservation_id"), str)
+                and record.get("reservation_id")
+                for record in restart_b_attempt_records
+            ),
+            "Pending RETURN did not expose exact B attempt cleanup bindings",
+        )
+        restart_b_attempt_bindings = {
+            str(record["worker_id"]): {
+                "capability_digest": str(record["capability_digest"]),
+                "reservation_id": str(record["reservation_id"]),
+            }
+            for record in restart_b_attempt_records
+        }
         run_share.stop()
         run_share.join(timeout=25, cooperative_sleep=gevent_sleep)
+        restart_b_request_count_after_stop = len(
+            source_server.request_times("source-b.ts"),
+        )
+
+        def restart_b_cleanup_snapshot():
+            current_records = {
+                str(record.get("worker_id")): record
+                for record in _worker_records(redis_client, worker_id)
+                if record.get("worker_id")
+                and str(record.get("worker_id")) in restart_b_attempt_ids
+            }
+            records = [current_records.get(worker) for worker in restart_b_attempt_ids]
+            exact_bindings = all(
+                record is not None
+                and record.get("capability_digest")
+                == restart_b_attempt_bindings[worker]["capability_digest"]
+                and record.get("reservation_id")
+                == restart_b_attempt_bindings[worker]["reservation_id"]
+                for worker, record in zip(restart_b_attempt_ids, records)
+            )
+            ledger_released = bool(records) and all(
+                record is not None
+                and record.get("state") in {"failed", "released"}
+                and record.get("reservation_state") in {"none", "released"}
+                for record in records
+            )
+            private_markers_absent = all(
+                record is not None
+                and not redis_client.exists(
+                    CAPABILITY_PREFIX
+                    + restart_b_attempt_bindings[worker]["capability_digest"],
+                )
+                and not redis_client.exists(
+                    reservation_credential_marker_key(
+                        restart_b_attempt_bindings[worker]["reservation_id"],
+                    ),
+                )
+                for worker, record in zip(restart_b_attempt_ids, records)
+            )
+            native_resources_absent = all(
+                worker not in native_server.stream_managers
+                and worker not in native_server._live_stream_managers
+                and worker not in native_server.client_managers
+                and redis_client.get(RedisKeys.channel_owner(worker)) is None
+                and int(redis_client.scard(RedisKeys.clients(worker)) or 0) == 0
+                and not redis_client.exists(RedisKeys.channel_stopping(worker))
+                for worker in restart_b_attempt_ids
+            )
+            provider_counts, provider_active = source_server.snapshot()
+            return {
+                "conditions": {
+                    "attempt_ledger_released": ledger_released,
+                    "attempt_binding_preserved": exact_bindings,
+                    "attempt_markers_absent": private_markers_absent,
+                    "native_resources_absent": native_resources_absent,
+                    "provider_b_inactive": provider_active["source-b.ts"] == 0,
+                    "provider_b_requests_unchanged": (
+                        len(source_server.request_times("source-b.ts"))
+                        == restart_b_request_count_after_stop
+                        and provider_counts["source-b.ts"]
+                        == restart_b_request_count_after_stop
+                    ),
+                    "profile_b_at_baseline": (
+                        _profile_count(redis_client, profile_b.id, profile_connections_key)
+                        == restart_b_profile_baseline
+                    ),
+                },
+                "worker_states": [
+                    _allowlisted_state(
+                        record.get("state") if record else None,
+                        frozenset({
+                            "issued", "reserving", "reserved", "starting", "active",
+                            "releasing", "released", "release_failed", "failed",
+                        }),
+                    )
+                    for record in records
+                ],
+                "reservation_states": [
+                    _allowlisted_state(
+                        record.get("reservation_state") if record else None,
+                        frozenset({
+                            "none", "reserving", "reserved", "releasing",
+                            "released", "release_failed",
+                        }),
+                    )
+                    for record in records
+                ],
+                "provider_b_active": provider_active["source-b.ts"],
+                "provider_b_requests": provider_counts["source-b.ts"],
+            }
+
+        restart_b_release_timeout = _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
+        restart_b_resources_released, restart_b_release_snapshot = (
+            _wait_for_readiness_snapshot(
+                restart_b_cleanup_snapshot, restart_b_release_timeout,
+                monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
+            )
+        )
+        _require_with_failure_diagnostic(
+            restart_b_resources_released,
+            "Stopping the pending RETURN task did not release its exact B attempt",
+            lambda: restart_b_release_snapshot,
+            diagnostic_label="CATCHUPARR_PENDING_RETURN_B_CLEANUP_DIAGNOSTIC",
+        )
         interrupted_return = return_ledger.read(worker_id)
         _require(
             interrupted_return is not None
@@ -5255,9 +5545,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # The replacement task now borrows a fresh ordinary A viewer. Keep it
         # alive through Pause to prove cleanup leaves the native viewer intact.
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
-        post_restart_buffer_floor = int(
-            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
-        )
         live_response = _open_after_readiness(
             lambda: wait_for_native_a_teardown(second_borrow_client_id),
             lambda: client.get(
@@ -5268,7 +5555,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         _require(live_response.status_code == 200,
                  "Post-restart ordinary A viewer could not open")
-        live_session, live_reader = _create_native_live_reader_session(
+        live_session, post_restart_native_buffer = _create_native_live_reader_session(
             live_response, native_server, worker_id,
         )
         live_reader = live_session.reader
@@ -5280,8 +5567,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             metadata_field=ChannelMetadataField,
             channel_state=ChannelState, timeout=45,
         )
-        post_restart_first_media, _post_restart_media_index = live_reader.read_after(
-            post_restart_buffer_floor, minimum_bytes=188 * 100, timeout=20,
+        post_restart_first_media, _post_restart_media_index = _read_after_current_buffer_head(
+            live_session, post_restart_native_buffer,
+            minimum_bytes=188 * 100, timeout=20,
         )
         _verify_audio_video_tone(
             ffmpeg, ffprobe, post_restart_first_media, 440,

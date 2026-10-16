@@ -416,6 +416,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
             a_assignments_preserved=True,
             b_worker_released=True,
             b_native_resources_absent=True,
+            b_binding_preserved=True,
             b_reservation_released=True,
             b_private_markers_absent=True,
             b_provider_inactive=True,
@@ -428,6 +429,140 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertFalse(all(disturbed_a.values()))
         retained_b = dict(conditions, dedicated_b_reservation_released=False)
         self.assertFalse(all(retained_b.values()))
+
+    def test_source_removal_fails_fast_when_a_drops_then_recovers(self):
+        healthy = probe._source_removal_transition_conditions(
+            a_owner_preserved=True,
+            a_active=True,
+            a_client_preserved=True,
+            a_provider_preserved=True,
+            a_profile_preserved=True,
+            a_assignments_preserved=True,
+            b_worker_released=False,
+            b_native_resources_absent=False,
+            b_binding_preserved=False,
+            b_reservation_released=False,
+            b_private_markers_absent=False,
+            b_provider_inactive=False,
+            b_request_count_preserved=True,
+            b_profile_released=False,
+        )
+        disturbed = dict(healthy, ordinary_a_active=False)
+        released = dict(
+            healthy,
+            dedicated_b_worker_released=True,
+            dedicated_b_native_resources_absent=True,
+            dedicated_b_binding_preserved=True,
+            dedicated_b_reservation_released=True,
+            dedicated_b_private_markers_absent=True,
+            dedicated_b_provider_inactive=True,
+            dedicated_b_profile_released=True,
+        )
+        snapshots = iter(({"conditions": disturbed}, {"conditions": released}))
+        now = [0.0]
+        ready, observed, reason = probe._wait_for_source_removal_transition(
+            lambda: next(snapshots), 5,
+            monotonic=lambda: now[0],
+            sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+        )
+        self.assertFalse(ready)
+        self.assertFalse(observed["conditions"]["ordinary_a_active"])
+        self.assertEqual("ordinary_a_changed", reason)
+        self.assertEqual(0.0, now[0])
+
+    def test_source_removal_waits_only_for_b_release_when_a_stays_healthy(self):
+        conditions = probe._source_removal_transition_conditions(
+            a_owner_preserved=True,
+            a_active=True,
+            a_client_preserved=True,
+            a_provider_preserved=True,
+            a_profile_preserved=True,
+            a_assignments_preserved=True,
+            b_worker_released=False,
+            b_native_resources_absent=False,
+            b_binding_preserved=False,
+            b_reservation_released=False,
+            b_private_markers_absent=False,
+            b_provider_inactive=False,
+            b_request_count_preserved=True,
+            b_profile_released=False,
+        )
+        released = dict(
+            conditions,
+            dedicated_b_worker_released=True,
+            dedicated_b_native_resources_absent=True,
+            dedicated_b_binding_preserved=True,
+            dedicated_b_reservation_released=True,
+            dedicated_b_private_markers_absent=True,
+            dedicated_b_provider_inactive=True,
+            dedicated_b_profile_released=True,
+        )
+        snapshots = iter(({"conditions": conditions}, {"conditions": released}))
+        now = [0.0]
+        ready, observed, reason = probe._wait_for_source_removal_transition(
+            lambda: next(snapshots), 5,
+            monotonic=lambda: now[0],
+            sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+        )
+        self.assertTrue(ready)
+        self.assertIsNone(reason)
+        self.assertTrue(all(observed["conditions"].values()))
+        self.assertGreater(now[0], 0.0)
+
+    def test_fresh_media_floor_uses_new_buffer_epoch(self):
+        class Buffer:
+            def __init__(self, index):
+                self.redis_client = SimpleNamespace(get=lambda _key: index)
+                self.buffer_index_key = "synthetic-index"
+
+        observed_floors = []
+        session = SimpleNamespace(
+            reader=SimpleNamespace(
+                read_after=lambda floor, **_kwargs: (
+                    observed_floors.append(floor) or b"fresh", floor + 1,
+                ),
+            ),
+        )
+        _old_media, _old_index = probe._read_after_current_buffer_head(
+            session, Buffer(1000), minimum_bytes=1, timeout=1,
+        )
+        _new_media, new_index = probe._read_after_current_buffer_head(
+            session, Buffer(1), minimum_bytes=1, timeout=1,
+        )
+        self.assertEqual([1000, 1], observed_floors)
+        self.assertEqual(2, new_index)
+
+    def test_source_removal_diagnostic_allowlists_ledger_states(self):
+        worker_states = frozenset({"active", "released", "failed"})
+        reservation_states = frozenset({"reserved", "released", "none"})
+        self.assertEqual("active", probe._allowlisted_state("active", worker_states))
+        self.assertEqual("released", probe._allowlisted_state("released", reservation_states))
+        self.assertEqual(
+            "unknown",
+            probe._allowlisted_state("SyntheticSecretValue123", worker_states),
+        )
+        self.assertEqual("unknown", probe._allowlisted_state(None, reservation_states))
+
+    def test_source_removal_binds_original_native_client_registration(self):
+        expected = {
+            "expected_client_id": "synthetic-client-a",
+            "connected_at": "100.0",
+            "expected_connected_at": "100.0",
+            "worker_id": "synthetic-native-worker",
+            "expected_worker_id": "synthetic-native-worker",
+        }
+        self.assertTrue(probe._native_client_identity_matches(
+            {"synthetic-client-a"}, **expected,
+        ))
+        self.assertFalse(probe._native_client_identity_matches(
+            {"synthetic-client-b"}, **expected,
+        ))
+        self.assertFalse(probe._native_client_identity_matches(
+            {"synthetic-client-a"}, **dict(expected, connected_at="101.0"),
+        ))
+        self.assertFalse(probe._native_client_identity_matches(
+            {"synthetic-client-a", "synthetic-recorder-client"}, **expected,
+        ))
 
     def test_live_failover_provider_exposes_pre_response_request_boundary(self):
         source = object.__new__(aio_recorder_failover._SyntheticFailoverSourceServer)
