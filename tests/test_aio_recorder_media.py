@@ -1863,6 +1863,39 @@ class RecorderMediaProbeTests(unittest.TestCase):
             )
         self.assertEqual(2, redis.reads)
 
+    def test_identity_capture_rejects_local_disconnect_after_latching_ordinary(self):
+        class Keys:
+            clients = staticmethod(lambda _worker: "clients")
+
+        class Redis:
+            def __init__(self):
+                self.reads = 0
+
+            def smembers(self, _key):
+                self.reads += 1
+                return {b"ordinary-client"}
+
+            def hget(self, key, field):
+                if key.endswith("ordinary-client") and field == "connected_at":
+                    return b"100.5"
+                if key.endswith("ordinary-client") and field == "worker_id":
+                    return b"native-owner"
+                return None
+
+        counts = iter((1, 0, 1))
+        redis = Redis()
+        server = SimpleNamespace(
+            worker_id="native-owner",
+            client_managers={"worker": SimpleNamespace(get_client_count=lambda: next(counts))},
+        )
+        with self.assertRaisesRegex(RuntimeError, "ordinary client detached"):
+            probe._wait_for_native_client_count(
+                redis, server, Keys, "worker", 1, expected_local=1,
+                return_identity=True,
+                verified_borrow_client_ids=lambda: {"catchuparr-client-borrow"},
+            )
+        self.assertEqual(2, redis.reads)
+
     def test_native_active_wait_does_not_accept_connecting(self):
         redis = _FakeRedis(state_after_reads=10**9)
         manager = SimpleNamespace(running=True)

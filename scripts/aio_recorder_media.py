@@ -2836,6 +2836,10 @@ def _wait_for_native_client_count(
             }
             if local_count > 1 or len(verified_ids) > 1:
                 raise RuntimeError("Native live route registered an unverified client")
+            if ordinary_identity is not None and local_count != 1:
+                raise RuntimeError(
+                    "Native recorder ordinary client detached during identity capture"
+                )
             if local_count == 1:
                 ordinary_identity, missing_verified_ids = _native_ordinary_client_observation(
                     redis_client,
