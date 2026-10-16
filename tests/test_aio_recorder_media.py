@@ -1,7 +1,10 @@
+import io
 import json
+import sys
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -37,6 +40,55 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_dead_recorder_failure_reports_safe_terminal_task_diagnostics(self):
+        thread = threading.Thread(target=lambda: None)
+        thread.start()
+        thread.join()
+        run = SimpleNamespace(
+            _lock=threading.Lock(),
+            thread=thread,
+            stop_event=threading.Event(),
+            failures=["task:ValueError"],
+            result={"status": "sharing_cleanup_pending"},
+            results=[SimpleNamespace(
+                status="media_stalled", useful_segments=0, return_code=17,
+                attempt_switch_id=None,
+            )],
+            processes=[SimpleNamespace(poll=lambda: 17)],
+            input_headers=[{"X-Catchuparr-Borrow": "synthetic-bearer-secret"}],
+        )
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(
+            RuntimeError, "Synthetic recorder task ended before expected media was indexed",
+        ):
+            with patch.dict(
+                sys.modules,
+                {"aio_recorder_failover": SimpleNamespace(
+                    _segment_has_useful_av=lambda *_: True,
+                    _segment_tone_frequency=lambda *_: 880,
+                )},
+            ):
+                probe._wait_for_indexed_tone(
+                    run, object(), "synthetic-channel", "ffmpeg", "ffprobe",
+                    expected_hz=880, existing_ids=set(), minimum=1, timeout=1,
+                )
+        line = next(
+            line for line in output.getvalue().splitlines()
+            if line.startswith("CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC ")
+        )
+        diagnostic = json.loads(line.split(" ", 1)[1])
+        self.assertEqual("sharing_cleanup_pending", diagnostic["task_status"])
+        self.assertEqual(["ValueError"], diagnostic["failure_classes"])
+        self.assertEqual(
+            [{
+                "status": "media_stalled", "useful_segments": 0,
+                "return_code": 17, "switch_id_present": False,
+            }],
+            diagnostic["attempts"],
+        )
+        self.assertEqual([17], diagnostic["process_exit_codes"])
+        self.assertNotIn("synthetic-bearer-secret", line)
+
     def test_teardown_budget_accounts_for_sequential_shutdown_and_marker_ttl(self):
         self.assertEqual(
             156.0,

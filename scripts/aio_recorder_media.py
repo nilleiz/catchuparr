@@ -87,6 +87,73 @@ def _open_after_readiness(wait_for_ready, open_request):
     return open_request()
 
 
+def _recorder_task_early_exit_diagnostic(run) -> dict:
+    """Return only safe terminal task/attempt summaries, never inputs or secrets."""
+    lock = getattr(run, "_lock", None)
+    if lock is None:
+        failures = list(getattr(run, "failures", ()))
+        results = list(getattr(run, "results", ()))
+        inputs = list(getattr(run, "input_headers", ()))
+        processes = list(getattr(run, "processes", ()))
+    else:
+        with lock:
+            failures = list(getattr(run, "failures", ()))
+            results = list(getattr(run, "results", ()))
+            inputs = list(getattr(run, "input_headers", ()))
+            processes = list(getattr(run, "processes", ()))
+
+    allowed_statuses = {
+        "stopped", "switch_requested", "media_stalled", "exited", "no_media",
+        "already_running", "no_permitted_sources", "proxy_integration_unsupported",
+        "sharing_return_recovery_pending", "sharing_authority_unavailable",
+        "sharing_cleanup_pending", "sharing_admission_uncertain", "recording_paused",
+        "stale_control", "disabled", "stale_configuration", "outside_schedule",
+    }
+
+    def safe_status(value):
+        return value if isinstance(value, str) and value in allowed_statuses else "other"
+
+    attempt_summaries = []
+    for result in results:
+        useful = getattr(result, "useful_segments", None)
+        return_code = getattr(result, "return_code", None)
+        attempt_summaries.append({
+            "status": safe_status(getattr(result, "status", None)),
+            "useful_segments": useful if type(useful) is int and useful >= 0 else None,
+            "return_code": return_code if type(return_code) is int else None,
+            "switch_id_present": isinstance(
+                getattr(result, "attempt_switch_id", None), str,
+            ),
+        })
+
+    task_result = getattr(run, "result", None)
+    task_status = (
+        safe_status(task_result.get("status"))
+        if isinstance(task_result, dict) else "unavailable"
+    )
+    failure_classes = []
+    for failure in failures:
+        last_part = failure.rsplit(":", 1)[-1] if isinstance(failure, str) else ""
+        failure_classes.append(last_part if last_part.isidentifier() else "other")
+
+    process_exit_codes = []
+    for process in processes:
+        code = process.poll()
+        process_exit_codes.append(code if type(code) is int else None)
+
+    thread = getattr(run, "thread", None)
+    stop_event = getattr(run, "stop_event", None)
+    return {
+        "thread_alive": bool(thread is not None and thread.is_alive()),
+        "stop_requested": bool(stop_event is not None and stop_event.is_set()),
+        "task_status": task_status,
+        "failure_classes": failure_classes,
+        "attempts": attempt_summaries,
+        "attempt_count": len(inputs),
+        "process_exit_codes": process_exit_codes,
+    }
+
+
 def _assert_private_worker_stop_request_count(before: dict, after: dict) -> None:
     """A cooperative stop must not open another provider request."""
     _require(
@@ -2298,9 +2365,12 @@ def _wait_for_indexed_tone(
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        _require(
-            run.thread is not None and run.thread.is_alive(),
+        task_alive = run.thread is not None and run.thread.is_alive()
+        _require_with_failure_diagnostic(
+            task_alive,
             "Synthetic recorder task ended before expected media was indexed",
+            lambda: _recorder_task_early_exit_diagnostic(run),
+            diagnostic_label="CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC",
         )
         matched = []
         for segment in store.segments(channel_uuid):
