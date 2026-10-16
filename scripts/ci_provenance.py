@@ -180,8 +180,8 @@ def validate_provenance(
     base = base if isinstance(base, dict) else {}
     head_repo = head.get("repo")
     base_repo = base.get("repo")
-    head_repo = head_repo if isinstance(head_repo, dict) else {}
-    base_repo = base_repo if isinstance(base_repo, dict) else {}
+    trusted_head_repo = run.get("head_repository")
+    trusted_base_repo = run.get("repository")
     parents = tested_commit.get("parents") if isinstance(tested_commit, dict) else None
     tested_tree = tested_commit.get("tree") if isinstance(tested_commit, dict) else None
     tested_tree_sha = tested_tree.get("sha") if isinstance(tested_tree, dict) else None
@@ -199,10 +199,8 @@ def validate_provenance(
         and type(pr_number) is int and pr_number > 0
         and isinstance(run.get("head_sha"), str)
         and run["head_sha"].lower() == str(head.get("sha", "")).lower()
-        and isinstance(head_repo.get("full_name"), str)
-        and head_repo["full_name"].casefold() == repository.casefold()
-        and isinstance(base_repo.get("full_name"), str)
-        and base_repo["full_name"].casefold() == repository.casefold()
+        and _same_repository(head_repo, trusted_head_repo)
+        and _same_repository(base_repo, trusted_base_repo)
     )
     ref_prefix = f"{repository}/{WORKFLOW_PATH}@refs/pull/"
     if (
@@ -264,6 +262,34 @@ def _trusted_run(run: dict, repository: str, workflow_id: int) -> bool:
             )
         )
     )
+
+
+def _same_repository(candidate: object, trusted: object) -> bool:
+    """Bind minimal PR repo objects to repositories on the trusted run."""
+    if not isinstance(candidate, dict) or not isinstance(trusted, dict):
+        return False
+    candidate_id = candidate.get("id")
+    trusted_id = trusted.get("id")
+    ids_match = type(candidate_id) is int and type(trusted_id) is int and candidate_id == trusted_id
+    candidate_url = candidate.get("url") or candidate.get("html_url")
+    trusted_url = trusted.get("url") or trusted.get("html_url")
+    urls_match = (
+        isinstance(candidate_url, str) and isinstance(trusted_url, str)
+        and candidate_url.rstrip("/").casefold() == trusted_url.rstrip("/").casefold()
+    )
+    candidate_full_name = candidate.get("full_name")
+    trusted_full_name = trusted.get("full_name")
+    full_names_match = (
+        isinstance(candidate_full_name, str) and isinstance(trusted_full_name, str)
+        and candidate_full_name.casefold() == trusted_full_name.casefold()
+    )
+    candidate_name = candidate.get("name")
+    trusted_name = trusted.get("name")
+    names_match = (
+        not isinstance(candidate_name, str) or not isinstance(trusted_name, str)
+        or candidate_name.casefold() == trusted_name.casefold()
+    )
+    return (ids_match or urls_match or full_names_match) and names_match
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -357,6 +383,25 @@ def _artifact_contents(artifact_zip: bytes, archive_name: str) -> tuple[dict, by
     return provenance, package
 
 
+def _artifact_provenance(artifact_zip: bytes) -> dict:
+    """Read provenance before choosing the versioned package member."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(artifact_zip)) as archive:
+            names = archive.namelist()
+            if len(names) != 2 or len(names) != len(set(names)) or "ci-provenance.json" not in names:
+                raise ProvenanceError("CI artifact contents are incomplete")
+            for name in names:
+                path = PurePosixPath(name)
+                if path.is_absolute() or ".." in path.parts or "\\" in name:
+                    raise ProvenanceError("CI artifact contains an unsafe path")
+            value = json.loads(archive.read("ci-provenance.json"))
+    except (zipfile.BadZipFile, KeyError, json.JSONDecodeError) as exc:
+        raise ProvenanceError("CI artifact archive is invalid") from exc
+    if not isinstance(value, dict):
+        raise ProvenanceError("CI provenance is invalid")
+    return value
+
+
 def _archive_inventory(archive_bytes: bytes) -> dict[str, str]:
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
@@ -436,21 +481,28 @@ def reuse_ci_artifact(package_root: Path, output_dir: Path, repository: str, tok
                              and item.get("expired") is False), None)
             if artifact is None or type(artifact.get("id")) is not int:
                 continue
-            data_zip = api.get_bytes(f"actions/artifacts/{artifact['id']}/zip")
-            provenance, package_bytes = _artifact_contents(data_zip, archive_name)
-            tested_commit = _run_commit(api, str(provenance.get("source_sha", "")))
-            tree_obj = tested_commit.get("tree")
-            tree = tree_obj.get("sha", "").lower() if isinstance(tree_obj, dict) else ""
-            if tree != release_tree:
+            try:
+                data_zip = api.get_bytes(f"actions/artifacts/{artifact['id']}/zip")
+                candidate_provenance = _artifact_provenance(data_zip)
+                if candidate_provenance.get("archive_name") != archive_name:
+                    continue
+                provenance, package_bytes = _artifact_contents(data_zip, archive_name)
+                tested_commit = _run_commit(api, str(provenance.get("source_sha", "")))
+                tree_obj = tested_commit.get("tree")
+                tree = tree_obj.get("sha", "").lower() if isinstance(tree_obj, dict) else ""
+                if tree != release_tree:
+                    continue
+                validate_provenance(
+                    provenance, repository=repository, workflow_id=workflow_id,
+                    run=run, tested_commit=tested_commit, source_tree=tree,
+                    expected_inventory=source_inventory,
+                    archive_name=archive_name, archive_bytes=package_bytes,
+                )
+                _compare_archive_to_source(package_bytes, package_root, source_inventory)
+                if _archive_inventory(package_bytes) != source_inventory:
+                    continue
+            except ProvenanceError:
                 continue
-            validate_provenance(
-                provenance, repository=repository, workflow_id=workflow_id,
-                run=run, tested_commit=tested_commit, source_tree=tree, expected_inventory=source_inventory,
-                archive_name=archive_name, archive_bytes=package_bytes,
-            )
-            _compare_archive_to_source(package_bytes, package_root, source_inventory)
-            if _archive_inventory(package_bytes) != source_inventory:
-                raise ProvenanceError("CI archive checksums do not match the release source inventory")
             valid_evidence = (run, artifact, provenance, package_bytes)
             break
         if valid_evidence is not None:
