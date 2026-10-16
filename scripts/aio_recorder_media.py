@@ -19,6 +19,49 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _crash_child_failure_diagnostic(result, expected_code, parsed_value):
+    """Describe a child failure without exposing captured stdout or stderr."""
+    if not isinstance(parsed_value, dict):
+        if not result.stdout.strip():
+            shape = "empty"
+        elif isinstance(parsed_value, list):
+            shape = "array"
+        elif parsed_value is not None:
+            shape = "scalar"
+        else:
+            shape = "invalid_json"
+        keys = []
+        exception_class = "unavailable"
+    else:
+        shape = "object"
+        keys = sorted(
+            key for key in parsed_value
+            if key in {
+                "native_registered", "completed", "pending", "denied",
+                "closed", "opened", "read_ts", "error", "exception_class",
+            }
+        )
+        raw_exception_class = parsed_value.get("exception_class")
+        exception_class = (
+            raw_exception_class
+            if raw_exception_class in {
+                "AssertionError", "AttributeError", "BorrowBindingLost",
+                "ConnectionError", "ImportError", "JSONDecodeError", "KeyError", "OSError",
+                "PermissionError", "RedisError", "RuntimeError", "TimeoutError",
+                "TypeError", "ValueError",
+            }
+            else "other" if parsed_value.get("error") is True else "unavailable"
+        )
+    exit_code = result.returncode if type(result.returncode) is int else None
+    return {
+        "exit_code": exit_code,
+        "expected_exit_code": expected_code,
+        "stdout_json_shape": shape,
+        "known_result_keys": keys,
+        "child_exception_class": exception_class,
+    }
+
+
 def _require_with_failure_diagnostic(
     condition: bool,
     message: str,
@@ -511,9 +554,11 @@ def _run_registration_crash_recovery_probe(
             value = json.loads(result.stdout)
         except (json.JSONDecodeError, TypeError):
             value = None
-        _require(
+        _require_with_failure_diagnostic(
             result.returncode == expected_code and isinstance(value, dict),
             f"Owned crash-probe child returned an unexpected result in {mode}",
+            lambda: _crash_child_failure_diagnostic(result, expected_code, value),
+            diagnostic_label="CATCHUPARR_SHARING_CRASH_CHILD_FAILURE",
         )
         return value
 

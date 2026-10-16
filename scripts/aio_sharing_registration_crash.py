@@ -157,10 +157,22 @@ def main(argv: list[str] | None = None) -> int:
         if mode == "replay":
             return _replay(token)
         return _successful_open_and_read(token)
-    except Exception:
+    except Exception as exc:
         # Never echo exceptions: Redis and Django errors can contain private
         # connection details. The caller receives only this fixed result code.
-        _emit({"error": True})
+        allowed_exception_classes = {
+            "AssertionError", "AttributeError", "BorrowBindingLost",
+            "ConnectionError", "ImportError", "JSONDecodeError", "KeyError", "OSError",
+            "PermissionError", "RedisError", "RuntimeError", "TimeoutError",
+            "TypeError", "ValueError",
+        }
+        exception_class = type(exc).__name__
+        _emit({
+            "error": True,
+            "exception_class": (
+                exception_class if exception_class in allowed_exception_classes else "other"
+            ),
+        })
         return 70
 
 

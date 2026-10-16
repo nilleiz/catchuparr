@@ -455,6 +455,10 @@ def _recorder_task_exit_diagnostic(run) -> dict[str, object]:
         "attempts": _recorder_attempt_summary(results),
         "process_exit_codes": process_exit_codes,
         "stop_requested": bool(stop_event is not None and stop_event.is_set()),
+        "stop_set_source": (
+            getattr(stop_event, "first_set_source", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
         "expected_generation_present": isinstance(getattr(run, "expected_generation", None), str),
         "expected_control_generation_present": type(getattr(run, "expected_control_generation", None)) is int,
         "thread_alive": bool(thread is not None and thread.is_alive()),
@@ -1005,6 +1009,38 @@ def _verified_segments(
     return result
 
 
+def _classify_stop_set_source(module_name, function_name) -> str:
+    if module_name == "catchuparr.tasks":
+        return {
+            "supervise": "tasks.supervisor",
+            "run_prepared_borrow": "tasks.borrow_runner",
+            "acknowledge_return_media": "tasks.return_ack",
+            "run": "tasks.recorder_loop",
+        }.get(function_name, "tasks.other")
+    if module_name in {"aio_recorder_failover", "scripts.aio_recorder_failover"}:
+        return "probe.harness_cleanup" if function_name in {"stop", "join", "join_after_supervisor"} else "probe.other"
+    return "other"
+
+
+class _ObservedRecorderStopEvent(threading.Event):
+    """Record the first finite stop source for this disposable integration run."""
+
+    def __init__(self):
+        super().__init__()
+        self.first_set_source = "not_set"
+
+    def set(self):
+        if not self.is_set() and self.first_set_source == "not_set":
+            try:
+                caller = sys._getframe(1)
+                self.first_set_source = _classify_stop_set_source(
+                    caller.f_globals.get("__name__"), caller.f_code.co_name,
+                )
+            except Exception:
+                self.first_set_source = "unavailable"
+        super().set()
+
+
 class _RecorderTaskRun:
     """Run the real recorder task with bounded engine timeouts and stop control."""
 
@@ -1012,7 +1048,7 @@ class _RecorderTaskRun:
         self.channel_uuid = str(channel_uuid)
         self.startup_timeout = float(startup_timeout)
         self.media_idle_timeout = float(media_idle_timeout)
-        self.stop_event = threading.Event()
+        self.stop_event = _ObservedRecorderStopEvent()
         self.results: list[object] = []
         self.result: dict | None = None
         self.failures: list[str] = []
