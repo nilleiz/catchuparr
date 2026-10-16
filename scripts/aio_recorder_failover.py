@@ -397,6 +397,18 @@ def _make_runtime_timeout_diagnostic_callback(
     return build
 
 
+def _failover_configuration_settings(settings: Mapping[str, object]) -> dict[str, object]:
+    """Force synthetic failover fixtures to use the sharing-off baseline."""
+    return {
+        **settings,
+        "connection_sharing_enabled": False,
+        "live_stability_seconds": 0,
+        "last_viewer_return_seconds": 0,
+        "min_switch_interval_seconds": 0,
+        "connection_sharing_migration_confirmed": True,
+    }
+
+
 def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
     payload = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
     if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
@@ -1626,7 +1638,7 @@ def probe_recorder_failover(root: Path) -> None:
             "Native default StreamProfile was not set to Redirect",
         )
 
-        settings = {
+        settings = _failover_configuration_settings({
             "filter_config": (
                 "version: 1\n"
                 f"profile: {profile_name}\n"
@@ -1641,10 +1653,33 @@ def probe_recorder_failover(root: Path) -> None:
             "archive_root": str(archive_root),
             "retention_hours": 1,
             "max_storage_gib": 1,
-        }
-        apply_configuration(settings, active_path=active_path)
+        })
+        apply_result = apply_configuration(settings, active_path=active_path)
+        _require(
+            isinstance(apply_result, dict) and apply_result.get("applied") is True,
+            "Failover probe configuration was not applied",
+        )
         active = load_active_configuration(active_path)
         _require(active is not None, "Applied failover policy could not be read")
+        _require(
+            active.get("connection_sharing_enabled") is False
+            and all(
+                active.get(field) == 0
+                for field in (
+                    "live_stability_seconds",
+                    "last_viewer_return_seconds",
+                    "min_switch_interval_seconds",
+                )
+            )
+            and all(
+                item.get("enabled") is False
+                and item.get("live_stability_seconds") == 0
+                and item.get("last_viewer_return_seconds") == 0
+                and item.get("min_switch_interval_seconds") == 0
+                for item in active.get("connection_sharing", {}).values()
+            ),
+            "Failover probe did not apply sharing-off settings",
+        )
         expected_ids = [str(streams[label].id) for label in ("a", "b", "d")]
         for channel in channels.values():
             candidates = ranked_source_candidates(str(channel.uuid), active)
