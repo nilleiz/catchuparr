@@ -36,6 +36,7 @@ SYNTHETIC_SOURCE_TONES = {
 TONE_MATCH_TOLERANCE_HZ = 45
 TONE_SAMPLE_RATE = 48_000
 FAILOVER_DIAGNOSTIC_PREFIX = "CATCHUPARR_AIO_FAILOVER_TIMEOUT "
+RECORDER_EXIT_DIAGNOSTIC_PREFIX = "CATCHUPARR_AIO_RECORDER_EXIT "
 FAILOVER_DIAGNOSTIC_MAX_BYTES = 8192
 _SOURCE_ROLE_NAMES = {
     "b": "Synthetic Source B",
@@ -401,6 +402,74 @@ def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
     if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
         payload = '{"diagnostic":"omitted"}'
     print(FAILOVER_DIAGNOSTIC_PREFIX + payload, file=sys.stderr, flush=True)
+
+
+def _recorder_task_exit_diagnostic(run) -> dict[str, object]:
+    """Summarize an exited synthetic task using only bounded allowlisted fields."""
+    lock = getattr(run, "_lock", None)
+    if lock is None:
+        results = list(getattr(run, "results", ()))
+        failures = list(getattr(run, "failures", ()))
+        processes = list(getattr(run, "processes", ()))
+    else:
+        with lock:
+            results = list(getattr(run, "results", ()))
+            failures = list(getattr(run, "failures", ()))
+            processes = list(getattr(run, "processes", ()))
+
+    allowed_statuses = {
+        "stopped", "switch_requested", "media_stalled", "exited", "no_media",
+        "already_running", "no_permitted_sources", "proxy_integration_unsupported",
+        "sharing_return_recovery_pending", "sharing_authority_unavailable",
+        "sharing_cleanup_pending", "sharing_admission_uncertain", "recording_paused",
+        "sharing_unavailable", "control_unavailable", "legacy_job", "stale_control",
+        "disabled", "stale_configuration", "invalid_schedule", "outside_schedule",
+    }
+    allowed_exception_classes = {
+        "AssertionError", "AttributeError", "BorrowBindingLost", "CalledProcessError",
+        "ConnectionError", "FileExistsError", "ImportError", "KeyError", "OSError",
+        "PermissionError", "RecorderAttemptAdmissionUncertain", "RecorderControlError",
+        "RecorderLeaseError", "RedisError", "RuntimeError", "ScheduleError",
+        "TimeoutError", "TimeoutExpired", "TypeError", "ValueError",
+    }
+    task_result = getattr(run, "result", None)
+    task_status = task_result.get("status") if isinstance(task_result, dict) else None
+    if not isinstance(task_status, str) or task_status not in allowed_statuses:
+        task_status = "unavailable"
+    failure_classes = []
+    for failure in failures[:16]:
+        name = failure[len("task:"):] if isinstance(failure, str) and failure.startswith("task:") else failure
+        failure_classes.append(name if isinstance(name, str) and name in allowed_exception_classes else "other")
+    process_exit_codes = []
+    for process in processes[:16]:
+        try:
+            code = process.poll()
+        except Exception:
+            code = None
+        process_exit_codes.append(code if type(code) is int else None)
+    thread = getattr(run, "thread", None)
+    stop_event = getattr(run, "stop_event", None)
+    return {
+        "task_status": task_status,
+        "failure_classes": failure_classes,
+        "attempts": _recorder_attempt_summary(results),
+        "process_exit_codes": process_exit_codes,
+        "stop_requested": bool(stop_event is not None and stop_event.is_set()),
+        "expected_generation_present": isinstance(getattr(run, "expected_generation", None), str),
+        "expected_control_generation_present": type(getattr(run, "expected_control_generation", None)) is int,
+        "thread_alive": bool(thread is not None and thread.is_alive()),
+    }
+
+
+def _emit_recorder_exit_diagnostic(run) -> None:
+    try:
+        payload = json.dumps(_recorder_task_exit_diagnostic(run), sort_keys=True, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
+            payload = '{"diagnostic":"omitted"}'
+        print(RECORDER_EXIT_DIAGNOSTIC_PREFIX + payload, file=sys.stderr, flush=True)
+    except Exception:
+        # Diagnostics must never replace the original task-exit failure.
+        pass
 
 
 def _cleanup_failed_recorder_run(run: _RecorderTaskRun) -> None:
@@ -1198,7 +1267,9 @@ def _wait_for_source_segments(
     deadline = time.monotonic() + timeout
     last_verified: dict[str, list] = {}
     while time.monotonic() < deadline:
-        _require(run.thread is not None and run.thread.is_alive(), "Recorder task ended before media was indexed")
+        if run.thread is None or not run.thread.is_alive():
+            _emit_recorder_exit_diagnostic(run)
+            raise RuntimeError("Recorder task ended before media was indexed")
         last_verified = _verified_segments(store, channel_uuid, ffmpeg, ffprobe)
         identified = last_verified.get(source_name, [])
         if len(identified) >= minimum:
