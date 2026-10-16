@@ -564,6 +564,70 @@ class RecorderMediaProbeTests(unittest.TestCase):
             {"synthetic-client-a", "synthetic-recorder-client"}, **expected,
         ))
 
+    def test_pending_return_freezes_attempts_after_join_including_pending_native_worker(self):
+        records = [{
+            "worker_id": "synthetic-b-first",
+            "stream_id": "synthetic-stream-b",
+            "capability_digest": "digest-first",
+            "reservation_id": "reservation-first",
+            "reservation_state": "released",
+        }]
+        pending_native_managers = set()
+
+        class Task:
+            def stop(self):
+                pass
+
+            def join(self, *, timeout, cooperative_sleep):
+                self.assert_join_args = (timeout, cooperative_sleep)
+                # A retry appears during shutdown after its profile reservation
+                # was released, while its native task manager is still pending.
+                records.append({
+                    "worker_id": "synthetic-b-retry",
+                    "stream_id": "synthetic-stream-b",
+                    "capability_digest": "digest-retry",
+                    "reservation_id": "reservation-retry",
+                    "reservation_state": "none",
+                })
+                pending_native_managers.add("synthetic-b-retry")
+
+        ids, bindings, valid = probe._stop_join_and_freeze_attempt_bindings(
+            Task(), lambda: list(records), baseline_worker_ids={"synthetic-old-b"},
+            stream_id="synthetic-stream-b", cooperative_sleep=lambda _delay: None,
+        )
+        self.assertTrue(valid)
+        self.assertEqual(("synthetic-b-first", "synthetic-b-retry"), ids)
+        self.assertEqual("reservation-retry", bindings["synthetic-b-retry"]["reservation_id"])
+        self.assertEqual({"synthetic-b-retry"}, pending_native_managers)
+
+        unchanged, _by_worker = probe._attempt_records_match_frozen_bindings(
+            records, baseline_worker_ids={"synthetic-old-b"},
+            stream_id="synthetic-stream-b", attempt_ids=ids, bindings=bindings,
+        )
+        self.assertTrue(unchanged)
+        records.append({
+            "worker_id": "synthetic-b-late",
+            "stream_id": "synthetic-stream-b",
+            "capability_digest": "digest-late",
+            "reservation_id": "reservation-late",
+        })
+        unchanged, _by_worker = probe._attempt_records_match_frozen_bindings(
+            records, baseline_worker_ids={"synthetic-old-b"},
+            stream_id="synthetic-stream-b", attempt_ids=ids, bindings=bindings,
+        )
+        self.assertFalse(unchanged)
+
+    def test_pending_return_uses_original_profile_baseline_during_async_drain(self):
+        original_baseline = 0
+        intermediate_count = 1
+        settled_count = 0
+        self.assertFalse(probe._profile_count_matches_original_baseline(
+            intermediate_count, original_baseline,
+        ))
+        self.assertTrue(probe._profile_count_matches_original_baseline(
+            settled_count, original_baseline,
+        ))
+
     def test_live_failover_provider_exposes_pre_response_request_boundary(self):
         source = object.__new__(aio_recorder_failover._SyntheticFailoverSourceServer)
         source._lock = threading.Lock()
