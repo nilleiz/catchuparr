@@ -4,6 +4,25 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.6.2] - Prerelease candidate
+
+### Fixed
+
+- Continue authenticated catch-up playback across programme changes without
+  requiring later EPG entries. M3U/XMLTV HLS playlists follow newly indexed
+  segments up to a 24-hour session bound; XC streams follow contiguous indexed
+  segments within Dispatcharr's duration limit.
+- Keep live-edge waiting finite and recorder-aware. XC waits at most 125 seconds
+  (the recorder's 120-second media-idle timeout plus five seconds for indexing
+  and finalization), stops at a real archive gap, and ends promptly when its
+  recorder lease is absent. HLS uses the same edge freshness window.
+
+### Notes
+
+- Requires Dispatcharr 0.32.0; unverified versions are refused. The plugin icon
+  remains included. Required GitHub CI and publication are pending.
+- Real-player programme-transition acceptance has not been established.
+
 ## [0.6.1] - Prerelease candidate
 
 ### Changed

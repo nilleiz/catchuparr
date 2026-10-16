@@ -1,8 +1,11 @@
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from catchuparr.engine.store import ArchiveStore
 from catchuparr.security import TokenStore
@@ -64,6 +67,137 @@ class ArchiveTSPlaybackTests(unittest.TestCase):
             older_than_utc=self.start + timedelta(days=1), max_bytes=0
         )
         self.assertCountEqual(removed, paths)
+
+    def test_live_stream_follows_new_segments_across_multiple_programme_boundaries(self):
+        self.add_segment("programme-a.ts", 0, b"programme-a")
+        response = self.request(
+            end=self.start + timedelta(hours=8), live=True, live_follow_seconds=1,
+        )
+        self.assertNotIn("Content-Length", response.headers)
+
+        def append_following():
+            time.sleep(0.05)
+            self.add_segment("programme-b.ts", 6, b"programme-b")
+            time.sleep(0.05)
+            self.add_segment("programme-c.ts", 12, b"programme-c")
+
+        writer = threading.Thread(target=append_following)
+        writer.start()
+        try:
+            body = b"".join(response.body)
+        finally:
+            writer.join(timeout=2)
+            response.close()
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(
+            body, b"programme-aprogramme-bprogramme-c",
+        )
+
+    def test_live_stream_stops_at_real_gap(self):
+        self.add_segment("first.ts", 0, b"first")
+        gap_response = self.request(
+            end=self.start + timedelta(hours=8), live=True, live_follow_seconds=1,
+        )
+        writer = threading.Thread(
+            target=lambda: (
+                time.sleep(0.05),
+                self.add_segment("after-gap.ts", 18, b"after-gap"),
+            )
+        )
+        writer.start()
+        try:
+            self.assertEqual(b"".join(gap_response.body), b"first")
+        finally:
+            writer.join(timeout=2)
+            gap_response.close()
+
+    def test_live_stream_has_bounded_idle_wait_when_recorder_has_stopped(self):
+        self.add_segment("first.ts", 0, b"first")
+        idle_response = self.request(
+            end=self.start + timedelta(hours=8), live=True, live_follow_seconds=0.05,
+        )
+        before = time.monotonic()
+        try:
+            self.assertEqual(b"".join(idle_response.body), b"first")
+        finally:
+            idle_response.close()
+        self.assertLess(time.monotonic() - before, 0.5)
+
+    def test_live_stream_follows_healthy_segment_delayed_beyond_ten_seconds(self):
+        self.add_segment("first.ts", 0, b"first")
+        self.service.live_edge_active = lambda _channel: True
+        fake_clock = [0.0]
+        appended = [False]
+
+        def fake_sleep(seconds):
+            fake_clock[0] += seconds
+            if fake_clock[0] >= 11 and not appended[0]:
+                appended[0] = True
+                self.add_segment("late.ts", 6, b"after-eleven-seconds")
+
+        with (
+            patch("catchuparr.ts_http.time.monotonic", side_effect=lambda: fake_clock[0]),
+            patch("catchuparr.ts_http.time.sleep", side_effect=fake_sleep),
+        ):
+            response = self.request(end=self.start + timedelta(hours=8), live=True)
+            try:
+                body = b"".join(response.body)
+            finally:
+                response.close()
+
+        self.assertTrue(appended[0])
+        self.assertGreaterEqual(fake_clock[0], 11)
+        self.assertEqual(body, b"firstafter-eleven-seconds")
+
+    def test_known_stopped_recorder_ends_live_follow_without_idle_delay(self):
+        self.add_segment("first.ts", 0, b"first")
+        self.service.live_edge_active = lambda _channel: False
+        response = self.request(end=self.start + timedelta(hours=8), live=True)
+        before = time.monotonic()
+        try:
+            self.assertEqual(b"".join(response.body), b"first")
+        finally:
+            response.close()
+        self.assertLess(time.monotonic() - before, 0.5)
+
+    def test_known_stopped_recorder_does_not_wait_for_missing_initial_media(self):
+        self.service.live_edge_active = lambda _channel: False
+        before = time.monotonic()
+        response = self.request(end=self.start + timedelta(hours=8), live=True)
+        self.assertEqual(response.status, 404)
+        self.assertLess(time.monotonic() - before, 0.5)
+
+    def test_default_live_idle_timeout_is_finite_after_recorder_stops(self):
+        from catchuparr.engine.recorder import LIVE_EDGE_IDLE_TIMEOUT_SECONDS
+
+        self.add_segment("first.ts", 0, b"first")
+        fake_clock = [0.0]
+
+        def fake_sleep(seconds):
+            fake_clock[0] += seconds
+
+        with (
+            patch("catchuparr.ts_http.time.monotonic", side_effect=lambda: fake_clock[0]),
+            patch("catchuparr.ts_http.time.sleep", side_effect=fake_sleep),
+            patch.object(self.service, "_renew_lease", wraps=self.service._renew_lease)
+            as renew_lease,
+            patch.object(
+                self.service, "_renew_response_stream",
+                wraps=self.service._renew_response_stream,
+            ) as renew_stream,
+        ):
+            response = self.request(end=self.start + timedelta(hours=8), live=True)
+            try:
+                body = b"".join(response.body)
+            finally:
+                response.close()
+
+        self.assertEqual(body, b"first")
+        self.assertGreater(fake_clock[0], 120)
+        self.assertLessEqual(fake_clock[0], LIVE_EDGE_IDLE_TIMEOUT_SECONDS + 0.1)
+        self.assertGreaterEqual(renew_lease.call_count, 3)
+        self.assertGreaterEqual(renew_stream.call_count, 2)
 
     def test_range_reads_join_adjacent_segment_bytes(self):
         self.add_segment("first.ts", 0, b"abcdef")

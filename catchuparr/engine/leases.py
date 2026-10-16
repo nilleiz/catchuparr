@@ -5,6 +5,11 @@ from __future__ import annotations
 import uuid
 
 
+def recorder_lease_active(redis_client, channel_id: str) -> bool:
+    """Read whether a channel currently has a recorder owner lease."""
+    return bool(redis_client.exists(f"catchuparr:recorder:{channel_id}"))
+
+
 class RedisRecorderLease:
     """A Redis lease with a monotonically increasing fencing token.
 

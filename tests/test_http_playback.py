@@ -237,25 +237,124 @@ class ArchiveHTTPTests(unittest.TestCase):
         self.tokens.revoke(self.token)
         self.assertEqual(self._playlist().status, 401)
 
-    def test_event_reload_reuses_lease_and_appends_segments(self):
-        end = self.start + timedelta(minutes=30)
+    def test_event_reload_reuses_lease_and_appends_across_programme_boundaries(self):
+        self.service.playlist_builder = None
+        end = self.start + timedelta(hours=24)
         first = self.service.playlist(self.token, "news", self.start, end, live=True)
         self.assertEqual(first.status, 200)
         first_text = first.body.decode()
         first_lease = first_text.split("&lease=")[1].splitlines()[0]
-        second_path = self.root / "second.ts"
-        second_path.write_bytes(b"abcdefghij")
-        self.archive.items.append(
-            Segment("seg-B", "news", second_path, self.start + timedelta(seconds=6),
-                    self.start + timedelta(seconds=12))
-        )
+        for segment_id, offset in (("seg-B", 6), ("seg-C", 45 * 60), ("seg-D", 90 * 60)):
+            segment_path = self.root / f"{segment_id}.ts"
+            segment_path.write_bytes(b"abcdefghij")
+            self.archive.items.append(Segment(
+                segment_id,
+                "news",
+                segment_path,
+                self.start + timedelta(seconds=offset),
+                self.start + timedelta(seconds=offset + 6),
+            ))
         second = self.service.playlist(self.token, "news", self.start, end, live=True)
         second_text = second.body.decode()
         self.assertEqual(second.status, 200)
         self.assertTrue(second_text.startswith(first_text))
+        self.assertEqual(second_text.count("#EXTINF:"), 4)
+        self.assertEqual(second_text.count("#EXT-X-DISCONTINUITY"), 2)
         self.assertIn(f"&lease={first_lease}", second_text)
         self.assertEqual(len(self.archive.leases), 1)
         self.assertEqual(self.service.segment(self.token, "news", "seg-A", first_lease).status, 200)
+
+    def test_seek_near_programme_boundary_reads_later_indexed_programmes(self):
+        self.service.playlist_builder = None
+        boundary = self.start + timedelta(minutes=45)
+        seek = boundary - timedelta(seconds=3)
+        entries = (
+            ("before-boundary", boundary - timedelta(seconds=6)),
+            ("second-programme", boundary + timedelta(seconds=10)),
+            ("third-programme", boundary + timedelta(minutes=45, seconds=10)),
+        )
+        for segment_id, start in entries:
+            path = self.root / f"{segment_id}.ts"
+            path.write_bytes(b"transport")
+            self.archive.items.append(Segment(
+                segment_id,
+                "news",
+                path,
+                start,
+                start + timedelta(seconds=6),
+            ))
+
+        response = self.service.playlist(
+            self.token,
+            "news",
+            seek,
+            seek + timedelta(hours=24),
+            live=False,
+        )
+        text = response.body.decode()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=3.000", text)
+        for segment_id, _start in entries:
+            self.assertIn(segment_id, text)
+        self.assertEqual(text.count("#EXT-X-DISCONTINUITY"), 2)
+        lease_id = text.split("&lease=", 1)[1].splitlines()[0]
+        self.assertEqual(
+            self.service.segment(self.token, "news", "third-programme", lease_id).status,
+            200,
+        )
+
+    def test_reloaded_legacy_programme_session_expands_into_continuous_window(self):
+        boundary = self.start + timedelta(minutes=45)
+        identity_end = self.start + timedelta(minutes=45)
+        first = self.service.playlist(
+            self.token,
+            "news",
+            self.start,
+            boundary,
+            live=False,
+            request_identity_end=identity_end,
+            programme_end_utc=boundary,
+            continuation_end_utc=boundary + timedelta(minutes=45),
+        )
+        lease_id = first.body.decode().split("&lease=", 1)[1].splitlines()[0]
+        path = self.root / "after-update.ts"
+        path.write_bytes(b"next programme")
+        self.archive.items.append(Segment(
+            "after-update",
+            "news",
+            path,
+            boundary,
+            boundary + timedelta(seconds=6),
+        ))
+
+        reloaded = self.service.playlist(
+            self.token,
+            "news",
+            self.start,
+            self.start + timedelta(hours=24),
+            live=True,
+            request_identity_end=identity_end,
+            continuous=True,
+        )
+        text = reloaded.body.decode()
+
+        self.assertEqual(reloaded.status, 200)
+        self.assertIn("after-update", text)
+        self.assertIn(f"&lease={lease_id}", text)
+        self.assertEqual(
+            self.service.segment(self.token, "news", "after-update", lease_id).status,
+            200,
+        )
+        with sqlite3.connect(self.root / "archive.sqlite3") as db:
+            programme_end, end, terminal = db.execute(
+                "SELECT programme_end_utc,end_utc,terminal "
+                "FROM http_playback_sessions WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+        self.assertIsNone(programme_end)
+        self.assertEqual(end, (self.start + timedelta(hours=24)).timestamp())
+        self.assertEqual(terminal, 0)
 
     def test_seek_playlist_stays_within_program_after_tail_get_or_range(self):
         self.service.playlist_builder = None
