@@ -4,7 +4,31 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
-## [0.6.0] - Prerelease candidate, not published
+## [0.6.1] - Prerelease candidate
+
+### Changed
+
+- Replace connection-sharing YAML and per-channel overrides with global GUI
+  controls for enablement and the three sharing delays. Preserve uniform legacy
+  values; require explicit confirmation when legacy channel settings differ.
+- Attach a newly initialized recorder immediately to a compatible existing
+  viewer connection. Later switches continue to respect configured delays.
+- Reuse successful exact-tree CI artifacts for release publication instead of
+  repeating full integration acceptance after merge and during release.
+
+### Fixed
+
+- Recover missing Redis sharing authority from validated committed history
+  without restoring old viewer grants or recorder leases. Reject malformed
+  history and preserve concurrent or newer authority.
+
+### Notes
+
+- Requires Dispatcharr 0.32.0 or newer. The plugin icon remains included.
+- Required GitHub CI and publication are pending for this candidate.
+
+## [0.6.0] - Prerelease
+
 
 ### Added
 
@@ -23,9 +47,8 @@ included here to explain the feature history leading to 0.4.0.
 ### Notes
 
 - The full synthetic native acceptance passed on the pinned Dispatcharr 0.32.0
-  AIO. Required GitHub CI and publication remain pending; this candidate is not
-  published. See the [0.6.0 candidate
-  guide](docs/candidate-0.6.0.md) records intended behavior and remaining checks.
+  AIO, and the prerelease was published after required GitHub CI passed.
+  See the [0.6.0 guide](docs/candidate-0.6.0.md).
 
 ## [0.5.1] - Prerelease candidate, not published
 
