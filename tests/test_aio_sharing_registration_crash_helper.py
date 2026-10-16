@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -7,6 +8,27 @@ from pathlib import Path
 
 
 class CrashProbeBootstrapTests(unittest.TestCase):
+    def test_child_failure_emits_only_finite_exception_class(self):
+        helper = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "aio_sharing_registration_crash.py"
+        )
+        result = subprocess.run(
+            [sys.executable, str(helper), "replay"],
+            input="not-json-private-payload",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(70, result.returncode)
+        self.assertEqual(
+            {"error": True, "exception_class": "JSONDecodeError"},
+            json.loads(result.stdout),
+        )
+        self.assertNotIn("not-json-private-payload", result.stdout + result.stderr)
+
     def test_child_imports_native_app_and_plugin_from_explicit_roots(self):
         with tempfile.TemporaryDirectory(prefix="synthetic-app-root-") as app_directory:
             with tempfile.TemporaryDirectory(prefix="synthetic-plugin-root-") as plugin_directory:

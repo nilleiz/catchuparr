@@ -164,6 +164,36 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertEqual(12.5, timestamp)
         self.assertEqual("", output.getvalue())
 
+    def test_crash_child_failure_summary_contains_only_safe_shape_fields(self):
+        result = SimpleNamespace(
+            returncode=70,
+            stdout=json.dumps({
+                "error": True,
+                "exception_class": "RuntimeError",
+                "private_payload": "synthetic-bearer-secret",
+            }),
+        )
+        diagnostic = probe._crash_child_failure_diagnostic(
+            result, 73, json.loads(result.stdout),
+        )
+        self.assertEqual({
+            "exit_code": 70,
+            "expected_exit_code": 73,
+            "stdout_json_shape": "object",
+            "known_result_keys": ["error", "exception_class"],
+            "child_exception_class": "RuntimeError",
+        }, diagnostic)
+        self.assertNotIn("synthetic-bearer-secret", json.dumps(diagnostic))
+
+    def test_crash_child_failure_summary_classifies_non_object_json(self):
+        result = SimpleNamespace(returncode=73, stdout='["private-token"]')
+        diagnostic = probe._crash_child_failure_diagnostic(
+            result, 73, json.loads(result.stdout),
+        )
+        self.assertEqual("array", diagnostic["stdout_json_shape"])
+        self.assertEqual([], diagnostic["known_result_keys"])
+        self.assertNotIn("private-token", json.dumps(diagnostic))
+
     def test_teardown_budget_accounts_for_sequential_shutdown_and_marker_ttl(self):
         self.assertEqual(
             156.0,

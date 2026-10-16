@@ -160,8 +160,32 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             {"status": "no_media", "useful_segments": 0},
         ])
         self.assertEqual(diagnostic["process_exit_codes"], [7])
+        self.assertEqual(diagnostic["stop_set_source"], "unavailable")
         for private_value in ("synthetic.invalid", "password", "private-token", "synthetic-generation"):
             self.assertNotIn(private_value, serialized)
+
+    def test_stop_set_source_is_a_finite_callsite_category(self):
+        self.assertEqual(
+            "tasks.supervisor",
+            probe._classify_stop_set_source("catchuparr.tasks", "supervise"),
+        )
+        self.assertEqual(
+            "tasks.other",
+            probe._classify_stop_set_source("catchuparr.tasks", "unknown_callable"),
+        )
+        self.assertEqual(
+            "probe.harness_cleanup",
+            probe._classify_stop_set_source("scripts.aio_recorder_failover", "stop"),
+        )
+        self.assertEqual(
+            "other",
+            probe._classify_stop_set_source("SyntheticSecretTokenABC123", "private"),
+        )
+        event = probe._ObservedRecorderStopEvent()
+        namespace = {"__name__": "catchuparr.tasks", "event": event}
+        exec("def supervise():\n    event.set()\n", namespace)
+        namespace["supervise"]()
+        self.assertEqual("tasks.supervisor", event.first_set_source)
 
     def test_early_task_exit_emits_diagnostic_and_keeps_original_error(self):
         run = SimpleNamespace(
