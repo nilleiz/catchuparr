@@ -60,6 +60,32 @@ def _native_teardown_readiness_timeout(
     )
 
 
+def _native_teardown_ready_conditions(
+    *,
+    route_available: bool,
+    stopping_marker_absent: bool,
+    metadata_not_stopping: bool,
+    owner_absent: bool,
+    clients_zero: bool,
+    managers_absent: bool,
+    source_inactive: bool,
+    profile_at_baseline: bool,
+    previous_borrow_absent: bool,
+) -> dict[str, bool]:
+    """Define readiness from exact A teardown facts, independent of B activity."""
+    return {
+        "native_route_admits_new_clients": route_available,
+        "redis_stopping_marker_absent": stopping_marker_absent,
+        "metadata_not_stopping": metadata_not_stopping,
+        "native_owner_absent": owner_absent,
+        "native_clients_zero": clients_zero,
+        "native_managers_absent": managers_absent,
+        "source_a_inactive": source_inactive,
+        "profile_a_at_baseline": profile_at_baseline,
+        "previous_borrow_registration_absent": previous_borrow_absent,
+    }
+
+
 def _wait_for_readiness_snapshot(
     snapshot_reader,
     timeout_seconds: float,
@@ -4325,31 +4351,33 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                         previous_borrow_client_id,
                     ) is None
                 )
-                conditions = {
-                    "native_route_admits_new_clients": not (
-                        ChannelService.is_channel_unavailable_for_new_clients(worker_id)
+                conditions = _native_teardown_ready_conditions(
+                    route_available=(
+                        not ChannelService.is_channel_unavailable_for_new_clients(worker_id)
                     ),
-                    "redis_stopping_marker_absent": not redis_client.exists(
+                    stopping_marker_absent=not redis_client.exists(
                         RedisKeys.channel_stopping(worker_id),
                     ),
-                    "metadata_not_stopping": state != _constant_text(ChannelState.STOPPING),
-                    "native_owner_absent": redis_client.get(
-                        RedisKeys.channel_owner(worker_id),
-                    ) is None,
-                    "native_clients_zero": int(
-                        redis_client.scard(RedisKeys.clients(worker_id)) or 0
-                    ) == 0,
-                    "native_managers_absent": (
+                    metadata_not_stopping=(
+                        state != _constant_text(ChannelState.STOPPING)
+                    ),
+                    owner_absent=(
+                        redis_client.get(RedisKeys.channel_owner(worker_id)) is None
+                    ),
+                    clients_zero=(
+                        int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+                    ),
+                    managers_absent=(
                         worker_id not in native_server.stream_managers
                         and worker_id not in native_server._live_stream_managers
                         and local_manager is None
                     ),
-                    "source_a_inactive": provider_active["source-a.ts"] == 0,
-                    "profile_a_at_baseline": (
+                    source_inactive=provider_active["source-a.ts"] == 0,
+                    profile_at_baseline=(
                         profile_a_count == profile_baselines[profile_a.id]
                     ),
-                    "previous_borrow_registration_absent": borrowed_absent,
-                }
+                    previous_borrow_absent=borrowed_absent,
+                )
                 return {
                     "conditions": conditions,
                     "metadata_state_stopping": (
@@ -4636,26 +4664,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and not run_no_source.failures,
             "Borrow cleanup did not settle the no-source task in PAUSED after native grace",
         )
-        no_source_paused_counts, no_source_paused_active = source_server.snapshot()
-        no_source_native_release_deadline = time.monotonic() + 25
-        while time.monotonic() < no_source_native_release_deadline:
-            manager = native_server.client_managers.get(worker_id)
-            manager_count = (
-                int(manager.get_client_count()) if manager is not None else 0
-            )
-            owner_present = redis_client.get(RedisKeys.channel_owner(worker_id)) is not None
-            no_source_paused_counts, no_source_paused_active = source_server.snapshot()
-            if (
-                no_source_paused_active["source-a.ts"] == 0
-                and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
-                and manager_count == 0
-                and not owner_present
-                and _profile_count(
-                    redis_client, profile_a.id, profile_connections_key,
-                ) == profile_baselines[profile_a.id]
-            ):
-                break
-            gevent_sleep(0.1)
+        # PAUSED is acknowledged before Dispatcharr finishes its asynchronous
+        # last-owner/profile teardown. Use the same A-scoped readiness contract
+        # as the return and reopen boundaries; B remains independently checked
+        # by the exact zero-request/profile assertions below.
+        wait_for_native_a_teardown(no_source_client_id)
         final_no_source_counts, final_no_source_active = source_server.snapshot()
         disconnect_key = RedisKeys.last_client_disconnect(worker_id)
         no_source_pause_conditions = {

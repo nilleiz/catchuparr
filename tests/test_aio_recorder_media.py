@@ -131,6 +131,58 @@ class RecorderMediaProbeTests(unittest.TestCase):
             ),
         )
 
+    def test_native_a_teardown_waits_for_owner_and_profile_but_not_source_b(self):
+        class FakeClock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, duration):
+                self.now += duration
+
+        clock = FakeClock()
+        snapshots = [
+            {
+                "conditions": probe._native_teardown_ready_conditions(
+                    route_available=False,
+                    stopping_marker_absent=False,
+                    metadata_not_stopping=False,
+                    owner_absent=False,
+                    clients_zero=True,
+                    managers_absent=False,
+                    source_inactive=True,
+                    profile_at_baseline=False,
+                    previous_borrow_absent=True,
+                ),
+                "source_b_active": 1,
+            },
+            {
+                "conditions": probe._native_teardown_ready_conditions(
+                    route_available=True,
+                    stopping_marker_absent=True,
+                    metadata_not_stopping=True,
+                    owner_absent=True,
+                    clients_zero=True,
+                    managers_absent=True,
+                    source_inactive=True,
+                    profile_at_baseline=True,
+                    previous_borrow_absent=True,
+                ),
+                "source_b_active": 1,
+            },
+        ]
+        ready, final = probe._wait_for_readiness_snapshot(
+            lambda: snapshots.pop(0),
+            2,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            poll_interval=1,
+        )
+        self.assertTrue(ready)
+        self.assertEqual(1, final["source_b_active"])
+        self.assertTrue(all(final["conditions"].values()))
+
     def test_readiness_poll_observes_shutdown_then_marker_before_open(self):
         class FakeClock:
             now = 0.0
