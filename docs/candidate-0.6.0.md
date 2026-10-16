@@ -8,7 +8,7 @@ provider slot, or create a source assignment for borrowing. Sharing is off by
 default and only applies to channels selected by the applied channel filter.
 
 This is a candidate record. Required CI and complete end-to-end acceptance on
-both pinned Dispatcharr versions are not yet approved. The candidate has not
+the pinned Dispatcharr 0.32.0 release are not yet approved. The candidate has not
 been published. Do not infer native runtime acceptance from local unit tests.
 
 ## Enable and configure
@@ -64,7 +64,7 @@ does not make assignments. If no source is available, recording waits paused.
 
 ## Release acceptance still required
 
-Before publication, run the required CI workflow and both pinned AIO probes.
+Before publication, run the required CI workflow and the pinned 0.32.0 AIO probe.
 The native probe must cover borrowing a source outside the allowlist without a
 new provider request, retaining unrelated viewers through Stop, exact cleanup
 at the first fallback provider request, first-viewer reuse, grace and switch

@@ -17,12 +17,12 @@ assignments, cloud storage or a transcoding service.
 ## Version and compatibility
 
 - The package version is **0.6.0 prerelease candidate**. It is not published.
-  Required CI, both pinned AIO jobs and final native sharing acceptance are
+  Required CI, the pinned AIO job and final native sharing acceptance are
   still gates. See [candidate 0.6.0](docs/candidate-0.6.0.md)
   and the [validation record](docs/validation.md).
-- The supported Dispatcharr versions in the compatibility guard are 0.31.0 and
-  0.32.0. This statement does not claim the pending 0.6.0 integration jobs have
-  passed.
+- The minimum supported Dispatcharr version is **0.32.0**. The compatibility
+  guard currently accepts the pinned 0.32.0 release; earlier and unverified
+  versions are refused.
 - The primary playback path is authenticated M3U/XMLTV with local HLS playback
   using MPEG-TS segments. Native XC is guarded; acceptance with a particular
   playback client is not established here.
@@ -347,10 +347,10 @@ ruff check .
 python3 scripts/build_plugin.py
 ```
 
-Release CI also runs pinned Dispatcharr 0.31.0 and 0.32.0 AIO integration jobs.
-For 0.6.0, native sharing must pass both versions, including ordinary-viewer
-retention, first-viewer borrowing, cooldown timing, Stop and Apply revocation,
-restart recovery, exact client cleanup, source switching, and retryable
+Release CI runs the pinned Dispatcharr 0.32.0 AIO integration job. For 0.6.0,
+native sharing must pass that job, including ordinary-viewer retention,
+first-viewer borrowing, cooldown timing, Stop and Apply revocation, restart
+recovery, exact client cleanup, source switching, and retryable
 acknowledgements. The current candidate has not yet cleared those gates.
 
 See the [changelog](CHANGELOG.md), [release roadmap](docs/roadmap.md),

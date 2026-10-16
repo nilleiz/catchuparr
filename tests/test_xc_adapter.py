@@ -85,7 +85,7 @@ def modules():
 
 class XCHookInstallTests(unittest.TestCase):
     def test_version_matrix_accepts_inspected_releases_and_rejects_unknown(self):
-        for version in ("0.31.0", "0.32.0"):
+        for version in ("0.32.0",):
             with self.subTest(version=version):
                 output, timeshift, _ = modules()
                 result = install_xc_hooks(
@@ -98,6 +98,16 @@ class XCHookInstallTests(unittest.TestCase):
             output, timeshift, dispatcharr_version="0.33.0", callbacks=XCCallbacks(),
         )
         self.assertFalse(result.installed)
+        self.assertIs(output._xc_channel_entry, original)
+
+    def test_rejects_dispatcharr_below_minimum(self):
+        output, timeshift, _ = modules()
+        original = output._xc_channel_entry
+        result = install_xc_hooks(
+            output, timeshift, dispatcharr_version="0.31.0", callbacks=XCCallbacks(),
+        )
+        self.assertFalse(result.installed)
+        self.assertIn("unsupported Dispatcharr version", result.reason)
         self.assertIs(output._xc_channel_entry, original)
 
     def test_rejects_signature_mismatch_without_partial_patch(self):
@@ -316,29 +326,14 @@ class XCHookBehaviorTests(unittest.TestCase):
         self.assertEqual(authorization_calls, [True])
         self.assertEqual(calls["m3u"], 2)
 
-    def test_031_native_m3u_uses_core_start_query_alias(self):
+    def test_rejects_031_native_m3u_hook_installation(self):
         output, timeshift, calls = modules()
-        calls["m3u_content"] = (
-            "#EXTM3U\n#EXTINF:-1,Local\n"
-            "https://dispatcharr.test/live/viewer/secret/8\n"
+        original = output.generate_m3u
+        result = install_xc_hooks(
+            output, timeshift, dispatcharr_version="0.31.0", callbacks=XCCallbacks(),
         )
-        callbacks = XCCallbacks(
-            authorize_xc_m3u=lambda request, user: True,
-            m3u_channel_archive_days=lambda user: {"8": 3},
-        )
-        self.assertTrue(install_xc_hooks(
-            output, timeshift, dispatcharr_version="0.31.0", callbacks=callbacks,
-        ).installed)
-
-        response = output.generate_m3u(Request(get={
-            "username": "viewer", "password": "secret", "direct": "false",
-        }), user={"catchup": True})
-
-        self.assertIn(
-            'catchup-source="https://dispatcharr.test/streaming/timeshift.php?'
-            'username=viewer&password=secret&stream=8&start={utc}&duration={duration:60}"',
-            response.content,
-        )
+        self.assertFalse(result.installed)
+        self.assertIs(output.generate_m3u, original)
 
     def test_running_programme_availability_receives_full_programme_window(self):
         checked = []
@@ -443,7 +438,7 @@ class XCHookBehaviorTests(unittest.TestCase):
                 self.assertTrue(install_xc_hooks(
                     output,
                     timeshift,
-                    dispatcharr_version="0.31.0",
+                    dispatcharr_version="0.32.0",
                     callbacks=XCCallbacks(
                         playback_available=lambda *args: True,
                         authorize_local_playback=(

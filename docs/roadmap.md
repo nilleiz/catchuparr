@@ -1,12 +1,12 @@
 # Catchuparr roadmap
 
-Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidates with publication gates recorded below. Version 0.6.0 adds optional live connection sharing; required CI and complete native acceptance on both pinned AIO versions remain pending. This roadmap does not authorize production deployment.
+Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidates with publication gates recorded below. Version 0.6.0 adds optional live connection sharing; required CI and complete native acceptance on the pinned Dispatcharr 0.32.0 AIO remain pending. This roadmap does not authorize production deployment.
 
 ## Workflow and release gates
 
 - Use separate worktrees, small `develop/` feature branches and PRs. Merge after independent review and green required checks; fix failures without weakening checks.
 - Every release includes an installable plugin ZIP, SHA-256 checksum, release notes and installation/update/rollback guidance.
-- Relevant synthetic tests, lint, compile and package checks, plus integration probes in pinned Dispatcharr 0.31.0 and 0.32.0 AIOs, gate publication. New private hooks are version/signature checked, idempotent and removable.
+- Relevant synthetic tests, lint, compile and package checks, plus integration probes in the pinned Dispatcharr 0.32.0 AIO, gate publication. New private hooks are version/signature checked, idempotent and removable.
 - Deploy only to the isolated single-container Dev AIO, with its separate database, Redis, volumes, ports and restricted egress. Preserve consistent private backups and existing archives.
 - Recording changes require real-player regression for start-over, seeking, pause/resume and programme transition. CI does not replace real-player acceptance.
 - No companion container is planned; no production update or upstream PR is authorized by this roadmap.
@@ -419,7 +419,7 @@ The candidate adds fenced episode and operation records, one-use signed borrow
 capabilities, exact reader registration and cleanup, restart reconciliation,
 and an FFmpeg attempt switch signal. A switch must reap the previous attempt
 and acknowledge exact reader cleanup before another source can launch. The
-release is not published. Required CI and full pinned 0.31.0 and 0.32.0 AIO
+release is not published. Required CI and full pinned 0.32.0 AIO
 acceptance remain open; see the [0.6.0 candidate guide](candidate-0.6.0.md)
 and [validation record](validation.md).
 
