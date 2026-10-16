@@ -459,6 +459,14 @@ def _recorder_task_exit_diagnostic(run) -> dict[str, object]:
             getattr(stop_event, "first_set_source", "unavailable")
             if stop_event is not None else "unavailable"
         ),
+        "first_supervisor_admission_status": (
+            getattr(stop_event, "first_supervisor_admission_status", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
+        "first_supervisor_stop_reason": (
+            getattr(stop_event, "first_supervisor_stop_reason", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
         "expected_generation_present": isinstance(getattr(run, "expected_generation", None), str),
         "expected_control_generation_present": type(getattr(run, "expected_control_generation", None)) is int,
         "thread_alive": bool(thread is not None and thread.is_alive()),
@@ -1034,6 +1042,37 @@ def _safe_supervisor_admission_status(module_name, function_name, frame_locals) 
     return status if isinstance(status, str) and status in allowed else "other"
 
 
+_SUPERVISOR_STOP_REASONS_BY_LINE = {
+    267: "admission_or_lease_renewal",
+    273: "stats_capability_refresh",
+    305: "attempt_renewal",
+    313: "candidate_currentness",
+    317: "exception",
+}
+
+
+def _safe_supervisor_stop_reason(module_name, function_name, line_number, frame_locals):
+    if module_name != "catchuparr.tasks" or function_name != "supervise":
+        return "unavailable"
+    reason = _SUPERVISOR_STOP_REASONS_BY_LINE.get(line_number)
+    if reason is None:
+        return "other"
+    if reason == "admission_or_lease_renewal":
+        admission = frame_locals.get("current_admission")
+        status = admission.get("status") if isinstance(admission, dict) else None
+        if status == "ready":
+            return "lease_renewal"
+        allowed = {
+            "recording_paused", "stale_configuration", "stale_control",
+            "outside_schedule", "invalid_schedule", "disabled", "control_unavailable",
+        }
+        return (
+            "admission_not_ready"
+            if isinstance(status, str) and status in allowed else "other"
+        )
+    return reason
+
+
 class _ObservedRecorderStopEvent(threading.Event):
     """Record the first finite stop source for this disposable integration run."""
 
@@ -1041,6 +1080,7 @@ class _ObservedRecorderStopEvent(threading.Event):
         super().__init__()
         self.first_set_source = "not_set"
         self.first_supervisor_admission_status = "unavailable"
+        self.first_supervisor_stop_reason = "unavailable"
         self._source_lock = threading.Lock()
 
     def set(self):
@@ -1054,9 +1094,13 @@ class _ObservedRecorderStopEvent(threading.Event):
                     self.first_supervisor_admission_status = _safe_supervisor_admission_status(
                         module_name, function_name, caller.f_locals,
                     )
+                    self.first_supervisor_stop_reason = _safe_supervisor_stop_reason(
+                        module_name, function_name, caller.f_lineno, caller.f_locals,
+                    )
                 except Exception:
                     self.first_set_source = "other"
                     self.first_supervisor_admission_status = "unavailable"
+                    self.first_supervisor_stop_reason = "unavailable"
             super().set()
 
 

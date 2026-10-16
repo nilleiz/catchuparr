@@ -482,6 +482,10 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
             getattr(stop_event, "first_supervisor_admission_status", "unavailable")
             if stop_event is not None else "unavailable"
         ),
+        "supervisor_stop_reason": (
+            getattr(stop_event, "first_supervisor_stop_reason", "unavailable")
+            if stop_event is not None else "unavailable"
+        ),
         "task_status": task_status,
         "failure_classes": failure_classes,
         "attempts": attempt_summaries,
