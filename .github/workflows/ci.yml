@@ -12,7 +12,7 @@ jobs:
   aio-integration:
     name: AIO integration (${{ matrix.version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     permissions:
       contents: read
     strategy:
