@@ -7,6 +7,11 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# The full probe runs its native teardown gates serially. Thirteen waits each
+# include the configured disconnect/cleanup phases, a 90-second stopping-marker
+# allowance, and monitor margin (at least 1,235 seconds total), before its
+# bounded media and recorder-failover phases.
+FULL_AIO_PROBE_TIMEOUT_SECONDS = 1800
 
 
 def _manage_script_exec(script_path: str) -> str:
@@ -115,9 +120,9 @@ def run():
                    # This synthetic shell does not start a Gunicorn HTTP server.
                    "sys.argv=['gunicorn','shell']; "
                    + _manage_script_exec("/app/manage.py"),
-                   # Sequential media, follower and recording failover phases
-                   # have their own bounded waits within this overall budget.
-                   stdin=script, timeout=600)
+                   # Sequential native cleanup, media, and recording failover
+                   # phases have bounded inner waits within this derived cap.
+                   stdin=script, timeout=FULL_AIO_PROBE_TIMEOUT_SECONDS)
     finally:
         subprocess.run(["docker", "rm", "-f", "-v", name],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
