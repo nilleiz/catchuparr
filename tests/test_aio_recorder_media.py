@@ -406,6 +406,29 @@ class RecorderMediaProbeTests(unittest.TestCase):
         diagnostic = {"conditions": conditions, "native_local_clients_zero": False}
         self.assertTrue(all(diagnostic["conditions"].values()))
 
+    def test_source_removal_requires_both_live_a_and_released_b(self):
+        conditions = probe._source_removal_transition_conditions(
+            a_owner_preserved=True,
+            a_active=True,
+            a_client_preserved=True,
+            a_provider_preserved=True,
+            a_profile_preserved=True,
+            a_assignments_preserved=True,
+            b_worker_released=True,
+            b_native_resources_absent=True,
+            b_reservation_released=True,
+            b_private_markers_absent=True,
+            b_provider_inactive=True,
+            b_request_count_preserved=True,
+            b_profile_released=True,
+        )
+        self.assertTrue(all(conditions.values()))
+
+        disturbed_a = dict(conditions, ordinary_a_active=False)
+        self.assertFalse(all(disturbed_a.values()))
+        retained_b = dict(conditions, dedicated_b_reservation_released=False)
+        self.assertFalse(all(retained_b.values()))
+
     def test_live_failover_provider_exposes_pre_response_request_boundary(self):
         source = object.__new__(aio_recorder_failover._SyntheticFailoverSourceServer)
         source._lock = threading.Lock()

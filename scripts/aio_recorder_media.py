@@ -105,6 +105,40 @@ def _wait_for_native_teardown_after_pause(
     return read_final_conditions()
 
 
+def _source_removal_transition_conditions(
+    *,
+    a_owner_preserved: bool,
+    a_active: bool,
+    a_client_preserved: bool,
+    a_provider_preserved: bool,
+    a_profile_preserved: bool,
+    a_assignments_preserved: bool,
+    b_worker_released: bool,
+    b_native_resources_absent: bool,
+    b_reservation_released: bool,
+    b_private_markers_absent: bool,
+    b_provider_inactive: bool,
+    b_request_count_preserved: bool,
+    b_profile_released: bool,
+) -> dict[str, bool]:
+    """Keep the ordinary A viewer while the removed dedicated B worker drains."""
+    return {
+        "ordinary_a_owner_preserved": a_owner_preserved,
+        "ordinary_a_active": a_active,
+        "ordinary_a_client_preserved": a_client_preserved,
+        "ordinary_a_provider_preserved": a_provider_preserved,
+        "ordinary_a_profile_preserved": a_profile_preserved,
+        "ordinary_a_assignments_preserved": a_assignments_preserved,
+        "dedicated_b_worker_released": b_worker_released,
+        "dedicated_b_native_resources_absent": b_native_resources_absent,
+        "dedicated_b_reservation_released": b_reservation_released,
+        "dedicated_b_private_markers_absent": b_private_markers_absent,
+        "dedicated_b_provider_inactive": b_provider_inactive,
+        "dedicated_b_request_count_preserved": b_request_count_preserved,
+        "dedicated_b_profile_released": b_profile_released,
+    }
+
+
 def _wait_for_readiness_snapshot(
     snapshot_reader,
     timeout_seconds: float,
@@ -2542,6 +2576,7 @@ def _probe_running_recorder_controls(
         profile_credential_release_key,
     )
     from apps.plugins.models import PluginConfig
+    from apps.proxy.live_proxy.config_helper import ConfigHelper
     from apps.proxy.live_proxy.constants import ChannelMetadataField
     from apps.proxy.live_proxy.redis_keys import RedisKeys
 
@@ -2708,9 +2743,14 @@ def _probe_running_recorder_controls(
             row.save(update_fields=("settings",))
 
     def wait_for_private_cleanup(worker_id: str, expected_b_requests: int) -> None:
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
         while time.monotonic() < deadline:
             manager = native_server.stream_managers.get(worker_id)
+            client_manager = native_server.client_managers.get(worker_id)
             owner = redis_client.get(RedisKeys.channel_owner(worker_id))
             clients = int(redis_client.scard(RedisKeys.clients(worker_id)) or 0)
             active_counts = source_server.snapshot()[1]
@@ -2718,7 +2758,11 @@ def _probe_running_recorder_controls(
                 redis_client, profile_b.id, profile_connections_key,
             )
             if (
-                manager is None and owner is None and clients == 0
+                manager is None
+                and worker_id not in native_server._live_stream_managers
+                and client_manager is None
+                and owner is None and clients == 0
+                and not redis_client.exists(RedisKeys.channel_stopping(worker_id))
                 and active_counts["source-b.ts"] == 0
                 and source_server.snapshot()[0]["source-b.ts"] == expected_b_requests
                 and profile_count == profile_baselines[profile_b.id]
@@ -2727,8 +2771,11 @@ def _probe_running_recorder_controls(
             gevent_sleep(0.1)
         _require(
             native_server.stream_managers.get(worker_id) is None
+            and worker_id not in native_server._live_stream_managers
+            and native_server.client_managers.get(worker_id) is None
             and redis_client.get(RedisKeys.channel_owner(worker_id)) is None
             and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+            and not redis_client.exists(RedisKeys.channel_stopping(worker_id))
             and source_server.snapshot()[1]["source-b.ts"] == 0
             and source_server.snapshot()[0]["source-b.ts"] == expected_b_requests
             and _profile_count(redis_client, profile_b.id, profile_connections_key)
@@ -3144,6 +3191,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     )
     from apps.m3u.models import M3UAccount
     from apps.plugins.models import PluginConfig
+    from apps.proxy.live_proxy.config_helper import ConfigHelper
     from apps.proxy.live_proxy.constants import ChannelMetadataField, ChannelState
     from apps.proxy.live_proxy.redis_keys import RedisKeys
     from apps.proxy.live_proxy.server import ProxyServer
@@ -3162,7 +3210,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     )
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.recorder_control import control_deny_path, control_state_path
-    from catchuparr.recorder_proxy import configuration_generation, ranked_source_candidates
+    from catchuparr.recorder_proxy import (
+        CAPABILITY_PREFIX,
+        configuration_generation,
+        ranked_source_candidates,
+    )
 
     _require(
         os.environ.get("CATCHUPARR_INTEGRATION_TEST") == "1",
@@ -3789,15 +3841,23 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         first_b_worker_id = b_worker_id
         run_b.stop()
         run_b.join(cooperative_sleep=gevent_sleep)
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
         while time.monotonic() < deadline:
             b_manager = native_server.stream_managers.get(first_b_worker_id)
+            b_client_manager = native_server.client_managers.get(first_b_worker_id)
             b_clients = int(redis_client.scard(RedisKeys.clients(first_b_worker_id)) or 0)
             _counts, b_active = source_server.snapshot()
             if (
                 b_manager is None
+                and first_b_worker_id not in native_server._live_stream_managers
+                and b_client_manager is None
                 and redis_client.get(RedisKeys.channel_owner(first_b_worker_id)) is None
                 and b_clients == 0
+                and not redis_client.exists(RedisKeys.channel_stopping(first_b_worker_id))
                 and b_active["source-b.ts"] == 0
             ):
                 break
@@ -3805,8 +3865,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         first_b_stopped_counts, first_b_stopped_active = source_server.snapshot()
         _require(
             native_server.stream_managers.get(first_b_worker_id) is None
+            and first_b_worker_id not in native_server._live_stream_managers
+            and native_server.client_managers.get(first_b_worker_id) is None
             and redis_client.get(RedisKeys.channel_owner(first_b_worker_id)) is None
             and int(redis_client.scard(RedisKeys.clients(first_b_worker_id)) or 0) == 0
+            and not redis_client.exists(RedisKeys.channel_stopping(first_b_worker_id))
             and first_b_stopped_active["source-b.ts"] == 0
             and first_b_stopped_counts["source-b.ts"]
             == counts_during_b["source-b.ts"],
@@ -3982,23 +4045,34 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     880,
                     "Final indexed archive B",
                 )
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
         while time.monotonic() < deadline:
             b_manager = native_server.stream_managers.get(b_worker_id)
+            b_client_manager = native_server.client_managers.get(b_worker_id)
             b_clients = int(redis_client.scard(RedisKeys.clients(b_worker_id)) or 0)
             _counts, b_active = source_server.snapshot()
             if (
                 b_manager is None
+                and b_worker_id not in native_server._live_stream_managers
+                and b_client_manager is None
                 and redis_client.get(RedisKeys.channel_owner(b_worker_id)) is None
                 and b_clients == 0
+                and not redis_client.exists(RedisKeys.channel_stopping(b_worker_id))
                 and b_active["source-b.ts"] == 0
             ):
                 break
-            time.sleep(0.1)
+            gevent_sleep(0.1)
         _require(
             native_server.stream_managers.get(b_worker_id) is None
+            and b_worker_id not in native_server._live_stream_managers
+            and native_server.client_managers.get(b_worker_id) is None
             and redis_client.get(RedisKeys.channel_owner(b_worker_id)) is None
             and int(redis_client.scard(RedisKeys.clients(b_worker_id)) or 0) == 0
+            and not redis_client.exists(RedisKeys.channel_stopping(b_worker_id))
             and source_server.snapshot()[0]["source-b.ts"]
             == counts_after_running_controls["source-b.ts"]
             and source_server.snapshot()[1]["source-b.ts"] == 0,
@@ -4333,7 +4407,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "The borrowed recorder did not finish its useful A input before returning",
         )
 
-        from apps.proxy.live_proxy.config_helper import ConfigHelper
         from apps.proxy.live_proxy.services.channel_service import ChannelService
 
         def wait_for_native_a_teardown(previous_borrow_client_id: str) -> None:
@@ -4543,6 +4616,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # The new task must still borrow the existing A reader, close it at the
         # native grace deadline, persist PAUSED, and resume on B after Apply
         # restores an allowed source.
+        no_source_buffer_floor = int(
+            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
+        )
         no_source_response = client.get(
             f"/proxy/ts/stream/{channel.uuid}",
             HTTP_HOST="localhost",
@@ -4553,9 +4629,62 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         live_session, live_reader = _create_native_live_reader_session(
             no_source_response, native_server, worker_id,
         )
+        live_reader = live_session.reader
         _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
         )
+        no_source_native_owner, no_source_native_manager, no_source_client_manager = (
+            _wait_for_native_active(
+                redis_client, native_server, worker_id, redis_keys=RedisKeys,
+                metadata_field=ChannelMetadataField,
+                channel_state=ChannelState, timeout=45,
+            )
+        )
+        no_source_first_media, _no_source_first_index = live_reader.read_after(
+            no_source_buffer_floor, minimum_bytes=188 * 100, timeout=20,
+        )
+        _verify_audio_video_tone(
+            ffmpeg, ffprobe, no_source_first_media, 440,
+            "Ordinary live A before dedicated-source removal",
+        )
+        no_source_a_counts, no_source_a_active = source_server.snapshot()
+        no_source_a_profile_count = _profile_count(
+            redis_client, profile_a.id, profile_connections_key,
+        )
+        no_source_a_assignments = {
+            key: _key_dump(redis_client, key) for key in assignment_keys
+        }
+        no_source_a_metadata = _native_source_metadata(redis_client, metadata_key)
+        _require(
+            no_source_a_active["source-a.ts"] == 1
+            and no_source_a_profile_count == profile_baselines[profile_a.id] + 1
+            and no_source_native_manager.running
+            and no_source_client_manager.get_client_count() == 1,
+            "Ordinary A viewer did not reach ACTIVE with its exact provider reservation",
+        )
+        live_dedicated_b_records = [
+            record for record in _worker_records(redis_client, worker_id)
+            if record.get("state") == "active"
+            and record.get("reservation_state") == "reserved"
+            and record.get("stream_id") == str(stream_b.id)
+            and record.get("profile_id") == str(profile_b.id)
+        ]
+        _require(
+            len(live_dedicated_b_records) == 1
+            and no_source_a_active["source-b.ts"] == 1
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
+            == profile_baselines[profile_b.id] + 1,
+            "Dedicated B worker was not active before source-removal Apply",
+        )
+        no_source_b_record = live_dedicated_b_records[0]
+        no_source_b_worker_id = no_source_b_record.get("worker_id")
+        _require(
+            no_source_b_worker_id and no_source_b_worker_id != worker_id,
+            "Dedicated B worker identity was not available for the removal check",
+        )
+        no_source_b_requests = len(source_server.request_times("source-b.ts"))
+        no_source_b_reservation_id = no_source_b_record.get("reservation_id")
+        no_source_b_capability_digest = no_source_b_record.get("capability_digest")
         no_source_settings = dict(sharing_settings)
         no_source_settings["filter_config"] = (
             "version: 1\n"
@@ -4578,15 +4707,139 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "No-source policy did not leave the channel eligible with zero dedicated candidates",
         )
         run_share.join_after_supervisor(timeout=30, cooperative_sleep=gevent_sleep)
-        no_source_counts, no_source_active = source_server.snapshot()
-        _require(
-            no_source_active["source-a.ts"] == 1
-            and no_source_active["source-b.ts"] == 0
-            and _profile_count(redis_client, profile_b.id, profile_connections_key)
-            == profile_baselines[profile_b.id],
-            "Removing dedicated sources disturbed live A or retained B's reservation",
+        no_source_release_timeout = _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
         )
-        no_source_b_requests = len(source_server.request_times("source-b.ts"))
+        from catchuparr.adapters.recorder_proxy import reservation_credential_marker_key
+
+        def no_source_transition_snapshot():
+            current_counts, current_active = source_server.snapshot()
+            current_a_profile = _profile_count(
+                redis_client, profile_a.id, profile_connections_key,
+            )
+            current_b_profile = _profile_count(
+                redis_client, profile_b.id, profile_connections_key,
+            )
+            matching_b_records = [
+                record for record in _worker_records(redis_client, worker_id)
+                if record.get("worker_id") == no_source_b_worker_id
+            ]
+            b_record = matching_b_records[0] if len(matching_b_records) == 1 else None
+            b_worker_released = bool(
+                b_record
+                and b_record.get("state") in {"released", "failed"}
+                and b_record.get("reservation_state") in {"released", "none"}
+            )
+            b_reservation_released = (
+                b_record is not None
+                and (no_source_b_reservation_id is None
+                     or b_record.get("reservation_id") == no_source_b_reservation_id)
+            )
+            markers_absent = (
+                (not no_source_b_capability_digest
+                 or not redis_client.exists(CAPABILITY_PREFIX + no_source_b_capability_digest))
+                and (not no_source_b_reservation_id
+                     or not redis_client.exists(
+                         reservation_credential_marker_key(no_source_b_reservation_id),
+                     ))
+            )
+            state = _redis_text(redis_client.hget(
+                metadata_key, ChannelMetadataField.STATE,
+            ))
+            manager = native_server.stream_managers.get(worker_id)
+            client_manager = native_server.client_managers.get(worker_id)
+            owner = _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id)))
+            conditions = _source_removal_transition_conditions(
+                a_owner_preserved=(
+                    owner == no_source_native_owner
+                    and _redis_text(native_server.worker_id) == no_source_native_owner
+                ),
+                a_active=(
+                    state == _constant_text(ChannelState.ACTIVE)
+                    and manager is no_source_native_manager
+                    and bool(getattr(manager, "running", False))
+                ),
+                a_client_preserved=(
+                    int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 1
+                    and client_manager is no_source_client_manager
+                    and client_manager is not None
+                    and int(client_manager.get_client_count()) == 1
+                ),
+                a_provider_preserved=(
+                    current_active["source-a.ts"] == 1
+                    and current_counts["source-a.ts"] == no_source_a_counts["source-a.ts"]
+                ),
+                a_profile_preserved=(
+                    current_a_profile == no_source_a_profile_count
+                ),
+                a_assignments_preserved=(
+                    {key: _key_dump(redis_client, key) for key in assignment_keys}
+                    == no_source_a_assignments
+                    and _native_source_metadata(redis_client, metadata_key)
+                    == no_source_a_metadata
+                ),
+                b_worker_released=b_worker_released,
+                b_native_resources_absent=(
+                    no_source_b_worker_id not in native_server.stream_managers
+                    and no_source_b_worker_id not in native_server._live_stream_managers
+                    and no_source_b_worker_id not in native_server.client_managers
+                    and redis_client.get(
+                        RedisKeys.channel_owner(no_source_b_worker_id),
+                    ) is None
+                    and int(redis_client.scard(
+                        RedisKeys.clients(no_source_b_worker_id),
+                    ) or 0) == 0
+                    and not redis_client.exists(
+                        RedisKeys.channel_stopping(no_source_b_worker_id),
+                    )
+                    and _redis_text(redis_client.hget(
+                        RedisKeys.channel_metadata(no_source_b_worker_id),
+                        ChannelMetadataField.STATE,
+                    )) != _constant_text(ChannelState.STOPPING)
+                ),
+                b_reservation_released=b_reservation_released,
+                b_private_markers_absent=markers_absent,
+                b_provider_inactive=current_active["source-b.ts"] == 0,
+                b_request_count_preserved=(
+                    len(source_server.request_times("source-b.ts")) == no_source_b_requests
+                    and current_counts["source-b.ts"] == no_source_a_counts["source-b.ts"]
+                ),
+                b_profile_released=(
+                    current_b_profile == profile_baselines[profile_b.id]
+                ),
+            )
+            return {
+                "conditions": conditions,
+                "a_provider": {
+                    "active": current_active["source-a.ts"],
+                    "requests": current_counts["source-a.ts"],
+                },
+                "b_provider": {
+                    "active": current_active["source-b.ts"],
+                    "requests": current_counts["source-b.ts"],
+                },
+                "a_profile": current_a_profile,
+                "b_profile": current_b_profile,
+                "b_worker_state": b_record.get("state") if b_record else "unresolved",
+                "b_reservation_state": (
+                    b_record.get("reservation_state") if b_record else "unresolved"
+                ),
+                "native_a_active": conditions["ordinary_a_active"],
+            }
+
+        no_source_ready, no_source_last_snapshot = _wait_for_readiness_snapshot(
+            no_source_transition_snapshot, no_source_release_timeout,
+            monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
+        )
+        _require_with_failure_diagnostic(
+            no_source_ready,
+            "Removing dedicated sources disturbed live A or retained B's reservation",
+            lambda: no_source_last_snapshot,
+            diagnostic_label="CATCHUPARR_NO_SOURCE_TRANSITION_DIAGNOSTIC",
+        )
+        no_source_counts, no_source_active = source_server.snapshot()
         run_no_source = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
         )
@@ -4816,6 +5069,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # Re-open A after the same native teardown readiness gate used
         # immediately after the first return.
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
+        second_cycle_buffer_floor = int(
+            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
+        )
         live_response = _open_after_readiness(
             lambda: wait_for_native_a_teardown(no_source_client_id),
             lambda: client.get(
@@ -4829,8 +5085,21 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         live_session, live_reader = _create_native_live_reader_session(
             live_response, native_server, worker_id,
         )
+        live_reader = live_session.reader
         _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+        )
+        _wait_for_native_active(
+            redis_client, native_server, worker_id, redis_keys=RedisKeys,
+            metadata_field=ChannelMetadataField,
+            channel_state=ChannelState, timeout=45,
+        )
+        second_cycle_first_media, _second_cycle_media_index = live_reader.read_after(
+            second_cycle_buffer_floor, minimum_bytes=188 * 100, timeout=20,
+        )
+        _verify_audio_video_tone(
+            ffmpeg, ffprobe, second_cycle_first_media, 440,
+            "Second-cycle ordinary live A before borrow",
         )
         _require(
             source_server.snapshot()[0]["source-a.ts"] == second_cycle_a_baseline + 1,
@@ -4986,6 +5255,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # The replacement task now borrows a fresh ordinary A viewer. Keep it
         # alive through Pause to prove cleanup leaves the native viewer intact.
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
+        post_restart_buffer_floor = int(
+            native_buffer.redis_client.get(native_buffer.buffer_index_key) or 0
+        )
         live_response = _open_after_readiness(
             lambda: wait_for_native_a_teardown(second_borrow_client_id),
             lambda: client.get(
@@ -4999,8 +5271,21 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         live_session, live_reader = _create_native_live_reader_session(
             live_response, native_server, worker_id,
         )
+        live_reader = live_session.reader
         _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+        )
+        _wait_for_native_active(
+            redis_client, native_server, worker_id, redis_keys=RedisKeys,
+            metadata_field=ChannelMetadataField,
+            channel_state=ChannelState, timeout=45,
+        )
+        post_restart_first_media, _post_restart_media_index = live_reader.read_after(
+            post_restart_buffer_floor, minimum_bytes=188 * 100, timeout=20,
+        )
+        _verify_audio_video_tone(
+            ffmpeg, ffprobe, post_restart_first_media, 440,
+            "Post-restart ordinary live A before borrow",
         )
         post_restart_borrow_headers = None
         post_restart_borrow_deadline = time.monotonic() + 90
@@ -5152,62 +5437,23 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             live_response = None
             live_reader = None
             live_session = None
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if (
-                native_server.stream_managers.get(worker_id) is None
-                and redis_client.get(RedisKeys.channel_owner(worker_id)) is None
-            ):
-                break
-            gevent_sleep(0.1)
-        _require(
-            native_server.stream_managers.get(worker_id) is None
-            and redis_client.get(RedisKeys.channel_owner(worker_id)) is None,
-            "Stopping after borrow return left the native A owner running without viewers",
-        )
-
-        if live_session is not None:
-            live_session.close()
-            live_response = None
-            live_reader = None
-            live_session = None
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            owner = redis_client.get(RedisKeys.channel_owner(worker_id))
-            manager = native_server.stream_managers.get(worker_id)
-            client_manager = native_server.client_managers.get(worker_id)
-            clients = int(redis_client.scard(RedisKeys.clients(worker_id)) or 0)
-            counts_final, active_final = source_server.snapshot()
-            if (
-                owner is None
-                and manager is None
-                and clients == 0
-                and (client_manager is None or client_manager.get_client_count() == 0)
-                and active_final["source-a.ts"] == 0
-                and counts_final["source-a.ts"] == final_a_request_total
-                and _profile_count(redis_client, profile_a.id, profile_connections_key)
-                == profile_baselines[profile_a.id]
-            ):
-                break
-            # ClientManager schedules the owner's normal disconnect cleanup
-            # onto ProxyServer's gevent hub. Drive that hub while waiting so
-            # the harness observes the same cleanup path as a running web
-            # worker instead of blocking it with time.sleep.
-            gevent_sleep(0.1)
+        # Reuse the full native A release acknowledgment instead of shorter
+        # owner-only waits: Dispatcharr can retain the stopping marker after
+        # the last response closes while its native cleanup monitor drains.
+        wait_for_native_a_teardown(second_borrow_client_id)
+        counts_final, active_final = source_server.snapshot()
         _require(
             redis_client.get(RedisKeys.channel_owner(worker_id)) is None
             and native_server.stream_managers.get(worker_id) is None
             and int(redis_client.scard(RedisKeys.clients(worker_id)) or 0) == 0
+            and native_server.client_managers.get(worker_id) is None
             and _profile_count(redis_client, profile_a.id, profile_connections_key)
             == profile_baselines[profile_a.id]
-            and source_server.snapshot()[0]["source-a.ts"] == final_a_request_total
-            and source_server.snapshot()[1]["source-a.ts"] == 0,
-            "Stopping the final native live A client did not release its owner and provider slot",
-        )
-        _require(
-            _profile_count(redis_client, profile_b.id, profile_connections_key)
+            and counts_final["source-a.ts"] == final_a_request_total
+            and active_final["source-a.ts"] == 0
+            and _profile_count(redis_client, profile_b.id, profile_connections_key)
             == profile_baselines[profile_b.id],
-            "Archive B profile capacity changed after both workers stopped",
+            "Stopping the final native live A client did not release its owner and provider slot",
         )
         _require(
             {
