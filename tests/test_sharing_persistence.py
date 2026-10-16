@@ -66,14 +66,14 @@ def pending_attach():
             recorder_fence=11,
             lease_is_current=True,
             settings=SharingSettings(True, 5, 30, 60),
-            target=target(),
+            target=None,
         ),
     )
     ready = observe(
         start.state,
         SharingObservation(
             channel_uuid=CHANNEL,
-            now=105,
+            now=100,
             configuration_generation="config-a",
             control_generation=3,
             recorder_fence=11,
