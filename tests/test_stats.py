@@ -170,7 +170,7 @@ class StatsProjectionTests(unittest.TestCase):
             "apps.timeshift.stats": types.ModuleType("apps.timeshift.stats"),
             "apps.timeshift.stats_views": types.ModuleType("apps.timeshift.stats_views"),
         }
-        modules["version"].__version__ = "0.31.0"
+        modules["version"].__version__ = "0.32.0"
         modules["apps"].__path__ = []
         modules["apps.proxy"].__path__ = []
         modules["apps.proxy.live_proxy"].__path__ = []

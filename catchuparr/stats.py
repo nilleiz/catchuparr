@@ -1412,7 +1412,7 @@ def _install_builder(module: Any, name: str, transform) -> bool:
 
 
 def install_stats_hooks(*, route_hooks: bool = True) -> bool:
-    """Install hooks only for inspected Dispatcharr 0.31/0.32 signatures."""
+    """Install hooks only for the inspected Dispatcharr 0.32.0 signatures."""
     from version import __version__ as dispatcharr_version
 
     if not is_supported_dispatcharr_version(dispatcharr_version):
