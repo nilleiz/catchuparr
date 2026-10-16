@@ -49,27 +49,20 @@ pass the AIO integration checks and separate real-player acceptance before being
 described as player-validated. Local availability is never persisted into
 Dispatcharr's provider-derived channel catch-up fields.
 
-On each M3U seek, the endpoint resolves the requested UTC instant to the
-effective Dispatcharr guide programme. For older entries removed by an EPG
-refresh, it uses a locally saved programme snapshot only when that entire
-historical programme has archive coverage, matching the plugin XMLTV export.
-An unknown programme returns 404. The initial HLS playlist stops at that
-programme's end even if a client sends its original full duration after a
-seek. HLS reloads may append newly indexed segments within that programme.
-Fetching or prefetching its tail cannot unlock the next programme. Observed
-client-managed continuation requested a new archive window at a programme
-boundary.
-Server-side extension of the old playlist stays disabled; other clients need
-their own continuation test. A segment crossing the programme's end is omitted
-rather than serving
-content from the next programme; playback may therefore end one segment early.
-The playlist target stays at 60 seconds because stream-copy segmentation
-can have delayed keyframes.
+M3U archive playback uses a bounded continuous session. The requested time
+determines the starting segment; later EPG entries are not required, and HLS
+reloads can append newly indexed segments across programme boundaries. The
+session is limited to 24 hours, and HLS adds `#EXT-X-ENDLIST` after the archive
+edge is stale and no recorder lease is active.
 
-Local XC windows use the exact positive duration hint in minutes. With no
-usable hint, the actual EPG programme end determines the remaining window;
-without reliable EPG metadata, playback delegates to the provider. Dispatcharr's
-extra provider duration padding is never required for local archive coverage.
+Native XC requests keep Dispatcharr's minute-based duration contract. The
+authenticated archive route follows contiguous indexed segments across guide
+boundaries and does not require later EPG entries. A real timeline gap ends raw
+TS playback. At the live edge it waits up to 125 seconds, matching the
+recorder's 120-second media-idle timeout plus five seconds for indexing and
+finalization. If the recorder's Redis lease is absent, follow mode ends
+promptly; if Redis health cannot be checked, the finite timeout still applies.
+The playback window remains capped by Dispatcharr's configured duration limit.
 Use the plugin XMLTV endpoint with the plugin M3U export. Native XC M3U tags
 do not extend the core XMLTV endpoint's historical guide. The optional 0.5.0
 integration targets Dispatcharr's native `/output/m3u` and `/output/epg`

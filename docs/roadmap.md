@@ -23,6 +23,7 @@ Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidat
 | 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Implemented in the prerelease candidate; the 453-test suite and full pinned AIO probes passed; CI and isolated Dev verification remain pending |
 | 0.6.0 | Optional sharing of compatible live connections | High | Historical candidate; full synthetic native acceptance passed on pinned Dispatcharr 0.32.0 |
 | 0.6.1 | Global sharing controls, legacy settings migration and immediate initial attach | Medium | Focused unit coverage; required GitHub CI and publication pending; real-player acceptance not established |
+| 0.6.2 | Continue catch-up playback across programme boundaries to the live archive edge | Medium | Prerelease candidate; focused unit coverage; required GitHub CI and real-player acceptance pending |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.

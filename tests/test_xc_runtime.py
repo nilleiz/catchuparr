@@ -318,7 +318,7 @@ class XCRuntimeTests(unittest.TestCase):
 
         self.assertEqual(store.covered_end, edge)
 
-    def test_xc_one_minute_local_window_does_not_include_provider_padding(self):
+    def test_xc_short_duration_hint_still_has_bounded_cross_programme_window(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = ArchiveStore(root)
@@ -367,12 +367,12 @@ class XCRuntimeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(service.window[0], start)
-        self.assertEqual(service.window[1], start + timedelta(seconds=60))
+        self.assertEqual(service.window[1], start + timedelta(minutes=480))
 
-    def test_xc_missing_duration_uses_exact_epg_end_without_provider_padding(self):
+    def test_xc_missing_duration_uses_bounded_window_without_requiring_epg(self):
         programme_start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
         start = programme_start + timedelta(minutes=15)
-        expected_end = programme_start + timedelta(minutes=60)
+        expected_end = start + timedelta(minutes=480)
         timeshift_views = SimpleNamespace(
             parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
         )
@@ -397,7 +397,7 @@ class XCRuntimeTests(unittest.TestCase):
                 (start, expected_end),
             )
 
-    def test_xc_missing_duration_without_trustworthy_epg_end_is_not_local(self):
+    def test_xc_missing_duration_without_epg_uses_bounded_window(self):
         start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
         timeshift_views = SimpleNamespace(
             parse_catchup_timestamp=lambda _value: start.replace(tzinfo=None),
@@ -414,8 +414,9 @@ class XCRuntimeTests(unittest.TestCase):
             "apps.timeshift": apps_timeshift,
             "apps.timeshift.helpers": helpers,
         }):
-            self.assertIsNone(
-                _local_playback_window(timeshift_views, object(), "timestamp", None)
+            self.assertEqual(
+                _local_playback_window(timeshift_views, object(), "timestamp", None),
+                (start, start + timedelta(minutes=480)),
             )
 
     def test_xc_gap_inside_requested_minute_keeps_provider_fallback(self):
