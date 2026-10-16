@@ -39,6 +39,23 @@ class _SyntheticArchiveStore:
 
 
 class RecorderFailoverMediaTests(unittest.TestCase):
+    def test_failover_configuration_forces_global_sharing_off(self):
+        original = {
+            "filter_config": "version: 1\nrules: []\n",
+            "connection_sharing_enabled": True,
+            "live_stability_seconds": 60,
+        }
+
+        settings = probe._failover_configuration_settings(original)
+
+        self.assertFalse(settings["connection_sharing_enabled"])
+        self.assertEqual(settings["live_stability_seconds"], 0)
+        self.assertEqual(settings["last_viewer_return_seconds"], 0)
+        self.assertEqual(settings["min_switch_interval_seconds"], 0)
+        self.assertTrue(settings["connection_sharing_migration_confirmed"])
+        self.assertTrue(original["connection_sharing_enabled"])
+        self.assertEqual(original["live_stability_seconds"], 60)
+
     def test_supervisor_stop_reason_map_covers_actual_static_stop_sites(self):
         tree = ast.parse((Path(__file__).parents[1] / "catchuparr/tasks.py").read_text())
         record_channel = next(
