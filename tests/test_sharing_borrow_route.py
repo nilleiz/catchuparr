@@ -168,6 +168,54 @@ class SharingBorrowRouteTests(unittest.TestCase):
         self.assertEqual(proof.pending_return_deadline, 130.0)
         self.assertTrue(proof.borrowed_client_current)
 
+    def test_viewer_departure_between_native_cas_and_catalog_read_rechecks_grace(self):
+        episode, ack, active_grant, target = self._current_proof_inputs()
+        active_grant = replace(active_grant, phase="active", version=5,
+                               last_viewer_left_at=None, return_deadline=None)
+        waiting_grant = replace(active_grant, phase="wait_return", version=6,
+                                last_viewer_left_at=120.0, return_deadline=180.0)
+        no_viewers = SimpleNamespace(**{**vars(target), "ordinary_client_ids": ()})
+        with (
+            patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant",
+                  side_effect=(active_grant, active_grant, waiting_grant, waiting_grant)),
+            patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client",
+                  side_effect=((True, None, 5), (True, 180.0, 6))) as touch,
+            patch("catchuparr.adapters.sharing_borrow_route.observe_native_connection",
+                  side_effect=(SimpleNamespace(target=no_viewers),
+                               SimpleNamespace(target=no_viewers))),
+        ):
+            reader = native_borrow_proof_reader(
+                redis=object(), episode=episode, ack=ack,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+            )
+            proof = reader()
+        self.assertEqual(touch.call_count, 2)
+        self.assertEqual(proof.pending_return_deadline, 180.0)
+        self.assertEqual(proof.ordinary_viewer_ids, ())
+
+    def test_repeated_native_grace_read_skew_stays_fail_closed(self):
+        episode, ack, grant, target = self._current_proof_inputs()
+        active_grant = replace(grant, phase="active", version=5,
+                               last_viewer_left_at=None, return_deadline=None)
+        no_viewers = SimpleNamespace(**{**vars(target), "ordinary_client_ids": ()})
+        with (
+            patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant",
+                  side_effect=(active_grant, active_grant, active_grant, active_grant)),
+            patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client",
+                  return_value=(True, None, 5)) as touch,
+            patch("catchuparr.adapters.sharing_borrow_route.observe_native_connection",
+                  return_value=SimpleNamespace(target=no_viewers)),
+        ):
+            reader = native_borrow_proof_reader(
+                redis=object(), episode=episode, ack=ack,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+            )
+            with self.assertRaises(BorrowBindingLost):
+                reader()
+        self.assertEqual(touch.call_count, 2)
+
     def test_dynamic_grace_rejects_replaced_owner_profile_lease_and_grant_version(self):
         episode, ack, grant, target = self._current_proof_inputs()
         cases = (

@@ -451,7 +451,7 @@ def native_borrow_proof_reader(
     ):
         raise BorrowReaderUnavailable("native borrowed proof inputs are incomplete")
 
-    def proof() -> BorrowReadProof:
+    def proof(*, reconciled_viewer_race: bool = False) -> BorrowReadProof:
         checked_at = clock()
         if (
             isinstance(checked_at, bool)
@@ -500,6 +500,20 @@ def native_borrow_proof_reader(
             catalog_generation=current_grant.catalog_generation,
             assigned_sources=assigned_sources, observed_at=float(checked_at),
         )
+        # The Lua check and the richer source/catalog observation are two
+        # separate Redis reads. If the last ordinary viewer disconnects
+        # between them, Lua may report an active episode with no grace
+        # deadline while the following observation sees zero viewers. Take
+        # one fresh, fenced observation so Lua can atomically enter
+        # wait_return. Never authorize this skew without a deadline from that
+        # second Lua check; a repeated mismatch remains fail-closed.
+        if (observed is not None and not observed.target.ordinary_client_ids
+                and deadline is None):
+            if reconciled_viewer_race:
+                raise BorrowBindingLost(
+                    "ordinary viewer state remained inconsistent during grace reconciliation"
+                )
+            return proof(reconciled_viewer_race=True)
         if observed is None or observed.target.connection_identity != episode.identity:
             raise BorrowBindingLost("native owner, source, or stream profile changed")
         target = observed.target
