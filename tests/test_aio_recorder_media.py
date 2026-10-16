@@ -117,6 +117,53 @@ class RecorderMediaProbeTests(unittest.TestCase):
         )
         self.assertEqual("other", diagnostic["task_status"])
 
+    def test_allowed_source_wait_reports_existing_safe_task_exit_receipt(self):
+        now = [0.0]
+        run = SimpleNamespace(
+            result={"status": "sharing_return_recovery_pending"},
+            failures=["task:BorrowBindingLost", "SyntheticSecretTokenABC123"],
+            results=[SimpleNamespace(status="switch_requested", useful_segments=4,
+                                     return_code=0, attempt_switch_id="opaque")],
+            processes=[SimpleNamespace(poll=lambda: 0)],
+            input_headers=[{"X-Catchuparr-Borrow": "synthetic-bearer-secret"}],
+            stop_event=threading.Event(),
+            thread=SimpleNamespace(is_alive=lambda: True),
+        )
+        output = io.StringIO()
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with redirect_stdout(output), self.assertRaisesRegex(
+            RuntimeError,
+            "^Allowed B did not start after the observed native return deadline$",
+        ):
+            probe._wait_for_allowed_source_request(
+                run, lambda: [], 0, timeout=0.1, sleep=sleep,
+                monotonic=lambda: now[0],
+            )
+
+        line = next(
+            line for line in output.getvalue().splitlines()
+            if line.startswith("CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC ")
+        )
+        diagnostic = json.loads(line.split(" ", 1)[1])
+        self.assertEqual("sharing_return_recovery_pending", diagnostic["task_status"])
+        self.assertEqual(["BorrowBindingLost", "other"], diagnostic["failure_classes"])
+        self.assertEqual("switch_requested", diagnostic["attempts"][0]["status"])
+        self.assertNotIn("synthetic-bearer-secret", line)
+        self.assertNotIn("SyntheticSecretTokenABC123", line)
+
+    def test_allowed_source_wait_keeps_success_gate_without_diagnostic(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            timestamp = probe._wait_for_allowed_source_request(
+                SimpleNamespace(), lambda: [12.5], 0, timeout=1,
+                monotonic=lambda: 0.0,
+            )
+        self.assertEqual(12.5, timestamp)
+        self.assertEqual("", output.getvalue())
+
     def test_teardown_budget_accounts_for_sequential_shutdown_and_marker_ttl(self):
         self.assertEqual(
             156.0,
