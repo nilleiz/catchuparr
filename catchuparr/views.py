@@ -14,8 +14,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from .engine.recorder import LIVE_EDGE_IDLE_TIMEOUT_SECONDS
+
 logger = logging.getLogger(__name__)
-ARCHIVE_FINALIZATION_GRACE_SECONDS = 120
+ARCHIVE_FINALIZATION_GRACE_SECONDS = LIVE_EDGE_IDLE_TIMEOUT_SECONDS
 MAX_ARCHIVE_PLAYBACK_SECONDS = 24 * 60 * 60
 _ROUTE_NAMES = frozenset(
     {
@@ -700,6 +702,19 @@ def _archive_window_live(service, user_id, channel_id, end_epoch, now_epoch):
         and service.catchup_enabled(user_id, channel_id)
     ):
         return False
+    try:
+        from core.utils import RedisClient
+
+        from .engine.leases import recorder_lease_active
+
+        if end_epoch > now_epoch and recorder_lease_active(
+            RedisClient.get_client(), channel_id,
+        ):
+            return True
+    except Exception:
+        # Keep the bounded indexed-edge fallback if recorder ownership cannot
+        # be observed from this web process.
+        pass
     if end_epoch <= now_epoch:
         if now_epoch >= end_epoch + ARCHIVE_FINALIZATION_GRACE_SECONDS:
             return False

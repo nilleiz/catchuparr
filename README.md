@@ -242,10 +242,12 @@ authenticated archive session. M3U/XMLTV HLS playback does not require later
 EPG rows and can append newly indexed segments for up to 24 hours from the
 requested start. XC playback follows contiguous indexed TS segments within the
 Dispatcharr duration limit. XC stops at a real archive gap and waits no longer
-than 10 seconds for a next segment after the current edge. HLS marks the
-playlist finished after the indexed edge is stale for 120 seconds or the
-24-hour bound is reached. This candidate has focused synthetic coverage only;
-CI and real-player acceptance remain pending.
+than 125 seconds for a next segment after the current edge. That bound covers
+the recorder's 120-second media-idle timeout plus five seconds for indexing
+and finalization; a missing recorder lease closes XC follow mode promptly.
+HLS uses the same 125-second edge window and recorder lease, with a 24-hour
+session bound. This candidate has focused synthetic coverage only; CI and
+real-player acceptance remain pending.
 
 ## Access tokens and playback
 

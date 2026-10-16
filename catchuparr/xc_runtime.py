@@ -703,11 +703,24 @@ def _ts_service(archive_root: Path, timeshift_views):
             hls_sessions = _active_hls_session_count(config.archive_root, subject)
             return _dispatcharr_limit_allows(user, plugin_sessions + hls_sessions)
 
+        def live_edge_active(channel_uuid):
+            try:
+                from core.utils import RedisClient
+
+                from .engine.leases import recorder_lease_active
+
+                return recorder_lease_active(
+                    RedisClient.get_client(), str(channel_uuid),
+                )
+            except Exception:
+                return None
+
         service = ArchiveTSPlaybackService(
             store,
             authorize_user_channel=authorize,
             catchup_enabled=catchup,
             allow_new_session=allow_new_session,
+            live_edge_active=live_edge_active,
         )
         _TS_SERVICES[root] = service
         return service

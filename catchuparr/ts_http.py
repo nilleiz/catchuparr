@@ -22,9 +22,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .engine.admission import playback_admission_lock
+from .engine.recorder import LIVE_EDGE_IDLE_TIMEOUT_SECONDS
 from .http import RangeNotSatisfiable, parse_byte_range
 
 _TS_STREAM_CHUNK_BYTES = 64 * 1024
+_MAX_LIVE_FOLLOW_SECONDS = LIVE_EDGE_IDLE_TIMEOUT_SECONDS
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
@@ -144,6 +146,7 @@ class ArchiveTSPlaybackService:
         authorize_user_channel: Callable[[str, str], bool],
         catchup_enabled: Callable[[str, str], bool],
         allow_new_session: Callable[..., bool] | None = None,
+        live_edge_active: Callable[[str], bool | None] | None = None,
         lease_ttl_seconds: float = 4 * 60 * 60,
         clock: Callable[[], float] = time.time,
     ):
@@ -154,6 +157,7 @@ class ArchiveTSPlaybackService:
         self.authorize_user_channel = authorize_user_channel
         self.catchup_enabled = catchup_enabled
         self.allow_new_session = allow_new_session
+        self.live_edge_active = live_edge_active
         self.lease_ttl_seconds = lease_ttl_seconds
         self.clock = clock
         self._init_sessions()
@@ -247,7 +251,7 @@ class ArchiveTSPlaybackService:
         method: str = "GET",
         range_header: str | None = None,
         live: bool = False,
-        live_follow_seconds: float = 10.0,
+        live_follow_seconds: float = LIVE_EDGE_IDLE_TIMEOUT_SECONDS,
     ) -> TSHTTPResponse | StreamingTSHTTPResponse:
         """Token-authenticated standalone entry point."""
         if self.tokens is None or not token:
@@ -282,7 +286,7 @@ class ArchiveTSPlaybackService:
         method: str = "GET",
         range_header: str | None = None,
         live: bool = False,
-        live_follow_seconds: float = 10.0,
+        live_follow_seconds: float = LIVE_EDGE_IDLE_TIMEOUT_SECONDS,
     ) -> TSHTTPResponse | StreamingTSHTTPResponse:
         """Serve local TS for a user already authenticated by Dispatcharr."""
         method = method.upper()
@@ -292,7 +296,10 @@ class ArchiveTSPlaybackService:
             return _error(400, "invalid playback session")
         if not isinstance(device_key, str) or not _SESSION_ID_RE.fullmatch(device_key):
             return _error(400, "invalid playback device")
-        if not isinstance(live_follow_seconds, (int, float)) or not 0 <= live_follow_seconds <= 60:
+        if (
+            not isinstance(live_follow_seconds, (int, float))
+            or not 0 <= live_follow_seconds <= _MAX_LIVE_FOLLOW_SECONDS
+        ):
             return _error(400, "invalid live follow timeout")
         user = str(user_id).strip()
         channel = str(channel_id).strip()
@@ -339,8 +346,18 @@ class ArchiveTSPlaybackService:
             return _error(503, "archive temporarily unavailable")
 
         deadline = time.monotonic() + live_follow_seconds if live and live_follow_seconds else None
+        active_check_at = time.monotonic()
         while not segments and deadline is not None:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            if self.live_edge_active is not None and now >= active_check_at:
+                try:
+                    recorder_active = self.live_edge_active(channel)
+                except Exception:
+                    recorder_active = None
+                if recorder_active is False:
+                    break
+                active_check_at = now + 5.0
+            remaining = deadline - now
             if remaining <= 0:
                 break
             time.sleep(min(0.1, remaining))
@@ -502,7 +519,29 @@ class ArchiveTSPlaybackService:
                     seen_ids = {item.id for item in segments}
                     follow_deadline = time.monotonic() + live_follow_seconds
                     end_dt = datetime.fromtimestamp(end, timezone.utc)
+                    last_segment = segments[-1]
+                    active_check_at = time.monotonic()
                     while high_water < end and time.monotonic() < follow_deadline:
+                        now = time.monotonic()
+                        if self.live_edge_active is not None and now >= active_check_at:
+                            try:
+                                recorder_active = self.live_edge_active(channel)
+                            except Exception:
+                                recorder_active = None
+                            if recorder_active is False:
+                                break
+                            active_check_at = now + 5.0
+                        if now >= renew_at:
+                            if (
+                                not self._renew_lease(
+                                    user, channel, lease_id, device_key, last_segment
+                                )
+                                or not self._renew_response_stream(
+                                    response_stream_id, lease_id
+                                )
+                            ):
+                                raise OSError("playback lease expired during TS stream")
+                            renew_at = time.monotonic() + renewal_interval
                         if time.monotonic() >= cancellation_check_at:
                             if not self._response_stream_active(lease_id):
                                 raise OSError("playback session was stopped")
@@ -570,7 +609,9 @@ class ArchiveTSPlaybackService:
                                 yield chunk
                         seen_ids.add(segment.id)
                         high_water = max(high_water, segment.end_utc.timestamp())
+                        last_segment = segment
                         follow_deadline = time.monotonic() + live_follow_seconds
+                        active_check_at = time.monotonic()
             finally:
                 finish_response(retain_live_session=live)
 

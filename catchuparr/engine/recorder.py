@@ -17,6 +17,12 @@ from typing import Callable
 
 from .store import ArchiveStore
 
+DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS = 120.0
+ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS = 5.0
+LIVE_EDGE_IDLE_TIMEOUT_SECONDS = (
+    DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS + ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS
+)
+
 
 @dataclass(frozen=True)
 class RecorderAttemptResult:
@@ -209,7 +215,7 @@ class FFmpegCopyRecorder:
         stop_event: threading.Event,
         *,
         startup_timeout: float = 60.0,
-        media_idle_timeout: float = 120.0,
+        media_idle_timeout: float = DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
         poll_interval: float = 0.5,
         attempt_switch: RecorderAttemptSwitch | None = None,
         on_first_media: Callable[[float], bool] | None = None,

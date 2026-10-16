@@ -298,7 +298,12 @@ def probe():
     sys.path.insert(0, "/data/plugins")
     sys.path.insert(0, "/tmp")
     from apps.accounts.models import User
-    from apps.channels.models import Channel, ChannelProfile, ChannelProfileMembership
+    from apps.channels.models import (
+        Channel,
+        ChannelProfile,
+        ChannelProfileMembership,
+        ChannelStream,
+    )
     from apps.epg.models import EPGData, ProgramData
     from apps.output import views as output
     from apps.plugins.models import PluginConfig
@@ -352,11 +357,20 @@ def probe():
     closed_channel = Channel.objects.create(name="Closed minute", channel_number=3, user_level=0)
     no_guide_channel = Channel.objects.create(name="Missing guide", channel_number=4, user_level=0)
     long_segment_channel = Channel.objects.create(name="Long GOP", channel_number=5, user_level=0)
+    continuous_channel = Channel.objects.create(
+        name="Continuous playback", channel_number=6, user_level=0,
+    )
+    stopped_channel = Channel.objects.create(
+        name="Stopped playback", channel_number=7, user_level=0,
+    )
     channel_profile = ChannelProfile.objects.create(name="Synthetic playback profile")
     ChannelProfileMembership.objects.filter(channel_profile=channel_profile).update(
         enabled=False
     )
-    for selected_channel in (channel, closed_channel, no_guide_channel, long_segment_channel):
+    for selected_channel in (
+        channel, closed_channel, no_guide_channel, long_segment_channel,
+        continuous_channel, stopped_channel,
+    ):
         ChannelProfileMembership.objects.update_or_create(
             channel_profile=channel_profile,
             channel=selected_channel,
@@ -431,6 +445,9 @@ def probe():
                                start_time=start, end_time=start + timedelta(seconds=12))
     ProgramData.objects.create(epg=live_guide, title="Synthetic next",
                                start_time=start + timedelta(seconds=12),
+                               end_time=start + timedelta(seconds=18))
+    ProgramData.objects.create(epg=live_guide, title="Synthetic third",
+                               start_time=start + timedelta(seconds=18),
                                end_time=start + timedelta(seconds=72))
     source.write_bytes(b"\x47" + bytes([3]) * 187)
     store.add_segment(str(no_guide_channel.uuid), source, start,
@@ -457,6 +474,35 @@ def probe():
         store.add_segment(str(closed_channel.uuid), source,
                           closed_start + timedelta(seconds=offset),
                           closed_start + timedelta(seconds=offset + 10))
+    continuous_guide = EPGData.objects.create(
+        name="Synthetic continuous guide", tvg_id="continuous",
+    )
+    continuous_channel.epg_data = continuous_guide
+    continuous_channel.save(update_fields=["epg_data"])
+    for offset, duration, title in (
+        (0, 6, "Synthetic continuous first"),
+        (6, 6, "Synthetic continuous second"),
+        (12, 6, "Synthetic continuous third"),
+        (18, 54, "Synthetic continuous fourth"),
+    ):
+        ProgramData.objects.create(
+            epg=continuous_guide, title=title,
+            start_time=start + timedelta(seconds=offset),
+            end_time=start + timedelta(seconds=offset + duration),
+        )
+    continuous_path = root / "continuous-initial.ts"
+    continuous_path.write_bytes(b"\x47" + bytes([10]) * 187)
+    store.add_segment(
+        str(continuous_channel.uuid), continuous_path,
+        start + timedelta(seconds=6), start + timedelta(seconds=12),
+    )
+    stopped_start = timezone.now().replace(microsecond=0) - timedelta(minutes=15)
+    stopped_path = root / "stopped-playback.ts"
+    stopped_path.write_bytes(b"\x47" + bytes([11]) * 187)
+    store.add_segment(
+        str(stopped_channel.uuid), stopped_path,
+        stopped_start, stopped_start + timedelta(seconds=6),
+    )
     phase("archive_routes", "started")
     token_result = runtime.create_access_token(active)
     token = token_result["access_token"]
@@ -480,6 +526,21 @@ def probe():
 
     def request(path, params=None, **headers):
         return factory.get(path, params or {}, HTTP_HOST="localhost", **headers)
+
+    def close_hls_session(response, selected_channel):
+        urls = [
+            line for line in response.content.decode().splitlines()
+            if line and not line.startswith("#")
+        ]
+        if not urls:
+            return
+        lease = parse_qs(urlsplit(urls[-1]).query).get("lease", [None])[0]
+        if lease:
+            service = views._archive_service(
+                request("/catchuparr/archive", params), user, runtime.load_config(),
+            )
+            require(service.end_session(token, str(selected_channel.uuid), lease),
+                    "Synthetic HLS playback lease did not close")
 
     time_key = "utc" if __version__ == "0.32.0" else "start"
     xc_params = {"username": user.username, "password": xc_password,
@@ -518,8 +579,18 @@ def probe():
     missing_guide = views.archive_view(request(
         "/catchuparr/archive", dict(params, channel_id=str(no_guide_channel.uuid))
     ))
-    require(missing_guide.status_code == 404,
-            "Selected archive channel without EPG must not invent a programme window")
+    require(missing_guide.status_code == 200,
+            "Covered archive playback without EPG must remain available")
+    close_hls_session(missing_guide, no_guide_channel)
+    stopped_playlist = views.archive_view(request(
+        "/catchuparr/archive",
+        dict(params, channel_id=str(stopped_channel.uuid),
+             utc=str(stopped_start.timestamp()), duration="6"),
+    ))
+    require(stopped_playlist.status_code == 200
+            and b"#EXT-X-ENDLIST" in stopped_playlist.content,
+            "A stale recorder edge must produce a finite HLS playlist")
+    close_hls_session(stopped_playlist, stopped_channel)
     store.save_program_snapshot(
         str(no_guide_channel.uuid), start, start + timedelta(seconds=6),
         "Archived before guide refresh",
@@ -550,10 +621,16 @@ def probe():
     service = views._archive_service(request("/catchuparr/archive", params), user,
                                      runtime.load_config())
     require(service.end_session(token, str(long_segment_channel.uuid), long_lease))
+    from core.utils import RedisClient
+
+    redis_client = RedisClient.get_client()
+    hls_recorder_lease = f"catchuparr:recorder:{channel.uuid}"
+    redis_client.set(hls_recorder_lease, "synthetic-active", ex=30)
     archive = views.archive_view(request("/catchuparr/archive", params))
     require(archive.status_code == 200, f"Archive status {archive.status_code}")
-    require(archive.content.count(b"#EXTINF:") == 2,
-            "Initial programme must exclude the next programme's segment")
+    require(archive.content.count(b"#EXTINF:") == 2
+            and b"#EXT-X-ENDLIST" not in archive.content,
+            "Growing playback must begin with indexed media and stay open")
     require(b"#EXT-X-START:TIME-OFFSET=" in archive.content,
             "Start-over playlist must mark the requested playback origin")
     segment_url = next(line for line in archive.content.decode().splitlines()
@@ -576,21 +653,30 @@ def probe():
     waiting = views.archive_view(request("/catchuparr/archive", params))
     require(waiting.status_code == 200 and waiting.content == archive.content,
             "Tail prefetch must not alter the programme playlist")
-    store.add_segment(str(channel.uuid), source, start + timedelta(seconds=12),
-                      start + timedelta(seconds=18))
+    for index, offset in enumerate((12, 18, 24)):
+        append_path = root / f"continuous-append-{index}.ts"
+        append_path.write_bytes(b"\x47" + bytes([20 + index]) * 187)
+        store.add_segment(
+            str(channel.uuid), append_path,
+            start + timedelta(seconds=offset),
+            start + timedelta(seconds=offset + 6),
+        )
     bounded = views.archive_view(request("/catchuparr/archive", params))
-    require(bounded.status_code == 200 and bounded.content == archive.content,
-            "Prefetch and a newly indexed next programme must not extend this session")
+    require(bounded.status_code == 200
+            and bounded.content.count(b"#EXTINF:") == 5
+            and b"#EXT-X-ENDLIST" not in bounded.content,
+            "HLS reload must append media across two programme boundaries")
     require(service.end_session(token, str(channel.uuid), query["lease"]))
     seek_params = dict(params, utc=str(int(start.timestamp()) + 6))
     seek = views.archive_view(request("/catchuparr/archive", seek_params))
     require(seek.status_code == 200, f"HLS seek status {seek.status_code}")
-    require(seek.content.count(b"#EXTINF:") == 1,
-            "Seek with unchanged programme duration must stop at EPG end")
+    require(seek.content.count(b"#EXTINF:") == 4,
+            "A seek must keep following indexed media across later programmes")
     seek_segment = next(line for line in seek.content.decode().splitlines()
                         if line and not line.startswith("#"))
     seek_lease = parse_qs(urlsplit(seek_segment).query)["lease"][0]
     require(service.end_session(token, str(channel.uuid), seek_lease))
+    redis_client.delete(hls_recorder_lease)
 
     xc_playlist = output.generate_m3u(request("/get.php", xc_params), user=user)
     require(xc_playlist.status_code == 200)
@@ -650,6 +736,110 @@ def probe():
         runtime=runtime,
         request=request,
     )
+
+    require(
+        xc_playback(start.timestamp(), no_guide_channel.id)
+        == b"\x47" + bytes([3]) * 187,
+        "XC playback must not require an EPG entry when local media is covered",
+    )
+
+    continuous_xc_params = dict(
+        xc_params,
+        stream=str(continuous_channel.id),
+        duration="1",
+        **{time_key: str(int((start + timedelta(seconds=6)).timestamp()))},
+    )
+    continuous_recorder_lease = f"catchuparr:recorder:{continuous_channel.uuid}"
+    redis_client.set(continuous_recorder_lease, "synthetic-active", ex=30)
+    continuous_xc = timeshift.timeshift_proxy_query(request(
+        "/streaming/timeshift.php", continuous_xc_params,
+        HTTP_USER_AGENT="Catchuparr synthetic integration",
+        REMOTE_ADDR="127.0.0.41",
+    ))
+    require(continuous_xc.status_code == 200,
+            f"Continuous XC response status {continuous_xc.status_code}")
+    require(getattr(continuous_xc, "streaming", False),
+            "Continuous XC response must stay streaming")
+    require("Content-Length" not in continuous_xc,
+            "Live-edge XC response must not advertise a fixed body length")
+    require(
+        not ChannelStream.objects.filter(channel=continuous_channel).exists(),
+        "Synthetic continuous playback must not use a provider stream",
+    )
+    continuous_iterator = iter(continuous_xc.streaming_content)
+    try:
+        initial_chunk = next(continuous_iterator)
+        append_payloads = []
+        for index, offset in enumerate((12, 18)):
+            payload = b"\x47" + bytes([31 + index]) * 187
+            append_path = root / f"continuous-xc-append-{index}.ts"
+            append_path.write_bytes(payload)
+            store.add_segment(
+                str(continuous_channel.uuid), append_path,
+                start + timedelta(seconds=offset),
+                start + timedelta(seconds=offset + 6),
+            )
+            append_payloads.append(payload)
+        gap_payload = b"\x47" + bytes([39]) * 187
+        gap_path = root / "continuous-xc-gap.ts"
+        gap_path.write_bytes(gap_payload)
+        store.add_segment(
+            str(continuous_channel.uuid), gap_path,
+            start + timedelta(seconds=30), start + timedelta(seconds=36),
+        )
+
+        collected = []
+        reader_errors = []
+
+        def drain_continuous_xc():
+            try:
+                collected.extend(continuous_iterator)
+            except BaseException as exc:
+                reader_errors.append(type(exc).__name__)
+
+        reader = threading.Thread(target=drain_continuous_xc, daemon=True)
+        reader.start()
+        reader.join(timeout=5)
+        if reader.is_alive():
+            continuous_xc.close()
+            reader.join(timeout=1)
+        require(not reader.is_alive(),
+                "XC gap response exceeded the bounded five-second read")
+        require(not reader_errors, "XC continuous reader failed while following appended media")
+        require(
+            b"".join((initial_chunk, *collected))
+            == b"".join((b"\x47" + bytes([10]) * 187, *append_payloads)),
+            "XC seek near the programme boundary must follow two appends and stop before a gap",
+        )
+    finally:
+        continuous_xc.close()
+        redis_client.delete(continuous_recorder_lease)
+    from catchuparr.xc_runtime import _ts_service
+
+    continuous_service = _ts_service(root, timeshift)
+    with sqlite3.connect(root / "archive.sqlite3") as database:
+        continuous_leases = database.execute(
+            "SELECT lease_id FROM ts_playback_sessions "
+            "WHERE user_id=? AND channel_id=?",
+            (str(user.id), str(continuous_channel.uuid)),
+        ).fetchall()
+    require(bool(continuous_leases), "Continuous XC session was not recorded")
+    for (lease_id,) in continuous_leases:
+        require(
+            continuous_service.end_user_session(
+                user.id, str(continuous_channel.uuid), lease_id,
+            ),
+            "Continuous XC playback session did not close",
+        )
+    with sqlite3.connect(root / "archive.sqlite3") as database:
+        remaining_xc_sessions, remaining_xc_streams = database.execute(
+            "SELECT (SELECT COUNT(*) FROM ts_playback_sessions WHERE channel_id=?), "
+            "(SELECT COUNT(*) FROM ts_playback_streams st JOIN ts_playback_sessions s "
+            "ON s.lease_id=st.lease_id WHERE s.channel_id=?)",
+            (str(continuous_channel.uuid), str(continuous_channel.uuid)),
+        ).fetchone()
+    require(remaining_xc_sessions == 0 and remaining_xc_streams == 0,
+            "XC disconnect must release its playback session and stream lease")
 
     require(xc_playback(start.timestamp()) == b"\x47" + bytes(187))
     require(xc_playback((start + timedelta(seconds=6)).timestamp())
