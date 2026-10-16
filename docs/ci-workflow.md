@@ -1,6 +1,9 @@
 # CI and release evidence
 
 Pull requests run the unit, package, and pinned Dispatcharr 0.32.0 AIO checks.
+The AIO job has a 40-minute outer timeout for its 30-minute probe budget plus
+bounded setup and cleanup time; the probe's own deadline and assertions remain
+the source of its runtime limit.
 The CI workflow can also be dispatched manually for an explicit recovery or
 diagnostic run. Pull-request runs use concurrency cancellation so an obsolete
 PR revision does not continue consuming an AIO runner. CI does not rerun on
