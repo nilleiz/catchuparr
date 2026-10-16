@@ -20,12 +20,55 @@ WORKFLOW_PATH = ".github/workflows/ci.yml"
 ARTIFACT_NAME = "catchuparr-plugin"
 SCHEMA_VERSION = 1
 REQUIRED_JOBS = {"test-and-package", "AIO integration (0.32.0)"}
+REQUIRED_AIO_STEP = "Synthetic playback in actual Dispatcharr AIO"
 PACKAGE_SUFFIXES = {".py", ".json", ".png"}
 API_ROOT = "https://api.github.com"
+INFRA_CHANGE_FILES = {
+    "scripts/ci_provenance.py",
+    "tests/test_ci_provenance.py",
+    "README.md",
+    "CHANGELOG.md",
+}
 
 
 class ProvenanceError(Exception):
     """A safe, concise error suitable for CI logs."""
+
+
+def requires_aio(paths: list[str] | None) -> bool:
+    """Fail closed unless every changed path is an explicitly cheap input."""
+    if not paths:
+        return True
+    for path in paths:
+        if path in INFRA_CHANGE_FILES:
+            continue
+        if path.startswith("docs/") and path.endswith(".md") and ".." not in path.split("/"):
+            continue
+        if path.startswith(".github/workflows/") and path.endswith(".yml") and ".." not in path.split("/"):
+            continue
+        return True
+    return False
+
+
+def changed_paths(event: str, base_sha: str, head_sha: str) -> list[str] | None:
+    """Return changed names, or None when the comparison cannot be trusted."""
+    if event != "pull_request" or not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_sha) or not re.fullmatch(
+        r"[0-9a-fA-F]{40,64}", head_sha
+    ):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "--no-renames", "-z", base_sha, head_sha],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return [item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
+    except UnicodeDecodeError:
+        return None
 
 
 def _sha256(data: bytes) -> str:
@@ -234,6 +277,17 @@ def _required_job_records(run: dict) -> list[dict]:
     return [by_name[name] for name in REQUIRED_JOBS if name in by_name]
 
 
+def _native_aio_step_succeeded(jobs: list[dict]) -> bool:
+    aio_job = next((job for job in jobs if job.get("name") == "AIO integration (0.32.0)"), None)
+    steps = aio_job.get("steps") if isinstance(aio_job, dict) else None
+    return isinstance(steps, list) and any(
+        isinstance(step, dict)
+        and step.get("name") == REQUIRED_AIO_STEP
+        and step.get("conclusion") == "success"
+        for step in steps
+    )
+
+
 def _trusted_run(run: dict, repository: str, workflow_id: int) -> bool:
     if not isinstance(run, dict):
         return False
@@ -259,6 +313,7 @@ def _trusted_run(run: dict, repository: str, workflow_id: int) -> bool:
             or (
                 len(jobs) == len(REQUIRED_JOBS)
                 and all(job.get("conclusion") == "success" for job in jobs)
+                and _native_aio_step_succeeded(jobs)
             )
         )
     )
@@ -290,6 +345,40 @@ def _same_repository(candidate: object, trusted: object) -> bool:
         or candidate_name.casefold() == trusted_name.casefold()
     )
     return (ids_match or urls_match or full_names_match) and names_match
+
+
+def _bind_run_to_merged_pr(
+    api: GitHubAPI, run: dict, provenance: dict, release_tree: str,
+) -> None:
+    """Recover PR metadata omitted from merged workflow-run records and bind it."""
+    workflow_ref = provenance.get("workflow_ref")
+    prefix = f"{api.repository}/{WORKFLOW_PATH}@refs/pull/"
+    match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)/merge", workflow_ref or "")
+    if match is None:
+        raise ProvenanceError("CI provenance does not identify a pull request")
+    number = int(match.group(1))
+    pr = api.get_json(f"pulls/{number}")
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    if (
+        pr.get("number") != number
+        or pr.get("state") != "closed"
+        or pr.get("merged") is not True
+        or not isinstance(head.get("sha"), str)
+        or head["sha"].lower() != str(run.get("head_sha", "")).lower()
+        or not _same_repository(head.get("repo"), run.get("head_repository"))
+        or not _same_repository(base.get("repo"), run.get("repository"))
+    ):
+        raise ProvenanceError("Pull request identity does not match the trusted CI run")
+    merge_sha = pr.get("merge_commit_sha")
+    if not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_sha):
+        raise ProvenanceError("Merged pull request commit identity is missing")
+    merged_commit = _run_commit(api, merge_sha)
+    merged_tree = merged_commit.get("tree")
+    merged_tree_sha = merged_tree.get("sha") if isinstance(merged_tree, dict) else None
+    if not isinstance(merged_tree_sha, str) or merged_tree_sha.lower() != release_tree.lower():
+        raise ProvenanceError("Merged pull request tree differs from the release tree")
+    run["pull_requests"] = [{"number": number, "head": head, "base": base}]
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -487,6 +576,7 @@ def reuse_ci_artifact(package_root: Path, output_dir: Path, repository: str, tok
                 if candidate_provenance.get("archive_name") != archive_name:
                     continue
                 provenance, package_bytes = _artifact_contents(data_zip, archive_name)
+                _bind_run_to_merged_pr(api, run, provenance, release_tree)
                 tested_commit = _run_commit(api, str(provenance.get("source_sha", "")))
                 tree_obj = tested_commit.get("tree")
                 tree = tree_obj.get("sha", "").lower() if isinstance(tree_obj, dict) else ""
@@ -572,6 +662,11 @@ def _record(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    classify = subparsers.add_parser("classify")
+    classify.add_argument("--event", required=True)
+    classify.add_argument("--base-sha", default="")
+    classify.add_argument("--head-sha", default="")
+    classify.add_argument("--output", default="")
     record = subparsers.add_parser("record")
     record.add_argument("--package-root", type=Path, required=True)
     record.add_argument("--dist-dir", type=Path, required=True)
@@ -581,7 +676,21 @@ def main(argv: list[str] | None = None) -> int:
     reuse.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        if args.command == "record":
+        if args.command == "classify":
+            paths = changed_paths(args.event, args.base_sha, args.head_sha)
+            full = args.event != "pull_request" or requires_aio(paths)
+            value = "true" if full else "false"
+            if args.output:
+                with open(args.output, "a", encoding="utf-8") as output:
+                    output.write(f"full={value}\n")
+            print(f"Native AIO required: {value}")
+            if paths is None:
+                print("Changed-file comparison unavailable; running full AIO.")
+            elif full:
+                print("At least one changed path requires full native acceptance.")
+            else:
+                print("All changed paths are on the infrastructure-only allowlist.")
+        elif args.command == "record":
             _record(args)
         else:
             repository = os.environ.get("GITHUB_REPOSITORY", "")
