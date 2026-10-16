@@ -20,21 +20,21 @@ permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Required CI and native integration
-    uses: ./.github/workflows/ci.yml
-
   publish:
     name: Publish plugin archive
-    needs: checks
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Check out release source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Require a reviewed main-branch commit
         env:
@@ -52,11 +52,11 @@ jobs:
             exit 1
           }
 
-      - name: Download CI-built plugin archive
-        uses: actions/download-artifact@v4
-        with:
-          name: catchuparr-plugin
-          path: dist
+      - name: Reuse the exact-tree successful PR CI package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/ci_provenance.py reuse --package-root catchuparr --output-dir dist
 
       - name: Verify version, archive name, and changelog
         id: release

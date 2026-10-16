@@ -10,9 +10,9 @@ The initial 0.32.0 media run failed before 96,256 bytes; a later diagnostic-only
 run passed, but the original cause remains unknown. See the
 [0.5.1 candidate guide](candidate-0.5.1.md) and the 0.5.0 evidence below.
 
-## 0.6.0 optional live sharing candidate
+## 0.6.0 optional live sharing candidate (historical)
 
-The 0.6.0 candidate remains unpublished. The full synthetic native AIO
+The 0.6.0 candidate was not published. The full synthetic native AIO
 integration passed on the pinned Dispatcharr 0.32.0 image
 (`b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`) using
 source commit `2ce95f076754121460b06e29507c933cf7d71aae`. All six required
@@ -32,9 +32,13 @@ another provider request, no opening of excluded sources, ordinary-viewer
 preservation through Stop, exact client/process cleanup before fallback
 launch, cooldown deadlines, repeated borrow/return, Apply and Stop revocation,
 restart recovery, failure handling and acknowledgement retries. The complete
-checklist is in the [candidate guide](candidate-0.6.0.md). The pinned 0.32.0
+checklist is in the [0.6.0 candidate history](candidate-0.6.0.md). The pinned 0.32.0
 AIO passed it; required GitHub CI and publication remain outstanding.
 Synthetic server-side tests do not establish real-player acceptance.
+
+## 0.6.1 global sharing settings candidate
+
+Version 0.6.1 replaces per-channel sharing YAML with global sharing settings, migrates uniform prior values and requires explicit confirmation for conflicts. Its initial attach skips the live stability delay while later switches preserve the configured timing and guards. Focused unit tests cover these changes; required GitHub CI and publication remain pending. See the [0.6.1 candidate guide](candidate-0.6.1.md).
 
 ## 0.5.1 named profile inheritance prerelease
 

@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Local rolling catch-up archive, start-over and optional live connection sharing for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -13,11 +13,39 @@
       "help_text": "Use version: 1 with channel rules selected by numbers, names, groups, or enabled profiles. Named-profile rules provide inherited source filters and schedules; direct channel rules can override them regardless of order. Omitted source filters inherit, explicit include/exclude replaces the filter, and explicit priority replaces the whole map. A rule schedule replaces the whole week by default; schedule_mode: override_days changes only specified expanded days. Day precedence is explicit weekday, group, then daily. Timezone is YAML timezone, valid container TZ, then detected system zone. Validate and Apply the complete settings together; blank YAML selects no channels. Filtered sources may need another provider slot."
     },
     {
-      "id": "connection_sharing_config",
-      "label": "Recorder connection sharing (YAML)",
-      "type": "text",
-      "default": "",
-      "help_text": "Optional version: 1 YAML; blank disables sharing. Enabled per selected channel only. Defaults: 5 seconds for a stable live connection, 30 seconds after its last ordinary viewer leaves, and 60 seconds between switches. Add default.enabled: true or channel rules using the filter selectors. Cooldowns are strict integers from 0 to 3600; zero disables that cooldown. Sharing reuses only a compatible existing native live connection; it never opens an excluded source. Validate and Apply with the complete settings."
+      "id": "connection_sharing_enabled",
+      "label": "Share existing live connections",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When enabled, Catchuparr may reuse a compatible existing viewer connection for every selected channel. It never opens an excluded source."
+    },
+    {
+      "id": "live_stability_seconds",
+      "label": "Live stability delay (seconds)",
+      "type": "number",
+      "default": 5,
+      "help_text": "Delay before switching to a newly eligible live connection. The first attach to an already eligible viewer is immediate. Enter an integer from 0 to 3600."
+    },
+    {
+      "id": "last_viewer_return_seconds",
+      "label": "Return delay after last viewer leaves (seconds)",
+      "type": "number",
+      "default": 30,
+      "help_text": "Wait after the last ordinary viewer leaves before returning to an allowed source. Enter an integer from 0 to 3600."
+    },
+    {
+      "id": "min_switch_interval_seconds",
+      "label": "Minimum interval between switches (seconds)",
+      "type": "number",
+      "default": 60,
+      "help_text": "Minimum time between later source switches. The first attach has no switch cooldown. Enter an integer from 0 to 3600."
+    },
+    {
+      "id": "connection_sharing_migration_confirmed",
+      "label": "Confirm global sharing settings migration",
+      "type": "boolean",
+      "default": false,
+      "help_text": "If previous per-channel settings differ, choose the global values above and enable this box to confirm them. Until confirmed, Validate and Apply leave the current configuration unchanged."
     },
     {
       "id": "archive_root",

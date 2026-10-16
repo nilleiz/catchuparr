@@ -16,9 +16,9 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The package version is **0.6.0 prerelease candidate**. It is not published.
-  The pinned 0.32.0 native AIO acceptance passed; required GitHub CI and
-  publication remain gates. See [candidate 0.6.0](docs/candidate-0.6.0.md)
+- The package version is **0.6.1 prerelease candidate**. It is not published.
+  The pinned 0.32.0 native AIO acceptance passed for 0.6.0; required GitHub CI
+  and publication remain gates. See [candidate 0.6.1](docs/candidate-0.6.1.md)
   and the [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.32.0**. The compatibility
   guard currently accepts the pinned 0.32.0 release; earlier and unverified
@@ -62,7 +62,10 @@ immediate operational actions.
 | Setting | What it controls |
 | --- | --- |
 | **Channel and source filter (YAML)** | Channel selection, assigned M3U source include/exclude and priority, schedule and timezone. Blank YAML selects no channels. |
-| **Recorder connection sharing (YAML)** | Optional per-selected-channel reuse of a compatible existing native live connection. Blank YAML disables sharing. |
+| **Share existing live connections** | Optional global reuse of compatible existing viewer connections on all selected channels. Disabled by default. |
+| **Live stability delay** | Delay before later switches to a new viewer connection. The first eligible attach is immediate. |
+| **Return delay after last viewer leaves** | Grace before returning to an allowed source. |
+| **Minimum interval between switches** | Cooldown applied to later source switches. |
 | **Archive path** | Local writable storage shared by Dispatcharr web and worker processes. Default: `/data/catchuparr`. |
 | **Retention (hours)** | Archive retention from 1 to 720 hours. |
 | **Storage limit (GiB)** | Archive size limit from 1 to 10240 GiB. |
@@ -191,10 +194,10 @@ The YAML parser rejects unknown and duplicate fields, tags, anchors, aliases
 and merges. Input is limited to 64 KiB and 256 rules. Validation errors name the
 field and line without echoing the full YAML document.
 
-## Smart live connection sharing (0.6.0 candidate)
+## Smart live connection sharing (0.6.1 candidate)
 
-Sharing is disabled by default. It is configured separately from the source
-filter but applies only to channels selected by that filter. It can reuse a
+Sharing is disabled by default. It uses one global setting and applies only to
+channels selected by the source filter. It can reuse a
 healthy, compatible native live connection that already has an ordinary viewer,
 even when that viewer's assigned source is outside a recorder's `include`
 list. This reuses that viewer's stream; it does not open a new connection to an
@@ -204,32 +207,20 @@ sources allowed by the filter. If none is allowed, the recorder waits paused.
 The feature checks the existing Dispatcharr owner, assignment, account,
 profile, input compatibility, worker heartbeat and published media. It attaches
 an owned reader to that worker's published MPEG-TS buffer; it does not
-initialize or reserve another upstream stream. Viewer churn does not reset the
-stability timer for the same native connection.
+initialize or reserve another upstream stream. The initial recorder attach to
+an already eligible viewer is immediate. Later switches use the configured
+stability and minimum-interval delays; viewer churn does not reset stability
+for the same native connection. The default delays are 5 seconds for live
+stability, 30 seconds after the last ordinary viewer leaves, and 60 seconds
+between later switches. Each delay accepts an integer from 0 through 3600.
+Zero disables that delay. Apply sharing settings together with the filter and
+other settings.
 
-```yaml
-version: 1
-default:
-  enabled: true
-  live_stability_seconds: 5
-  last_viewer_return_seconds: 30
-  min_switch_interval_seconds: 60
-rules:
-  - channels:
-      numbers: [100]
-    min_switch_interval_seconds: 90
-  - channels:
-      names: ["Synthetic Channel B"]
-    enabled: false
-```
-
-The defaults are 5 seconds of stable live connection, 30 seconds after its last
-ordinary viewer leaves, and 60 seconds between successful switches. Values
-must be integers from 0 through 3600; booleans, floats and numeric strings are
-invalid. Zero disables only that cooldown. Use `default.enabled: true` to enable
-sharing for all selected channels, then add selector rules to override values.
-Per-rule values inherit from `default`. Apply sharing settings together with
-the filter and other settings.
+Upgrades migrate uniform settings from the prior per-channel configuration.
+If those channel values conflict, Validate and Apply report the conflict and
+leave the current configuration active. Choose the global values and enable
+**Confirm global sharing settings migration** to resolve it. New active
+snapshots store only the global sharing settings.
 
 After a borrow, the recorder waits until both the last-viewer grace and the
 remaining minimum switch interval have elapsed, then returns to an allowed
@@ -238,10 +229,11 @@ authority and recorder failure take the cleanup path without waiting for normal
 viewer cooldowns. A switch ends the current FFmpeg attempt and starts the next
 with a segment discontinuity. The recorder's channel fence remains in force.
 
-**0.6.0 is still a candidate.** The feature's end-to-end AIO and required CI
-gates are pending. Do not treat synthetic tests or the configuration example
-as evidence that a particular Dispatcharr deployment has passed acceptance.
-See [candidate 0.6.0](docs/candidate-0.6.0.md) for the exact remaining gates.
+**0.6.1 is still a candidate.** The 0.6.0 feature's pinned synthetic AIO
+acceptance passed; the 0.6.1 global settings and migration changes have focused
+unit coverage. Required GitHub CI and publication remain pending. Synthetic
+tests do not establish real-player acceptance. See
+[candidate 0.6.1](docs/candidate-0.6.1.md) for the remaining gates.
 
 ## Access tokens and playback
 
