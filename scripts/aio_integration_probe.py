@@ -158,9 +158,9 @@ def probe_source_configuration(channel, root):
     active_path = root / "synthetic-active-settings.json"
     apply_configuration(settings, active_path=active_path)
     active = load_active_configuration(active_path)
-    from aio_051_configuration_probe import validate_active_v6_snapshot
+    from aio_051_configuration_probe import validate_active_v7_snapshot
 
-    validate_active_v6_snapshot(
+    validate_active_v7_snapshot(
         active, json.loads(active_path.read_text(encoding="utf-8")),
         (str(channel.uuid),),
     )
@@ -396,12 +396,12 @@ def probe():
     from catchuparr.configuration import active_settings_path, load_active_configuration
 
     active = load_active_configuration()
-    from aio_051_configuration_probe import validate_active_v6_snapshot
+    from aio_051_configuration_probe import validate_active_v7_snapshot
 
     require(active is not None, "One Apply must make the active snapshot readable")
     active_path = active_settings_path()
     persisted = json.loads(active_path.read_text(encoding="utf-8"))
-    validate_active_v6_snapshot(
+    validate_active_v7_snapshot(
         active, persisted, tuple(active.get("channel_uuids", "").splitlines()),
     )
     require(
