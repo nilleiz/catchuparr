@@ -123,13 +123,41 @@ class RecorderMediaProbeTests(unittest.TestCase):
             probe._native_teardown_readiness_timeout(120, 1),
         )
 
-    def test_borrow_teardown_budget_covers_native_error_marker_ttl(self):
+    def test_borrow_teardown_budget_adds_both_native_marker_phases(self):
         self.assertEqual(
-            186.0,
+            216.0,
             probe._native_teardown_readiness_timeout(
-                120, 1, stopping_marker_ttl=60,
+                120, 1, stopping_marker_ttl=90,
             ),
         )
+
+    def test_paused_native_teardown_waits_after_all_cleanup_acknowledgments(self):
+        conditions = {
+            "episode_closed": True,
+            "borrow_hash_absent": True,
+            "borrow_membership_absent": True,
+            "borrow_marker_absent": True,
+            "ledger_paused": True,
+            "grace_deadline_elapsed": True,
+            "task_completed_cleanly": True,
+        }
+        calls = []
+        result = probe._wait_for_native_teardown_after_pause(
+            conditions,
+            lambda: calls.append("native_release_wait"),
+            lambda: calls.append("final_seven_conditions") or {"all": True},
+        )
+        self.assertEqual(["native_release_wait", "final_seven_conditions"], calls)
+        self.assertEqual({"all": True}, result)
+
+        conditions["ledger_paused"] = False
+        with self.assertRaisesRegex(RuntimeError, "did not settle.*PAUSED"):
+            probe._wait_for_native_teardown_after_pause(
+                conditions,
+                lambda: calls.append("must_not_wait"),
+                lambda: calls.append("must_not_read_final_conditions"),
+            )
+        self.assertEqual(["native_release_wait", "final_seven_conditions"], calls)
 
     def test_native_a_teardown_waits_for_owner_and_profile_but_not_source_b(self):
         class FakeClock:
