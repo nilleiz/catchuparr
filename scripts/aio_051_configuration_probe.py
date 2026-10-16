@@ -42,7 +42,9 @@ def validate_active_v7_snapshot(active, persisted, channel_uuids):
         and persisted.get("version") == _ACTIVE_SCHEMA_VERSION,
         "raw active snapshot did not persist schema version 7",
     )
-    active_settings = active.get("settings")
+    # load_active_configuration returns a flattened runtime view; only the raw
+    # persisted document retains the nested settings object.
+    active_settings = active
     persisted_settings = persisted.get("settings")
 
     def has_exact_defaults(settings):
