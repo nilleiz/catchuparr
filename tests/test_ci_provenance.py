@@ -92,6 +92,14 @@ def _tested_commit(*, parents: tuple[str, str] = (BASE_SHA, SOURCE_SHA)) -> dict
     }
 
 
+def _ci_artifact(provenance: dict, archive_name: str, package: bytes) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as artifact:
+        artifact.writestr("ci-provenance.json", json.dumps(provenance))
+        artifact.writestr(archive_name, package)
+    return output.getvalue()
+
+
 class CIProvenanceTest(unittest.TestCase):
     def test_inventory_matches_only_package_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -269,6 +277,72 @@ class CIProvenanceTest(unittest.TestCase):
                     expected_inventory=inventory, archive_name=ARCHIVE_NAME,
                     archive_bytes=archive,
                 )
+
+    def test_accepts_minimal_pr_repository_objects_bound_by_id(self):
+        archive, inventory = _make_archive()
+        run = _run()
+        run["repository"].update({"id": 10, "name": "catchuparr"})
+        run["head_repository"].update({"id": 10, "name": "catchuparr"})
+        run["pull_requests"][0]["head"]["repo"] = {"id": 10, "name": "catchuparr", "url": "https://api.github.test/repos/example/catchuparr"}
+        run["pull_requests"][0]["base"]["repo"] = {"id": 10, "name": "catchuparr", "url": "https://api.github.test/repos/example/catchuparr"}
+        result = validate_provenance(
+            _provenance(archive, inventory), repository=REPOSITORY,
+            workflow_id=WORKFLOW_ID, run=run, tested_commit=_tested_commit(),
+            source_tree=SOURCE_TREE, expected_inventory=inventory,
+            archive_name=ARCHIVE_NAME, archive_bytes=archive,
+        )
+        self.assertEqual(result["run_id"], run["id"])
+
+    def test_candidate_scan_skips_older_package_and_accepts_matching_run(self):
+        package, inventory = _make_archive()
+        old_name = "catchuparr-0.5.0.zip"
+        old_provenance = _provenance(package, inventory)
+        old_provenance["archive_name"] = old_name
+        current_run = _run()
+        current_run["id"] = 4568
+        current_provenance = _provenance(package, inventory)
+        current_provenance["run_id"] = current_run["id"]
+        old_artifact = _ci_artifact(old_provenance, old_name, package)
+        current_artifact = _ci_artifact(current_provenance, ARCHIVE_NAME, package)
+
+        class API:
+            def __init__(self, repository, token):
+                self.repository = repository
+                self.token = token
+
+            def get_json(self, path):
+                if path == "actions/workflows/ci.yml":
+                    return {"id": WORKFLOW_ID, "path": WORKFLOW_PATH, "state": "active"}
+                if path.startswith(f"actions/workflows/{WORKFLOW_ID}/runs?"):
+                    older = dict(_run(), id=4567)
+                    return {"workflow_runs": [older, current_run]}
+                if path == "actions/runs/4567/jobs?per_page=100":
+                    return {"jobs": _run()["jobs"]}
+                if path == "actions/runs/4568/jobs?per_page=100":
+                    return {"jobs": current_run["jobs"]}
+                if path.startswith("actions/runs/") and path.endswith("/artifacts?per_page=100"):
+                    artifact_id = 101 if "/4567/" in path else 102
+                    return {"artifacts": [{"id": artifact_id, "name": ARTIFACT_NAME, "expired": False}]}
+                if path == f"git/commits/{MERGE_SHA}":
+                    return _tested_commit()
+                raise AssertionError(f"Unexpected API path: {path}")
+
+            def get_bytes(self, path):
+                return old_artifact if "/101/" in path else current_artifact
+
+        with tempfile.TemporaryDirectory() as directory:
+            package_root = Path(directory) / "catchuparr"
+            package_root.mkdir()
+            (package_root / "plugin.py").write_text("class Plugin: pass\n")
+            (package_root / "plugin.json").write_text('{"version":"0.6.0"}\n')
+            (package_root / "logo.png").write_bytes(b"synthetic-logo-bytes")
+            output = Path(directory) / "dist"
+            with patch("scripts.ci_provenance.GitHubAPI", API), patch(
+                "scripts.ci_provenance._release_tree", return_value=(MERGE_SHA, SOURCE_TREE)
+            ):
+                result = reuse_ci_artifact(package_root, output, REPOSITORY, "synthetic-token")
+            self.assertEqual(result["run_id"], current_run["id"])
+            self.assertTrue((output / ARCHIVE_NAME).is_file())
 
 
 if __name__ == "__main__":
