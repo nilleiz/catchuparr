@@ -1,6 +1,6 @@
 # Catchuparr roadmap
 
-Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidates with publication gates recorded below. Version 0.6.0 adds optional live connection sharing; required CI and complete native acceptance on the pinned Dispatcharr 0.32.0 AIO remain pending. This roadmap does not authorize production deployment.
+Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidates with publication gates recorded below. Version 0.6.0 adds optional live connection sharing; pinned Dispatcharr 0.32.0 synthetic native acceptance passed, while required GitHub CI and publication remain pending. This roadmap does not authorize production deployment.
 
 ## Workflow and release gates
 
@@ -21,7 +21,7 @@ Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidat
 | 0.4.0 | Playback Stats and independent recorder visibility control | High to medium | Accepted and released |
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | User acceptance complete; final parity correction passed four focused native 0.32.0 cases; required release workflow remains pending; not yet published |
 | 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Implemented in the prerelease candidate; the 453-test suite and full pinned AIO probes passed; CI and isolated Dev verification remain pending |
-| 0.6.0 | Optional sharing of compatible live connections | High | Candidate implementation; required CI and complete native acceptance pending; not published |
+| 0.6.0 | Optional sharing of compatible live connections | High | Full synthetic native acceptance passed on pinned Dispatcharr 0.32.0; required GitHub CI pending; not published; real-player acceptance not established |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.
@@ -419,8 +419,8 @@ The candidate adds fenced episode and operation records, one-use signed borrow
 capabilities, exact reader registration and cleanup, restart reconciliation,
 and an FFmpeg attempt switch signal. A switch must reap the previous attempt
 and acknowledge exact reader cleanup before another source can launch. The
-release is not published. Required CI and full pinned 0.32.0 AIO
-acceptance remain open; see the [0.6.0 candidate guide](candidate-0.6.0.md)
+release is not published. Full pinned 0.32.0 AIO acceptance passed; required
+GitHub CI remains open. Real-player acceptance is separate; see the [0.6.0 candidate guide](candidate-0.6.0.md)
 and [validation record](validation.md).
 
 ## Deferred validation

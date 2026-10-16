@@ -22,8 +22,9 @@ included here to explain the feature history leading to 0.4.0.
 
 ### Notes
 
-- This candidate is not published. Required CI and full native acceptance in
-  the pinned Dispatcharr 0.32.0 AIO remain release gates. The [0.6.0 candidate
+- The full synthetic native acceptance passed on the pinned Dispatcharr 0.32.0
+  AIO. Required GitHub CI and publication remain pending; this candidate is not
+  published. See the [0.6.0 candidate
   guide](docs/candidate-0.6.0.md) records intended behavior and remaining checks.
 
 ## [0.5.1] - Prerelease candidate, not published
