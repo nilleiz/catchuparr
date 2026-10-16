@@ -187,6 +187,42 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         namespace["supervise"]()
         self.assertEqual("tasks.supervisor", event.first_set_source)
 
+    def test_concurrent_stop_setters_preserve_first_caller_atomically(self):
+        event = probe._ObservedRecorderStopEvent()
+        classifier_entered = threading.Event()
+        release_classifier = threading.Event()
+        classified = []
+
+        def classify(_module, function):
+            classified.append(function)
+            if function == "first_setter":
+                classifier_entered.set()
+                self.assertTrue(release_classifier.wait(2))
+                return "tasks.supervisor"
+            return "probe.harness_cleanup"
+
+        def first_setter():
+            event.set()
+
+        def second_setter():
+            event.set()
+
+        with patch.object(probe, "_classify_stop_set_source", side_effect=classify):
+            first = threading.Thread(target=first_setter, name="first_setter")
+            second = threading.Thread(target=second_setter, name="second_setter")
+            first.start()
+            self.assertTrue(classifier_entered.wait(1))
+            second.start()
+            release_classifier.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(event.is_set())
+        self.assertEqual("tasks.supervisor", event.first_set_source)
+        self.assertEqual(["first_setter"], classified)
+
     def test_early_task_exit_emits_diagnostic_and_keeps_original_error(self):
         run = SimpleNamespace(
             thread=SimpleNamespace(is_alive=lambda: False),

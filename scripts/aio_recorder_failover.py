@@ -1028,17 +1028,19 @@ class _ObservedRecorderStopEvent(threading.Event):
     def __init__(self):
         super().__init__()
         self.first_set_source = "not_set"
+        self._source_lock = threading.Lock()
 
     def set(self):
-        if not self.is_set() and self.first_set_source == "not_set":
-            try:
-                caller = sys._getframe(1)
-                self.first_set_source = _classify_stop_set_source(
-                    caller.f_globals.get("__name__"), caller.f_code.co_name,
-                )
-            except Exception:
-                self.first_set_source = "unavailable"
-        super().set()
+        with self._source_lock:
+            if not self.is_set() and self.first_set_source == "not_set":
+                try:
+                    caller = sys._getframe(1)
+                    self.first_set_source = _classify_stop_set_source(
+                        caller.f_globals.get("__name__"), caller.f_code.co_name,
+                    )
+                except Exception:
+                    self.first_set_source = "other"
+            super().set()
 
 
 class _RecorderTaskRun:
