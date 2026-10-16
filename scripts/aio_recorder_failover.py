@@ -1022,12 +1022,25 @@ def _classify_stop_set_source(module_name, function_name) -> str:
     return "other"
 
 
+def _safe_supervisor_admission_status(module_name, function_name, frame_locals) -> str:
+    if module_name != "catchuparr.tasks" or function_name != "supervise":
+        return "unavailable"
+    admission = frame_locals.get("current_admission")
+    status = admission.get("status") if isinstance(admission, dict) else None
+    allowed = {
+        "ready", "recording_paused", "stale_configuration", "stale_control",
+        "outside_schedule", "invalid_schedule", "disabled", "control_unavailable",
+    }
+    return status if isinstance(status, str) and status in allowed else "other"
+
+
 class _ObservedRecorderStopEvent(threading.Event):
     """Record the first finite stop source for this disposable integration run."""
 
     def __init__(self):
         super().__init__()
         self.first_set_source = "not_set"
+        self.first_supervisor_admission_status = "unavailable"
         self._source_lock = threading.Lock()
 
     def set(self):
@@ -1035,11 +1048,15 @@ class _ObservedRecorderStopEvent(threading.Event):
             if not self.is_set() and self.first_set_source == "not_set":
                 try:
                     caller = sys._getframe(1)
-                    self.first_set_source = _classify_stop_set_source(
-                        caller.f_globals.get("__name__"), caller.f_code.co_name,
+                    module_name = caller.f_globals.get("__name__")
+                    function_name = caller.f_code.co_name
+                    self.first_set_source = _classify_stop_set_source(module_name, function_name)
+                    self.first_supervisor_admission_status = _safe_supervisor_admission_status(
+                        module_name, function_name, caller.f_locals,
                     )
                 except Exception:
                     self.first_set_source = "other"
+                    self.first_supervisor_admission_status = "unavailable"
             super().set()
 
 
