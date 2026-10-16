@@ -303,8 +303,10 @@ def probe():
         ChannelProfile,
         ChannelProfileMembership,
         ChannelStream,
+        Stream,
     )
     from apps.epg.models import EPGData, ProgramData
+    from apps.m3u.models import M3UAccount
     from apps.output import views as output
     from apps.plugins.models import PluginConfig
     from apps.timeshift import views as timeshift
@@ -376,6 +378,17 @@ def probe():
             channel=selected_channel,
             defaults={"enabled": True},
         )
+    archive_only_account = M3UAccount.objects.create(
+        name="Synthetic archive-only channel source", max_streams=1,
+    )
+    archive_only_stream = Stream.objects.create(
+        name="Synthetic archive-only channel source",
+        url="http://127.0.0.1:1/archive-only.ts",
+        m3u_account=archive_only_account,
+    )
+    ChannelStream.objects.create(
+        channel=no_guide_channel, stream=archive_only_stream, order=0,
+    )
     root = Path("/data/ci-archive")
     root.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(root / "archive.sqlite3") as database:
@@ -579,8 +592,32 @@ def probe():
     missing_guide = views.archive_view(request(
         "/catchuparr/archive", dict(params, channel_id=str(no_guide_channel.uuid))
     ))
-    require(missing_guide.status_code == 200,
-            "Covered archive playback without EPG must remain available")
+    missing_guide_service = views._archive_service(
+        request("/catchuparr/archive", params), user, runtime.load_config(),
+    )
+    missing_guide_authorized = missing_guide_service.authorize_user_channel(
+        str(user.id), str(no_guide_channel.uuid),
+    )
+    body_classes = {
+        b"forbidden": "forbidden",
+        b"stream limit exceeded": "stream_limit",
+        b"no archived segments in requested range": "no_segments",
+        b"archive temporarily unavailable": "archive_unavailable",
+    }
+    missing_guide_body_class = body_classes.get(
+        missing_guide.content.strip(), "other",
+    )
+    require(
+        no_guide_channel.epg_data_id is None
+        and ChannelStream.objects.filter(channel=no_guide_channel).exists()
+        and missing_guide_authorized
+        and missing_guide.status_code == 200
+        and "application/vnd.apple.mpegurl" in missing_guide.headers.get("Content-Type", "")
+        and b"#EXTINF:" in missing_guide.content,
+        "Covered no-EPG archive route failed: "
+        f"status={missing_guide.status_code}, authorized={missing_guide_authorized}, "
+        f"body={missing_guide_body_class}",
+    )
     close_hls_session(missing_guide, no_guide_channel)
     stopped_playlist = views.archive_view(request(
         "/catchuparr/archive",
