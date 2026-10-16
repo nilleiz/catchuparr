@@ -4111,10 +4111,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         assignment_snapshot = {
             key: _key_dump(redis_client, key) for key in assignment_keys
         }
+        assigned_stream_id = _redis_text(
+            redis_client.get(f"channel_stream:{channel.id}")
+        )
         _require(
-            assignment_snapshot[f"channel_stream:{stream_a.id}"] is not None
+            assigned_stream_id == str(stream_a.id)
             and assignment_snapshot[f"stream_profile:{stream_a.id}"] is not None,
-            "Native live A did not publish its channel assignment and profile keys",
+            "Native live A did not publish its channel-keyed stream and profile keys",
         )
         source_metadata = _native_source_metadata(redis_client, metadata_key)
         _require(
