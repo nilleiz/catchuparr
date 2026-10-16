@@ -4513,6 +4513,105 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # Re-open an ordinary A viewer after the first successful return. The
         # recorder should borrow A a second time, then explicit Pause must
         # remove only its reader while leaving the ordinary viewer untouched.
+        from apps.proxy.live_proxy.config_helper import ConfigHelper
+        from apps.proxy.live_proxy.services.channel_service import ChannelService
+
+        def wait_for_native_a_reopen(previous_borrow_client_id: str) -> None:
+            """Wait for Dispatcharr's real last-client teardown to finish read-only."""
+            shutdown_bound = max(
+                35.0,
+                float(ConfigHelper.channel_shutdown_delay())
+                + float(ConfigHelper.cleanup_check_interval()) + 5.0,
+            )
+            deadline = time.monotonic() + shutdown_bound
+            last_snapshot = None
+            while time.monotonic() < deadline:
+                state = _redis_text(redis_client.hget(
+                    RedisKeys.channel_metadata(worker_id), ChannelMetadataField.STATE,
+                ))
+                profile_a_count = _profile_count(
+                    redis_client, profile_a.id, profile_connections_key,
+                )
+                provider_counts, provider_active = source_server.snapshot()
+                local_manager = native_server.client_managers.get(worker_id)
+                local_clients = (
+                    int(local_manager.get_client_count())
+                    if local_manager is not None else 0
+                )
+                borrowed_hash = (
+                    f"live:channel:{worker_id}:clients:{previous_borrow_client_id}"
+                )
+                borrowed_absent = (
+                    not redis_client.exists(borrowed_hash)
+                    and not redis_client.sismember(
+                        RedisKeys.clients(worker_id), previous_borrow_client_id,
+                    )
+                    and redis_client.hget(
+                        f"catchuparr:sharing:private:{worker_id}",
+                        previous_borrow_client_id,
+                    ) is None
+                )
+                conditions = {
+                    "native_route_admits_new_clients": not (
+                        ChannelService.is_channel_unavailable_for_new_clients(worker_id)
+                    ),
+                    "redis_stopping_marker_absent": not redis_client.exists(
+                        RedisKeys.channel_stopping(worker_id),
+                    ),
+                    "metadata_not_stopping": state != _constant_text(ChannelState.STOPPING),
+                    "native_owner_absent": redis_client.get(
+                        RedisKeys.channel_owner(worker_id),
+                    ) is None,
+                    "native_clients_zero": int(
+                        redis_client.scard(RedisKeys.clients(worker_id)) or 0
+                    ) == 0,
+                    "native_managers_absent": (
+                        worker_id not in native_server.stream_managers
+                        and worker_id not in native_server._live_stream_managers
+                        and local_manager is None
+                    ),
+                    "source_a_inactive": provider_active["source-a.ts"] == 0,
+                    "profile_a_at_baseline": (
+                        profile_a_count == profile_baselines[profile_a.id]
+                    ),
+                    "previous_borrow_registration_absent": borrowed_absent,
+                }
+                last_snapshot = {
+                    "conditions": conditions,
+                    "metadata_state_stopping": (
+                        state == _constant_text(ChannelState.STOPPING)
+                    ),
+                    "provider_a": {
+                        "active": provider_active["source-a.ts"],
+                        "requests": provider_counts["source-a.ts"],
+                    },
+                    "native": {
+                        "global_clients": int(
+                            redis_client.scard(RedisKeys.clients(worker_id)) or 0
+                        ),
+                        "local_clients": local_clients,
+                        "owner_present": redis_client.get(
+                            RedisKeys.channel_owner(worker_id),
+                        ) is not None,
+                    },
+                    "profile_a": {
+                        "current": profile_a_count,
+                        "baseline": profile_baselines[profile_a.id],
+                    },
+                    "previous_borrow_registration_absent": borrowed_absent,
+                }
+                if all(conditions.values()):
+                    return
+                gevent_sleep(0.1)
+
+            _require_with_failure_diagnostic(
+                False,
+                "Native A teardown did not finish before the next ordinary viewer",
+                lambda: last_snapshot or {"snapshot_available": False},
+                diagnostic_label="CATCHUPARR_NATIVE_REOPEN_DIAGNOSTIC",
+            )
+
+        wait_for_native_a_reopen(no_source_client_id)
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
         live_response = client.get(
             f"/proxy/ts/stream/{channel.uuid}",
@@ -4680,6 +4779,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         # The replacement task now borrows a fresh ordinary A viewer. Keep it
         # alive through Pause to prove cleanup leaves the native viewer intact.
+        wait_for_native_a_reopen(second_borrow_client_id)
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
         live_response = client.get(
             f"/proxy/ts/stream/{channel.uuid}",
