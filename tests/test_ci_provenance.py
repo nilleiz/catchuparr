@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from scripts.ci_provenance import (
     ARTIFACT_NAME,
+    REQUIRED_AIO_STEP,
     WORKFLOW_PATH,
     ProvenanceError,
     _archive_inventory,
@@ -16,7 +17,9 @@ from scripts.ci_provenance import (
     _bind_run_to_merged_pr,
     _compare_archive_to_source,
     _trusted_run,
+    changed_paths,
     package_inventory,
+    requires_aio,
     reuse_ci_artifact,
     validate_provenance,
 )
@@ -63,7 +66,11 @@ def _run() -> dict:
         }],
         "jobs": [
             {"name": "test-and-package", "conclusion": "success"},
-            {"name": "AIO integration (0.32.0)", "conclusion": "success"},
+            {
+                "name": "AIO integration (0.32.0)",
+                "conclusion": "success",
+                "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
+            },
         ],
     }
 
@@ -188,6 +195,9 @@ class CIProvenanceTest(unittest.TestCase):
         self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
         run = _run()
         run["jobs"][1]["conclusion"] = "failure"
+        self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
+        run = _run()
+        run["jobs"][1]["steps"][0]["conclusion"] = "skipped"
         self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
         run = _run()
         run["workflow_id"] = WORKFLOW_ID + 1
@@ -416,6 +426,49 @@ class CIProvenanceTest(unittest.TestCase):
 
         with self.assertRaises(ProvenanceError):
             _bind_run_to_merged_pr(API(_merged_pr(), merge_tree="f" * 40), _run(), provenance, SOURCE_TREE)
+
+
+class CIChangeClassificationTest(unittest.TestCase):
+    def test_infrastructure_allowlist_skips_native_probe(self):
+        self.assertFalse(requires_aio([
+            "scripts/ci_provenance.py",
+            "tests/test_ci_provenance.py",
+            "docs/ci-workflow.md",
+            "docs/nested/example.md",
+            "README.md",
+            "CHANGELOG.md",
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+        ]))
+
+    def test_runtime_or_unknown_paths_require_native_probe(self):
+        for paths in (
+            ["catchuparr/plugin.py"],
+            ["scripts/ci_provenance.py", "tests/test_ci_provenance.py", "tests/test_runtime.py"],
+            ["docs/example.png"],
+            [".github/workflows/ci.yaml"],
+            ["docs/../catchuparr/plugin.py"],
+            [],
+            None,
+        ):
+            with self.subTest(paths=paths):
+                self.assertTrue(requires_aio(paths))
+
+    def test_dispatch_and_invalid_or_failed_diff_force_full_probe(self):
+        sha = "a" * 40
+        self.assertIsNone(changed_paths("workflow_dispatch", sha, sha))
+        self.assertIsNone(changed_paths("pull_request", "invalid", sha))
+        with patch("scripts.ci_provenance.subprocess.run", side_effect=OSError):
+            self.assertIsNone(changed_paths("pull_request", sha, "b" * 40))
+
+    def test_changed_paths_uses_nul_delimited_git_diff(self):
+        sha = "a" * 40
+        fake = type("Result", (), {"stdout": b"README.md\0docs/ci-workflow.md\0"})()
+        with patch("scripts.ci_provenance.subprocess.run", return_value=fake) as run:
+            self.assertEqual(changed_paths("pull_request", sha, "b" * 40), [
+                "README.md", "docs/ci-workflow.md",
+            ])
+        self.assertEqual(run.call_args.args[0][-2:], [sha, "b" * 40])
 
 
 if __name__ == "__main__":
