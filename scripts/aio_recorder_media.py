@@ -1398,6 +1398,7 @@ def _wait_for_native_active(
     channel_state,
     timeout: float = 45,
     verified_borrow_client_ids=None,
+    expected_ordinary_identity=None,
 ):
     """Verify native readiness while preserving the exact ordinary client.
 
@@ -1439,10 +1440,53 @@ def _wait_for_native_active(
             verified_borrow_ids = {
                 _redis_text(value) for value in verified_borrow_client_ids()
             }
-            if verified_borrow_ids - client_ids:
-                # The server verifier saw an atomic registration that committed
-                # after this membership snapshot. Reconcile inside the existing
-                # bounded ACTIVE deadline with a fresh complete set read.
+            current_borrow_ids = client_ids & verified_borrow_ids
+            ordinary_ids = client_ids - current_borrow_ids
+            missing_verified_ids = verified_borrow_ids - client_ids
+            _require(
+                local_clients == 1
+                and len(client_ids) in (1, 2)
+                and len(ordinary_ids) == 1
+                and len(current_borrow_ids) <= 1
+                and len(verified_borrow_ids) <= 1
+                and (
+                    not missing_verified_ids
+                    or (
+                        len(client_ids) == 1
+                        and len(missing_verified_ids) == 1
+                        and len(verified_borrow_ids) == 1
+                    )
+                ),
+                "Native recorder parent client detached or an unverified client joined",
+            )
+            ordinary_client_id = next(iter(ordinary_ids))
+            if expected_ordinary_identity is not None:
+                _require(
+                    ordinary_client_id == expected_ordinary_identity["client_id"],
+                    "Native recorder ordinary client registration changed before ACTIVE",
+                )
+            ordinary_key = f"{clients_key}:{ordinary_client_id}"
+            connected_at = _redis_text(
+                redis_client.hget(ordinary_key, "connected_at"),
+            )
+            client_worker = _redis_text(redis_client.hget(ordinary_key, "worker_id"))
+            observed_identity = {
+                "client_id": ordinary_client_id,
+                "connected_at": connected_at,
+                "worker_id": client_worker,
+            }
+            expected_identity = expected_ordinary_identity or ordinary_identity
+            _require(
+                connected_at
+                and client_worker == expected_owner
+                and (expected_identity is None or observed_identity == expected_identity),
+                "Native recorder ordinary client registration changed before ACTIVE",
+            )
+            ordinary_identity = observed_identity
+            if missing_verified_ids:
+                # The server verifier saw this task's atomic registration after
+                # SMEMBERS. Validate the local ordinary client and reject every
+                # unrelated shape before taking a fresh membership snapshot.
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise RuntimeError(
@@ -1450,34 +1494,10 @@ def _wait_for_native_active(
                     )
                 time.sleep(min(0.01, remaining))
                 continue
-            current_borrow_ids = client_ids & verified_borrow_ids
-            ordinary_ids = client_ids - current_borrow_ids
             _require(
-                local_clients == 1
-                and len(client_ids) in (1, 2)
-                and len(ordinary_ids) == 1
-                and len(current_borrow_ids) == len(verified_borrow_ids)
-                and len(current_borrow_ids) <= 1,
-                "Native recorder parent client detached or an unverified client joined",
+                len(current_borrow_ids) == len(verified_borrow_ids),
+                "Native recorder borrow membership changed during readiness",
             )
-            ordinary_client_id = next(iter(ordinary_ids))
-            ordinary_key = f"{clients_key}:{ordinary_client_id}"
-            connected_at = _redis_text(
-                redis_client.hget(ordinary_key, "connected_at"),
-            )
-            client_worker = _redis_text(redis_client.hget(ordinary_key, "worker_id"))
-            observed_identity = (
-                ordinary_client_id,
-                connected_at,
-                client_worker,
-            )
-            _require(
-                connected_at
-                and client_worker == expected_owner
-                and (ordinary_identity is None or ordinary_identity == observed_identity),
-                "Native recorder ordinary client registration changed before ACTIVE",
-            )
-            ordinary_identity = observed_identity
         state = _redis_text(redis_client.hget(metadata_key, metadata_field.STATE))
         manager_running = bool(getattr(manager, "running", False))
         if state == active_state and manager_running:
@@ -2760,7 +2780,8 @@ def _wait_for_native_client_count(
     expected_local: int | None = None,
     timeout: float = 15,
     reject_excess: bool = False,
-) -> None:
+    return_identity: bool = False,
+):
     # The Redis set is shared across workers, while ClientManager counts are
     # process-local. Borrowed readers deliberately live in a task-owned manager
     # in the HTTP worker, so the probe must be able to assert those counts
@@ -2774,12 +2795,31 @@ def _wait_for_native_client_count(
     ):
         raise ValueError("native client counts must be non-negative integers")
     deadline = time.monotonic() + timeout
+    clients_key = redis_keys.clients(worker_id)
     while time.monotonic() < deadline:
         manager = native_server.client_managers.get(worker_id)
-        global_count = int(redis_client.scard(redis_keys.clients(worker_id)) or 0)
+        if return_identity:
+            client_ids = {_redis_text(item) for item in redis_client.smembers(clients_key)}
+            global_count = len(client_ids)
+        else:
+            client_ids = None
+            global_count = int(redis_client.scard(clients_key) or 0)
         local_count = int(manager.get_client_count()) if manager is not None else -1
         if global_count == expected and local_count == expected_local:
-            return
+            if not return_identity:
+                return None
+            if expected != 1:
+                raise ValueError("identity capture requires exactly one expected client")
+            client_id = next(iter(client_ids))
+            client_key = f"{clients_key}:{client_id}"
+            connected_at = _redis_text(redis_client.hget(client_key, "connected_at"))
+            client_worker = _redis_text(redis_client.hget(client_key, "worker_id"))
+            if connected_at and client_worker == _redis_text(native_server.worker_id):
+                return {
+                    "client_id": client_id,
+                    "connected_at": connected_at,
+                    "worker_id": client_worker,
+                }
         if reject_excess:
             _require(
                 global_count <= expected and local_count <= expected_local,
@@ -5629,13 +5669,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             live_response, native_server, worker_id,
         )
         live_reader = live_session.reader
-        _wait_for_native_client_count(
+        second_cycle_ordinary_identity = _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+            return_identity=True,
         )
         _wait_for_native_active(
             redis_client, native_server, worker_id, redis_keys=RedisKeys,
             metadata_field=ChannelMetadataField,
             channel_state=ChannelState, timeout=45,
+            expected_ordinary_identity=second_cycle_ordinary_identity,
             verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
                 run_share,
                 worker_id=worker_id,
@@ -5953,13 +5995,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             live_response, native_server, worker_id,
         )
         live_reader = live_session.reader
-        _wait_for_native_client_count(
+        post_restart_ordinary_identity = _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+            return_identity=True,
         )
         _wait_for_native_active(
             redis_client, native_server, worker_id, redis_keys=RedisKeys,
             metadata_field=ChannelMetadataField,
             channel_state=ChannelState, timeout=45,
+            expected_ordinary_identity=post_restart_ordinary_identity,
             verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
                 run_restart,
                 worker_id=worker_id,
