@@ -1360,6 +1360,34 @@ def _verify_audio_video_tone(
     return frequency
 
 
+def _verified_task_borrow_client_ids(
+    task,
+    *,
+    worker_id: str,
+    channel_uuid: str,
+    decode_capability,
+    is_server_verified,
+):
+    """Return only this task's signed borrow IDs that are still server verified."""
+    with task._lock:
+        headers = [dict(item) for item in task.input_headers]
+    verified = set()
+    for item in headers:
+        token = item.get("X-Catchuparr-Borrow")
+        if not isinstance(token, str) or not token:
+            continue
+        try:
+            capability = decode_capability(token)
+        except (TypeError, ValueError):
+            continue
+        if capability.channel_uuid != channel_uuid:
+            continue
+        client_id = f"catchuparr-client-{capability.nonce}"
+        if is_server_verified(worker_id, client_id):
+            verified.add(client_id)
+    return frozenset(verified)
+
+
 def _wait_for_native_active(
     redis_client,
     native_server,
@@ -1369,8 +1397,14 @@ def _wait_for_native_active(
     metadata_field,
     channel_state,
     timeout: float = 45,
+    verified_borrow_client_ids=None,
 ):
-    """Verify strict native readiness after one real response client registers."""
+    """Verify native readiness while preserving the exact ordinary client.
+
+    The default contract remains one global/local ordinary client. Later sharing
+    probe phases may pass the current task's server-verified borrow IDs; then one
+    exact borrow can join the ordinary client while ACTIVE readiness is pending.
+    """
     from time import monotonic
 
     owner_key = redis_keys.channel_owner(worker_id)
@@ -1379,6 +1413,7 @@ def _wait_for_native_active(
     expected_owner = _redis_text(native_server.worker_id)
     active_state = _constant_text(channel_state.ACTIVE)
     deadline = monotonic() + timeout
+    ordinary_identity = None
 
     while True:
         owner = _redis_text(redis_client.get(owner_key))
@@ -1389,10 +1424,47 @@ def _wait_for_native_active(
         _require(client_manager is not None, "Native recorder parent client manager is absent")
         local_clients = int(client_manager.get_client_count())
         global_clients = int(redis_client.scard(clients_key) or 0)
-        _require(
-            local_clients == 1 and global_clients == 1,
-            "Native recorder parent client detached before ACTIVE readiness",
-        )
+        if verified_borrow_client_ids is None:
+            _require(
+                local_clients == 1 and global_clients == 1,
+                "Native recorder parent client detached before ACTIVE readiness",
+            )
+        else:
+            client_ids = {
+                _redis_text(value) for value in redis_client.smembers(clients_key)
+            }
+            verified_borrow_ids = {
+                _redis_text(value) for value in verified_borrow_client_ids()
+            }
+            current_borrow_ids = client_ids & verified_borrow_ids
+            ordinary_ids = client_ids - current_borrow_ids
+            _require(
+                local_clients == 1
+                and global_clients == len(client_ids)
+                and len(client_ids) in (1, 2)
+                and len(ordinary_ids) == 1
+                and len(current_borrow_ids) == len(verified_borrow_ids)
+                and len(current_borrow_ids) <= 1,
+                "Native recorder parent client detached or an unverified client joined",
+            )
+            ordinary_client_id = next(iter(ordinary_ids))
+            ordinary_key = f"{clients_key}:{ordinary_client_id}"
+            connected_at = _redis_text(
+                redis_client.hget(ordinary_key, "connected_at"),
+            )
+            client_worker = _redis_text(redis_client.hget(ordinary_key, "worker_id"))
+            observed_identity = (
+                ordinary_client_id,
+                connected_at,
+                client_worker,
+            )
+            _require(
+                connected_at
+                and client_worker == expected_owner
+                and (ordinary_identity is None or ordinary_identity == observed_identity),
+                "Native recorder ordinary client registration changed before ACTIVE",
+            )
+            ordinary_identity = observed_identity
         state = _redis_text(redis_client.hget(metadata_key, metadata_field.STATE))
         manager_running = bool(getattr(manager, "running", False))
         if state == active_state and manager_running:
@@ -5551,6 +5623,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             redis_client, native_server, worker_id, redis_keys=RedisKeys,
             metadata_field=ChannelMetadataField,
             channel_state=ChannelState, timeout=45,
+            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
+                run_share,
+                worker_id=worker_id,
+                channel_uuid=str(channel.uuid),
+                decode_capability=decode_borrow_capability,
+                is_server_verified=catchuparr_stats._is_recorder_client,
+            ),
         )
         second_cycle_first_media, _second_cycle_media_index = _read_after_current_buffer_head(
             live_session, second_cycle_native_buffer,
@@ -5868,6 +5947,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             redis_client, native_server, worker_id, redis_keys=RedisKeys,
             metadata_field=ChannelMetadataField,
             channel_state=ChannelState, timeout=45,
+            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
+                run_restart,
+                worker_id=worker_id,
+                channel_uuid=str(channel.uuid),
+                decode_capability=decode_borrow_capability,
+                is_server_verified=catchuparr_stats._is_recorder_client,
+            ),
         )
         post_restart_first_media, _post_restart_media_index = _read_after_current_buffer_head(
             live_session, post_restart_native_buffer,
