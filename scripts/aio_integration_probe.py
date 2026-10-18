@@ -427,6 +427,25 @@ def probe():
 
     require(active is not None, "One Apply must make the active snapshot readable")
     active_path = active_settings_path()
+    # Both overview routes must consume the committed snapshot without changing
+    # configuration/control files or initializing additional state.
+    from catchuparr.plugin import Plugin
+    from catchuparr.recorder_control import control_state_path
+
+    control_path = control_state_path(active_path)
+    active_before = active_path.read_bytes()
+    control_before = control_path.read_bytes()
+    directory_before = set(active_path.parent.iterdir())
+    overview_plugin = Plugin.__new__(Plugin)
+    current_result = overview_plugin.run("current_recordings", {}, {})
+    schedule_result = overview_plugin.run("today_schedule", {}, {})
+    require(isinstance(current_result, dict) and isinstance(current_result.get("channels"), dict),
+            "Current recordings action did not return structured channel data")
+    require(isinstance(schedule_result, dict) and isinstance(schedule_result.get("channels", {}).get("today_schedule"), list),
+            "Today's schedule action did not return structured channel data")
+    require(active_path.read_bytes() == active_before and control_path.read_bytes() == control_before
+            and set(active_path.parent.iterdir()) == directory_before,
+            "Read-only overview action changed Catchuparr configuration/control files")
     persisted = json.loads(active_path.read_text(encoding="utf-8"))
     validate_active_v7_snapshot(
         active, persisted, tuple(active.get("channel_uuids", "").splitlines()),

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 class Plugin:
     name = "Catchuparr"
-    version = "0.6.2"
+    version = "0.6.3"
     description = "Local rolling catch-up archive, start-over and optional live connection sharing"
     author = "nilleiz"
     help_url = "https://github.com/nilleiz/catchuparr"
@@ -20,6 +20,20 @@ class Plugin:
         bootstrap()
 
     def run(self, action: str, params: dict, context: dict):
+        if action in {"current_recordings", "today_schedule"}:
+            from .configuration import load_applied_state_readonly
+
+            settings, control = load_applied_state_readonly()
+            if settings is None:
+                return {"status": "unavailable", "message": "Applied Catchuparr configuration is unavailable.", "channels": {}}
+            if action == "current_recordings":
+                from .recording_overview import current_recordings
+
+                return current_recordings(settings, control_state=control)
+            from .recording_schedule_overview import channel_metadata, today_schedule
+
+            ids = settings.get("channel_uuids", "").splitlines()
+            return today_schedule(settings, channel_metadata(ids), control_state=control)
         from .logging_utils import apply_log_level
         from .runtime import (
             apply_committed_log_level,
