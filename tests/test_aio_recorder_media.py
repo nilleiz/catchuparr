@@ -1,11 +1,14 @@
 import ast
 import io
 import json
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -41,6 +44,43 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_live_readonly_probe_allows_concurrent_archive_append_and_denies_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive_db = Path(directory) / "archive.sqlite3"
+            with sqlite3.connect(archive_db) as database:
+                database.execute("CREATE TABLE segments (created_at INTEGER)")
+                database.execute("INSERT INTO segments VALUES (1)")
+
+            def action():
+                uri = f"file:{archive_db}?mode=ro"
+                with sqlite3.connect(uri, uri=True) as database:
+                    database.execute("PRAGMA query_only=ON")
+                    rows = database.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+                def append_segment():
+                    with sqlite3.connect(archive_db) as writer:
+                        writer.execute("INSERT INTO segments VALUES (2)")
+
+                append = threading.Thread(target=append_segment)
+                append.start()
+                append.join(timeout=2)
+                self.assertFalse(append.is_alive())
+                return rows
+
+            rows = probe._run_current_recordings_readonly(action, archive_db)
+            self.assertEqual(1, rows)
+            with sqlite3.connect(archive_db) as database:
+                self.assertEqual(2, database.execute(
+                    "SELECT COUNT(*) FROM segments",
+                ).fetchone()[0])
+
+            def attempted_write():
+                with sqlite3.connect(f"file:{archive_db}?mode=ro", uri=True) as database:
+                    database.execute("PRAGMA query_only=ON")
+                    database.execute("UPDATE segments SET created_at=3")
+
+            with self.assertRaises(sqlite3.DatabaseError):
+                probe._run_current_recordings_readonly(attempted_write, archive_db)
+
     def test_dead_recorder_failure_reports_safe_terminal_task_diagnostics(self):
         thread = threading.Thread(target=lambda: None)
         thread.start()

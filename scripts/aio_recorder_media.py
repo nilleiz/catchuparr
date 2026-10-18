@@ -21,10 +21,104 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _run_current_recordings_readonly(action, archive_db):
+    """Run the action while an SQLite authorizer watches its archive reads."""
+    import sqlite3
+    from urllib.parse import unquote, urlsplit
+
+    from catchuparr import recording_overview
+
+    archive_path = Path(archive_db).resolve()
+    original_connect = recording_overview.sqlite3.connect
+    action_thread_id = threading.get_ident()
+    inspected = []
+    attempted_writes = []
+    write_actions = {
+        getattr(sqlite3, name) for name in (
+            "SQLITE_INSERT", "SQLITE_UPDATE", "SQLITE_DELETE",
+            "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX",
+            "SQLITE_CREATE_TEMP_TABLE", "SQLITE_CREATE_TEMP_TRIGGER",
+            "SQLITE_CREATE_TEMP_VIEW", "SQLITE_CREATE_TRIGGER", "SQLITE_CREATE_VIEW",
+            "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE", "SQLITE_DROP_TEMP_INDEX",
+            "SQLITE_DROP_TEMP_TABLE", "SQLITE_DROP_TEMP_TRIGGER", "SQLITE_DROP_TEMP_VIEW",
+            "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VIEW", "SQLITE_ALTER_TABLE",
+            "SQLITE_REINDEX", "SQLITE_ANALYZE", "SQLITE_CREATE_VTABLE",
+            "SQLITE_DROP_VTABLE", "SQLITE_ATTACH", "SQLITE_DETACH",
+        ) if hasattr(sqlite3, name)
+    }
+
+    class GuardedConnection:
+        def __init__(self, connection, observation):
+            self._connection = connection
+            self._observation = observation
+
+        def execute(self, statement, *args, **kwargs):
+            result = self._connection.execute(statement, *args, **kwargs)
+            if statement.strip().upper() == "PRAGMA QUERY_ONLY=ON":
+                self._observation["query_only"] = bool(
+                    self._connection.execute("PRAGMA query_only").fetchone()[0]
+                )
+            return result
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def guarded_connect(database, *args, **kwargs):
+        if threading.get_ident() != action_thread_id:
+            return original_connect(database, *args, **kwargs)
+        value = str(database)
+        parsed_path = unquote(urlsplit(value).path) if value.startswith("file:") else value
+        try:
+            is_archive = Path(parsed_path).resolve() == archive_path
+        except (OSError, ValueError):
+            is_archive = False
+        connection = original_connect(database, *args, **kwargs)
+        if not is_archive:
+            return connection
+        uri_readonly = value.startswith("file:") and "mode=ro" in value.split("?", 1)[-1].split("&")
+        observation = {"uri_readonly": uri_readonly, "query_only": False}
+
+        def authorize(action_code, arg1, arg2, _database, _trigger):
+            if action_code in write_actions:
+                attempted_writes.append(str(arg1 or "unknown"))
+                return sqlite3.SQLITE_DENY
+            if action_code == getattr(sqlite3, "SQLITE_PRAGMA", None) and arg2 is not None:
+                allowed_query_only = (
+                    str(arg1 or "").lower() == "query_only"
+                    and str(arg2).upper() == "ON"
+                )
+                if not allowed_query_only:
+                    attempted_writes.append("pragma")
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(authorize)
+        inspected.append(observation)
+        return GuardedConnection(connection, observation)
+
+    recording_overview.sqlite3.connect = guarded_connect
+    try:
+        result = action()
+    finally:
+        recording_overview.sqlite3.connect = original_connect
+    _require(bool(inspected), "Current recordings did not inspect the archive index")
+    _require(all(item["uri_readonly"] and item["query_only"] for item in inspected),
+             "Current recordings archive connection was not read-only/query-only")
+    _require(not attempted_writes,
+             "Current recordings attempted to change the archive index")
+    return result
+
+
 def _assert_live_overview(root, active_path, control_path, channel_uuid, expected_mode):
     """Validate read-only current-recording output while a real attempt is live."""
     import hashlib
-    import sqlite3
     from datetime import datetime, timezone
 
     from catchuparr.plugin import Plugin
@@ -39,34 +133,20 @@ def _assert_live_overview(root, active_path, control_path, channel_uuid, expecte
         except FileNotFoundError:
             return None
 
-    def archive_rows():
-        if not archive_db.is_file():
-            return None
-        with sqlite3.connect(f"file:{archive_db}?mode=ro", uri=True) as database:
-            database.execute("PRAGMA query_only=ON")
-            names = {row[0] for row in database.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'",
-            )}
-            selected = []
-            for table in ("segments", "programs", "playback_leases", "recorder_fences"):
-                if table in names:
-                    selected.append((table, tuple(database.execute(
-                        f"SELECT * FROM {table} ORDER BY 1",
-                    ).fetchall())))
-            return tuple(selected)
-
     def state_snapshot():
         return (
             active_path.read_bytes(), control_path.read_bytes(),
-            set(active_path.parent.iterdir()), set(archive_root.iterdir()),
-            file_digest(outbox_db), archive_rows(),
+            file_digest(outbox_db),
         )
 
     before = state_snapshot()
-    result = Plugin.__new__(Plugin).run("current_recordings", {}, {})
+    result = _run_current_recordings_readonly(
+        lambda: Plugin.__new__(Plugin).run("current_recordings", {}, {}),
+        archive_db,
+    )
     after = state_snapshot()
     _require(before == after,
-             "Current recordings overview changed configuration, archive, or outbox state")
+             "Current recordings overview changed applied configuration or outbox state")
     _require(result.get("status") == "ok" and isinstance(result.get("channels"), list),
              "Current recordings overview did not return applied channel rows")
     rows = {row.get("channel_uuid"): row for row in result["channels"]}

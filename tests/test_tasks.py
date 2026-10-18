@@ -1126,6 +1126,7 @@ class RecorderTaskTests(unittest.TestCase):
             }
             with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
+                recorder_module = importlib.import_module("catchuparr.engine.recorder")
                 with (
                     patch("catchuparr.runtime.load_config", return_value=config),
                     patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
@@ -1167,7 +1168,7 @@ class RecorderTaskTests(unittest.TestCase):
                     ),
                     patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
                     patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
-                    patch("catchuparr.engine.recorder.FFmpegCopyRecorder", FakeRecorder),
+                    patch.object(recorder_module, "FFmpegCopyRecorder", FakeRecorder),
                 ):
                     result = tasks.record_channel("channel-1", expected_generation, 6)
 
