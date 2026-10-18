@@ -25,7 +25,18 @@ class Plugin:
 
             settings, control = load_applied_state_readonly()
             if settings is None:
-                return {"status": "unavailable", "message": "Applied Catchuparr configuration is unavailable.", "channels": {}}
+                return {
+                    "status": "unavailable",
+                    "message": "Applied Catchuparr configuration is unavailable.",
+                    "channels": [],
+                    "summary": {
+                        "channel_count": 0,
+                        "window_count": 0,
+                        "recording_paused": None,
+                        "pause_state": "unknown",
+                    },
+                    "recording_paused": None,
+                }
             if action == "current_recordings":
                 from .recording_overview import current_recordings
 

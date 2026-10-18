@@ -439,10 +439,18 @@ def probe():
     overview_plugin = Plugin.__new__(Plugin)
     current_result = overview_plugin.run("current_recordings", {}, {})
     schedule_result = overview_plugin.run("today_schedule", {}, {})
-    require(isinstance(current_result, dict) and isinstance(current_result.get("channels"), dict),
-            "Current recordings action did not return structured channel data")
-    require(isinstance(schedule_result, dict) and isinstance(schedule_result.get("channels", {}).get("today_schedule"), list),
-            "Today's schedule action did not return structured channel data")
+    require(isinstance(current_result, dict) and isinstance(current_result.get("channels"), list)
+            and isinstance(current_result.get("summary"), dict),
+            "Current recordings action did not return the shared structured response format")
+    require(all({"channel_uuid", "number", "name", "state", "mode", "reason", "source"}
+                <= set(row) for row in current_result["channels"]),
+            "Current recordings action omitted expected channel state fields")
+    require(isinstance(schedule_result, dict) and isinstance(schedule_result.get("channels"), list)
+            and isinstance(schedule_result.get("summary"), dict),
+            "Today's schedule action did not return the shared structured response format")
+    require(all({"channel_uuid", "number", "name", "windows"} <= set(row)
+                and isinstance(row["windows"], list) for row in schedule_result["channels"]),
+            "Today's schedule action omitted selected channels or window lists")
     require(active_path.read_bytes() == active_before and control_path.read_bytes() == control_before
             and set(active_path.parent.iterdir()) == directory_before,
             "Read-only overview action changed Catchuparr configuration/control files")
