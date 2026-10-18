@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -977,6 +977,98 @@ def probe():
         phase("recorder_media", "started")
         probe_actual_recorder_media(root)
         phase("recorder_media", "complete")
+        from aio_recorder_diagnostics_probe import probe_actual_recorder_diagnostics
+
+        phase("recorder_overviews", "started")
+        diagnostic_fixture = probe_actual_recorder_diagnostics(root)
+        require(isinstance(diagnostic_fixture, dict),
+                "Recorder diagnostics probe did not return its synthetic channel references")
+        dedicated_channel_uuid = diagnostic_fixture.get("dedicated_channel_uuid")
+        borrowed_channel_uuid = diagnostic_fixture.get("borrowed_channel_uuid")
+        require(isinstance(dedicated_channel_uuid, str) and isinstance(borrowed_channel_uuid, str),
+                "Recorder diagnostics probe omitted dedicated or borrowed channel references")
+
+        def file_state(path, *, digest=False):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                return None
+            state = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            if digest:
+                import hashlib
+
+                state += (hashlib.sha256(path.read_bytes()).digest(),)
+            return state
+
+        archive_database = root / "archive.sqlite3"
+        outbox_database = active_path.with_name(".catchuparr-sharing-authority.sqlite3")
+        before_overviews = (
+            active_path.read_bytes(), control_path.read_bytes(),
+            set(active_path.parent.iterdir()),
+            file_state(archive_database), file_state(outbox_database, digest=True),
+        )
+        current_after_attempts = overview_plugin.run("current_recordings", {}, {})
+        schedule_after_attempts = overview_plugin.run("today_schedule", {}, {})
+        require(current_after_attempts.get("status") == "ok"
+                and isinstance(current_after_attempts.get("channels"), list),
+                "Current recordings did not return an applied channel list after synthetic attempts")
+        current_rows = {
+            row.get("channel_uuid"): row for row in current_after_attempts["channels"]
+        }
+        for channel_uuid, expected_mode in (
+            (dedicated_channel_uuid, "dedicated"),
+            (borrowed_channel_uuid, "borrowed"),
+        ):
+            row = current_rows.get(channel_uuid)
+            require(row is not None and row.get("state") == "recording"
+                    and row.get("mode") == expected_mode,
+                    "Current recordings did not confirm the synthetic dedicated and borrowed attempts")
+            progress_at = row.get("last_confirmed_progress_at")
+            require(isinstance(progress_at, str),
+                    "Current recordings omitted the last confirmed media progress time")
+            try:
+                parsed_progress_at = datetime.fromisoformat(progress_at.replace("Z", "+00:00"))
+            except ValueError:
+                parsed_progress_at = None
+            require(isinstance(parsed_progress_at, datetime)
+                    and parsed_progress_at.tzinfo is not None
+                    and parsed_progress_at.utcoffset() == timezone.utc.utcoffset(parsed_progress_at),
+                    "Current recordings returned a progress time without a UTC offset")
+            source = row.get("source")
+            require(isinstance(source, dict) and source.get("mode") == expected_mode
+                    and source.get("stream_name") and source.get("provider_name"),
+                    "Current recordings did not return sanitized assigned-source display metadata")
+            require(type(row.get("indexed_segments_since_attempt")) is int
+                    and row["indexed_segments_since_attempt"] > 0
+                    and row.get("recent_media_progress") is True,
+                    "Current recordings did not confirm indexed media progress")
+        expected_problem_count = sum(
+            row.get("state") in {"error", "no_media_progress", "cleanup_pending", "unknown"}
+            for row in current_after_attempts["channels"]
+        )
+        require(current_after_attempts["summary"].get("problems") == expected_problem_count,
+                "Current recordings summary problem count does not match channel states")
+        require(schedule_after_attempts.get("status") == "ok"
+                and isinstance(schedule_after_attempts.get("channels"), list),
+                "Today's schedule did not return selected channels after synthetic attempts")
+        schedule_rows = {row.get("channel_uuid"): row for row in schedule_after_attempts["channels"]}
+        require(set(schedule_rows) == set(active.get("channel_uuids", "").splitlines()),
+                "Today's schedule omitted or added a selected channel")
+        require(all(isinstance(row.get("windows"), list) for row in schedule_rows.values()),
+                "Today's schedule omitted per-channel window lists")
+        require(schedule_after_attempts.get("schedule_date")
+                and schedule_after_attempts.get("timezone") == active["recording_schedule"]["timezone"],
+                "Today's schedule omitted the applied local date or timezone")
+        require(schedule_after_attempts.get("recording_paused") is False,
+                "Today's schedule did not report the active global recorder state")
+        after_overviews = (
+            active_path.read_bytes(), control_path.read_bytes(),
+            set(active_path.parent.iterdir()),
+            file_state(archive_database), file_state(outbox_database, digest=True),
+        )
+        require(after_overviews == before_overviews,
+                "Read-only recording overviews changed configuration, archive, or sharing outbox state")
+        phase("recorder_overviews", "complete")
         from aio_recorder_failover import probe_recorder_failover
 
         phase("recorder_failover", "started")
