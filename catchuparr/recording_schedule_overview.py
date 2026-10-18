@@ -44,29 +44,47 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
         local_now = instant.astimezone(zone)
     except (ValueError, TypeError):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
-    paused = bool(control_state and control_state.paused)
+    paused = getattr(control_state, "paused", None)
+    if type(paused) is not bool:
+        paused = None
     schedules = schedule_config.get("channels")
     if not isinstance(schedules, dict):
+        return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
+
+    from .recording_overview import _channel_sort_key, _display_name
+
+    channel_ids = settings.get("channel_uuids", "")
+    if isinstance(channel_ids, str):
+        selected_ids = list(dict.fromkeys(item for item in channel_ids.splitlines() if item))
+    elif isinstance(channel_ids, (tuple, list)):
+        selected_ids = list(dict.fromkeys(item for item in channel_ids if isinstance(item, str) and item))
+    else:
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
 
     rows = []
     day_start = datetime.combine(local_now.date(), time.min, tzinfo=zone)
     day_end = datetime.combine(local_now.date() + timedelta(days=1), time.min, tzinfo=zone)
-    for channel_id, snapshot in schedules.items():
+    for channel_id in selected_ids:
+        metadata = channels.get(channel_id, {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        row = {
+            "channel_uuid": channel_id,
+            "number": metadata.get("number"),
+            "name": metadata.get("name") or "Unknown channel",
+            "windows": [],
+        }
+        snapshot = schedules.get(channel_id)
         try:
             schedule = schedule_from_snapshot(snapshot)
         except (ValueError, TypeError):
             return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
-        metadata = channels.get(channel_id, {})
-        number = metadata.get("number")
-        name = metadata.get("name")
-        label = " · ".join(str(x) for x in (number, name) if x not in (None, "")) or "Unknown channel"
         windows = []
         if schedule.mode == "continuous":
             windows = [(day_start, day_end)]
         else:
-            # Evaluate each local minute through the existing schedule evaluator;
-            # this preserves its wall-clock/DST matching semantics.
+            # Sample real minutes and use the existing evaluator, preserving its
+            # wall-clock/DST matching without inventing nonexistent spring times.
             from .schedule import schedule_is_active
             cursor = day_start.astimezone(timezone.utc)
             utc_day_end = day_end.astimezone(timezone.utc)
@@ -88,24 +106,54 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
                 status = "current"
             else:
                 status = "upcoming"
-            rows.append({"channel": label, "channel_uuid": channel_id,
-                         "start": start.strftime("%H:%M"),
-                         "end": "24:00" if end.date() > local_now.date() else end.strftime("%H:%M"),
-                         "status": status, "paused": paused})
-    rows.sort(key=lambda row: (row["start"], row["channel"].casefold()))
-    if not rows:
-        message = f"No recording windows scheduled for {local_now.strftime('%A, %Y-%m-%d')}."
-    else:
-        lines = [
-            f"{row['start']}–{row['end']}  {row['channel']}  "
-            f"({row['status']}{', paused' if row['paused'] else ''})"
-            for row in rows
-        ]
-        message = f"Today's recording schedule · {timezone_name}\n" + "\n".join(lines)
-    return {"status": "ok", "message": message,
-            "channels": {"today_schedule": rows},
-            "schedule_date": local_now.date().isoformat(), "timezone": timezone_name}
+            row["windows"].append({
+                "start": start.strftime("%H:%M"),
+                "end": "24:00" if end.date() > local_now.date() else end.strftime("%H:%M"),
+                "status": status,
+            })
+        rows.append(row)
+    rows.sort(key=_channel_sort_key)
+    pause_label = "paused" if paused is True else "active" if paused is False else "unknown"
+    header = f"Today's recording schedule · {local_now.date().isoformat()} · {timezone_name}"
+    if paused is True:
+        header += " · Recording paused"
+    elif paused is None:
+        header += " · Pause state unknown"
+    lines = []
+    for row in rows:
+        label = _display_name(row)
+        if not row["windows"]:
+            lines.append(f"{label} — No recording windows planned.")
+            continue
+        lines.extend(
+            f"{label} — {window['start']}–{window['end']} ({window['status']})"
+            for window in row["windows"]
+        )
+    if not lines:
+        lines.append("No channels are selected.")
+    window_count = sum(len(row["windows"]) for row in rows)
+    return {
+        "status": "ok",
+        "message": header + "\n" + "\n".join(lines),
+        "channels": rows,
+        "summary": {
+            "channel_count": len(rows),
+            "window_count": window_count,
+            "recording_paused": paused,
+            "pause_state": pause_label,
+        },
+        "schedule_date": local_now.date().isoformat(),
+        "timezone": timezone_name,
+        "recording_paused": paused,
+    }
 
 
 def _error(status, message):
-    return {"status": status, "message": message, "channels": {"today_schedule": []}}
+    return {
+        "status": status,
+        "message": message,
+        "channels": [],
+        "summary": {"channel_count": 0, "window_count": 0, "recording_paused": None,
+                    "pause_state": "unknown"},
+        "recording_paused": None,
+    }
