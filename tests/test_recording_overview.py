@@ -49,6 +49,7 @@ class RecordingOverviewTests(unittest.TestCase):
     def _diagnostic(self, *, started, phase="recording"):
         return {self.channel: {
             "phase": phase, "source": "dedicated", "stream_id": "17", "account_id": "4",
+            "m3u_profile_id": "9", "input_profile_id": "4",
             "started_at": started, "error_code": "",
         }}
 
@@ -157,15 +158,18 @@ class RecordingOverviewTests(unittest.TestCase):
         }), patch("catchuparr.recording_overview.read_recorder_diagnostics", return_value=diagnostic), \
              patch("catchuparr.recording_overview.source_metadata", return_value={
                  "stream_name": "Synthetic Stream A", "provider_id": "4",
-                 "provider_name": "Synthetic Provider", "profile_id": "9",
-                 "profile_name": "Synthetic Profile",
+                 "provider_name": "Synthetic Provider", "m3u_profile_id": "9",
+                 "m3u_profile_name": "Synthetic Provider Profile", "input_profile_id": "4",
+                 "input_profile_name": "Synthetic Stream Profile", "profile_id": "4",
+                 "profile_name": "Synthetic Stream Profile",
              }):
             result = current_recordings(
                 self.settings, self.control, redis_client=self.redis, now=self.now,
             )
         row = result["channels"][0]
         self.assertEqual(row["mode"], "borrowed")
-        self.assertEqual(row["source"]["profile_name"], "Synthetic Profile")
+        self.assertEqual(row["source"]["input_profile_name"], "Synthetic Stream Profile")
+        self.assertEqual(row["source"]["m3u_profile_name"], "Synthetic Provider Profile")
 
     def test_outside_schedule_is_explicit(self):
         self.settings["recording_schedule"]["channels"][self.channel] = normalize_schedule({
@@ -210,7 +214,9 @@ class RecordingOverviewTests(unittest.TestCase):
              patch("catchuparr.recording_overview.source_metadata", return_value={
                  "stream_name": "Synthetic Stream A", "stream_id": "17",
                  "provider_id": "4", "provider_name": "Synthetic Provider",
-                 "profile_id": "9", "profile_name": "Synthetic Profile",
+                 "m3u_profile_id": "9", "m3u_profile_name": "Synthetic Provider Profile",
+                 "input_profile_id": "4", "input_profile_name": "Synthetic Stream Profile",
+                 "profile_id": "4", "profile_name": "Synthetic Stream Profile",
              }):
             result = current_recordings(
                 self.settings, self.control, redis_client=self.redis, now=self.now,
@@ -218,7 +224,8 @@ class RecordingOverviewTests(unittest.TestCase):
         self.assertIn("Problems: 0", result["message"])
         self.assertIn("Synthetic Stream A (id 17)", result["message"])
         self.assertIn("provider Synthetic Provider (id 4)", result["message"])
-        self.assertIn("profile Synthetic Profile (id 9)", result["message"])
+        self.assertIn("Stream profile Synthetic Stream Profile (id 4)", result["message"])
+        self.assertIn("provider profile Synthetic Provider Profile (id 9)", result["message"])
         self.assertIn("Last confirmed progress: none", result["message"])
 
     def test_source_display_suppresses_urls_and_credentials(self):

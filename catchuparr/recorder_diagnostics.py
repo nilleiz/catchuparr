@@ -38,7 +38,10 @@ local function finite_number(value)
 end
 if kind(KEYS[1]) ~= 'string' or kind(KEYS[2]) ~= 'hash'
    or (kind(KEYS[3]) ~= 'none' and kind(KEYS[3]) ~= 'hash')
-   or (kind(KEYS[4]) ~= 'none' and kind(KEYS[4]) ~= 'hash') then return 0 end
+   or (kind(KEYS[4]) ~= 'none' and kind(KEYS[4]) ~= 'hash')
+   or kind(KEYS[5]) ~= 'string' or kind(KEYS[6]) ~= 'string'
+   or kind(KEYS[7]) ~= 'hash'
+   or (kind(KEYS[8]) ~= 'none' and kind(KEYS[8]) ~= 'string') then return 0 end
 local ttl = redis.call('TTL', KEYS[1])
 local started = finite_number(ARGV[8])
 local now = finite_number(ARGV[9])
@@ -55,12 +58,26 @@ if redis.call('GET', KEYS[1]) ~= ARGV[1]
    or redis.call('HGET', KEYS[2], 'control_generation') ~= ARGV[6]
    or redis.call('HGET', KEYS[2], 'lease_fence') ~= ARGV[7]
    or redis.call('HGET', KEYS[2], 'lease_key') ~= KEYS[1]
-   or redis.call('HGET', KEYS[2], 'lease_value') ~= ARGV[1] then return 0 end
+   or redis.call('HGET', KEYS[2], 'lease_value') ~= ARGV[1]
+   or redis.call('HGET', KEYS[2], 'profile_id') ~= ARGV[17]
+   or redis.call('GET', KEYS[5]) ~= ARGV[19]
+   or redis.call('TTL', KEYS[5]) <= 0
+   or redis.call('TTL', KEYS[6]) <= 0
+   or redis.call('HGET', KEYS[7], 'owner') ~= ARGV[19]
+   or redis.call('HGET', KEYS[7], 'stream_id') ~= ARGV[4]
+   or redis.call('HGET', KEYS[7], 'm3u_profile') ~= ARGV[17]
+   or redis.call('HGET', KEYS[7], 'stream_profile') ~= ARGV[18]
+   or (redis.call('HGET', KEYS[7], 'channel_uuid')
+       and redis.call('HGET', KEYS[7], 'channel_uuid') ~= ARGV[2])
+   or (redis.call('HGET', KEYS[7], 'state') ~= 'active'
+       and redis.call('HGET', KEYS[7], 'state') ~= 'waiting_for_clients')
+   or redis.call('EXISTS', KEYS[8]) ~= 0 then return 0 end
 local diagnostic_ttl = math.min(ttl, tonumber(ARGV[13]))
 if not diagnostic_ttl or diagnostic_ttl < 1 then return 0 end
 redis.call('HSET', KEYS[3],
   'channel_uuid', ARGV[3], 'worker_id', ARGV[2],
   'attempt_digest', ARGV[11], 'stream_id', ARGV[4], 'account_id', ARGV[5],
+  'm3u_profile_id', ARGV[17], 'input_profile_id', ARGV[18],
   'config_generation', ARGV[10], 'control_generation', ARGV[6],
   'fence', ARGV[7], 'phase', ARGV[14], 'source', ARGV[15],
   'started_at', ARGV[8], 'updated_at', ARGV[9], 'error_code', ARGV[16])
@@ -69,6 +86,7 @@ if ARGV[14] == 'error' and ARGV[16] ~= '' then
   redis.call('HSET', KEYS[4],
     'channel_uuid', ARGV[3], 'worker_id', ARGV[2],
     'attempt_digest', ARGV[11], 'stream_id', ARGV[4], 'account_id', ARGV[5],
+    'm3u_profile_id', ARGV[17], 'input_profile_id', ARGV[18],
     'config_generation', ARGV[10], 'control_generation', ARGV[6],
     'fence', ARGV[7], 'phase', 'error', 'source', ARGV[15],
     'started_at', ARGV[8], 'updated_at', ARGV[9], 'error_code', ARGV[16])
@@ -88,7 +106,10 @@ if kind(KEYS[1]) ~= 'string' or kind(KEYS[2]) ~= 'hash' or kind(KEYS[3]) ~= 'has
    or (kind(KEYS[4]) ~= 'none' and kind(KEYS[4]) ~= 'hash')
    or (kind(KEYS[5]) ~= 'none' and kind(KEYS[5]) ~= 'hash')
    or kind(KEYS[6]) ~= 'hash' or kind(KEYS[7]) ~= 'set'
-   or kind(KEYS[8]) ~= 'hash' or kind(KEYS[9]) ~= 'none' then return 0 end
+   or kind(KEYS[8]) ~= 'hash' or kind(KEYS[9]) ~= 'none'
+   or kind(KEYS[10]) ~= 'string' or kind(KEYS[11]) ~= 'string'
+   or kind(KEYS[12]) ~= 'hash'
+   or (kind(KEYS[13]) ~= 'none' and kind(KEYS[13]) ~= 'string') then return 0 end
 local lease_ttl = redis.call('TTL', KEYS[1])
 local episode_ttl = redis.call('TTL', KEYS[3])
 local started = finite_number(ARGV[13])
@@ -124,6 +145,18 @@ if redis.call('GET', KEYS[1]) ~= ARGV[1]
    or redis.call('HGET', KEYS[8], 'worker_id') ~= client_worker_id
    or redis.call('HGET', KEYS[8], 'connected_at') ~= connected_at
    or redis.call('TTL', KEYS[8]) <= 0
+   or redis.call('GET', KEYS[10]) ~= ARGV[22]
+   or redis.call('TTL', KEYS[10]) <= 0
+   or redis.call('TTL', KEYS[11]) <= 0
+   or redis.call('HGET', KEYS[12], 'owner') ~= ARGV[23]
+   or redis.call('HGET', KEYS[12], 'stream_id') ~= ARGV[5]
+   or redis.call('HGET', KEYS[12], 'm3u_profile') ~= ARGV[7]
+   or redis.call('HGET', KEYS[12], 'stream_profile') ~= ARGV[8]
+   or (redis.call('HGET', KEYS[12], 'channel_uuid')
+       and redis.call('HGET', KEYS[12], 'channel_uuid') ~= ARGV[2])
+   or (redis.call('HGET', KEYS[12], 'state') ~= 'active'
+       and redis.call('HGET', KEYS[12], 'state') ~= 'waiting_for_clients')
+   or redis.call('EXISTS', KEYS[13]) ~= 0
    or not client_worker_id or not connected_at
    or (grant_phase ~= 'active' and grant_phase ~= 'wait_return') then return 0 end
 local diagnostic_ttl = math.min(lease_ttl, episode_ttl, tonumber(ARGV[20]))
@@ -187,7 +220,7 @@ def publish_recorder_diagnostic(
         channel_uuid = _channel_id(channel_uuid)
         if not isinstance(lease_value, str) or not lease_value:
             return False
-        from .adapters.recorder_proxy import is_managed_worker_id, worker_id_key
+        from .adapters.recorder_proxy import is_managed_worker_id, read_worker_record, worker_id_key
 
         if not is_managed_worker_id(worker_id):
             return False
@@ -214,13 +247,39 @@ def publish_recorder_diagnostic(
         if not math.isfinite(started_at) or started_at <= 0 or not math.isfinite(current_time):
             return False
         worker_key = worker_id_key(worker_id)
+        worker_record = read_worker_record(redis, worker_id)
+        if not worker_record or worker_record.get("profile_id") is None:
+            return False
+        profile_id = str(worker_record["profile_id"])
+        metadata_key = f"live:channel:{worker_id}:metadata"
+        owner_key = f"live:channel:{worker_id}:owner"
+        native_owner = redis.get(owner_key)
+        if isinstance(native_owner, bytes):
+            native_owner = native_owner.decode("utf-8", errors="strict")
+        metadata = _hash(redis.hgetall(metadata_key))
+        input_profile_id = metadata.get("stream_profile")
+        if (not _SAFE_ID.fullmatch(profile_id)
+                or not _SAFE_ID.fullmatch(input_profile_id or "")
+                or not isinstance(native_owner, str) or not _SAFE_ID.fullmatch(native_owner)
+                or metadata.get("owner") != native_owner
+                or metadata.get("stream_id") != str(stream_id)
+                or metadata.get("m3u_profile") != profile_id
+                or metadata.get("state", "").lower() not in {"active", "waiting_for_clients"}
+                or int(redis.ttl(owner_key)) <= 0
+                or int(redis.ttl(f"live:worker:{native_owner}:heartbeat")) <= 0
+                or redis.exists(f"live:channel:{worker_id}:stopping")):
+            return False
         result = redis.eval(
             _PUBLISH_LUA,
-            4,
+            8,
             f"catchuparr:recorder:{channel_uuid}",
             worker_key,
             live_key(channel_uuid),
             last_error_key(channel_uuid),
+            owner_key,
+            f"live:worker:{native_owner}:heartbeat",
+            metadata_key,
+            f"live:channel:{worker_id}:stopping",
             lease_value,
             worker_id,
             channel_uuid,
@@ -237,6 +296,9 @@ def publish_recorder_diagnostic(
             phase,
             source,
             error_code,
+            profile_id,
+            input_profile_id,
+            native_owner,
         )
         return type(result) is int and result == 1
     except Exception:
@@ -289,7 +351,7 @@ def publish_borrowed_recorder_diagnostic(
         if not math.isfinite(started_at) or started_at <= 0 or not math.isfinite(current_time):
             return False
         result = redis.eval(
-            _PUBLISH_BORROWED_LUA, 9,
+            _PUBLISH_BORROWED_LUA, 13,
             f"catchuparr:recorder:{channel_uuid}",
             f"catchuparr:sharing:current:{channel_uuid}",
             f"catchuparr:sharing:episode:{channel_uuid}",
@@ -298,6 +360,10 @@ def publish_borrowed_recorder_diagnostic(
             f"live:channel:{channel_uuid}:clients",
             f"live:channel:{channel_uuid}:clients:{client_id}",
             f"live:channel:{channel_uuid}:client:{client_id}:stop",
+            f"live:channel:{channel_uuid}:owner",
+            f"live:worker:{worker_id}:heartbeat",
+            f"live:channel:{channel_uuid}:metadata",
+            f"live:channel:{channel_uuid}:stopping",
             lease_value, channel_uuid, episode_id, worker_id, stream_id, account_id,
             m3u_profile_id, input_profile_id, catalog_generation,
             str(config_generation), str(control_generation), str(fence),
@@ -305,7 +371,7 @@ def publish_borrowed_recorder_diagnostic(
             hashlib.sha256(worker_id.encode("utf-8")).hexdigest(),
             hashlib.sha256(episode_id.encode("utf-8")).hexdigest(),
             phase, error_code, str(LAST_ERROR_TTL_SECONDS), str(LIVE_TTL_CAP_SECONDS),
-            client_id,
+            client_id, worker_id, worker_id,
         )
         return type(result) is int and result == 1
     except Exception:
@@ -374,7 +440,29 @@ def _worker_and_lease_match(redis, worker, record, channel_uuid):
         current = redis.get(expected["lease_key"])
         if isinstance(current, bytes):
             current = current.decode("utf-8", errors="strict")
-        return current == lease_value and int(redis.ttl(expected["lease_key"])) > 0
+        if current != lease_value or int(redis.ttl(expected["lease_key"])) <= 0:
+            return False
+        profile_id = str(worker.get("profile_id", ""))
+        worker_id = record["worker_id"]
+        metadata_key = f"live:channel:{worker_id}:metadata"
+        metadata = _hash(redis.hgetall(metadata_key))
+        owner_key = f"live:channel:{worker_id}:owner"
+        owner = redis.get(owner_key)
+        if isinstance(owner, bytes):
+            owner = owner.decode("utf-8", errors="strict")
+        heartbeat_key = f"live:worker:{owner}:heartbeat" if owner else ""
+        input_profile_id = metadata.get("stream_profile", "")
+        return bool(
+            profile_id and record.get("m3u_profile_id") == profile_id
+            and input_profile_id and record.get("input_profile_id") == input_profile_id
+            and owner and metadata.get("owner") == owner and int(redis.ttl(owner_key)) > 0
+            and redis.exists(heartbeat_key) and int(redis.ttl(heartbeat_key)) > 0
+            and not redis.exists(f"live:channel:{worker_id}:stopping")
+            and metadata.get("stream_id") == record["stream_id"]
+            and metadata.get("m3u_profile") == profile_id
+            and metadata.get("state", "").lower() in {"active", "waiting_for_clients"}
+            and ("channel_uuid" not in metadata or metadata["channel_uuid"] == worker_id)
+        )
     except Exception:
         return False
 
@@ -420,6 +508,25 @@ def _borrowed_grant_match(redis, record, channel_uuid):
                 or int(redis.ttl(f"live:channel:{channel_uuid}:clients:{grant.client_id}")) <= 0
                 or redis.exists(f"live:channel:{channel_uuid}:client:{grant.client_id}:stop")):
             return False
+        owner_key = f"live:channel:{channel_uuid}:owner"
+        owner = redis.get(owner_key)
+        if isinstance(owner, bytes):
+            owner = owner.decode("utf-8", errors="strict")
+        heartbeat_key = f"live:worker:{grant.worker_id}:heartbeat"
+        if (owner != grant.owner_lock_value
+                or int(redis.ttl(owner_key)) <= 0
+                or not redis.exists(heartbeat_key)
+                or int(redis.ttl(heartbeat_key)) <= 0
+                or redis.exists(f"live:channel:{channel_uuid}:stopping")):
+            return False
+        metadata = _hash(redis.hgetall(f"live:channel:{channel_uuid}:metadata"))
+        if (metadata.get("owner") != grant.metadata_owner
+                or metadata.get("stream_id") != grant.stream_id
+                or metadata.get("m3u_profile") != grant.m3u_profile_id
+                or metadata.get("stream_profile") != grant.input_profile_id
+                or metadata.get("state", "").lower() not in {"active", "waiting_for_clients"}
+                or ("channel_uuid" in metadata and metadata["channel_uuid"] != channel_uuid)):
+            return False
         lease = redis.get(f"catchuparr:recorder:{channel_uuid}")
         if isinstance(lease, bytes):
             lease = lease.decode("utf-8", errors="strict")
@@ -455,6 +562,9 @@ def _validated_record(raw, channel_uuid, config_generation, control_state):
                     or not _HEX64.fullmatch(record.get("catalog_generation", ""))):
                 return None
         elif not record.get("worker_id"):
+            return None
+        if (not _SAFE_ID.fullmatch(record.get("m3u_profile_id", ""))
+                or not _SAFE_ID.fullmatch(record.get("input_profile_id", ""))):
             return None
         return record
     except (TypeError, ValueError, KeyError):

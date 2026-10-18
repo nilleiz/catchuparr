@@ -21,6 +21,90 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _assert_live_overview(root, active_path, control_path, channel_uuid, expected_mode):
+    """Validate read-only current-recording output while a real attempt is live."""
+    import hashlib
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from catchuparr.plugin import Plugin
+
+    archive_root = Path(root)
+    archive_db = archive_root / "archive.sqlite3"
+    outbox_db = active_path.with_name(".catchuparr-sharing-authority.sqlite3")
+
+    def file_digest(path):
+        try:
+            return hashlib.sha256(path.read_bytes()).digest()
+        except FileNotFoundError:
+            return None
+
+    def archive_rows():
+        if not archive_db.is_file():
+            return None
+        with sqlite3.connect(f"file:{archive_db}?mode=ro", uri=True) as database:
+            database.execute("PRAGMA query_only=ON")
+            names = {row[0] for row in database.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'",
+            )}
+            selected = []
+            for table in ("segments", "programs", "playback_leases", "recorder_fences"):
+                if table in names:
+                    selected.append((table, tuple(database.execute(
+                        f"SELECT * FROM {table} ORDER BY 1",
+                    ).fetchall())))
+            return tuple(selected)
+
+    def state_snapshot():
+        return (
+            active_path.read_bytes(), control_path.read_bytes(),
+            set(active_path.parent.iterdir()), set(archive_root.iterdir()),
+            file_digest(outbox_db), archive_rows(),
+        )
+
+    before = state_snapshot()
+    result = Plugin.__new__(Plugin).run("current_recordings", {}, {})
+    after = state_snapshot()
+    _require(before == after,
+             "Current recordings overview changed configuration, archive, or outbox state")
+    _require(result.get("status") == "ok" and isinstance(result.get("channels"), list),
+             "Current recordings overview did not return applied channel rows")
+    rows = {row.get("channel_uuid"): row for row in result["channels"]}
+    row = rows.get(str(channel_uuid))
+    _require(row is not None and row.get("state") == "recording"
+             and row.get("mode") == expected_mode,
+             f"Live {expected_mode} overview did not confirm indexed recorder progress")
+    progress = row.get("last_confirmed_progress_at")
+    try:
+        parsed = datetime.fromisoformat(progress.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        parsed = None
+    _require(isinstance(parsed, datetime) and parsed.tzinfo is not None
+             and parsed.utcoffset() == timezone.utc.utcoffset(parsed),
+             "Current recordings overview omitted UTC media progress time")
+    source = row.get("source")
+    _require(
+        isinstance(source, dict) and source.get("mode") == expected_mode
+        and source.get("stream_name") and source.get("provider_name")
+        and source.get("stream_id") and source.get("provider_id")
+        and source.get("input_profile_id") and source.get("input_profile_name")
+        and source.get("m3u_profile_id") and source.get("m3u_profile_name"),
+        "Current recordings overview omitted exact source/provider/profile metadata",
+    )
+    _require("://" not in str(source) and "token" not in str(source).lower(),
+             "Current recordings overview leaked a URL or credential-like value")
+    _require(type(row.get("indexed_segments_since_attempt")) is int
+             and row["indexed_segments_since_attempt"] > 0
+             and row.get("recent_media_progress") is True,
+             "Current recordings overview did not confirm a fresh indexed segment")
+    expected_problems = sum(
+        item.get("state") in {"unknown", "error", "cleanup_pending", "no_media_progress"}
+        for item in result["channels"]
+    )
+    _require(result.get("summary", {}).get("problems") == expected_problems,
+             "Current recordings summary problem count disagrees with channel states")
+
+
 def global_sharing_draft(
     settings: dict, *, enabled: bool, live_stability_seconds: int,
     last_viewer_return_seconds: int, min_switch_interval_seconds: int,
@@ -4866,6 +4950,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             cooperative_sleep=gevent_sleep,
         )
         _require(bool(borrowed_segments), "Borrowed live A did not reach the archive")
+        from aio_recorder_diagnostics_probe import probe_live_borrowed_diagnostic
+
+        borrowed_diagnostic_cleanup = probe_live_borrowed_diagnostic(redis_client, worker_id)
+        try:
+            _assert_live_overview(
+                root, active_path, control_path, worker_id, "borrowed",
+            )
+        finally:
+            borrowed_diagnostic_cleanup()
 
         # A consumed opening capability cannot be replayed into a second
         # reader, even while its first reader remains active.
@@ -5020,6 +5113,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             cooperative_sleep=gevent_sleep,
         )
         _require(bool(returned_segments), "Recorder did not return to allowed source B")
+        from aio_recorder_diagnostics_probe import probe_live_dedicated_diagnostic
+
+        dedicated_diagnostic_cleanup = probe_live_dedicated_diagnostic(redis_client, worker_id)
+        try:
+            _assert_live_overview(
+                root, active_path, control_path, worker_id, "dedicated",
+            )
+        finally:
+            dedicated_diagnostic_cleanup()
         with run_share._lock:
             share_results = list(run_share.results)
         _require(
