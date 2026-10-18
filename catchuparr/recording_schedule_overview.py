@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from decimal import Decimal
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -17,10 +19,12 @@ def channel_metadata(channel_ids):
         number_field = next((name for name in ("channel_number", "number") if name in fields), None)
         columns = ["uuid", "name"] + ([number_field] if number_field else [])
         rows = Channel.objects.filter(uuid__in=channel_ids).values(*columns)
+        from .recording_overview import _safe_display
+
         return {
             str(row["uuid"]): {
-                "name": row.get("name"),
-                "number": row.get(number_field) if number_field else None,
+                "name": _safe_display(row.get("name")) or "Unknown channel",
+                "number": _safe_number(row.get(number_field)) if number_field else None,
             }
             for row in rows
         }
@@ -51,7 +55,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
     if not isinstance(schedules, dict):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
 
-    from .recording_overview import _channel_sort_key, _display_name
+    from .recording_overview import _channel_sort_key, _display_name, _safe_display
 
     channel_ids = settings.get("channel_uuids", "")
     if isinstance(channel_ids, str):
@@ -70,8 +74,8 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             metadata = {}
         row = {
             "channel_uuid": channel_id,
-            "number": metadata.get("number"),
-            "name": metadata.get("name") or "Unknown channel",
+            "number": _safe_number(metadata.get("number")),
+            "name": _safe_display(metadata.get("name")) or "Unknown channel",
             "windows": [],
         }
         snapshot = schedules.get(channel_id)
@@ -157,3 +161,16 @@ def _error(status, message):
                     "pause_state": "unknown"},
         "recording_paused": None,
     }
+
+
+def _safe_number(value):
+    """Return finite numeric channel numbering without accepting display text."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return value if isinstance(value, int) else numeric
