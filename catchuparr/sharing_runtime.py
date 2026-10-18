@@ -591,6 +591,11 @@ class RecorderBorrowCoordinator:
                 assigned_sources=self.assigned_sources,
                 observed_at=now,
             )
+        except Exception:
+            from .logging_utils import error
+
+            error("sharing_observation_failed")
+            return None
         finally:
             try:
                 from django.db import close_old_connections
@@ -944,7 +949,8 @@ def retry_pending_open_cleanups() -> tuple[int, int]:
 
 def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                                 now: float | None = None, stale_after: float = 120.0,
-                                episode_id: str | None = None) -> tuple[int, int]:
+                                episode_id: str | None = None,
+                                channel_uuid: str | None = None) -> tuple[int, int]:
     """Rebuild exact cleanup ownership from SQLite after a web worker restart.
 
     This runs only at route setup, never in the TS byte loop. Stale opening
@@ -975,7 +981,7 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
     try:
         candidates = ledger.registration_recovery_candidates(
             stale_opening_before=float(observed_at) - float(stale_after),
-            episode_id=episode_id,
+            episode_id=episode_id, channel_uuid=channel_uuid,
         )
         text_backend = redis_backend_signature(redis_text)
     except Exception:
@@ -1437,6 +1443,9 @@ def prepare_borrow_opening(
                 last_switch_at=last_switch_at,
             )
             if not projected:
+                from .logging_utils import error
+
+                error("sharing_projection_failed")
                 raise BorrowEpisodeRejected("native opening projection was not acknowledged")
             capability = sign_borrow_capability(
                 secret=capability_secret,
@@ -1483,6 +1492,10 @@ def prepare_borrow_opening(
                     )
                 except Exception:
                     closed = False
+            if not closed:
+                from .logging_utils import error
+
+                error("sharing_cleanup_pending")
             try:
                 episode_ledger.revoke(
                     episode.episode_id,

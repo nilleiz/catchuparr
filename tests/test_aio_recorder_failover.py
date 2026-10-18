@@ -117,44 +117,44 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         self.assertEqual(stop_lines, set(probe._SUPERVISOR_STOP_REASONS_BY_LINE))
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 270,
+                "catchuparr.tasks", "supervise", 364,
                 {"current_admission": {"status": "ready"}},
             ),
             "lease_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 270,
+                "catchuparr.tasks", "supervise", 364,
                 {"current_admission": {"status": "stale_control"}},
             ),
             "admission_not_ready",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 276, {},
+                "catchuparr.tasks", "supervise", 388, {},
             ),
             "stats_capability_refresh",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 308, {},
+                "catchuparr.tasks", "supervise", 420, {},
             ),
             "attempt_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 316, {},
+                "catchuparr.tasks", "supervise", 428, {},
             ),
             "candidate_currentness",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 320, {},
+                "catchuparr.tasks", "supervise", 432, {},
             ),
             "exception",
         )
         self.assertEqual(
-            probe._safe_supervisor_stop_reason("untrusted", "supervise", 270, {}),
+            probe._safe_supervisor_stop_reason("untrusted", "supervise", 364, {}),
             "unavailable",
         )
 
@@ -310,7 +310,7 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             "current_admission": {"status": "stale_configuration"},
         }
         tree = ast.parse("def supervise(current_admission=current_admission):\n    event.set()\n")
-        ast.increment_lineno(tree, 268)
+        ast.increment_lineno(tree, 362)
         exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
         self.assertEqual("tasks.supervisor", event.first_set_source)

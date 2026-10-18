@@ -128,7 +128,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         tree = ast.parse(
             "def supervise(current_admission=current_admission):\n    stop_event.set()\n"
         )
-        ast.increment_lineno(tree, 268)
+        ast.increment_lineno(tree, 362)
         exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
         diagnostic = probe._recorder_task_early_exit_diagnostic(

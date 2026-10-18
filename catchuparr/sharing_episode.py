@@ -550,11 +550,14 @@ class BorrowEpisodeLedger:
 
     def registration_recovery_candidates(
         self, *, stale_opening_before: float, episode_id: str | None = None,
+        channel_uuid: str | None = None,
     ) -> tuple[tuple[BorrowEpisodeSnapshot, BorrowRegistrationAttempt | None], ...]:
         """Find pending or expired opening state for restart-safe exact cleanup."""
         cutoff = _finite_time(stale_opening_before, "stale_opening_before")
         if episode_id is not None and (not isinstance(episode_id, str) or not episode_id):
             raise ValueError("episode_id must be non-empty or null")
+        if channel_uuid is not None and (not isinstance(channel_uuid, str) or not channel_uuid):
+            raise ValueError("channel_uuid must be non-empty or null")
         with self._db() as db:
             rows = db.execute(
                 """SELECT e.*, r.episode_id AS r_episode_id, r.channel_uuid AS r_channel_uuid,
@@ -568,8 +571,9 @@ class BorrowEpisodeLedger:
                 WHERE (e.phase='cleanup_pending'
                    OR (e.phase='opening' AND e.updated_at<=?))
                    AND (? IS NULL OR e.episode_id=?)
+                   AND (? IS NULL OR e.channel_uuid=?)
                 ORDER BY e.updated_at""",
-                (cutoff, episode_id, episode_id),
+                (cutoff, episode_id, episode_id, channel_uuid, channel_uuid),
             ).fetchall()
         result = []
         for row in rows:

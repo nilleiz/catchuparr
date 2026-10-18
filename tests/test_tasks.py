@@ -48,6 +48,10 @@ class FakeRedis:
                 return 0
             self.values[lock_key] = f"{current}:{owner}"
             return current
+        if "EXPIRE" in script:
+            key = keys[0]
+            expected = argv[0]
+            return int(self.values.get(key) == expected)
         if "DEL" in script:
             key = keys[0]
             expected = argv[0]
@@ -96,6 +100,7 @@ def _recording_task_fake_modules(redis):
 def _isolated_plugin_modules(fake_modules):
     """Keep package children aligned with sys.modules while stubbing Dispatcharr."""
     package = importlib.import_module("catchuparr")
+    adapter_package = importlib.import_module("catchuparr.adapters")
     fake_modules = {
         **fake_modules,
         "catchuparr.adapters.recorder_proxy": fake_modules.get(
@@ -114,7 +119,6 @@ def _isolated_plugin_modules(fake_modules):
     )
     missing = object()
     previous = {name: package.__dict__.get(name, missing) for name in child_names}
-    adapter_package = None
     previous_adapter_proxy = missing
     try:
         with patch.dict(sys.modules, fake_modules):
@@ -125,9 +129,8 @@ def _isolated_plugin_modules(fake_modules):
                     package.__dict__.pop(name, None)
                 else:
                     package.__dict__[name] = module
-            adapter_package = sys.modules.get("catchuparr.adapters")
             adapter_proxy = sys.modules.get("catchuparr.adapters.recorder_proxy")
-            if adapter_package is not None and adapter_proxy is not None:
+            if adapter_proxy is not None:
                 previous_adapter_proxy = getattr(
                     adapter_package, "recorder_proxy", missing,
                 )
@@ -815,7 +818,7 @@ class RecorderTaskTests(unittest.TestCase):
                         BorrowCoordinator,
                     ),
                     patch("catchuparr.sharing_episode.BorrowEpisodeLedger", return_value=object()),
-                    patch("catchuparr.sharing_runtime.retry_durable_open_cleanups"),
+                    patch("catchuparr.sharing_runtime.retry_durable_open_cleanups", return_value=(0, 0)),
                     patch("catchuparr.sharing_runtime.retry_pending_open_cleanups"),
                     patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
                     patch("catchuparr.adapters.sharing_borrow_route.encode_borrow_capability", return_value="synthetic-borrow-token"),
@@ -961,6 +964,7 @@ class RecorderTaskTests(unittest.TestCase):
                             poll=lambda **_kwargs: lifecycle.append("observe_native") or None,
                         ),
                     ),
+                    patch("catchuparr.sharing_runtime.retry_durable_open_cleanups", return_value=(0, 0)),
                     patch(
                         "catchuparr.recorder_proxy.issue_recorder_attempt",
                         side_effect=lambda _redis, _lease, **kwargs: (

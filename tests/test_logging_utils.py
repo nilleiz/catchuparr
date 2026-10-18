@@ -31,6 +31,31 @@ class LoggingUtilsTests(unittest.TestCase):
             error("supervision_failed")
         self.assertEqual("[Catchuparr] supervision_failed", captured.records[0].getMessage())
 
+    def test_sharing_failures_keep_distinct_fixed_categories(self):
+        apply_log_level("ERROR")
+        with self.assertLogs("catchuparr", level="ERROR") as captured:
+            error("sharing_observation_failed")
+            error("sharing_projection_failed")
+            error("sharing_registration_failed")
+            error("sharing_binding_lost")
+            error("sharing_cleanup_pending")
+        self.assertEqual(
+            [
+                "[Catchuparr] sharing_observation_failed",
+                "[Catchuparr] sharing_projection_failed",
+                "[Catchuparr] sharing_registration_failed",
+                "[Catchuparr] sharing_binding_lost",
+                "[Catchuparr] sharing_cleanup_pending",
+            ],
+            [record.getMessage() for record in captured.records],
+        )
+        with self.assertLogs("catchuparr", level="ERROR") as invalid:
+            error("private exception with credentials")
+        self.assertEqual(
+            "[Catchuparr] diagnostic_category_invalid",
+            invalid.records[0].getMessage(),
+        )
+
     def test_events_are_prefixed_and_drop_unapproved_values(self):
         with self.assertLogs("catchuparr", level="INFO") as captured:
             event(
