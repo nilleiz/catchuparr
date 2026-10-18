@@ -111,6 +111,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
                 source.get("stream_id"),
                 source.get("account_id"),
                 source.get("m3u_profile_id"),
+                source.get("input_profile_id"),
             )
             if binding is None:
                 source = None
@@ -165,7 +166,7 @@ _STATES = (
 )
 
 
-def source_metadata(channel_uuid, stream_id, account_id, profile_id=None):
+def source_metadata(channel_uuid, stream_id, account_id, m3u_profile_id=None, input_profile_id=None):
     """Read display-only metadata for an exact currently assigned source."""
     if not all(isinstance(value, str) and value for value in (channel_uuid, stream_id, account_id)):
         return None
@@ -192,14 +193,27 @@ def source_metadata(channel_uuid, stream_id, account_id, profile_id=None):
         }
         if not _safe_identifier(result["stream_id"]) or not _safe_identifier(actual_account_id):
             return None
-        if profile_id is not None:
-            if not isinstance(profile_id, str) or not profile_id:
+        if m3u_profile_id is not None:
+            if not isinstance(m3u_profile_id, str) or not m3u_profile_id:
                 return None
-            profile = account.profiles.filter(id=profile_id).only("id", "name").first()
-            if profile is None:
+            m3u_profile = account.profiles.filter(id=m3u_profile_id).only("id", "name").first()
+            if m3u_profile is None:
                 return None
-            result["profile_id"] = str(profile.id)
-            result["profile_name"] = _safe_display(getattr(profile, "name", None))
+            result["m3u_profile_id"] = str(m3u_profile.id)
+            result["m3u_profile_name"] = _safe_display(getattr(m3u_profile, "name", None))
+        if input_profile_id is not None:
+            if not isinstance(input_profile_id, str) or not input_profile_id:
+                return None
+            from core.models import StreamProfile
+
+            input_profile = StreamProfile.objects.filter(id=input_profile_id).only("id", "name").first()
+            if input_profile is None:
+                return None
+            result["input_profile_id"] = str(input_profile.id)
+            result["input_profile_name"] = _safe_display(getattr(input_profile, "name", None))
+            # Keep the generic field tied to Dispatcharr's actual input profile.
+            result["profile_id"] = str(input_profile.id)
+            result["profile_name"] = result["input_profile_name"]
         return result
     except Exception:
         return None
@@ -213,6 +227,7 @@ def _source_for_diagnostic(channel_uuid, diagnostic):
         "stream_id": diagnostic.get("stream_id"),
         "account_id": diagnostic.get("account_id"),
         "m3u_profile_id": diagnostic.get("m3u_profile_id"),
+        "input_profile_id": diagnostic.get("input_profile_id"),
     }
 
 
@@ -324,11 +339,16 @@ def _message_row(row):
         provider_name, provider_id = source.get("provider_name"), source.get("provider_id")
         if provider_name:
             details.append(f"provider {provider_name} (id {provider_id})" if provider_id else f"provider {provider_name}")
-        profile_name, profile_id = source.get("profile_name"), source.get("profile_id")
+        profile_name, profile_id = source.get("input_profile_name"), source.get("input_profile_id")
         if profile_name:
-            details.append(f"profile {profile_name} (id {profile_id})" if profile_id else f"profile {profile_name}")
+            details.append(f"Stream profile {profile_name} (id {profile_id})" if profile_id
+                           else f"Stream profile {profile_name}")
         elif profile_id:
-            details.append(f"profile id {profile_id}")
+            details.append(f"Stream profile id {profile_id}")
+        m3u_name, m3u_id = source.get("m3u_profile_name"), source.get("m3u_profile_id")
+        if m3u_name:
+            details.append(f"provider profile {m3u_name} (id {m3u_id})" if m3u_id
+                           else f"provider profile {m3u_name}")
         parts.append("  Source: " + "; ".join(value for value in details if value))
     if row.get("last_confirmed_progress_none"):
         parts.append("  Last confirmed progress: none")

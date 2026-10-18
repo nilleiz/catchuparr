@@ -152,6 +152,43 @@ def _isolated_plugin_modules(fake_modules):
 
 
 class RecorderTaskTests(unittest.TestCase):
+    def test_failed_first_media_diagnostic_is_remembered_and_retried(self):
+        with _isolated_plugin_modules({
+            "celery": _fake_module(
+                "celery", shared_task=lambda *, name: lambda function: function,
+            ),
+        }):
+            tasks = importlib.import_module("catchuparr.tasks")
+            lock = threading.RLock()
+            state = {"diagnostic": {
+                "kind": "dedicated", "attempt": "attempt-1", "started_at": 10.0,
+                "phase": "starting", "last_published": 19.0,
+            }}
+            with lock:
+                tasks._remember_recorder_diagnostic(
+                    state, "dedicated", "attempt-1", "recording", 10.0,
+                    published=False, now=20.0,
+                )
+            self.assertEqual(state["diagnostic"]["phase"], "recording")
+            self.assertEqual(state["diagnostic"]["last_published"], 0.0)
+            calls = []
+
+            def retry(_attempt, phase, *, started_at):
+                calls.append((phase, started_at))
+                with lock:
+                    tasks._remember_recorder_diagnostic(
+                        state, "dedicated", "attempt-1", phase, started_at,
+                        published=True, now=21.0,
+                    )
+
+            tasks._refresh_current_recorder_diagnostic(
+                lock, state, retry, lambda *_args, **_kwargs: self.fail("wrong publisher"),
+                now=21.0,
+            )
+            self.assertEqual(calls, [("recording", 10.0)])
+            self.assertEqual(state["diagnostic"]["phase"], "recording")
+            self.assertEqual(state["diagnostic"]["last_published"], 21.0)
+
     def test_diagnostic_refresh_cannot_overwrite_concurrent_first_media_phase(self):
         with _isolated_plugin_modules({
             "celery": _fake_module(

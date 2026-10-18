@@ -37,6 +37,21 @@ def _refresh_current_recorder_diagnostic(
             )
 
 
+def _remember_recorder_diagnostic(attempt_state, kind, binding, phase, started_at, *,
+                                  published, now=None):
+    """Remember confirmed media phase even when its advisory Redis write fails."""
+    previous = attempt_state.get("diagnostic") or {}
+    changed_phase = previous.get("phase") != phase
+    attempt_state["diagnostic"] = {
+        "kind": kind, "attempt" if kind == "dedicated" else "prepared": binding,
+        "started_at": started_at,
+        "phase": phase,
+        "last_published": (
+            time.monotonic() if now is None else float(now)
+        ) if published else (0.0 if changed_phase else previous.get("last_published", 0.0)),
+    }
+
+
 def _issue_recorder_capability(redis, channel_uuid: str, fence: int, owner: str):
     token = secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
@@ -278,12 +293,10 @@ def record_channel(
                     control_generation=attempt.control_generation,
                     fence=int(lease.fence), error_code=error_code,
                 )
-                if published:
-                    attempt_state["diagnostic"] = {
-                        "kind": "dedicated", "attempt": attempt,
-                        "started_at": effective_started_at, "phase": phase,
-                        "last_published": time.monotonic(),
-                    }
+                _remember_recorder_diagnostic(
+                    attempt_state, "dedicated", attempt, phase, effective_started_at,
+                    published=published,
+                )
             except Exception:
                 # Diagnostics are advisory and must never alter admission or cleanup.
                 return
@@ -311,12 +324,10 @@ def record_channel(
                     control_generation=capability.control_generation,
                     fence=capability.recorder_fence, error_code=error_code,
                 )
-                if published:
-                    attempt_state["diagnostic"] = {
-                        "kind": "borrowed", "prepared": prepared,
-                        "started_at": effective_started_at, "phase": phase,
-                        "last_published": time.monotonic(),
-                    }
+                _remember_recorder_diagnostic(
+                    attempt_state, "borrowed", prepared, phase, effective_started_at,
+                    published=published,
+                )
             except Exception:
                 # Diagnostics are advisory and must never alter admission or cleanup.
                 return

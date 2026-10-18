@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -18,6 +19,26 @@ from catchuparr.recorder_diagnostics import (
 class RecordingRedis:
     def __init__(self):
         self.calls = []
+        self.worker_id = None
+
+    def hgetall(self, key):
+        if self.worker_id and key.endswith(self.worker_id):
+            return {b"profile_id": b"5", b"account_id": b"7"}
+        if ":metadata" in key:
+            return {
+                b"owner": self.worker_id.encode(), b"stream_id": b"31",
+                b"m3u_profile": b"5", b"stream_profile": b"4", b"state": b"active",
+            }
+        return {}
+
+    def get(self, key):
+        return self.worker_id if key.endswith(":owner") else None
+
+    def ttl(self, _key):
+        return 30
+
+    def exists(self, _key):
+        return 0
 
     def eval(self, script, key_count, *args):
         self.calls.append((script, key_count, args))
@@ -31,6 +52,7 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         self.generation = "a" * 64
         self.catalog = "b" * 64
         self.worker_id = "catchuparr-r" + "c" * 40
+        self.redis.worker_id = self.worker_id
 
     def test_dedicated_write_uses_atomic_worker_and_lease_cas(self):
         with patch("catchuparr.adapters.recorder_proxy.is_managed_worker_id", return_value=True):
@@ -45,9 +67,9 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         self.assertIn("HGET", script)
         self.assertIn("TTL", script)
         self.assertLess(script.index("TYPE"), script.index("HSET"))
-        self.assertEqual(key_count, 4)
+        self.assertEqual(key_count, 8)
         self.assertTrue(args[1].endswith(self.worker_id))
-        self.assertEqual(args[-3:], ("recording", "dedicated", ""))
+        self.assertEqual(args[-6:], ("recording", "dedicated", "", "5", "4", self.worker_id))
 
     def test_borrowed_write_checks_current_authority_and_exact_grant(self):
         result = publish_borrowed_recorder_diagnostic(
@@ -61,12 +83,12 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         self.assertTrue(result)
         script, key_count, args = self.redis.calls[0]
         self.assertIs(script, _PUBLISH_BORROWED_LUA)
-        self.assertEqual(key_count, 9)
+        self.assertEqual(key_count, 13)
         self.assertIn("authority_revision", script)
         self.assertIn("m3u_profile_id", script)
-        self.assertEqual(args[-5:], (
+        self.assertEqual(args[-7:], (
             "starting", "", str(LAST_ERROR_TTL_SECONDS), str(LIVE_TTL_CAP_SECONDS),
-            "catchuparr-client-9",
+            "catchuparr-client-9", "nativeworker", "nativeworker",
         ))
 
     def test_invalid_inputs_never_call_redis(self):
@@ -106,15 +128,36 @@ class DiagnosticReaderRedis:
         self.lease = lease
         self.live_ttl = live_ttl
         self.error_ttl = error_ttl
+        self.alive = True
+        self.native_metadata = {
+            "owner": self.live.get("worker_id"),
+            "stream_id": self.live.get("stream_id"),
+            "m3u_profile": self.live.get("m3u_profile_id"),
+            "stream_profile": self.live.get("input_profile_id"),
+            "state": "active",
+        }
 
     def hgetall(self, key):
-        return self.error if ":last-error:" in key else self.live
+        if ":last-error:" in key:
+            return self.error
+        if ":metadata" in key:
+            return self.native_metadata
+        return self.live
 
     def ttl(self, key):
-        return self.error_ttl if ":last-error:" in key else self.live_ttl
+        if ":last-error:" in key:
+            return self.error_ttl
+        if key.endswith(":owner") or key.endswith(":heartbeat"):
+            return 20 if self.alive else -2
+        return self.live_ttl
 
-    def get(self, _key):
+    def get(self, key):
+        if key.endswith(":owner"):
+            return self.live.get("worker_id")
         return self.lease
+
+    def exists(self, key):
+        return int(key.endswith(":heartbeat") and self.alive)
 
 
 class RecorderDiagnosticReaderTests(unittest.TestCase):
@@ -135,6 +178,7 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
             "stream_id": "31", "account_id": "7", "config_generation": generation,
             "control_generation": "6", "lease_fence": "5",
             "lease_key": f"catchuparr:recorder:{self.channel}", "lease_value": "5:owner",
+            "profile_id": "9",
         }
         self.live = {
             "channel_uuid": self.channel, "worker_id": self.worker_id,
@@ -142,6 +186,11 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
             "config_generation": generation, "control_generation": "6", "fence": "5",
             "phase": "recording", "source": "dedicated", "started_at": "1000",
             "updated_at": "1010", "error_code": "",
+            "m3u_profile_id": "9", "input_profile_id": "4",
+        }
+        self.redis_native_metadata = {
+            "owner": self.worker_id, "stream_id": "31", "m3u_profile": "9",
+            "stream_profile": "4", "state": "active",
         }
 
     def _read(self, redis):
@@ -171,6 +220,73 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
         redis.error_ttl = 100
         redis.error["control_generation"] = "5"
         self.assertNotIn(self.channel, self._read(redis))
+
+    def test_dedicated_binding_requires_native_owner_profile_and_heartbeat(self):
+        redis = DiagnosticReaderRedis(live=self.live)
+        redis.native_metadata = {
+            "owner": self.worker_id, "stream_id": "31", "m3u_profile": "9",
+            "stream_profile": "4", "state": "active",
+        }
+        redis.native_alive = True
+        redis.hgetall = lambda key: (
+            redis.error if ":last-error:" in key else
+            redis.native_metadata if ":metadata" in key else redis.live
+        )
+        redis.get = lambda key: self.worker_id if key.endswith(":owner") else redis.lease
+        redis.exists = lambda key: int(key.endswith(":heartbeat") and redis.native_alive)
+        redis.ttl = lambda key: (
+            redis.error_ttl if ":last-error:" in key else
+            20 if key.endswith(":owner") or key.endswith(":heartbeat") else redis.live_ttl
+        )
+        self.assertIn(self.channel, self._read(redis))
+        redis.native_alive = False
+        self.assertNotIn(self.channel, self._read(redis))
+        redis.native_alive = True
+        redis.native_metadata["stream_profile"] = "stale"
+        self.assertNotIn(self.channel, self._read(redis))
+
+    def test_borrowed_binding_requires_live_native_owner_and_metadata(self):
+        episode_id = "episode_9"
+        native_id = "native-worker"
+        client_id = "catchuparr-client-9"
+        grant = SimpleNamespace(
+            episode_id=episode_id, worker_id=native_id, stream_id="31", account_id="7",
+            m3u_profile_id="9", input_profile_id="4", catalog_generation="b" * 64,
+            configuration_generation=self.control.configuration_generation,
+            control_generation=6, recorder_fence=5, client_id=client_id,
+            client_worker_id=native_id, connected_at="1000", lease_value="5:owner",
+            owner_lock_value=native_id, metadata_owner=native_id,
+        )
+        diagnostic = dict(
+            self.live, source="borrowed", m3u_profile_id="9", input_profile_id="4",
+            episode_digest=hashlib.sha256(episode_id.encode()).hexdigest(),
+            worker_digest=hashlib.sha256(native_id.encode()).hexdigest(),
+            catalog_generation="b" * 64,
+        )
+        redis = DiagnosticReaderRedis(live=diagnostic)
+        redis.alive = True
+        redis.hgetall = lambda key: (
+            diagnostic if ":diagnostic:" in key else
+            {"configuration_generation": self.control.configuration_generation,
+             "control_generation": "6", "catalog_generation": "b" * 64,
+             "authority_revision": "3"} if ":sharing:current:" in key else
+            {client_id: episode_id} if ":sharing:private:" in key else
+            {"worker_id": native_id, "connected_at": "1000"} if f":clients:{client_id}" in key else
+            {"owner": native_id, "stream_id": "31", "m3u_profile": "9",
+             "stream_profile": "4", "state": "active"} if ":metadata" in key else {}
+        )
+        redis.get = lambda key: native_id if key.endswith(":owner") else redis.lease
+        redis.sismember = lambda _key, member: member == client_id
+        redis.exists = lambda key: int(key.endswith(":heartbeat") and redis.alive)
+        redis.ttl = lambda key: 20 if not key.endswith(":last-error:") else 3600
+        with patch("catchuparr.adapters.sharing_native.read_native_episode_grant", return_value=grant):
+            self.assertIn(self.channel, read_recorder_diagnostics(
+                redis, self.settings, self.control, now=1010,
+            ))
+            redis.alive = False
+            self.assertNotIn(self.channel, read_recorder_diagnostics(
+                redis, self.settings, self.control, now=1010,
+            ))
 
 
 if __name__ == "__main__":
