@@ -83,6 +83,40 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         result = today_schedule(active, {}, now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc))
         self.assertEqual([row["channel_uuid"] for row in result["channels"]], ["selected"])
 
+    def test_channel_display_rejects_urls_credentials_tokens_and_injected_numbers(self):
+        secret_name = "https://user:secret@example.test/channel?access_token=private"
+        secret_number = "10\nAuthorization: Bearer private"
+        result = today_schedule(
+            settings({"a": "continuous"}),
+            {"a": {"number": secret_number, "name": secret_name}},
+            now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc),
+        )
+        output = repr(result)
+        self.assertEqual(result["channels"][0]["name"], "Unknown channel")
+        self.assertIsNone(result["channels"][0]["number"])
+        for secret in ("user:secret", "access_token", "private", "Authorization", "Bearer", "example.test"):
+            self.assertNotIn(secret, output)
+
+    def test_nonfinite_channel_numbers_are_omitted(self):
+        for number in (float("inf"), float("nan")):
+            with self.subTest(number=number):
+                result = today_schedule(
+                    settings({"a": "continuous"}),
+                    {"a": {"number": number, "name": "Synthetic Channel"}},
+                    now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc),
+                )
+                self.assertIsNone(result["channels"][0]["number"])
+
+    def test_unsafe_channel_metadata_is_removed_from_rows_and_message(self):
+        result = today_schedule(
+            settings({"selected": "continuous"}),
+            {"selected": {"number": 1, "name": "https://example.invalid/watch?token=synthetic"}},
+            now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result["channels"][0]["name"], "Unknown channel")
+        self.assertNotIn("example.invalid", result["message"])
+        self.assertNotIn("synthetic", result["message"])
+
     def test_statuses_overnight_and_week_wrap_are_clipped_to_today(self):
         result = today_schedule(settings({"a": {"sunday": [{"start": "23:00", "end": "01:00"}],
                                               "monday": [{"start": "08:00", "end": "09:00"}]}}), {},
