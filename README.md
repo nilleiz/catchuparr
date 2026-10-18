@@ -16,9 +16,9 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The package version is **0.6.2 prerelease candidate**. It is not published.
+- The package version is **0.6.3 prerelease candidate**. It is not published.
   The pinned 0.32.0 native AIO acceptance passed for 0.6.0; required GitHub CI
-  and publication remain gates. See [candidate 0.6.2](docs/candidate-0.6.2.md)
+  and publication remain gates. See [candidate 0.6.3](docs/candidate-0.6.3.md)
   and the [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.32.0**. The compatibility
   guard currently accepts the pinned 0.32.0 release; earlier and unverified
