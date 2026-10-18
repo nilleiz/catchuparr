@@ -152,6 +152,59 @@ def _isolated_plugin_modules(fake_modules):
 
 
 class RecorderTaskTests(unittest.TestCase):
+    def test_diagnostic_refresh_cannot_overwrite_concurrent_first_media_phase(self):
+        with _isolated_plugin_modules({
+            "celery": _fake_module(
+                "celery", shared_task=lambda *, name: lambda function: function,
+            ),
+        }):
+            tasks = importlib.import_module("catchuparr.tasks")
+            state_lock = threading.RLock()
+            state = {"diagnostic": {
+                "kind": "dedicated", "attempt": object(), "started_at": 10.0,
+                "phase": "starting", "last_published": 0.0,
+            }}
+            refresh_entered = threading.Event()
+            release_refresh = threading.Event()
+            media_ready = threading.Event()
+            events = []
+
+            def publish_dedicated(_attempt, phase, *, started_at):
+                events.append(("refresh", phase, started_at))
+                refresh_entered.set()
+                self.assertTrue(release_refresh.wait(2))
+                state["diagnostic"]["phase"] = phase
+                state["diagnostic"]["last_published"] = 20.0
+
+            def publish_borrow(_prepared, _phase, *, started_at):
+                self.fail("dedicated diagnostic refresh called borrowed publisher")
+
+            refresh = threading.Thread(
+                target=tasks._refresh_current_recorder_diagnostic,
+                args=(state_lock, state, publish_dedicated, publish_borrow),
+                kwargs={"now": 20.0},
+            )
+            refresh.start()
+            self.assertTrue(refresh_entered.wait(2))
+
+            def record_first_media():
+                media_ready.set()
+                with state_lock:
+                    events.append(("media", "recording"))
+                    state["diagnostic"]["phase"] = "recording"
+                    state["diagnostic"]["last_published"] = 21.0
+
+            media = threading.Thread(target=record_first_media)
+            media.start()
+            self.assertTrue(media_ready.wait(2))
+            release_refresh.set()
+            refresh.join(timeout=2)
+            media.join(timeout=2)
+            self.assertFalse(refresh.is_alive())
+            self.assertFalse(media.is_alive())
+            self.assertEqual("recording", state["diagnostic"]["phase"])
+            self.assertEqual([("refresh", "starting", 10.0), ("media", "recording")], events)
+
     def test_admission_uses_one_snapshot_for_schedule_and_archive_settings(self):
         import uuid
 
@@ -473,10 +526,91 @@ class RecorderTaskTests(unittest.TestCase):
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
             ):
                 result = tasks.reconcile_recorders()
-        self.assertEqual({"queued": 1}, result)
+        self.assertEqual({"queued": 1, "cleanup_pending": 0}, result)
         self.assertEqual(
             [{"args": ["channel-1", expected_generation, 7], "queue": "dvr"}], queued
         )
+
+    def test_reconcile_retries_channel_cleanup_before_dispatch_and_respects_live_lease(self):
+        redis = FakeRedis()
+        queued = []
+        cleanup_calls = []
+        outcomes = [(0, 1), (1, 0)]
+
+        class ChannelQuery:
+            def filter(self, **_kwargs):
+                return self
+
+            def values_list(self, *_args, **_kwargs):
+                return ["channel-1"]
+
+        class FakeStore:
+            def __init__(self, _root):
+                pass
+
+            def cleanup(self, **_kwargs):
+                return None
+
+            def reconcile_orphans(self, **_kwargs):
+                return None
+
+        def task_decorator(*, name):
+            def decorate(function):
+                if name == "catchuparr.record_channel":
+                    function.apply_async = lambda **kwargs: queued.append(kwargs)
+                return function
+
+            return decorate
+
+        active = _active_configuration()
+        active["connection_sharing"] = {"channel-1": {"enabled": True}}
+        config = SimpleNamespace(
+            channel_uuids=("channel-1",), archive_root=Path("/tmp/synthetic-archive"),
+            retention_hours=24, max_storage_bytes=1024,
+        )
+        fake_modules = {
+            "celery": _fake_module("celery", shared_task=task_decorator),
+            "apps": _fake_module("apps"),
+            "apps.channels": _fake_module("apps.channels"),
+            "apps.channels.models": _fake_module(
+                "apps.channels.models", Channel=SimpleNamespace(objects=ChannelQuery()),
+            ),
+            "core": _fake_module("core"),
+            "core.utils": _fake_module(
+                "core.utils", RedisClient=SimpleNamespace(get_client=lambda: redis),
+            ),
+            "version": _fake_module("version", __version__="0.32.0"),
+        }
+        with _isolated_plugin_modules(fake_modules):
+            tasks = importlib.import_module("catchuparr.tasks")
+
+            def cleanup(_ledger, _redis, **kwargs):
+                cleanup_calls.append(kwargs.get("channel_uuid"))
+                return outcomes.pop(0)
+
+            with (
+                patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
+                patch("catchuparr.runtime.load_config", return_value=config),
+                patch(
+                    "catchuparr.configuration.load_applied_state",
+                    return_value=(active, SimpleNamespace(paused=False, generation=7)),
+                ),
+                patch("catchuparr.engine.store.ArchiveStore", FakeStore),
+                patch("catchuparr.sharing_runtime.retry_durable_open_cleanups", side_effect=cleanup),
+            ):
+                pending_result = tasks.reconcile_recorders()
+                self.assertEqual([], queued)
+                redis.values["catchuparr:dispatch:channel-1"] = "1"
+                ready_result = tasks.reconcile_recorders()
+                # An active recorder lease prevents reconcile from scanning
+                # cleanup concurrently with its task-owned recovery path.
+                redis.values["catchuparr:recorder:channel-1"] = "9:owner"
+                tasks.reconcile_recorders()
+
+        self.assertEqual({"queued": 0, "cleanup_pending": 1}, pending_result)
+        self.assertEqual({"queued": 0, "cleanup_pending": 0}, ready_result)
+        self.assertEqual(["channel-1", "channel-1"], cleanup_calls)
+        self.assertEqual([], queued)
 
     def test_queued_recorder_does_not_start_for_a_stale_generation(self):
         redis = FakeRedis()
@@ -608,7 +742,7 @@ class RecorderTaskTests(unittest.TestCase):
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
             ):
                 result = tasks.reconcile_recorders()
-        self.assertEqual({"queued": 0}, result)
+        self.assertEqual({"queued": 0, "cleanup_pending": 0}, result)
         self.assertEqual([], queued)
 
     def test_setup_failure_releases_lease_after_durable_fence_acquisition(self):
@@ -683,6 +817,7 @@ class RecorderTaskTests(unittest.TestCase):
             polls = []
             recorder_inputs = []
             cleanup_calls = []
+            recovery_events = []
 
             class StopEvent:
                 def __init__(self):
@@ -741,6 +876,7 @@ class RecorderTaskTests(unittest.TestCase):
 
                 def poll(self, **_kwargs):
                     polls.append(self.dedicated_source_available)
+                    recovery_events.append("native_observation")
                     # Model an already-connected native viewer on an excluded
                     # source. The initial synchronous observation must claim it
                     # before any dedicated candidate is considered.
@@ -818,7 +954,13 @@ class RecorderTaskTests(unittest.TestCase):
                         BorrowCoordinator,
                     ),
                     patch("catchuparr.sharing_episode.BorrowEpisodeLedger", return_value=object()),
-                    patch("catchuparr.sharing_runtime.retry_durable_open_cleanups", return_value=(0, 0)),
+                    patch(
+                        "catchuparr.sharing_runtime.retry_durable_open_cleanups",
+                        side_effect=lambda *_args, **kwargs: (
+                            recovery_events.append(("cleanup", kwargs.get("channel_uuid")))
+                            if "episode_id" not in kwargs else None
+                        ) or (0, 0),
+                    ),
                     patch("catchuparr.sharing_runtime.retry_pending_open_cleanups"),
                     patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
                     patch("catchuparr.adapters.sharing_borrow_route.encode_borrow_capability", return_value="synthetic-borrow-token"),
@@ -833,7 +975,10 @@ class RecorderTaskTests(unittest.TestCase):
                     patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
                     patch(
                         "catchuparr.tasks.threading",
-                        SimpleNamespace(Event=lambda: stop_event, Lock=threading.Lock, Thread=InlineThread),
+                        SimpleNamespace(
+                            Event=lambda: stop_event, Lock=threading.Lock,
+                            RLock=threading.RLock, Thread=InlineThread,
+                        ),
                     ),
                 ):
                     result = tasks.record_channel("channel-1", expected_generation, 6)
@@ -841,6 +986,9 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertEqual({"status": "stopped"}, result)
             self.assertEqual([True], coordinator_sources)
             self.assertEqual([True], polls)
+            self.assertEqual(
+                [("cleanup", "channel-1"), "native_observation"], recovery_events,
+            )
             self.assertEqual(1, len(recorder_inputs))
             self.assertEqual(
                 "http://dispatcharr/catchuparr/sharing/channel-1",
