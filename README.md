@@ -21,8 +21,10 @@ assignments, cloud storage or a transcoding service.
   and publication remain gates. See [candidate 0.6.3](docs/candidate-0.6.3.md)
   and the [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.32.0**. The compatibility
-  guard currently accepts the pinned 0.32.0 release; earlier and unverified
-  versions are refused.
+  guard accepts well-formed versions at or above that minimum. The
+  native compatibility acceptance remains pinned to 0.32.0; newer versions
+  have not been verified by this candidate. API-specific guards still fail
+  closed when the expected Dispatcharr interfaces do not match.
 - The primary playback path is authenticated M3U/XMLTV with local HLS playback
   using MPEG-TS segments. Native XC is guarded; acceptance with a particular
   playback client is not established here.

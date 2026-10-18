@@ -12,4 +12,7 @@ snapshot is reported as unknown. Draft configuration does not affect either
 view.
 
 No configuration migration is required. The candidate remains unpublished;
-CI and release acceptance are pending.
+CI and release acceptance are pending. The compatibility guard accepts
+well-formed Dispatcharr versions from stable 0.32.0 onward; native acceptance
+for this candidate remains pinned to 0.32.0, so newer versions are not claimed
+as verified. API-specific guards still check the interfaces they use.
