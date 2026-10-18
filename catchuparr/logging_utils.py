@@ -35,6 +35,43 @@ _EVENTS = frozenset({
     "control_state_invalid",
     "setting_invalid",
     "error_suppressed",
+    "sharing_observation_failed",
+    "sharing_projection_failed",
+    "sharing_registration_failed",
+    "sharing_binding_lost",
+    "sharing_cleanup_pending",
+    "sharing_recovery_failed",
+    "sharing_recovery_stale",
+    "sharing_attempt_cleanup_pending",
+    "sharing_attempt_reconciled",
+    "sharing_return_recovery_pending",
+})
+_ERROR_CATEGORIES = frozenset({
+    "configuration_recovery_failed",
+    "route_install_failed",
+    "schedule_install_failed",
+    "xc_install_failed",
+    "xc_uninstall_failed",
+    "scheduler_disable_failed",
+    "route_uninstall_failed",
+    "stats_hook_install_failed",
+    "stats_hook_uninstall_failed",
+    "control_state_invalid",
+    "supervision_failed",
+    "recorder_worker_stopped",
+    "borrowed_recorder_worker_stopped",
+    "borrow_cleanup_pending",
+    "sharing_attempt_cleanup_pending",
+    "sharing_attempt_reconciled",
+    "sharing_observation_failed",
+    "sharing_projection_failed",
+    "sharing_registration_failed",
+    "sharing_binding_lost",
+    "sharing_cleanup_pending",
+    "sharing_recovery_failed",
+    "sharing_recovery_stale",
+    "sharing_return_recovery_pending",
+    "diagnostic_category_invalid",
 })
 _STATE_KEYS = frozenset({
     "generation", "config_generation", "control_generation", "channel_count",
@@ -103,8 +140,8 @@ def event(name: str, level: int = logging.INFO, **state: object) -> None:
 
 def error(category: str) -> None:
     """Rate-limit a fixed error category without retaining arbitrary messages."""
-    if category not in _EVENTS:
-        category = "runtime_disabled"
+    if category not in _ERROR_CATEGORIES:
+        category = "diagnostic_category_invalid"
     now = time.monotonic()
     suppressed = 0
     log_initial = False

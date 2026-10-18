@@ -3733,6 +3733,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         active_settings_path,
         apply_configuration,
         load_active_configuration,
+        load_applied_state,
     )
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.recorder_control import control_deny_path, control_state_path
@@ -4703,28 +4704,123 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and share_active_baseline["source-b.ts"] == 0,
             "Sharing fixture did not start with only the existing live A connection",
         )
+        # Leave one exact registered opening durably awaiting cleanup. The
+        # next recorder task must close this channel-local residue before its
+        # first native observation, then attach to this same ordinary viewer.
+        from hashlib import sha256
+
+        from catchuparr.adapters.sharing_native import NativeClientRegistrationAck
+        from catchuparr.adapters.sharing_reader import redis_backend_signature
+        from catchuparr.recorder_proxy import configuration_generation
+        from catchuparr.sharing_episode import BorrowEpisodeLedger
+        from catchuparr.sharing_persistence import SharingIntentToken
+        from catchuparr.sharing_planner import SharingAction
+
+        sharing_active, sharing_control = load_applied_state(active_path)
+        _require(sharing_active is not None, "Sharing recovery snapshot is unavailable")
+        sharing_episode_ledger = BorrowEpisodeLedger(
+            archive_root / ".catchuparr-sharing.sqlite3",
+        )
+        sharing_identity = (
+            str(channel.uuid), str(native_owner), str(native_owner),
+            str(stream_a.id), str(stream_a.m3u_account_id),
+            source_metadata["m3u_profile"], source_metadata["stream_profile"],
+        )
+        failed_token = SharingIntentToken(
+            channel_uuid=str(channel.uuid), revision=1, intent_epoch=9000,
+            action=SharingAction.ATTACH_BORROW,
+            configuration_generation=configuration_generation(sharing_active),
+            control_generation=sharing_control.generation,
+            recorder_fence=0, target_identity=sharing_identity,
+            target_admitted=True, not_before=time.time(),
+        )
+        failed_opening = sharing_episode_ledger.begin_open(
+            failed_token,
+            lease_digest=sha256(b"synthetic expired opening lease").hexdigest(),
+            identity=sharing_identity,
+            client_id="catchuparr-client-synthetic-failed-opening",
+        )
+        failed_registration = sharing_episode_ledger.prepare_registration(
+            failed_opening, local_worker_id=str(worker_id),
+            backend_signature=redis_backend_signature(redis_client),
+            user_agent="Synthetic recorder cleanup test", client_ip="127.0.0.1",
+        )
+        failed_ack = NativeClientRegistrationAck(
+            channel_uuid=str(channel.uuid), episode_id=failed_opening.episode_id,
+            client_id=failed_registration.client_id,
+            local_worker_id=failed_registration.local_worker_id,
+            redis_backend_signature=failed_registration.backend_signature,
+            connected_at=str(time.time()),
+            projection_version=failed_opening.version + 1,
+            user_agent=failed_registration.user_agent,
+            client_ip=failed_registration.client_ip,
+        )
+        sharing_episode_ledger.record_registration_ack(
+            failed_opening.episode_id, failed_ack,
+        )
+        sharing_episode_ledger.revoke(
+            failed_opening.episode_id,
+            expected_version=failed_opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        recovery_order = []
+        from catchuparr import sharing_runtime as sharing_runtime_module
+
+        original_retry_cleanup = sharing_runtime_module.retry_durable_open_cleanups
+        original_native_observation = sharing_runtime_module.observe_native_connection
+
+        def observe_after_channel_cleanup(*args, **kwargs):
+            observed_channel = args[1] if len(args) > 1 else kwargs.get("channel_uuid")
+            if str(observed_channel) == str(channel.uuid):
+                _require(
+                    recovery_order and recovery_order[-1] == "cleanup_acknowledged",
+                    "Native viewer observation ran before failed-opening cleanup ACK",
+                )
+                recovery_order.append("native_observation")
+            return original_native_observation(*args, **kwargs)
+
+        def retry_channel_cleanup(*args, **kwargs):
+            result = original_retry_cleanup(*args, **kwargs)
+            if kwargs.get("channel_uuid") == str(channel.uuid):
+                _require(
+                    result == (1, 0)
+                    and sharing_episode_ledger.read(str(channel.uuid)).phase == "closed",
+                    "Task did not ACK cleanup for the exact failed channel opening",
+                )
+                recovery_order.append("cleanup_acknowledged")
+            return result
+
         run_share = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
         )
-        run_share.start()
-        harnesses.append(run_share)
+        with patch.object(
+            sharing_runtime_module, "retry_durable_open_cleanups", retry_channel_cleanup,
+        ), patch.object(
+            sharing_runtime_module, "observe_native_connection", observe_after_channel_cleanup,
+        ):
+            run_share.start()
+            harnesses.append(run_share)
 
-        borrow_headers = None
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
-            with run_share._lock:
-                borrow_headers = next(
-                    (dict(headers) for headers in run_share.input_headers
-                     if "X-Catchuparr-Borrow" in headers),
-                    None,
-                )
-            if borrow_headers is not None:
-                break
-            if run_share.failures:
-                raise RuntimeError("Sharing recorder failed before opening a native borrow")
-            time.sleep(0.1)
+            borrow_headers = None
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                with run_share._lock:
+                    borrow_headers = next(
+                        (dict(headers) for headers in run_share.input_headers
+                         if "X-Catchuparr-Borrow" in headers),
+                        None,
+                    )
+                if borrow_headers is not None:
+                    break
+                if run_share.failures:
+                    raise RuntimeError("Sharing recorder failed before opening a native borrow")
+                time.sleep(0.1)
         _require(borrow_headers is not None,
                  "Sharing recorder did not request the signed native-buffer route")
+        _require(
+            recovery_order[:2] == ["cleanup_acknowledged", "native_observation"],
+            "New recorder did not recover the channel opening before observing its viewer",
+        )
         _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 2,
             expected_local=1, timeout=30,
