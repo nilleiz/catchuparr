@@ -16,6 +16,27 @@ RECORDER_CAPABILITY_HEADER = "X-Catchuparr-Recorder"
 RECORDER_CAPABILITY_TTL_SECONDS = 30
 
 
+def _refresh_current_recorder_diagnostic(
+    state_lock, attempt_state, publish_dedicated, publish_borrow, *, now=None,
+):
+    """Renew the current phase under its transition lock, never a stale snapshot."""
+    current_time = time.monotonic() if now is None else float(now)
+    with state_lock:
+        diagnostic = attempt_state.get("diagnostic")
+        if not isinstance(diagnostic, dict) or current_time - diagnostic.get("last_published", 0) < 10:
+            return
+        if diagnostic.get("kind") == "dedicated":
+            publish_dedicated(
+                diagnostic.get("attempt"), diagnostic.get("phase", "starting"),
+                started_at=diagnostic.get("started_at"),
+            )
+        elif diagnostic.get("kind") == "borrowed":
+            publish_borrow(
+                diagnostic.get("prepared"), diagnostic.get("phase", "starting"),
+                started_at=diagnostic.get("started_at"),
+            )
+
+
 def _issue_recorder_capability(redis, channel_uuid: str, fence: int, owner: str):
     token = secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
@@ -51,6 +72,7 @@ def reconcile_recorders():
         active, control = load_active_configuration(), None
     apply_log_level(active.get("log_level", "INFO") if active else "INFO")
     config = load_config(active_snapshot=active) if active is not None else None
+    cleanup_pending = set()
     if config is not None and active is not None:
         generation = configuration_generation(active)
         desired = set(config.channel_uuids)
@@ -58,6 +80,35 @@ def reconcile_recorders():
             str(value)
             for value in Channel.objects.filter(uuid__in=desired).values_list("uuid", flat=True)
         )
+        sharing = active.get("connection_sharing")
+        if isinstance(sharing, dict):
+            from .sharing_episode import BorrowEpisodeLedger
+            from .sharing_runtime import retry_durable_open_cleanups
+
+            episode_ledger = BorrowEpisodeLedger(
+                config.archive_root / ".catchuparr-sharing.sqlite3",
+            )
+            for channel in sorted(valid):
+                setting = sharing.get(channel)
+                if not isinstance(setting, dict) or setting.get("enabled") is not True:
+                    continue
+                lease_key = f"catchuparr:recorder:{channel}"
+                if redis.exists(lease_key):
+                    continue
+                try:
+                    _, pending = retry_durable_open_cleanups(
+                        episode_ledger, redis, now=time.time(), channel_uuid=channel,
+                    )
+                except Exception as exc:
+                    pending = 1
+                    from .logging_utils import error
+
+                    error("sharing_recovery_failed", exc, callsite="reconcile_cleanup")
+                if pending:
+                    cleanup_pending.add(channel)
+                    from .logging_utils import error
+
+                    error("sharing_cleanup_pending", callsite="reconcile_cleanup")
         if control is not None and not control.paused:
             schedules = active.get("recording_schedule", {})
             timezone_name = schedules.get("timezone") if isinstance(schedules, dict) else None
@@ -65,6 +116,8 @@ def reconcile_recorders():
             if isinstance(timezone_name, str) and isinstance(channel_schedules, dict):
                 now = datetime.now(timezone.utc)
                 for channel in sorted(valid):
+                    if channel in cleanup_pending:
+                        continue
                     try:
                         schedule = schedule_from_snapshot(channel_schedules[channel])
                         if not schedule_is_active(schedule, timezone_name, now):
@@ -88,7 +141,7 @@ def reconcile_recorders():
         )
         if redis.set("catchuparr:orphan-reconcile", "1", nx=True, ex=600):
             store.reconcile_orphans(grace_seconds=3600)
-    return {"queued": queued}
+    return {"queued": queued, "cleanup_pending": len(cleanup_pending)}
 
 
 @shared_task(name="catchuparr.snapshot_epg")
@@ -154,6 +207,7 @@ def record_channel(
     from .engine.leases import RedisRecorderLease
     from .engine.recorder import (
         DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
+        DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
         FFmpegCopyRecorder,
     )
     from .engine.store import ArchiveStore
@@ -196,7 +250,9 @@ def record_channel(
     stats_capability_digest = None
     stop_event = None
     monitor = None
-    attempt_state_lock = threading.Lock()
+    # The diagnostic callback and supervisor renewal share this lock across the
+    # Redis CAS so an older phase cannot overwrite a newer first-media phase.
+    attempt_state_lock = threading.RLock()
     attempt_state = {
         "attempt": None, "candidate": None, "switch": None, "borrow": None,
         "active_borrow": None, "return_prepared": None, "diagnostic": None,
@@ -208,60 +264,62 @@ def record_channel(
     ) -> None:
         if attempt is None:
             return
-        try:
-            from .recorder_diagnostics import publish_recorder_diagnostic
+        with attempt_state_lock:
+            try:
+                from .recorder_diagnostics import publish_recorder_diagnostic
 
-            published = publish_recorder_diagnostic(
-                redis, str(channel_uuid), str(lease._value),
-                worker_id=attempt.worker_id, phase=phase, source="dedicated",
-                stream_id=attempt.stream_id, account_id=attempt.account_id,
-                started_at=started_at or time.time(),
-                config_generation=attempt.config_generation,
-                control_generation=attempt.control_generation,
-                fence=int(lease.fence), error_code=error_code,
-            )
-            if published:
-                with attempt_state_lock:
+                effective_started_at = started_at or time.time()
+                published = publish_recorder_diagnostic(
+                    redis, str(channel_uuid), str(lease._value),
+                    worker_id=attempt.worker_id, phase=phase, source="dedicated",
+                    stream_id=attempt.stream_id, account_id=attempt.account_id,
+                    started_at=effective_started_at,
+                    config_generation=attempt.config_generation,
+                    control_generation=attempt.control_generation,
+                    fence=int(lease.fence), error_code=error_code,
+                )
+                if published:
                     attempt_state["diagnostic"] = {
                         "kind": "dedicated", "attempt": attempt,
-                        "started_at": started_at or time.time(), "phase": phase,
+                        "started_at": effective_started_at, "phase": phase,
                         "last_published": time.monotonic(),
                     }
-        except Exception:
-            # Diagnostics are advisory and must never alter admission or cleanup.
-            return
+            except Exception:
+                # Diagnostics are advisory and must never alter admission or cleanup.
+                return
 
     def publish_borrow_diagnostic(
         prepared, phase: str, *, error_code: str | None = None,
         started_at: float | None = None,
     ) -> None:
-        try:
-            from .recorder_diagnostics import publish_borrowed_recorder_diagnostic
+        with attempt_state_lock:
+            try:
+                from .recorder_diagnostics import publish_borrowed_recorder_diagnostic
 
-            capability = prepared.capability
-            identity = capability.connection_identity
-            published = publish_borrowed_recorder_diagnostic(
-                redis, str(channel_uuid), str(lease._value),
-                episode_id=prepared.episode_id, client_id=prepared.client_id,
-                worker_id=identity[1],
-                stream_id=identity[4], account_id=identity[5],
-                m3u_profile_id=identity[6], input_profile_id=identity[7],
-                catalog_generation=capability.catalog_generation,
-                phase=phase, started_at=started_at or time.time(),
-                config_generation=capability.configuration_generation,
-                control_generation=capability.control_generation,
-                fence=capability.recorder_fence, error_code=error_code,
-            )
-            if published:
-                with attempt_state_lock:
+                capability = prepared.capability
+                identity = capability.connection_identity
+                effective_started_at = started_at or time.time()
+                published = publish_borrowed_recorder_diagnostic(
+                    redis, str(channel_uuid), str(lease._value),
+                    episode_id=prepared.episode_id, client_id=prepared.client_id,
+                    worker_id=identity[1],
+                    stream_id=identity[4], account_id=identity[5],
+                    m3u_profile_id=identity[6], input_profile_id=identity[7],
+                    catalog_generation=capability.catalog_generation,
+                    phase=phase, started_at=effective_started_at,
+                    config_generation=capability.configuration_generation,
+                    control_generation=capability.control_generation,
+                    fence=capability.recorder_fence, error_code=error_code,
+                )
+                if published:
                     attempt_state["diagnostic"] = {
                         "kind": "borrowed", "prepared": prepared,
-                        "started_at": started_at or time.time(), "phase": phase,
+                        "started_at": effective_started_at, "phase": phase,
                         "last_published": time.monotonic(),
                     }
-        except Exception:
-            # Diagnostics are advisory and must never alter admission or cleanup.
-            return
+            except Exception:
+                # Diagnostics are advisory and must never alter admission or cleanup.
+                return
 
     try:
         stop_event = threading.Event()
@@ -311,11 +369,11 @@ def record_channel(
                 _, cleanup_pending = retry_durable_open_cleanups(
                     episode_ledger, redis, now=time.time(), channel_uuid=str(channel_uuid),
                 )
-            except Exception:
+            except Exception as exc:
                 cleanup_pending = 1
-                error("sharing_recovery_failed")
+                error("sharing_recovery_failed", exc, callsite="startup_recovery")
             if cleanup_pending:
-                error("sharing_cleanup_pending")
+                error("sharing_cleanup_pending", callsite="startup_recovery")
                 return {"status": "sharing_cleanup_pending"}
 
             # Recovery may have crossed a lease or configuration boundary.
@@ -325,7 +383,7 @@ def record_channel(
                 channel_uuid, expected_generation, expected_control_generation
             )
             if (recovered_admission["status"] != "ready" or not lease.renew()):
-                error("sharing_recovery_stale")
+                error("sharing_recovery_stale", callsite="startup_admission")
                 return {"status": "sharing_recovery_stale"}
             active = recovered_admission["active"]
 
@@ -344,7 +402,7 @@ def record_channel(
             if pending_return is not None:
                 return_receipt = sharing_coordinator.recovered_return_receipt()
                 if return_receipt is None:
-                    error("sharing_return_recovery_pending")
+                    error("sharing_return_recovery_pending", callsite="return_recovery")
                     return {"status": "sharing_return_recovery_pending"}
                 attempt_state["return_prepared"] = return_receipt
             # A channel without an allowed dedicated source still needs a live
@@ -363,24 +421,10 @@ def record_channel(
                     ):
                         stop_event.set()
                         return
-                    with attempt_state_lock:
-                        current_diagnostic = attempt_state.get("diagnostic")
-                    if (
-                        isinstance(current_diagnostic, dict)
-                        and time.monotonic() - current_diagnostic.get("last_published", 0) >= 10
-                    ):
-                        if current_diagnostic.get("kind") == "dedicated":
-                            publish_dedicated_diagnostic(
-                                current_diagnostic.get("attempt"),
-                                current_diagnostic.get("phase", "starting"),
-                                started_at=current_diagnostic.get("started_at"),
-                            )
-                        elif current_diagnostic.get("kind") == "borrowed":
-                            publish_borrow_diagnostic(
-                                current_diagnostic.get("prepared"),
-                                current_diagnostic.get("phase", "starting"),
-                                started_at=current_diagnostic.get("started_at"),
-                            )
+                    _refresh_current_recorder_diagnostic(
+                        attempt_state_lock, attempt_state,
+                        publish_dedicated_diagnostic, publish_borrow_diagnostic,
+                    )
                     if stats_capability_key is not None:
                         if not redis.expire(
                             stats_capability_key, RECORDER_CAPABILITY_TTL_SECONDS
@@ -427,8 +471,8 @@ def record_channel(
                     ):
                         stop_event.set()
                         return
-                except Exception:
-                    error("supervision_failed")
+                except Exception as exc:
+                    error("supervision_failed", exc, callsite="recorder_supervisor")
                     stop_event.set()
                     return
 
@@ -447,8 +491,8 @@ def record_channel(
                     active=initial_admission["active"],
                     control_generation=expected_control_generation,
                 )
-            except Exception:
-                error("sharing_observation_failed")
+            except Exception as exc:
+                error("sharing_observation_failed", exc, callsite="native_observation")
                 return {"status": "sharing_unavailable"}
             if initial_borrow is not None:
                 attempt_state["borrow"] = initial_borrow
@@ -477,7 +521,6 @@ def record_channel(
                     from .sharing_runtime import (
                         borrow_cleanup_acknowledged,
                         retry_durable_open_cleanups,
-                        retry_pending_open_cleanups,
                     )
 
                     episode_ledger = BorrowEpisodeLedger(
@@ -489,8 +532,8 @@ def record_channel(
                     retry_durable_open_cleanups(
                         episode_ledger, redis, now=time.time(),
                         stale_after=0, episode_id=prepared.episode_id,
+                        channel_uuid=str(channel_uuid),
                     )
-                    retry_pending_open_cleanups()
                     return borrow_cleanup_acknowledged(redis, episode_ledger, prepared)
                 except Exception:
                     return False
@@ -509,7 +552,7 @@ def record_channel(
                     # to an allowlisted recorder while its native registration
                     # may still be present.
                     if not cleanup_prepared_borrow(prepared):
-                        error("borrow_cleanup_pending")
+                        error("borrow_cleanup_pending", callsite="borrowed_cleanup")
                     stop_event.set()
                     return True
                 from .adapters.sharing_borrow_route import encode_borrow_capability
@@ -532,7 +575,7 @@ def record_channel(
                 )
                 if stop_event.is_set() or current_state["status"] != "ready":
                     if not cleanup_prepared_borrow(prepared):
-                        error("borrow_cleanup_pending")
+                        error("borrow_cleanup_pending", callsite="borrowed_cleanup")
                     stop_event.set()
                     return True
                 borrow_outcome = "failure"
@@ -549,12 +592,12 @@ def record_channel(
 
                 try:
                     borrow_result = recorder.run_candidate(
-                        stop_event, startup_timeout=60,
+                        stop_event, startup_timeout=DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
                         media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
                         on_first_media=record_borrow_media,
                     )
-                except Exception:
-                    error("borrowed_recorder_worker_stopped")
+                except Exception as exc:
+                    error("borrowed_recorder_worker_stopped", exc, callsite="borrowed_worker")
                     publish_borrow_diagnostic(
                         prepared, "error", error_code="borrowed_recorder_worker_stopped",
                         started_at=borrow_started_at,
@@ -586,7 +629,7 @@ def record_channel(
                             with attempt_state_lock:
                                 attempt_state["return_prepared"] = prepared
                 if not cleanup_acknowledged:
-                    error("borrow_cleanup_pending")
+                    error("borrow_cleanup_pending", callsite="borrowed_cleanup")
                     publish_borrow_diagnostic(
                         prepared, "cleanup_pending", started_at=borrow_started_at,
                     )
@@ -671,10 +714,10 @@ def record_channel(
                             current_lease_fence=int(lease.fence),
                             unreturned_capability=True,
                         ):
-                            error("sharing_attempt_cleanup_pending")
+                            error("sharing_attempt_cleanup_pending", callsite="attempt_reconciliation")
                             stop_event.set()
                             return {"status": "sharing_cleanup_pending"}
-                        error("sharing_attempt_reconciled")
+                        error("sharing_attempt_reconciled", callsite="attempt_reconciliation")
                         return {"status": "sharing_admission_uncertain"}
                     with attempt_state_lock:
                         attempt_state["attempt"] = attempt
@@ -738,22 +781,22 @@ def record_channel(
                             try:
                                 result = recorder.run_candidate(
                                     stop_event,
-                                    startup_timeout=60,
+                                    startup_timeout=DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
                                     media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
                                     **({"attempt_switch": attempt_switch}
                                        if attempt_switch is not None else {}),
                                     **({"on_first_media": first_media_callback}
                                        if first_media_callback is not None else {}),
                                 )
-                            except Exception:
-                                error("recorder_worker_stopped")
+                            except Exception as exc:
+                                error("recorder_worker_stopped", exc, callsite="dedicated_worker")
                                 publish_dedicated_diagnostic(
                                     attempt, "error", error_code="recorder_worker_stopped",
                                     started_at=dedicated_started_at,
                                 )
                             else:
                                 if result.status in {"no_media", "media_stalled", "exited"}:
-                                    error("recorder_worker_stopped")
+                                    error("recorder_worker_stopped", callsite="dedicated_worker")
                                     publish_dedicated_diagnostic(
                                         attempt, "error", error_code="recorder_worker_stopped",
                                         started_at=dedicated_started_at,
@@ -770,8 +813,8 @@ def record_channel(
                             cleanup_ok = stop_recorder_attempt(redis, attempt, lease)
                             if cleanup_ok and sharing_authority is not None:
                                 cleanup_ok = attempt.acknowledge_reaped(redis)
-                        except Exception:
-                            error("supervision_failed")
+                        except Exception as exc:
+                            error("supervision_failed", exc, callsite="dedicated_worker")
                         if not revoked or not cleanup_ok:
                             stop_event.set()
                         with attempt_state_lock:
@@ -842,8 +885,8 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
 
     try:
         active, control = load_applied_state()
-    except RecorderControlError:
-        error("control_state_invalid")
+    except RecorderControlError as exc:
+        error("control_state_invalid", exc, callsite="control_state_read")
         return {"status": "control_unavailable"}
     if control.paused:
         return {"status": "recording_paused"}
@@ -867,8 +910,8 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
         return {"status": "stale_configuration"}
     try:
         schedule, timezone_name = _active_schedule(active, channel_uuid)
-    except (ScheduleError, ValueError):
-        error("schedule_install_failed")
+    except (ScheduleError, ValueError) as exc:
+        error("schedule_install_failed", exc, callsite="schedule_validation")
         return {"status": "invalid_schedule"}
     if not schedule_is_active(schedule, timezone_name, datetime.now(timezone.utc)):
         event("recorder_schedule_closed")

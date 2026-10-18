@@ -56,6 +56,25 @@ class LoggingUtilsTests(unittest.TestCase):
             invalid.records[0].getMessage(),
         )
 
+    def test_error_logs_only_allowlisted_callsite_and_exception_class(self):
+        apply_log_level("ERROR")
+        with self.assertLogs("catchuparr", level="ERROR") as captured:
+            error(
+                "sharing_observation_failed",
+                RuntimeError("https://user:secret@example.invalid/feed"),
+                callsite="native_observation",
+            )
+            error(
+                "sharing_observation_failed",
+                RuntimeError("private detail"),
+                callsite="opening_cleanup",
+            )
+        output = "\n".join(record.getMessage() for record in captured.records)
+        self.assertIn("cause=native_observation exception=RuntimeError", output)
+        self.assertIn("cause=opening_cleanup exception=RuntimeError", output)
+        self.assertNotIn("secret", output)
+        self.assertNotIn("private detail", output)
+
     def test_events_are_prefixed_and_drop_unapproved_values(self):
         with self.assertLogs("catchuparr", level="INFO") as captured:
             event(

@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from .engine.recorder import (
+    ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS,
+    DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
+)
 from .recorder_diagnostics import (
     _selected_channel_ids,
     last_error_key,
@@ -14,9 +21,10 @@ from .recorder_diagnostics import (
     read_recorder_diagnostics,
 )
 
-STARTUP_TIMEOUT_SECONDS = 60.0
-MEDIA_IDLE_TIMEOUT_SECONDS = 120.0
-INDEX_FINALIZATION_GRACE_SECONDS = 5.0
+_SAFE_DISPLAY = re.compile(r"^[^\x00-\x1f\x7f]{1,120}$")
+_SENSITIVE_DISPLAY = re.compile(
+    r"(?i)(://|\b[a-z][a-z0-9+.-]*:|\b(?:bearer|authorization|password|api[_ -]?key|access[_ -]?token)\b|[?&](?:token|key|auth)=|\b[a-z0-9.-]+\.(?:com|net|org|io|tv)(?:/|$))"
+)
 
 
 def current_recordings(settings, control_state=None, *, redis_client=None, now=None):
@@ -70,6 +78,11 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
     for channel_uuid in channel_ids:
         channel = metadata.get(channel_uuid, {})
         diagnostic = diagnostics.get(channel_uuid)
+        evidence = None
+        if diagnostic and diagnostic.get("phase") != "error":
+            evidence = _indexed_media_since(
+                settings, channel_uuid, diagnostic["started_at"], timestamp,
+            )
         if not redis_ready:
             state, mode, reason = "unknown", "unconfirmed", "redis_unavailable"
         elif diagnostic and diagnostic.get("phase") == "error":
@@ -89,6 +102,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
             else:
                 state, mode, reason = _state_for_channel(
                     settings, channel_uuid, diagnostic, redis_client, timestamp,
+                    evidence=evidence,
                 )
         source = _source_for_diagnostic(channel_uuid, diagnostic) if diagnostic else None
         if source is not None:
@@ -107,7 +121,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         channel_row = {
             "channel_uuid": channel_uuid,
             "number": channel.get("number"),
-            "name": channel.get("name") or "Unknown channel",
+            "name": _safe_display(channel.get("name")) or "Unknown channel",
             "state": state,
             "mode": mode,
             "reason": reason,
@@ -116,19 +130,32 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         if diagnostic and diagnostic.get("phase") == "error":
             channel_row["error_code"] = diagnostic.get("error_code")
         if diagnostic and diagnostic.get("phase") == "recording":
-            evidence = _indexed_media_since(settings, channel_uuid, diagnostic["started_at"], timestamp)
-            if evidence["available"]:
-                channel_row["indexed_segments_since_attempt"] = evidence["count"]
-                channel_row["recent_media_progress"] = evidence["recent"]
-            else:
-                channel_row["indexed_segments_since_attempt"] = None
-                channel_row["recent_media_progress"] = None
+            channel_row["indexed_segments_since_attempt"] = (
+                evidence["count"] if evidence and evidence["available"] else None
+            )
+            channel_row["recent_media_progress"] = (
+                evidence["recent"] if evidence and evidence["available"] else None
+            )
+        progress_at = evidence.get("last_progress_at") if evidence and evidence.get("available") else None
+        channel_row["last_confirmed_progress_at"] = (
+            datetime.fromtimestamp(progress_at, tz=timezone.utc).isoformat()
+            if progress_at is not None else None
+        )
+        channel_row["last_confirmed_progress_none"] = progress_at is None
         rows.append(channel_row)
 
     rows.sort(key=_channel_sort_key)
     counts = {name: sum(row["state"] == name for row in rows) for name in _STATES}
-    lines = [f"{_display_name(row)} — {row['state'].replace('_', ' ')}" for row in rows]
-    message = "Current recordings\n" + ("\n".join(lines) if lines else "No channels are selected.")
+    problem_count = sum(
+        row["state"] in {"no_media_progress", "cleanup_pending", "error", "unknown"}
+        for row in rows
+    )
+    counts["problems"] = problem_count
+    lines = [f"Problems: {problem_count}"]
+    lines.extend(_message_row(row) for row in rows)
+    if not rows:
+        lines.append("No channels are selected.")
+    message = "Current recordings\n" + "\n".join(lines)
     return {"status": "ok", "message": message, "channels": rows, "summary": counts}
 
 
@@ -158,10 +185,13 @@ def source_metadata(channel_uuid, stream_id, account_id, profile_id=None):
         if account is None or actual_account_id != str(account_id):
             return None
         result = {
-            "stream_name": str(getattr(stream, "name", "") or "") or None,
+            "stream_name": _safe_display(getattr(stream, "name", None)),
+            "stream_id": str(getattr(stream, "id", "") or "") or None,
             "provider_id": actual_account_id,
-            "provider_name": str(getattr(account, "name", "") or "") or None,
+            "provider_name": _safe_display(getattr(account, "name", None)),
         }
+        if not _safe_identifier(result["stream_id"]) or not _safe_identifier(actual_account_id):
+            return None
         if profile_id is not None:
             if not isinstance(profile_id, str) or not profile_id:
                 return None
@@ -169,7 +199,7 @@ def source_metadata(channel_uuid, stream_id, account_id, profile_id=None):
             if profile is None:
                 return None
             result["profile_id"] = str(profile.id)
-            result["profile_name"] = str(getattr(profile, "name", "") or "") or None
+            result["profile_name"] = _safe_display(getattr(profile, "name", None))
         return result
     except Exception:
         return None
@@ -191,7 +221,7 @@ def _mode(diagnostic):
     return source if source in {"dedicated", "borrowed"} else "unconfirmed"
 
 
-def _state_for_channel(settings, channel_uuid, diagnostic, redis_client, now):
+def _state_for_channel(settings, channel_uuid, diagnostic, redis_client, now, *, evidence=None):
     if diagnostic is None:
         try:
             if int(redis_client.ttl(live_key(channel_uuid))) > 0:
@@ -213,15 +243,19 @@ def _state_for_channel(settings, channel_uuid, diagnostic, redis_client, now):
     if phase == "no_media_progress":
         return "no_media_progress", mode, "media_progress_not_confirmed"
     if phase == "starting":
-        if now - diagnostic["started_at"] <= STARTUP_TIMEOUT_SECONDS:
+        if evidence is not None and not evidence["available"]:
+            return "unknown", mode, "archive_index_unavailable"
+        if now - diagnostic["started_at"] <= DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS:
             return "starting", mode, "recorder_starting"
         return "no_media_progress", mode, "startup_media_not_confirmed"
     if phase == "recording":
-        evidence = _indexed_media_since(settings, channel_uuid, diagnostic["started_at"], now)
+        evidence = evidence or _indexed_media_since(
+            settings, channel_uuid, diagnostic["started_at"], now,
+        )
         if not evidence["available"]:
             return "unknown", mode, "archive_index_unavailable"
         if evidence["count"] < 1:
-            if now - diagnostic["started_at"] <= STARTUP_TIMEOUT_SECONDS:
+            if now - diagnostic["started_at"] <= DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS:
                 return "starting", mode, "waiting_for_first_indexed_segment"
             return "no_media_progress", mode, "no_indexed_segment_since_attempt"
         if evidence["recent"]:
@@ -241,19 +275,66 @@ def _indexed_media_since(settings, channel_uuid, started_at, now):
         try:
             db.execute("PRAGMA query_only=ON")
             row = db.execute(
-                "SELECT COUNT(*), MAX(end_utc) FROM segments "
-                "WHERE channel_id=? AND end_utc>?",
-                (channel_uuid, float(started_at)),
+                "SELECT COUNT(*), MAX(created_at) FROM segments "
+                "WHERE channel_id=? AND created_at>=? AND created_at<=?",
+                (channel_uuid, float(started_at),
+                 float(now) + ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS),
             ).fetchone()
         finally:
             db.close()
         count, latest = int(row[0] or 0), row[1]
-        fresh = (latest is not None and -INDEX_FINALIZATION_GRACE_SECONDS
-                 <= float(now) - float(latest)
-                 <= MEDIA_IDLE_TIMEOUT_SECONDS + INDEX_FINALIZATION_GRACE_SECONDS)
-        return {"available": True, "count": count, "recent": bool(count and fresh)}
+        fresh = (
+            latest is not None
+            and -ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS <= float(now) - float(latest)
+            <= DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS + ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS
+        )
+        return {
+            "available": True, "count": count, "recent": bool(count and fresh),
+            "last_progress_at": float(latest) if latest is not None else None,
+        }
     except (OSError, sqlite3.Error, TypeError, ValueError, KeyError):
-        return {"available": False, "count": 0, "recent": False}
+        return {"available": False, "count": 0, "recent": False, "last_progress_at": None}
+
+
+def _safe_display(value):
+    if value is None:
+        return None
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    if not _SAFE_DISPLAY.fullmatch(text) or _SENSITIVE_DISPLAY.search(text):
+        return None
+    return text or None
+
+
+def _safe_identifier(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is not None
+
+
+def _message_row(row):
+    state = row["state"].replace("_", " ")
+    parts = [f"{_display_name(row)} — {state}"]
+    source = row.get("source")
+    if source:
+        details = [source.get("mode")]
+        stream_name = source.get("stream_name")
+        stream_id = source.get("stream_id")
+        if stream_name:
+            details.append(f"{stream_name} (id {stream_id})" if stream_id else stream_name)
+        elif stream_id:
+            details.append(f"stream id {stream_id}")
+        provider_name, provider_id = source.get("provider_name"), source.get("provider_id")
+        if provider_name:
+            details.append(f"provider {provider_name} (id {provider_id})" if provider_id else f"provider {provider_name}")
+        profile_name, profile_id = source.get("profile_name"), source.get("profile_id")
+        if profile_name:
+            details.append(f"profile {profile_name} (id {profile_id})" if profile_id else f"profile {profile_name}")
+        elif profile_id:
+            details.append(f"profile id {profile_id}")
+        parts.append("  Source: " + "; ".join(value for value in details if value))
+    if row.get("last_confirmed_progress_none"):
+        parts.append("  Last confirmed progress: none")
+    elif row.get("last_confirmed_progress_at"):
+        parts.append(f"  Last confirmed progress: {row['last_confirmed_progress_at']}")
+    return "\n".join(parts)
 
 
 def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now):
@@ -282,20 +363,28 @@ def _unknown_all(settings, channel_ids, control_state, reason):
     metadata = _channel_metadata(channel_ids)
     rows = [
         {"channel_uuid": channel_id, "number": metadata.get(channel_id, {}).get("number"),
-         "name": metadata.get(channel_id, {}).get("name") or "Unknown channel",
-         "state": "unknown", "mode": "unconfirmed", "reason": reason, "source": None}
+         "name": _safe_display(metadata.get(channel_id, {}).get("name")) or "Unknown channel",
+         "state": "unknown", "mode": "unconfirmed", "reason": reason, "source": None,
+         "last_confirmed_progress_at": None, "last_confirmed_progress_none": True}
         for channel_id in channel_ids
     ]
     rows.sort(key=_channel_sort_key)
-    return {"status": "ok", "message": "Current recordings\n" + "\n".join(
-        f"{_display_name(row)} — unknown ({reason.replace('_', ' ')})" for row in rows
-    ), "channels": rows,
-        "summary": {name: sum(row["state"] == name for row in rows) for name in _STATES}}
+    summary = {name: sum(row["state"] == name for row in rows) for name in _STATES}
+    summary["problems"] = len(rows)
+    return {
+        "status": "ok",
+        "message": "Current recordings\nProblems: " + str(len(rows)) + "\n" + "\n".join(
+            f"{_message_row(row)}\n  Reason: {reason.replace('_', ' ')}" for row in rows
+        ),
+        "channels": rows,
+        "summary": summary,
+    }
 
 
 def _unavailable(reason):
     return {"status": "unavailable", "message": "Current recordings are unavailable.",
-            "channels": [], "summary": {name: 0 for name in _STATES}, "reason": reason}
+            "channels": [], "summary": {**{name: 0 for name in _STATES}, "problems": 0},
+            "reason": reason}
 
 
 def _channel_sort_key(row):
