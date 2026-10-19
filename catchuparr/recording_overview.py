@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from .action_messages import format_action_message
 from .engine.recorder import (
     ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS,
     DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
@@ -26,9 +27,6 @@ _SAFE_DISPLAY = re.compile(r"^[^\x00-\x1f\x7f]{1,120}$")
 _SENSITIVE_DISPLAY = re.compile(
     r"(?i)(://|\b[a-z][a-z0-9+.-]*:|\b(?:bearer|authorization|password|api[_ -]?key|access[_ -]?token)\b|[?&](?:token|key|auth)=|\b[a-z0-9.-]+\.(?:com|net|org|io|tv)(?:/|$))"
 )
-ACTION_MESSAGE_SEPARATOR = " " + "\u00a0" * 200 + " "
-
-
 def current_recordings(settings, control_state=None, *, redis_client=None, now=None):
     """Return state for every selected applied channel without changing state.
 
@@ -162,7 +160,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         message = "Recording schedule unavailable."
         status = "unavailable"
     elif visible:
-        message = ACTION_MESSAGE_SEPARATOR.join(_message_row(row) for row in visible)
+        message = format_action_message(_message_row(row) for row in visible)
         status = "ok"
     else:
         message = "No recordings scheduled now."
@@ -441,7 +439,7 @@ def _unknown_all(settings, channel_ids, control_state, reason, *, now=None):
     visible = [row for row in rows if row.get("scheduled_now") is True]
     message = (
         "Recording schedule unavailable." if schedule_unknown else
-        ACTION_MESSAGE_SEPARATOR.join(_message_row(row) for row in visible) if visible else
+        format_action_message(_message_row(row) for row in visible) if visible else
         "No recordings scheduled now."
     )
     return {
