@@ -139,14 +139,14 @@ def _run_current_recordings_readonly(action, archive_db):
     return result
 
 
-def _assert_live_overview(root, active_path, control_path, channel_uuid, expected_mode):
+def _assert_live_overview(archive_root, active_path, control_path, channel_uuid, expected_mode):
     """Validate read-only current-recording output while a real attempt is live."""
     import hashlib
     from datetime import datetime, timezone
 
     from catchuparr.plugin import Plugin
 
-    archive_root = Path(root)
+    archive_root = Path(archive_root)
     archive_db = archive_root / "archive.sqlite3"
     outbox_db = active_path.with_name(".catchuparr-sharing-authority.sqlite3")
 
@@ -5094,7 +5094,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         borrowed_diagnostic_cleanup = probe_live_borrowed_diagnostic(redis_client, worker_id)
         try:
             _assert_live_overview(
-                root, active_path, control_path, worker_id, "borrowed",
+                archive_root, active_path, control_path, worker_id, "borrowed",
             )
         finally:
             borrowed_diagnostic_cleanup()
@@ -5257,7 +5257,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         dedicated_diagnostic_cleanup = probe_live_dedicated_diagnostic(redis_client, worker_id)
         try:
             _assert_live_overview(
-                root, active_path, control_path, worker_id, "dedicated",
+                archive_root, active_path, control_path, worker_id, "dedicated",
             )
         finally:
             dedicated_diagnostic_cleanup()

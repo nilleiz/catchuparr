@@ -65,7 +65,9 @@ class RecorderMediaProbeTests(unittest.TestCase):
 
     def test_live_readonly_probe_allows_concurrent_archive_append_and_denies_writes(self):
         with tempfile.TemporaryDirectory() as directory:
-            archive_db = Path(directory) / "archive.sqlite3"
+            configured_archive_root = Path(directory) / "synthetic-live-archive"
+            configured_archive_root.mkdir()
+            archive_db = configured_archive_root / "archive.sqlite3"
             with sqlite3.connect(archive_db) as database:
                 database.execute("CREATE TABLE segments (created_at INTEGER)")
                 database.execute("INSERT INTO segments VALUES (1)")
@@ -99,6 +101,27 @@ class RecorderMediaProbeTests(unittest.TestCase):
 
             with self.assertRaises(sqlite3.DatabaseError):
                 probe._run_current_recordings_readonly(attempted_write, archive_db)
+
+    def test_live_overview_calls_use_the_configured_nested_archive_root(self):
+        source = (Path(__file__).parents[1] / "scripts/aio_recorder_media.py").read_text()
+        tree = ast.parse(source)
+        probe_function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "probe_actual_live_archive_isolation"
+        )
+        calls = [
+            node for node in ast.walk(probe_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_assert_live_overview"
+        ]
+        self.assertEqual(2, len(calls))
+        self.assertTrue(all(
+            isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "archive_root"
+            for call in calls
+        ))
 
     def test_dead_recorder_failure_reports_safe_terminal_task_diagnostics(self):
         thread = threading.Thread(target=lambda: None)
