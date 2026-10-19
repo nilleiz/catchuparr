@@ -6,13 +6,10 @@ import math
 import unicodedata
 from collections.abc import Iterable
 
-# Canvas measurements for 17px Lato; gap target is intentionally 280px.
+# Canvas measurements for 17px Lato at the 350px action-message width.
 # Estimates are static and do not inspect the runtime font or viewport.
-TARGET_WIDTH_PX = 280.0
+TARGET_WIDTH_PX = 350.0
 NBSP_WIDTH_PX = 4.35205
-# The static glyph widths add without browser font-pair kerning. Chromium
-# measured a 1.53px smaller width for a near-target synthetic schedule row.
-WRAP_TOLERANCE_PX = 2.0
 FALLBACK_LATIN_WIDTH_PX = 8.5
 EAST_ASIAN_WIDTH_PX = 17.0
 _CALIBRATED_WIDTHS = {
@@ -175,13 +172,10 @@ def _last_visual_line_width(text: str) -> float:
         for index, (kind, unit_width) in enumerate(units):
             if index == 0 and line_width:
                 line_width += _CALIBRATED_WIDTHS[" "]
-                if line_width + unit_width > TARGET_WIDTH_PX + WRAP_TOLERANCE_PX:
+                if line_width + unit_width > TARGET_WIDTH_PX:
                     line_width = 0.0
             break_before = kind != "\0" or (index > 0 and units[index - 1][0] != "\0")
-            if (
-                break_before and line_width
-                and line_width + unit_width > TARGET_WIDTH_PX + WRAP_TOLERANCE_PX
-            ):
+            if break_before and line_width and line_width + unit_width > TARGET_WIDTH_PX:
                 line_width = unit_width
             else:
                 line_width += unit_width
