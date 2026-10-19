@@ -227,7 +227,7 @@ def _source_for_diagnostic(channel_uuid, diagnostic):
         "stream_id": diagnostic.get("stream_id"),
         "account_id": diagnostic.get("account_id"),
         "m3u_profile_id": diagnostic.get("m3u_profile_id"),
-        "input_profile_id": diagnostic.get("input_profile_id"),
+        "input_profile_id": diagnostic.get("input_profile_id") or None,
     }
 
 

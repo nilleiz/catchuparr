@@ -103,6 +103,8 @@ def _dedicated_writer_guard_checks(redis_client, channel_uuid, lease_value, live
         "current_attempt_native_owner_lock_live": False,
         "current_attempt_native_owner_heartbeat_live": False,
         "current_attempt_metadata_matches": False,
+        "current_attempt_m3u_profile_matches": False,
+        "current_attempt_input_profile_absent": False,
         "current_attempt_profile_matches": False,
         "current_attempt_state_supported": False,
         "current_attempt_stop_marker_clear": False,
@@ -170,10 +172,16 @@ def _dedicated_writer_guard_checks(redis_client, channel_uuid, lease_value, live
             metadata.get("owner") == owner
             and metadata.get("stream_id") == worker.get("stream_id")
         )
-        checks["current_attempt_profile_matches"] = bool(
+        checks["current_attempt_m3u_profile_matches"] = bool(
             worker.get("profile_id")
             and metadata.get("m3u_profile") == worker.get("profile_id")
-            and metadata.get("stream_profile")
+        )
+        checks["current_attempt_input_profile_absent"] = (
+            "stream_profile" not in metadata
+        )
+        checks["current_attempt_profile_matches"] = bool(
+            checks["current_attempt_m3u_profile_matches"]
+            and checks["current_attempt_input_profile_absent"]
         )
         checks["current_attempt_state_supported"] = metadata.get("state", "").lower() in {
             "active", "waiting_for_clients",

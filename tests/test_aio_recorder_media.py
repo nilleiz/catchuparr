@@ -170,7 +170,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
                     return {
                         b"owner": b"native-owner-synthetic",
                         b"stream_id": b"stream-synthetic", b"m3u_profile": b"5",
-                        b"stream_profile": b"4", b"state": b"active",
+                        b"state": b"active",
                     }
                 return {}
 
@@ -201,6 +201,9 @@ class RecorderMediaProbeTests(unittest.TestCase):
                 self.assertTrue(checks["current_attempt_lease_matches"])
                 self.assertFalse(checks["live_record_matches_current_attempt"])
                 self.assertTrue(checks["current_attempt_native_owner_heartbeat_live"])
+                self.assertTrue(checks["current_attempt_m3u_profile_matches"])
+                self.assertTrue(checks["current_attempt_input_profile_absent"])
+                self.assertTrue(checks["current_attempt_profile_matches"])
                 self.assertTrue(all(type(value) is bool for value in checks.values()))
 
         for scanned_keys in ([], [worker_key, worker_key.encode()]):

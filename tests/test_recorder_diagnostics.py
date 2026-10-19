@@ -77,6 +77,55 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         ))
         self.assertEqual(args[5], f"live:worker:{self.redis.native_owner}:heartbeat")
 
+    def test_dedicated_write_proves_native_missing_input_profile_exactly(self):
+        class NoInputProfileRedis(RecordingRedis):
+            def hgetall(inner_self, key):
+                values = super(NoInputProfileRedis, inner_self).hgetall(key)
+                if ":metadata" in key:
+                    values.pop(b"stream_profile", None)
+                return values
+
+        redis = NoInputProfileRedis()
+        redis.worker_id = self.worker_id
+        with patch("catchuparr.adapters.recorder_proxy.is_managed_worker_id", return_value=True):
+            self.assertTrue(publish_recorder_diagnostic(
+                redis, self.channel, "8:synthetic-owner", worker_id=self.worker_id,
+                phase="recording", source="dedicated", stream_id="31", account_id="7",
+                started_at=1000, config_generation=self.generation,
+                control_generation=3, fence=8, now=1010,
+            ))
+        script, _, args = redis.calls[0]
+        self.assertIn("(redis.call('HGET', KEYS[7], 'stream_profile') or '') ~= ARGV[18]", script)
+        self.assertIn("redis.call('HEXISTS', KEYS[7], 'stream_profile') ~= 0", script)
+        self.assertEqual(args[-6:], (
+            "recording", "dedicated", "", "5", "", redis.native_owner,
+        ))
+
+        class EmptyInputProfileRedis(RecordingRedis):
+            def hgetall(inner_self, key):
+                values = super(EmptyInputProfileRedis, inner_self).hgetall(key)
+                if ":metadata" in key:
+                    values[b"stream_profile"] = b""
+                return values
+
+        empty_profile_redis = EmptyInputProfileRedis()
+        empty_profile_redis.worker_id = self.worker_id
+        with patch("catchuparr.adapters.recorder_proxy.is_managed_worker_id", return_value=True):
+            self.assertFalse(publish_recorder_diagnostic(
+                empty_profile_redis, self.channel, "8:synthetic-owner",
+                worker_id=self.worker_id, phase="recording", source="dedicated",
+                stream_id="31", account_id="7", started_at=1000,
+                config_generation=self.generation, control_generation=3, fence=8, now=1010,
+            ))
+        self.assertEqual(empty_profile_redis.calls, [])
+
+        self.assertFalse(publish_recorder_diagnostic(
+            redis, self.channel, "8:synthetic-owner", worker_id=self.worker_id,
+            phase="recording", source="unconfirmed", stream_id="31", account_id="7",
+            started_at=1000, config_generation=self.generation,
+            control_generation=3, fence=8, now=1010,
+        ))
+
     def test_borrowed_write_checks_current_authority_and_exact_grant(self):
         self.assertIsNone(_SAFE_ID.fullmatch("native:worker.123"))
         self.assertIsNotNone(_SAFE_NATIVE_OWNER.fullmatch("native:worker.123"))
@@ -254,6 +303,23 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
         redis.native_alive = False
         self.assertNotIn(self.channel, self._read(redis))
         redis.native_alive = True
+        redis.native_metadata["stream_profile"] = "stale"
+        self.assertNotIn(self.channel, self._read(redis))
+
+    def test_dedicated_binding_accepts_exact_absence_of_native_input_profile(self):
+        live = dict(self.live, input_profile_id="")
+        redis = DiagnosticReaderRedis(live=live)
+        redis.native_metadata = {
+            "owner": self.worker_id, "stream_id": "31", "m3u_profile": "9",
+            "state": "active",
+        }
+        self.assertIn(self.channel, self._read(redis))
+        redis.native_metadata["stream_profile"] = ""
+        self.assertNotIn(self.channel, self._read(redis))
+        redis.native_metadata.pop("stream_profile")
+        redis.native_metadata["m3u_profile"] = "stale"
+        self.assertNotIn(self.channel, self._read(redis))
+        redis.native_metadata["m3u_profile"] = "9"
         redis.native_metadata["stream_profile"] = "stale"
         self.assertNotIn(self.channel, self._read(redis))
 

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.configuration import active_configuration_generation
-from catchuparr.recording_overview import _safe_display, current_recordings
+from catchuparr.recording_overview import _safe_display, _source_for_diagnostic, current_recordings
 from catchuparr.schedule import normalize_schedule
 
 
@@ -63,6 +63,13 @@ class RecordingOverviewTests(unittest.TestCase):
             return current_recordings(
                 self.settings, control or self.control, redis_client=self.redis, now=self.now,
             )
+
+    def test_dedicated_diagnostic_without_native_input_profile_has_no_profile_lookup(self):
+        source = _source_for_diagnostic(self.channel, {
+            "source": "dedicated", "stream_id": "17", "account_id": "4",
+            "m3u_profile_id": "9", "input_profile_id": "",
+        })
+        self.assertIsNone(source["input_profile_id"])
 
     def test_recording_requires_fresh_indexed_media_after_attempt_start(self):
         start = self.now.timestamp() - 100
