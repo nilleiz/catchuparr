@@ -322,6 +322,11 @@ programme changes in the intended client before relying on this path.
 | **Pause recording** | Immediately pause recorder activity and fence stale queued starts. |
 | **Resume recording** | Re-enable recording according to the applied configuration and schedule. |
 
+Current recordings shows only channels scheduled at the current time, with a
+compact recorder and source status. Today's recording schedule lists channels
+with today's windows. Both actions retain their structured channel and summary
+fields for callers that need the full details.
+
 ## Troubleshooting
 
 - **No channels record:** confirm the YAML has a matching selector, validate and

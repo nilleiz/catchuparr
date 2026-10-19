@@ -9,6 +9,8 @@ included here to explain the feature history leading to 0.4.0.
 - Adds read-only Current recordings and Today's recording schedule plugin actions.
 - Schedule overview uses the applied schedule and timezone, shows current,
   upcoming and past windows, and marks a global recorder pause.
+- Refreshes both action messages in place with compact scheduled-channel rows;
+  structured diagnostic and schedule data remain available to callers.
 - No configuration migration or archive change is required. CI and publication
   remain pending.
 

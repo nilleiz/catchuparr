@@ -55,7 +55,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
     if not isinstance(schedules, dict):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
 
-    from .recording_overview import _channel_sort_key, _display_name, _safe_display
+    from .recording_overview import _channel_sort_key, _safe_display
 
     channel_ids = settings.get("channel_uuids", "")
     if isinstance(channel_ids, str):
@@ -117,28 +117,23 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             })
         rows.append(row)
     rows.sort(key=_channel_sort_key)
-    pause_label = "paused" if paused is True else "active" if paused is False else "unknown"
-    header = f"Today's recording schedule · {local_now.date().isoformat()} · {timezone_name}"
-    if paused is True:
-        header += " · Recording paused"
-    elif paused is None:
-        header += " · Pause state unknown"
     lines = []
     for row in rows:
-        label = _display_name(row)
-        if not row["windows"]:
-            lines.append(f"{label} — No recording windows planned.")
-            continue
-        lines.extend(
-            f"{label} — {window['start']}–{window['end']} ({window['status']})"
-            for window in row["windows"]
-        )
+        if row["windows"]:
+            label = _safe_display(row.get("name")) or "Unknown channel"
+            windows_text = ", ".join(
+                f"{window['start']}–{window['end']}" for window in row["windows"]
+            )
+            lines.append(f"{label}: {windows_text}")
     if not lines:
-        lines.append("No channels are selected.")
+        lines.append("No recordings scheduled today.")
+    elif paused is True:
+        lines.insert(0, "Recording paused")
+    pause_label = "paused" if paused is True else "active" if paused is False else "unknown"
     window_count = sum(len(row["windows"]) for row in rows)
     return {
         "status": "ok",
-        "message": header + "\n" + "\n".join(lines),
+        "message": "\n".join(lines),
         "channels": rows,
         "summary": {
             "channel_count": len(rows),

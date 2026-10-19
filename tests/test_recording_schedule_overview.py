@@ -33,7 +33,8 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.assertEqual([(window["start"], window["end"]) for window in rows[0]["windows"]],
                          [("09:00", "10:00"), ("13:00", "14:00")])
         self.assertEqual(rows[1]["windows"][0]["end"], "24:00")
-        self.assertIn("2026-10-19", result["message"])
+        self.assertEqual(result["message"],
+                         "Alpha: 09:00–10:00, 13:00–14:00\nBeta: 00:00–24:00")
 
     def test_empty_day_and_paused_state_visible(self):
         result = today_schedule(settings({"a": {"sunday": []}, "b": "continuous"}),
@@ -43,15 +44,15 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.assertEqual([row["number"] for row in result["channels"]], [2, 10])
         empty = result["channels"][1]
         self.assertEqual(empty["windows"], [])
-        self.assertIn("No recording windows planned", result["message"])
-        self.assertIn("2026-10-18", result["message"])
+        self.assertEqual(result["message"], "Continuous: 00:00–24:00")
         self.assertIsNone(result["recording_paused"])
-        self.assertIn("Pause state unknown", result["message"])
+        self.assertNotIn("Pause state unknown", result["message"])
         result = today_schedule(settings({"a": {"daily": [{"start": "09:00", "end": "10:00"}]}}),
                                 {}, control_state=type("Control", (), {"paused": True})(),
-                                now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc))
+                                now=datetime(2026, 10, 19, 7, tzinfo=timezone.utc))
         self.assertTrue(result["recording_paused"])
-        self.assertIn("Recording paused", result["message"])
+        self.assertEqual(result["message"],
+                         "Recording paused\nUnknown channel: 09:00–10:00")
         active = today_schedule(settings({"a": "continuous"}), {},
                                  control_state=type("Control", (), {"paused": False})(),
                                  now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc))
@@ -61,7 +62,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                                       control_state=type("Control", (), {"paused": True})(),
                                       now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
         self.assertTrue(paused_empty["recording_paused"])
-        self.assertIn("Recording paused", paused_empty["message"])
+        self.assertEqual(paused_empty["message"], "No recordings scheduled today.")
 
     def test_past_current_and_upcoming_statuses(self):
         result = today_schedule(
@@ -74,6 +75,31 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             [window["status"] for window in result["channels"][0]["windows"]],
             ["past", "current", "upcoming"],
         )
+        self.assertEqual(result["message"], "Unknown channel: 09:00–10:00, 11:00–13:00, 14:00–15:00")
+
+    def test_message_omits_free_channels_and_has_no_heading(self):
+        result = today_schedule(
+            settings({
+                "active": {"daily": [
+                    {"start": "09:00", "end": "10:00"},
+                    {"start": "13:00", "end": "14:00"},
+                ]},
+                "free": {"sunday": []},
+            }),
+            {"active": {"name": "Synthetic Channel A"}, "free": {"name": "Free Channel"}},
+            now=datetime(2026, 10, 18, 8, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result["message"], "Synthetic Channel A: 09:00–10:00, 13:00–14:00")
+        self.assertEqual(len(result["channels"]), 2)
+        self.assertNotIn("Free Channel", result["message"])
+
+    def test_empty_message_and_schedule_unavailable_are_explicit(self):
+        empty = today_schedule(settings({"free": {"sunday": []}}), {},
+                               now=datetime(2026, 10, 18, 8, tzinfo=timezone.utc))
+        self.assertEqual(empty["message"], "No recordings scheduled today.")
+        invalid = today_schedule({"channel_uuids": "a", "recording_schedule": {}}, {})
+        self.assertEqual(invalid["status"], "schedule_unavailable")
+        self.assertIn("unavailable", invalid["message"].lower())
 
     def test_only_applied_selected_channels_are_listed(self):
         active = settings({"selected": "continuous"})
