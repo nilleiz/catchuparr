@@ -251,7 +251,8 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
 
     def test_borrowed_binding_requires_live_native_owner_and_metadata(self):
         episode_id = "episode_9"
-        native_id = "native-worker"
+        native_id = self.channel
+        native_owner = "native-owner"
         client_id = "catchuparr-client-9"
         grant = SimpleNamespace(
             episode_id=episode_id, worker_id=native_id, stream_id="31", account_id="7",
@@ -259,7 +260,7 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
             configuration_generation=self.control.configuration_generation,
             control_generation=6, recorder_fence=5, client_id=client_id,
             client_worker_id=native_id, connected_at="1000", lease_value="5:owner",
-            owner_lock_value=native_id, metadata_owner=native_id,
+            owner_lock_value=native_owner, metadata_owner=native_owner,
         )
         diagnostic = dict(
             self.live, source="borrowed", m3u_profile_id="9", input_profile_id="4",
@@ -276,18 +277,36 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
              "authority_revision": "3"} if ":sharing:current:" in key else
             {client_id: episode_id} if ":sharing:private:" in key else
             {"worker_id": native_id, "connected_at": "1000"} if f":clients:{client_id}" in key else
-            {"owner": native_id, "stream_id": "31", "m3u_profile": "9",
+            {"owner": native_owner, "stream_id": "31", "m3u_profile": "9",
              "stream_profile": "4", "state": "active"} if ":metadata" in key else {}
         )
-        redis.get = lambda key: native_id if key.endswith(":owner") else redis.lease
+        redis.get = lambda key: native_owner if key.endswith(":owner") else redis.lease
         redis.sismember = lambda _key, member: member == client_id
-        redis.exists = lambda key: int(key.endswith(":heartbeat") and redis.alive)
-        redis.ttl = lambda key: 20 if not key.endswith(":last-error:") else 3600
+        owner_heartbeat = f"live:worker:{native_owner}:heartbeat"
+        channel_heartbeat = f"live:worker:{native_id}:heartbeat"
+        redis.owner_heartbeat_exists = True
+        redis.channel_heartbeat_exists = True
+        redis.owner_heartbeat_ttl = 20
+        redis.exists = lambda key: int(
+            (key == owner_heartbeat and redis.owner_heartbeat_exists)
+            or (key == channel_heartbeat and redis.channel_heartbeat_exists)
+        )
+        redis.ttl = lambda key: (
+            redis.owner_heartbeat_ttl if key == owner_heartbeat else
+            20 if key == channel_heartbeat else
+            20 if not key.endswith(":last-error:") else 3600
+        )
         with patch("catchuparr.adapters.sharing_native.read_native_episode_grant", return_value=grant):
             self.assertIn(self.channel, read_recorder_diagnostics(
                 redis, self.settings, self.control, now=1010,
             ))
-            redis.alive = False
+            redis.owner_heartbeat_exists = False
+            # A live channel UUID heartbeat cannot substitute for the owner process.
+            self.assertNotIn(self.channel, read_recorder_diagnostics(
+                redis, self.settings, self.control, now=1010,
+            ))
+            redis.owner_heartbeat_exists = True
+            redis.owner_heartbeat_ttl = -2
             self.assertNotIn(self.channel, read_recorder_diagnostics(
                 redis, self.settings, self.control, now=1010,
             ))
