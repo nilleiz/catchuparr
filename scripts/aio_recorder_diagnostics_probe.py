@@ -28,7 +28,16 @@ def _probe_dedicated_binding(redis_client, channel_uuid, *, now, last_error_key,
     error_diagnostic_key = last_error_key(channel_uuid)
     if not lease_value or int(redis_client.ttl(lease_key)) <= 0:
         raise AssertionError("dedicated recorder lease is not live")
-    diagnostic = _wait_for_recording(redis_client, live_diagnostic_key, "dedicated")
+    try:
+        diagnostic = _wait_for_recording(redis_client, live_diagnostic_key, "dedicated")
+    except AssertionError:
+        guards = _dedicated_writer_guard_checks(
+            redis_client, channel_uuid, lease_value, live_diagnostic_key,
+        )
+        raise AssertionError(
+            "dedicated recording diagnostic was not confirmed in time; "
+            f"guard_checks={json.dumps(guards, sort_keys=True, separators=(',', ':'))}"
+        ) from None
     saved = {
         live_diagnostic_key: _capture_hash(redis_client, live_diagnostic_key),
         error_diagnostic_key: _capture_hash(redis_client, error_diagnostic_key),
@@ -73,6 +82,88 @@ def _probe_dedicated_binding(redis_client, channel_uuid, *, now, last_error_key,
         cleanup()
         raise
     return cleanup
+
+
+def _dedicated_writer_guard_checks(redis_client, channel_uuid, lease_value, live_key):
+    """Return bounded booleans for the exact live dedicated writer binding."""
+    from catchuparr.adapters.recorder_proxy import PLUGIN_REDIS_PREFIX
+    from catchuparr.recorder_diagnostics import _HEX64, _SAFE_ID, _SAFE_NATIVE_OWNER
+
+    checks = {
+        "live_record_present": False,
+        "live_record_is_dedicated": False,
+        "live_record_is_recording": False,
+        "worker_record_present": False,
+        "worker_record_shapes_valid": False,
+        "lease_matches_worker_record": False,
+        "native_owner_lock_live": False,
+        "native_owner_heartbeat_live": False,
+        "native_metadata_matches_worker": False,
+        "native_profile_matches_worker": False,
+        "native_state_supported": False,
+        "stop_marker_clear": False,
+        "redis_reads_available": False,
+    }
+    try:
+        live_record = _decode_hash(redis_client.hgetall(live_key))
+        checks["redis_reads_available"] = True
+        checks["live_record_present"] = bool(live_record)
+        checks["live_record_is_dedicated"] = live_record.get("source") == "dedicated"
+        checks["live_record_is_recording"] = live_record.get("phase") == "recording"
+        worker_id = live_record.get("worker_id")
+        if not worker_id:
+            return checks
+        worker_key = f"{PLUGIN_REDIS_PREFIX}worker:{worker_id}"
+        worker = _decode_hash(redis_client.hgetall(worker_key))
+        if not worker:
+            return checks
+        checks["worker_record_present"] = True
+        checks["worker_record_shapes_valid"] = bool(
+            worker.get("channel_uuid") == channel_uuid
+            and worker.get("worker_id") == worker_id
+            and _SAFE_ID.fullmatch(worker.get("stream_id", ""))
+            and _SAFE_ID.fullmatch(worker.get("account_id", ""))
+            and _HEX64.fullmatch(worker.get("config_generation", ""))
+            and worker.get("control_generation", "").isdecimal()
+            and worker.get("lease_fence", "").isdecimal()
+        )
+        lease_key = f"catchuparr:recorder:{channel_uuid}"
+        checks["lease_matches_worker_record"] = bool(
+            worker.get("lease_key") == lease_key
+            and worker.get("lease_value") == lease_value
+            and _text(redis_client.get(lease_key)) == lease_value
+            and int(redis_client.ttl(lease_key)) > 0
+        )
+        owner_key = f"live:channel:{worker_id}:owner"
+        metadata_key = f"live:channel:{worker_id}:metadata"
+        owner = _text(redis_client.get(owner_key))
+        heartbeat_key = f"live:worker:{owner}:heartbeat" if owner else ""
+        metadata = _decode_hash(redis_client.hgetall(metadata_key))
+        checks["native_owner_lock_live"] = bool(
+            owner and _SAFE_NATIVE_OWNER.fullmatch(owner)
+            and int(redis_client.ttl(owner_key)) > 0
+        )
+        checks["native_owner_heartbeat_live"] = bool(
+            owner and int(redis_client.ttl(heartbeat_key)) > 0
+        )
+        checks["native_metadata_matches_worker"] = bool(
+            metadata.get("owner") == owner
+            and metadata.get("stream_id") == worker.get("stream_id")
+        )
+        checks["native_profile_matches_worker"] = bool(
+            worker.get("profile_id")
+            and metadata.get("m3u_profile") == worker.get("profile_id")
+            and metadata.get("stream_profile")
+        )
+        checks["native_state_supported"] = metadata.get("state", "").lower() in {
+            "active", "waiting_for_clients",
+        }
+        checks["stop_marker_clear"] = not bool(
+            redis_client.exists(f"live:channel:{worker_id}:stopping")
+        )
+    except Exception:
+        pass
+    return checks
 
 
 def probe_live_borrowed_diagnostic(redis_client, channel_uuid: str, *, now=None):
