@@ -326,6 +326,7 @@ Current recordings shows only channels scheduled at the current time, with a
 compact recorder and source status. Today's recording schedule lists channels
 with today's windows. Both actions retain their structured channel and summary
 fields for callers that need the full details.
+The host UI may not preserve line breaks in action messages.
 
 ## Troubleshooting
 
