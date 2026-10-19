@@ -44,6 +44,24 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_live_overview_source_metadata_is_mode_specific(self):
+        common = {
+            "stream_name": "source", "provider_name": "provider",
+            "stream_id": "stream-id", "provider_id": "provider-id",
+            "m3u_profile_id": "m3u-id", "m3u_profile_name": "m3u-name",
+        }
+        borrowed = {
+            **common, "mode": "borrowed",
+            "input_profile_id": "input-id", "input_profile_name": "input-name",
+        }
+        dedicated = {**common, "mode": "dedicated"}
+        self.assertTrue(probe._overview_source_metadata_matches(borrowed, "borrowed"))
+        self.assertTrue(probe._overview_source_metadata_matches(dedicated, "dedicated"))
+        self.assertFalse(probe._overview_source_metadata_matches(common | {"mode": "borrowed"}, "borrowed"))
+        self.assertFalse(probe._overview_source_metadata_matches(
+            dedicated | {"input_profile_id": "unexpected"}, "dedicated",
+        ))
+
     def test_failed_opening_identity_factory_builds_token_contract(self):
         from catchuparr.sharing_persistence import SharingIntentToken
         from catchuparr.sharing_planner import SharingAction
