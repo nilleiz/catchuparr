@@ -6,9 +6,9 @@ import math
 import unicodedata
 from collections.abc import Iterable
 
-# Canvas measurements for 17px Lato at the 350px action-message width.
+# Canvas measurements for 17px Lato; gap target is intentionally 280px.
 # Estimates are static and do not inspect the runtime font or viewport.
-TARGET_WIDTH_PX = 350.0
+TARGET_WIDTH_PX = 280.0
 NBSP_WIDTH_PX = 4.35205
 FALLBACK_LATIN_WIDTH_PX = 8.5
 EAST_ASIAN_WIDTH_PX = 17.0

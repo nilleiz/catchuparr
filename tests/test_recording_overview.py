@@ -44,6 +44,9 @@ class ActionMessageFormattingTests(unittest.TestCase):
     def padding_before_next_row(message):
         return message.split("NextRow", 1)[0].count("\u00a0")
 
+    def test_padding_target_is_narrower_than_previous_toast_estimate(self):
+        self.assertEqual(TARGET_WIDTH_PX, 280.0)
+
     def test_padding_varies_with_last_visual_line_width(self):
         short = format_action_message(("A", "NextRow"))
         long = format_action_message(("W" * 21, "NextRow"))
