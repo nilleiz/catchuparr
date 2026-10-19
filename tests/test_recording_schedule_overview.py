@@ -1,12 +1,10 @@
 import tempfile
 import unittest
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from catchuparr.configuration import load_applied_state_readonly
-from catchuparr.configuration import SourceCatalog, apply_configuration
+from catchuparr.configuration import SourceCatalog, apply_configuration, load_applied_state_readonly
 from catchuparr.plugin import Plugin
 from catchuparr.recording_schedule_overview import today_schedule
 from catchuparr.schedule import normalize_schedule
