@@ -3611,7 +3611,9 @@ def _probe_running_recorder_controls(
     with patch.object(tasks.record_channel, "apply_async", side_effect=capture_pause_reconcile):
         pause_reconcile_result = tasks.reconcile_recorders.run()
     _require(
-        pause_reconcile_result == {"queued": 0} and not pause_reconcile_dispatches,
+        isinstance(pause_reconcile_result, dict)
+        and pause_reconcile_result.get("queued") == 0
+        and not pause_reconcile_dispatches,
         "Paused real reconciliation queued another recorder task",
     )
     _require(
