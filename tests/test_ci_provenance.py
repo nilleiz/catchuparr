@@ -461,6 +461,18 @@ class CIChangeClassificationTest(unittest.TestCase):
         with patch("scripts.ci_provenance.subprocess.run", side_effect=OSError):
             self.assertIsNone(changed_paths("pull_request", sha, "b" * 40))
 
+    def test_manual_native_skip_is_opt_in_and_cannot_be_release_evidence(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+        self.assertIn("skip_native:", workflow)
+        self.assertIn("default: false", workflow)
+        self.assertIn("inputs.skip_native", workflow)
+        self.assertIn("Record explicit manual native AIO skip", workflow)
+        self.assertIn("cannot satisfy release acceptance", workflow)
+
+        run = _run()
+        run["jobs"][1]["steps"][0]["conclusion"] = "skipped"
+        self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
+
     def test_changed_paths_uses_nul_delimited_git_diff(self):
         sha = "a" * 40
         fake = type("Result", (), {"stdout": b"README.md\0docs/ci-workflow.md\0"})()
