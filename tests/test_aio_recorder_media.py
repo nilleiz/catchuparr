@@ -156,7 +156,12 @@ class RecorderMediaProbeTests(unittest.TestCase):
         }
 
         class Redis:
+            def __init__(self, scanned_keys):
+                self.scanned_keys = scanned_keys
+
             def hgetall(self, key):
+                if isinstance(key, bytes):
+                    key = key.decode()
                 if key == f"catchuparr:recorder:diagnostic:{channel}":
                     return {b"phase": b"recording", b"source": b"borrowed"}
                 if key == worker_key:
@@ -171,7 +176,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
 
             def scan_iter(self, *, match, count):
                 self.assertion = (match, count)
-                return [worker_key]
+                return self.scanned_keys
 
             def get(self, key):
                 if key == f"catchuparr:recorder:{channel}":
@@ -186,15 +191,26 @@ class RecorderMediaProbeTests(unittest.TestCase):
             def exists(self, _key):
                 return 0
 
-        checks = _dedicated_writer_guard_checks(
-            Redis(), channel, lease_value,
-            f"catchuparr:recorder:diagnostic:{channel}",
-        )
-        self.assertTrue(checks["current_attempt_record_found"])
-        self.assertTrue(checks["current_attempt_lease_matches"])
-        self.assertFalse(checks["live_record_matches_current_attempt"])
-        self.assertTrue(checks["current_attempt_native_owner_heartbeat_live"])
-        self.assertTrue(all(type(value) is bool for value in checks.values()))
+        for scanned_key in (worker_key, worker_key.encode()):
+            with self.subTest(scanned_key_type=type(scanned_key).__name__):
+                checks = _dedicated_writer_guard_checks(
+                    Redis([scanned_key]), channel, lease_value,
+                    f"catchuparr:recorder:diagnostic:{channel}",
+                )
+                self.assertTrue(checks["current_attempt_record_found"])
+                self.assertTrue(checks["current_attempt_lease_matches"])
+                self.assertFalse(checks["live_record_matches_current_attempt"])
+                self.assertTrue(checks["current_attempt_native_owner_heartbeat_live"])
+                self.assertTrue(all(type(value) is bool for value in checks.values()))
+
+        for scanned_keys in ([], [worker_key, worker_key.encode()]):
+            with self.subTest(scanned_key_count=len(scanned_keys)):
+                checks = _dedicated_writer_guard_checks(
+                    Redis(scanned_keys), channel, lease_value,
+                    f"catchuparr:recorder:diagnostic:{channel}",
+                )
+                self.assertFalse(checks["current_attempt_record_found"])
+                self.assertFalse(checks["current_attempt_lease_matches"])
 
     def test_dead_recorder_failure_reports_safe_terminal_task_diagnostics(self):
         thread = threading.Thread(target=lambda: None)
