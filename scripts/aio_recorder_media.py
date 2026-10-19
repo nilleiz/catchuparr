@@ -30,6 +30,20 @@ def _failed_opening_identity(channel_uuid, native_owner, stream, metadata):
     )
 
 
+def _ack_failed_opening_cleanup(ledger, channel_uuid, episode_id, result, *, acknowledged):
+    """Validate only the first ACK for the exact seeded failed opening."""
+    if acknowledged:
+        return True
+    episode = ledger.read(str(channel_uuid))
+    _require(
+        result in {(0, 0), (1, 0)}
+        and episode.episode_id == episode_id
+        and episode.phase == "closed",
+        "Task did not ACK cleanup for the exact failed channel opening",
+    )
+    return True
+
+
 def _run_current_recordings_readonly(action, archive_db):
     """Run the action while an SQLite authorizer watches its archive reads."""
     import sqlite3
@@ -4968,6 +4982,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             reason="cleanup_pending", cleanup_acknowledged=False,
         )
         recovery_order = []
+        failed_opening_acknowledged = False
         from catchuparr import sharing_runtime as sharing_runtime_module
 
         original_retry_cleanup = sharing_runtime_module.retry_durable_open_cleanups
@@ -4977,22 +4992,24 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             observed_channel = args[1] if len(args) > 1 else kwargs.get("channel_uuid")
             if str(observed_channel) == str(channel.uuid):
                 _require(
-                    recovery_order and recovery_order[-1] == "cleanup_acknowledged",
+                    failed_opening_acknowledged,
                     "Native viewer observation ran before failed-opening cleanup ACK",
                 )
-                recovery_order.append("native_observation")
+                if "native_observation" not in recovery_order:
+                    recovery_order.append("native_observation")
             return original_native_observation(*args, **kwargs)
 
         def retry_channel_cleanup(*args, **kwargs):
+            nonlocal failed_opening_acknowledged
             result = original_retry_cleanup(*args, **kwargs)
             if kwargs.get("channel_uuid") == str(channel.uuid):
-                episode = sharing_episode_ledger.read(str(channel.uuid))
-                _require(
-                    result in {(0, 0), (1, 0)}
-                    and episode.phase == "closed",
-                    "Task did not ACK cleanup for the exact failed channel opening",
+                _ack_failed_opening_cleanup(
+                    sharing_episode_ledger, channel.uuid,
+                    failed_opening.episode_id, result,
+                    acknowledged=failed_opening_acknowledged,
                 )
-                if "cleanup_acknowledged" not in recovery_order:
+                if not failed_opening_acknowledged:
+                    failed_opening_acknowledged = True
                     recovery_order.append("cleanup_acknowledged")
             return result
 
