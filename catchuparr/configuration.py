@@ -1621,7 +1621,7 @@ def load_applied_state_readonly(active_path: Path | None = None):
         if active is not None:
             try:
                 if _deny_marker_exists(control_deny_path(path)):
-                    return _active_configuration_view(active), None
+                    return active, None
                 raw = json.loads(control_state_path(path).read_text(encoding="utf-8"))
                 control = _parse_state(raw)
                 if (active.get("version", 0) >= 4 and
@@ -1629,7 +1629,10 @@ def load_applied_state_readonly(active_path: Path | None = None):
                     control = None
             except (OSError, ValueError):
                 control = None
-        return (_active_configuration_view(active) if active is not None else None), control
+        # _load_active_configuration_locked already returns the flattened
+        # runtime view. Reapplying the persisted-document converter here
+        # breaks v7 snapshots because that view has no nested ``settings``.
+        return active, control
     finally:
         if acquired:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

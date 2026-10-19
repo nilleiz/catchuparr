@@ -1,10 +1,12 @@
 import tempfile
 import unittest
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from catchuparr.configuration import load_applied_state_readonly
+from catchuparr.configuration import SourceCatalog, apply_configuration
 from catchuparr.plugin import Plugin
 from catchuparr.recording_schedule_overview import today_schedule
 from catchuparr.schedule import normalize_schedule
@@ -158,6 +160,44 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             active_path = root / "active.json"
             self.assertEqual(load_applied_state_readonly(active_path), (None, None))
             self.assertEqual(list(root.iterdir()), [])
+
+    def test_readonly_loader_returns_persisted_v7_applied_view_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active_path = root / "active.json"
+            lock_path = active_path.with_suffix(".json.lock")
+            channel = "00000000-0000-0000-0000-000000000001"
+            apply_configuration(
+                {
+                    "filter_config": "version: 1\nprofile: Synthetic Profile\nrules:\n  - channels: {profile: all}\n",
+                    "archive_root": str(root / "archive"),
+                    "retention_hours": 24,
+                    "max_storage_gib": 20,
+                },
+                SourceCatalog(
+                    channels=({"uuid": channel, "number": "1", "name": "Synthetic Channel A"},),
+                    accounts=(), streams_by_channel={channel: ()},
+                    profiles=({"id": "1", "name": "Synthetic Profile", "channel_uuids": (channel,)},),
+                ),
+                active_path,
+            )
+            contents = active_path.read_bytes()
+            active_path.write_bytes(contents)
+            # Apply creates the real v7 snapshot and control sidecar; remove
+            # the latter to exercise the valid-active/unknown-control contract.
+            (root / ".catchuparr-recorder-control.json").unlink(missing_ok=True)
+            (root / ".catchuparr-recorder-control.json.lock").unlink(missing_ok=True)
+            lock_path.touch()
+            entries_before = {path.name for path in root.iterdir()}
+
+            active, control = load_applied_state_readonly(active_path)
+
+            self.assertEqual(active["version"], 7)
+            self.assertEqual(active["connection_sharing"][channel]["enabled"], False)
+            self.assertEqual(active["channel_uuids"], channel)
+            self.assertIsNone(control)
+            self.assertEqual(active_path.read_bytes(), contents)
+            self.assertEqual({path.name for path in root.iterdir()}, entries_before)
 
 
 if __name__ == "__main__":
