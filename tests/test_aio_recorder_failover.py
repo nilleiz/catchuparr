@@ -310,7 +310,7 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             "current_admission": {"status": "stale_configuration"},
         }
         tree = ast.parse("def supervise(current_admission=current_admission):\n    event.set()\n")
-        ast.increment_lineno(tree, 362)
+        ast.increment_lineno(tree, 431)
         exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
         self.assertEqual("tasks.supervisor", event.first_set_source)
