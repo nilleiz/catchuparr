@@ -316,6 +316,7 @@ def record_channel(
                     redis, str(channel_uuid), str(lease._value),
                     episode_id=prepared.episode_id, client_id=prepared.client_id,
                     worker_id=identity[1],
+                    owner_lock_value=identity[2], metadata_owner=identity[3],
                     stream_id=identity[4], account_id=identity[5],
                     m3u_profile_id=identity[6], input_profile_id=identity[7],
                     catalog_generation=capability.catalog_generation,

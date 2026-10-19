@@ -107,6 +107,8 @@ def probe_live_borrowed_diagnostic(redis_client, channel_uuid: str, *, now=None)
         "episode_id": grant.episode_id,
         "client_id": grant.client_id,
         "worker_id": grant.worker_id,
+        "owner_lock_value": grant.owner_lock_value,
+        "metadata_owner": grant.metadata_owner,
         "stream_id": grant.stream_id,
         "account_id": grant.account_id,
         "m3u_profile_id": grant.m3u_profile_id,

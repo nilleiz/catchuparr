@@ -75,7 +75,8 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         result = publish_borrowed_recorder_diagnostic(
             self.redis, self.channel, "8:synthetic-owner", episode_id="episode_9",
             client_id="catchuparr-client-9",
-            worker_id="nativeworker", stream_id="31", account_id="7",
+            worker_id="nativeworker", owner_lock_value="native-lock",
+            metadata_owner="native-owner", stream_id="31", account_id="7",
             m3u_profile_id="5", input_profile_id="4", catalog_generation=self.catalog,
             phase="starting", started_at=1000, config_generation=self.generation,
             control_generation=3, fence=8, now=1010,
@@ -88,8 +89,10 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         self.assertIn("m3u_profile_id", script)
         self.assertEqual(args[-7:], (
             "starting", "", str(LAST_ERROR_TTL_SECONDS), str(LIVE_TTL_CAP_SECONDS),
-            "catchuparr-client-9", "nativeworker", "nativeworker",
+            "catchuparr-client-9", "native-lock", "native-owner",
         ))
+        self.assertTrue(args[10].endswith(":native-owner:heartbeat"))
+        self.assertEqual(args[16], "nativeworker")
 
     def test_invalid_inputs_never_call_redis(self):
         with patch("catchuparr.adapters.recorder_proxy.is_managed_worker_id", return_value=True):
@@ -108,6 +111,7 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         self.assertFalse(publish_borrowed_recorder_diagnostic(
             self.redis, self.channel, "lease", episode_id="episode",
             client_id="catchuparr-client-9", worker_id="nativeworker",
+            owner_lock_value="native-owner", metadata_owner="native-owner",
             stream_id="31", account_id="7", m3u_profile_id="5", input_profile_id="4",
             catalog_generation=self.catalog, phase="error", started_at=1000,
             config_generation=self.generation, control_generation=3, fence=8,
