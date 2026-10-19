@@ -62,7 +62,8 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                                       control_state=type("Control", (), {"paused": True})(),
                                       now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
         self.assertTrue(paused_empty["recording_paused"])
-        self.assertEqual(paused_empty["message"], "No recordings scheduled today.")
+        self.assertEqual(paused_empty["message"],
+                         "Recording paused\nNo recordings scheduled today.")
 
     def test_past_current_and_upcoming_statuses(self):
         result = today_schedule(
@@ -98,6 +99,13 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                                now=datetime(2026, 10, 18, 8, tzinfo=timezone.utc))
         self.assertEqual(empty["message"], "No recordings scheduled today.")
         invalid = today_schedule({"channel_uuids": "a", "recording_schedule": {}}, {})
+        self.assertEqual(invalid["status"], "schedule_unavailable")
+        self.assertIn("unavailable", invalid["message"].lower())
+        malformed = today_schedule({"channel_uuids": "a", "recording_schedule": "invalid"}, {})
+        self.assertEqual(malformed["status"], "schedule_unavailable")
+
+    def test_invalid_timezone_rejects_continuous_schedule(self):
+        invalid = today_schedule(settings({"a": "continuous"}, "Invalid/Zone"), {})
         self.assertEqual(invalid["status"], "schedule_unavailable")
         self.assertIn("unavailable", invalid["message"].lower())
 

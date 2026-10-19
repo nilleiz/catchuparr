@@ -38,7 +38,9 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
     Metadata values may contain ``number`` and ``name``. The caller supplies
     only the validated applied snapshot, never editable draft settings.
     """
-    schedule_config = settings.get("recording_schedule") or {}
+    schedule_config = settings.get("recording_schedule")
+    if not isinstance(schedule_config, dict):
+        return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
     timezone_name = schedule_config.get("timezone")
     if not isinstance(timezone_name, str):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
@@ -46,7 +48,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
         zone = ZoneInfo(timezone_name)
         instant = now or datetime.now(timezone.utc)
         local_now = instant.astimezone(zone)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, KeyError):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
     paused = getattr(control_state, "paused", None)
     if type(paused) is not bool:
@@ -127,7 +129,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             lines.append(f"{label}: {windows_text}")
     if not lines:
         lines.append("No recordings scheduled today.")
-    elif paused is True:
+    if paused is True:
         lines.insert(0, "Recording paused")
     pause_label = "paused" if paused is True else "active" if paused is False else "unknown"
     window_count = sum(len(row["windows"]) for row in rows)

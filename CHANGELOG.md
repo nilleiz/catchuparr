@@ -4,15 +4,14 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
-## [0.6.3] - Prerelease candidate
+## [0.6.3] - In-place presentation refresh
 
 - Adds read-only Current recordings and Today's recording schedule plugin actions.
 - Schedule overview uses the applied schedule and timezone, shows current,
   upcoming and past windows, and marks a global recorder pause.
 - Refreshes both action messages in place with compact scheduled-channel rows;
-  structured diagnostic and schedule data remain available to callers.
-- No configuration migration or archive change is required. CI and publication
-  remain pending.
+  structured diagnostic and schedule data remain available to callers. This
+  presentation update requires no configuration migration or archive change.
 
 ## [0.6.2] - Prerelease candidate
 
