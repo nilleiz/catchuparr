@@ -38,7 +38,9 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
     Metadata values may contain ``number`` and ``name``. The caller supplies
     only the validated applied snapshot, never editable draft settings.
     """
-    schedule_config = settings.get("recording_schedule") or {}
+    schedule_config = settings.get("recording_schedule")
+    if not isinstance(schedule_config, dict):
+        return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
     timezone_name = schedule_config.get("timezone")
     if not isinstance(timezone_name, str):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
@@ -46,7 +48,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
         zone = ZoneInfo(timezone_name)
         instant = now or datetime.now(timezone.utc)
         local_now = instant.astimezone(zone)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, KeyError):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
     paused = getattr(control_state, "paused", None)
     if type(paused) is not bool:
@@ -55,7 +57,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
     if not isinstance(schedules, dict):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
 
-    from .recording_overview import _channel_sort_key, _display_name, _safe_display
+    from .recording_overview import _channel_sort_key, _safe_display
 
     channel_ids = settings.get("channel_uuids", "")
     if isinstance(channel_ids, str):
@@ -117,28 +119,23 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             })
         rows.append(row)
     rows.sort(key=_channel_sort_key)
-    pause_label = "paused" if paused is True else "active" if paused is False else "unknown"
-    header = f"Today's recording schedule · {local_now.date().isoformat()} · {timezone_name}"
-    if paused is True:
-        header += " · Recording paused"
-    elif paused is None:
-        header += " · Pause state unknown"
     lines = []
     for row in rows:
-        label = _display_name(row)
-        if not row["windows"]:
-            lines.append(f"{label} — No recording windows planned.")
-            continue
-        lines.extend(
-            f"{label} — {window['start']}–{window['end']} ({window['status']})"
-            for window in row["windows"]
-        )
+        if row["windows"]:
+            label = _safe_display(row.get("name")) or "Unknown channel"
+            windows_text = ", ".join(
+                f"{window['start']}–{window['end']}" for window in row["windows"]
+            )
+            lines.append(f"{label}: {windows_text}")
     if not lines:
-        lines.append("No channels are selected.")
+        lines.append("No recordings scheduled today.")
+    if paused is True:
+        lines.insert(0, "Recording paused")
+    pause_label = "paused" if paused is True else "active" if paused is False else "unknown"
     window_count = sum(len(row["windows"]) for row in rows)
     return {
         "status": "ok",
-        "message": header + "\n" + "\n".join(lines),
+        "message": "\n".join(lines),
         "channels": rows,
         "summary": {
             "channel_count": len(rows),

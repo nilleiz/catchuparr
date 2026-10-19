@@ -8,7 +8,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.configuration import active_configuration_generation
-from catchuparr.recording_overview import _safe_display, _source_for_diagnostic, current_recordings
+from catchuparr.recording_overview import (
+    _message_row,
+    _safe_display,
+    _source_for_diagnostic,
+    current_recordings,
+)
 from catchuparr.schedule import normalize_schedule
 
 
@@ -143,17 +148,19 @@ class RecordingOverviewTests(unittest.TestCase):
         self.assertEqual(len(result["channels"]), 1)
         self.assertEqual(result["channels"][0]["state"], "paused")
 
-    def test_cleanup_and_error_states_are_not_hidden_by_schedule(self):
+    def test_cleanup_and_error_states_outside_active_schedule_are_hidden_from_message_only(self):
         self.settings["recording_schedule"]["channels"][self.channel] = normalize_schedule({
             "monday": [],
         }).to_snapshot()
         self.control.configuration_generation = active_configuration_generation(self.settings)
         cleanup = self._call(self._diagnostic(started=self.now.timestamp(), phase="cleanup_pending"))
         self.assertEqual(cleanup["channels"][0]["state"], "cleanup_pending")
+        self.assertEqual(cleanup["message"], "No recordings scheduled now.")
         error = self._diagnostic(started=self.now.timestamp(), phase="error")
         error[self.channel]["error_code"] = "recorder_worker_stopped"
         failed = self._call(error)
         self.assertEqual(failed["channels"][0]["state"], "error")
+        self.assertNotIn("failed:", failed["message"])
 
     def test_borrowed_source_displays_only_current_grant_metadata(self):
         diagnostic = self._diagnostic(started=self.now.timestamp(), phase="starting")
@@ -213,7 +220,7 @@ class RecordingOverviewTests(unittest.TestCase):
         self.assertEqual("archive_index_unavailable", result["channels"][0]["reason"])
         self.assertTrue(result["channels"][0]["last_confirmed_progress_none"])
 
-    def test_message_includes_safe_source_progress_and_problem_count(self):
+    def test_message_is_compact_and_keeps_structured_source_progress(self):
         diagnostic = self._diagnostic(started=self.now.timestamp() - 5, phase="starting")
         with patch("catchuparr.recording_overview._channel_metadata", return_value={
             self.channel: {"number": 12, "name": "Synthetic Channel A"},
@@ -228,12 +235,135 @@ class RecordingOverviewTests(unittest.TestCase):
             result = current_recordings(
                 self.settings, self.control, redis_client=self.redis, now=self.now,
             )
-        self.assertIn("Problems: 0", result["message"])
-        self.assertIn("Synthetic Stream A (id 17)", result["message"])
-        self.assertIn("provider Synthetic Provider (id 4)", result["message"])
-        self.assertIn("Stream profile Synthetic Stream Profile (id 4)", result["message"])
-        self.assertIn("provider profile Synthetic Provider Profile (id 9)", result["message"])
-        self.assertIn("Last confirmed progress: none", result["message"])
+        self.assertEqual(result["message"], "#12: Synthetic Channel A - Synthetic Provider Profile [starting]")
+        self.assertEqual(result["channels"][0]["source"]["provider_name"], "Synthetic Provider")
+        self.assertEqual(result["channels"][0]["source"]["stream_name"], "Synthetic Stream A")
+        self.assertEqual(result["channels"][0]["last_confirmed_progress_at"], None)
+        self.assertNotIn("provider Synthetic Provider", result["message"])
+        self.assertNotIn("id 17", result["message"])
+
+    def test_active_confirmed_recording_and_borrowed_attachment_compact_status(self):
+        started = self.now.timestamp() - 20
+        with sqlite3.connect(self.database) as db:
+            db.execute("INSERT INTO segments VALUES (?, ?, ?, ?)", (
+                self.channel, started, self.now.timestamp(), self.now.timestamp(),
+            ))
+        diagnostic = self._diagnostic(started=started)
+        diagnostic[self.channel]["source"] = "borrowed"
+        with patch("catchuparr.recording_overview._channel_metadata", return_value={
+            self.channel: {"number": 12, "name": "Synthetic Channel A"},
+        }), patch("catchuparr.recording_overview.read_recorder_diagnostics", return_value=diagnostic), \
+             patch("catchuparr.recording_overview.source_metadata", return_value={
+                 "stream_name": "Synthetic Stream Name", "m3u_profile_name": "Synthetic M3U Profile",
+                 "provider_name": "private provider",
+                 "provider_id": "42", "stream_id": "17",
+             }):
+            result = current_recordings(
+                self.settings, self.control, redis_client=self.redis, now=self.now,
+            )
+        self.assertEqual(result["message"],
+                         "#12: Synthetic Channel A - Synthetic M3U Profile [ok, attached]")
+        self.assertEqual(result["channels"][0]["state"], "recording")
+
+    def test_active_error_is_safe_and_unknown_schedule_is_explicit(self):
+        error = self._diagnostic(started=self.now.timestamp(), phase="error")
+        error[self.channel]["error_code"] = "recorder_worker_stopped"
+        result = self._call(error)
+        self.assertEqual(result["message"],
+                         "#12: Synthetic Channel A - — [failed: recorder-stopped]")
+        self.assertNotIn("recorder_worker_stopped", result["message"])
+        self.settings["recording_schedule"] = {}
+        unknown = self._call(error)
+        self.assertEqual(unknown["status"], "unavailable")
+        self.assertEqual(unknown["message"], "Recording schedule unavailable.")
+
+    def test_redis_failure_outside_window_is_not_rendered_as_current_recording(self):
+        self.settings["recording_schedule"]["channels"][self.channel] = normalize_schedule(
+            {"monday": []},
+        ).to_snapshot()
+        self.control.configuration_generation = active_configuration_generation(self.settings)
+
+        class BrokenRedis:
+            def ping(self):
+                raise OSError("unavailable")
+
+        result = current_recordings(self.settings, self.control, redis_client=BrokenRedis(), now=self.now)
+        self.assertEqual(result["message"], "No recordings scheduled now.")
+        self.assertEqual(result["channels"][0]["state"], "unknown")
+        self.assertEqual(result["channels"][0]["reason"], "redis_unavailable")
+
+    def test_unknown_applied_state_filters_by_current_schedule_and_reports_unknown_schedule(self):
+        with patch("catchuparr.recording_overview._channel_metadata", return_value={
+            self.channel: {"number": 12, "name": "Synthetic Channel A"},
+        }):
+            result = current_recordings(
+                self.settings, None, redis_client=self.redis, now=self.now,
+            )
+        self.assertEqual(result["message"], "#12: Synthetic Channel A - — [failed: unknown]")
+        self.assertEqual(result["channels"][0]["state"], "unknown")
+        self.settings["recording_schedule"] = {}
+        unavailable = current_recordings(
+            self.settings, None, redis_client=self.redis, now=self.now,
+        )
+        self.assertEqual(unavailable["status"], "unavailable")
+        self.assertEqual(unavailable["message"], "Recording schedule unavailable.")
+
+    def test_bad_timezone_is_unavailable_for_continuous_schedule_in_normal_and_fallback_paths(self):
+        self.settings["recording_schedule"]["timezone"] = "Invalid/Zone"
+        self.control.configuration_generation = active_configuration_generation(self.settings)
+        diagnostic = self._diagnostic(started=self.now.timestamp(), phase="error")
+        diagnostic[self.channel]["error_code"] = "recorder_worker_stopped"
+        normal = self._call(diagnostic)
+        self.assertEqual(normal["status"], "unavailable")
+        self.assertEqual(normal["message"], "Recording schedule unavailable.")
+        self.assertEqual(normal["channels"][0]["state"], "error")
+        self.assertEqual(normal["summary"]["error"], 1)
+        fallback = current_recordings(
+            self.settings, None, redis_client=self.redis, now=self.now,
+        )
+        self.assertEqual(fallback["status"], "unavailable")
+        self.assertEqual(fallback["message"], "Recording schedule unavailable.")
+
+    def test_active_and_off_window_error_rows_keep_structured_states_and_summary(self):
+        off_window = str(uuid.uuid4())
+        self.settings["channel_uuids"] += "\n" + off_window
+        self.settings["recording_schedule"]["channels"][off_window] = normalize_schedule(
+            {"monday": []},
+        ).to_snapshot()
+        self.control.configuration_generation = active_configuration_generation(self.settings)
+        diagnostics = self._diagnostic(started=self.now.timestamp(), phase="error")
+        diagnostics[self.channel]["error_code"] = "recorder_worker_stopped"
+        diagnostics[off_window] = dict(diagnostics[self.channel])
+        with patch("catchuparr.recording_overview._selected_channel_ids",
+                   return_value=[self.channel, off_window]), \
+             patch("catchuparr.recording_overview._channel_metadata", return_value={
+                 self.channel: {"number": 12, "name": "Synthetic Channel A"},
+                 off_window: {"number": 13, "name": "Synthetic Channel B"},
+             }), patch("catchuparr.recording_overview.read_recorder_diagnostics", return_value=diagnostics), \
+             patch("catchuparr.recording_overview.source_metadata", return_value=None):
+            result = current_recordings(
+                self.settings, self.control, redis_client=self.redis, now=self.now,
+            )
+        rows = {row["channel_uuid"]: row for row in result["channels"]}
+        self.assertEqual(rows[self.channel]["state"], "error")
+        self.assertEqual(rows[off_window]["state"], "error")
+        self.assertTrue(rows[self.channel]["scheduled_now"])
+        self.assertFalse(rows[off_window]["scheduled_now"])
+        self.assertEqual(result["summary"]["error"], 2)
+        self.assertEqual(result["message"],
+                         "#12: Synthetic Channel A - — [failed: recorder-stopped]")
+
+    def test_compact_failure_labels_are_fixed_and_state_specific(self):
+        row = {"number": 1, "name": "Synthetic Channel", "source": None,
+               "state": "no_media_progress"}
+        self.assertEqual(_message_row(row), "#1: Synthetic Channel - — [failed: no-media]")
+        row["state"] = "cleanup_pending"
+        self.assertEqual(_message_row(row), "#1: Synthetic Channel - — [failed: cleanup-pending]")
+        row["state"] = "unknown"
+        self.assertEqual(_message_row(row), "#1: Synthetic Channel - — [failed: unknown]")
+        row.update(state="error", error_code="unrecognized_private_error")
+        self.assertEqual(_message_row(row), "#1: Synthetic Channel - — [failed: unknown]")
+        self.assertNotIn("no-tuners", _message_row(row))
 
     def test_source_display_suppresses_urls_and_credentials(self):
         self.assertEqual("Good provider", _safe_display("Good provider"))
