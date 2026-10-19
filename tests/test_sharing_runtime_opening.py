@@ -86,6 +86,75 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_failed_opening_ack_is_exact_and_later_cleanup_is_ignored(self):
+        from scripts.aio_recorder_media import _ack_failed_opening_cleanup
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-exact-ack-synthetic",
+        )
+        closed = self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        self.assertTrue(_ack_failed_opening_cleanup(
+            self.episode_ledger, CHANNEL, opening.episode_id, (0, 0),
+            acknowledged=False,
+        ))
+
+        # A new active cleanup after the original ACK must not be checked
+        # against the old episode identity or completion count.
+        next_state = replace(self.saved.state, intent_epoch=self.saved.state.intent_epoch + 1)
+        next_saved = self.intent_ledger.save(
+            next_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=self.saved.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        replacement = self.episode_ledger.begin_open(
+            next_saved.intent, lease_digest=sha256((LEASE + "-next").encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-next-ack-synthetic",
+            expected_version=closed.version,
+        )
+        self.assertTrue(_ack_failed_opening_cleanup(
+            self.episode_ledger, CHANNEL, opening.episode_id, (0, 1),
+            acknowledged=True,
+        ))
+        self.assertEqual("opening", self.episode_ledger.read(CHANNEL).phase)
+        self.assertEqual(replacement.episode_id, self.episode_ledger.read(CHANNEL).episode_id)
+
+    def test_failed_opening_ack_rejects_closed_replacement_episode(self):
+        from scripts.aio_recorder_media import _ack_failed_opening_cleanup
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-replaced-ack-synthetic",
+        )
+        closed = self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        next_state = replace(self.saved.state, intent_epoch=self.saved.state.intent_epoch + 1)
+        next_saved = self.intent_ledger.save(
+            next_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=self.saved.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        replacement = self.episode_ledger.begin_open(
+            next_saved.intent, lease_digest=sha256((LEASE + "-replacement").encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-replacement-ack-synthetic",
+            expected_version=closed.version,
+        )
+        replacement_closed = self.episode_ledger.revoke(
+            replacement.episode_id, expected_version=replacement.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        self.assertEqual("closed", replacement_closed.phase)
+        with self.assertRaisesRegex(RuntimeError, "exact failed channel opening"):
+            _ack_failed_opening_cleanup(
+                self.episode_ledger, CHANNEL, opening.episode_id, (0, 0),
+                acknowledged=False,
+            )
+
     def prepare(self, *, project=True, close=True, validate=lambda _token: True):
         with patch(
             "catchuparr.sharing_runtime.project_opening_episode", return_value=project,
