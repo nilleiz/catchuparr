@@ -71,6 +71,19 @@ class ActionMessageFormattingTests(unittest.TestCase):
         east_asian_padding = self.padding_before_next_row(format_action_message(("漢", "NextRow")))
         self.assertLess(east_asian_padding, ascii_padding)
 
+    def test_long_cjk_and_mixed_rows_wrap_at_character_breaks(self):
+        for row in ("漢" * 25 + " - Tail", "Latin 漢" * 20 + " end"):
+            with self.subTest(row=row[:20]):
+                width = _last_visual_line_width(row)
+                message = format_action_message((row, "NextRow"))
+                padding = self.padding_before_next_row(message)
+                self.assertLessEqual(width, TARGET_WIDTH_PX)
+                self.assertGreater(width, 0)
+                self.assertLessEqual(
+                    width + (padding + 1) * NBSP_WIDTH_PX,
+                    TARGET_WIDTH_PX,
+                )
+
     def test_combining_mark_has_zero_extra_estimated_width(self):
         plain = self.padding_before_next_row(format_action_message(("Cafe", "NextRow")))
         combined = self.padding_before_next_row(format_action_message(("Cafe\u0301", "NextRow")))

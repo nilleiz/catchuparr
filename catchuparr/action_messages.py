@@ -157,14 +157,28 @@ def _text_width(text: str) -> float:
 
 
 def _last_visual_line_width(text: str) -> float:
-    """Simulate browser whitespace wrapping at the calibrated width."""
+    """Estimate the last visual line, including CJK break opportunities."""
     line_width = 0.0
-    for word in text.split():
-        word_width = _text_width(word)
-        if line_width and line_width + _CALIBRATED_WIDTHS[" "] + word_width > TARGET_WIDTH_PX:
-            line_width = word_width
-        else:
-            line_width += (_CALIBRATED_WIDTHS[" "] if line_width else 0.0) + word_width
+    words = text.split()
+    for word_index, word in enumerate(words):
+        units = []
+        for character in word:
+            if unicodedata.east_asian_width(character) in {"W", "F"}:
+                units.append((character, _character_width(character)))
+            elif units and units[-1][0] == "\0":
+                units[-1] = ("\0", units[-1][1] + _character_width(character))
+            else:
+                units.append(("\0", _character_width(character)))
+        for index, (kind, unit_width) in enumerate(units):
+            if index == 0 and line_width:
+                line_width += _CALIBRATED_WIDTHS[" "]
+                if line_width + unit_width > TARGET_WIDTH_PX:
+                    line_width = 0.0
+            break_before = kind != "\0" or (index > 0 and units[index - 1][0] != "\0")
+            if break_before and line_width and line_width + unit_width > TARGET_WIDTH_PX:
+                line_width = unit_width
+            else:
+                line_width += unit_width
     return line_width
 
 
