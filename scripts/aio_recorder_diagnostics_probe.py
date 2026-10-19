@@ -116,15 +116,20 @@ def _dedicated_writer_guard_checks(redis_client, channel_uuid, lease_value, live
         checks["live_record_is_recording"] = live_record.get("phase") == "recording"
         lease_key = f"catchuparr:recorder:{channel_uuid}"
         pattern = f"{PLUGIN_REDIS_PREFIX}worker:catchuparr-r*"
+        expected_worker_prefix = f"{PLUGIN_REDIS_PREFIX}worker:"
         current_attempts = []
         for worker_key in redis_client.scan_iter(match=pattern, count=100):
+            worker_key_text = _text(worker_key)
+            if not isinstance(worker_key_text, str):
+                continue
             worker = _decode_hash(redis_client.hgetall(worker_key))
             if (worker.get("channel_uuid") == channel_uuid
                     and worker.get("lease_key") == lease_key
                     and worker.get("lease_value") == lease_value
                     and worker.get("state") in _ACTIVE_WORKER_STATES):
                 worker_id = worker.get("worker_id")
-                if worker_id and worker_key.endswith(worker_id):
+                expected_worker_key = expected_worker_prefix + worker_id if worker_id else ""
+                if worker_key_text == expected_worker_key:
                     current_attempts.append((worker_id, worker))
         if len(current_attempts) != 1:
             return checks
