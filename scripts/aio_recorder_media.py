@@ -715,6 +715,28 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
         ),
         "task_status": task_status,
         "failure_classes": failure_classes,
+        "exception_call_sites": [
+            [
+                {
+                    "file": (
+                        frame.get("file")[:80]
+                        if isinstance(frame.get("file"), str) else None
+                    ),
+                    "function": (
+                        frame.get("function")[:80]
+                        if isinstance(frame.get("function"), str) else None
+                    ),
+                    "line": (
+                        frame.get("line")
+                        if type(frame.get("line")) is int else None
+                    ),
+                }
+                for frame in call_sites[-8:]
+                if isinstance(frame, dict)
+            ]
+            for call_sites in getattr(run, "exception_call_sites", ())[-4:]
+            if isinstance(call_sites, list)
+        ],
         "attempts": attempt_summaries,
         "attempt_count": len(inputs),
         "process_exit_codes": process_exit_codes,

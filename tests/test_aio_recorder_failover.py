@@ -264,6 +264,10 @@ class RecorderFailoverMediaTests(unittest.TestCase):
                 input_url="http://user:password@synthetic.invalid/private-token",
             )],
             failures=["task:BorrowBindingLost", "Bearer private-token"],
+            exception_call_sites=[[
+                {"file": "tasks.py", "function": "record_channel", "line": 375,
+                 "locals": "private-token"},
+            ]],
             processes=[FakeProcess()],
             result={"status": "sharing_cleanup_pending", "token": "private-token"},
             thread=FakeThread(),
@@ -276,6 +280,9 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         serialized = json.dumps(diagnostic)
         self.assertEqual(diagnostic["task_status"], "sharing_cleanup_pending")
         self.assertEqual(diagnostic["failure_classes"], ["BorrowBindingLost", "other"])
+        self.assertEqual(diagnostic["exception_call_sites"], [[
+            {"file": "tasks.py", "function": "record_channel", "line": 375},
+        ]])
         self.assertEqual(diagnostic["attempts"], [
             {"status": "no_media", "useful_segments": 0},
         ])
