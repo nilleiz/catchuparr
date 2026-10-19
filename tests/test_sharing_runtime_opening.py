@@ -833,6 +833,12 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
                 self.episode_ledger, object(), now=300.0,
                 stale_after=1000.0, channel_uuid=CHANNEL,
             ))
+            # Startup can already have ACKed the cleanup before another
+            # recovery entry point runs. That retry is a successful no-op.
+            self.assertEqual((0, 0), retry_durable_open_cleanups(
+                self.episode_ledger, object(), now=301.0,
+                stale_after=1000.0, channel_uuid=CHANNEL,
+            ))
         cleanup.assert_called_once()
         self.assertEqual(target_registration.client_id, cleanup.call_args.args[1].client_id)
         self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
