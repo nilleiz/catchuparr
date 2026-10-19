@@ -4,7 +4,10 @@ Pull requests always run the unit and package checks. The pinned Dispatcharr
 0.32.0 native AIO probe runs unless every changed path is explicitly limited to
 the provenance helper and its tests, Markdown documentation, README or
 changelog, or workflow YAML files. Unknown files and unavailable diff metadata
-run the full probe. Manual workflow dispatch always runs it. The AIO job has a
+run the full probe. Manual workflow dispatch runs it by default. The workflow
+offers an explicit `skip_native` input for a manually requested package/unit
+validation run; its default is false, and the skip does not produce release
+acceptance evidence. The AIO job has a
 40-minute outer timeout for its 30-minute probe budget plus bounded setup and
 cleanup time; the probe's own deadline and assertions remain its runtime limit.
 Pull-request runs use concurrency cancellation so obsolete revisions do not
