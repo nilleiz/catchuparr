@@ -26,6 +26,7 @@ ERROR_CODES = frozenset({
     "control_state_invalid", "schedule_install_failed", "runtime_disabled",
 })
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SAFE_NATIVE_OWNER = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -260,7 +261,8 @@ def publish_recorder_diagnostic(
         input_profile_id = metadata.get("stream_profile")
         if (not _SAFE_ID.fullmatch(profile_id)
                 or not _SAFE_ID.fullmatch(input_profile_id or "")
-                or not isinstance(native_owner, str) or not _SAFE_ID.fullmatch(native_owner)
+                or not isinstance(native_owner, str)
+                or not _SAFE_NATIVE_OWNER.fullmatch(native_owner)
                 or metadata.get("owner") != native_owner
                 or metadata.get("stream_id") != str(stream_id)
                 or metadata.get("m3u_profile") != profile_id
@@ -334,9 +336,11 @@ def publish_borrowed_recorder_diagnostic(
         if not isinstance(lease_value, str) or not lease_value:
             return False
         if any(not _SAFE_ID.fullmatch(str(value)) for value in (
-            episode_id, client_id, worker_id, owner_lock_value, metadata_owner,
-            stream_id, account_id, m3u_profile_id, input_profile_id,
-        )):
+            episode_id, client_id, stream_id, account_id, m3u_profile_id, input_profile_id,
+        )) or any(
+            not isinstance(value, str) or not _SAFE_NATIVE_OWNER.fullmatch(value)
+            for value in (worker_id, owner_lock_value, metadata_owner)
+        ):
             return False
         if not _HEX64.fullmatch(str(config_generation)) or not _HEX64.fullmatch(str(catalog_generation)):
             return False

@@ -7,6 +7,8 @@ from unittest.mock import patch
 from catchuparr.configuration import active_configuration_generation
 from catchuparr.recorder_diagnostics import (
     _PUBLISH_BORROWED_LUA,
+    _SAFE_ID,
+    _SAFE_NATIVE_OWNER,
     ERROR_CODES,
     LAST_ERROR_TTL_SECONDS,
     LIVE_TTL_CAP_SECONDS,
@@ -20,19 +22,20 @@ class RecordingRedis:
     def __init__(self):
         self.calls = []
         self.worker_id = None
+        self.native_owner = "native.owner.synthetic:123"
 
     def hgetall(self, key):
         if self.worker_id and key.endswith(self.worker_id):
             return {b"profile_id": b"5", b"account_id": b"7"}
         if ":metadata" in key:
             return {
-                b"owner": self.worker_id.encode(), b"stream_id": b"31",
+                b"owner": self.native_owner.encode(), b"stream_id": b"31",
                 b"m3u_profile": b"5", b"stream_profile": b"4", b"state": b"active",
             }
         return {}
 
     def get(self, key):
-        return self.worker_id if key.endswith(":owner") else None
+        return self.native_owner if key.endswith(":owner") else None
 
     def ttl(self, _key):
         return 30
@@ -69,14 +72,19 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         self.assertLess(script.index("TYPE"), script.index("HSET"))
         self.assertEqual(key_count, 8)
         self.assertTrue(args[1].endswith(self.worker_id))
-        self.assertEqual(args[-6:], ("recording", "dedicated", "", "5", "4", self.worker_id))
+        self.assertEqual(args[-6:], (
+            "recording", "dedicated", "", "5", "4", self.redis.native_owner,
+        ))
+        self.assertEqual(args[5], f"live:worker:{self.redis.native_owner}:heartbeat")
 
     def test_borrowed_write_checks_current_authority_and_exact_grant(self):
+        self.assertIsNone(_SAFE_ID.fullmatch("native:worker.123"))
+        self.assertIsNotNone(_SAFE_NATIVE_OWNER.fullmatch("native:worker.123"))
         result = publish_borrowed_recorder_diagnostic(
             self.redis, self.channel, "8:synthetic-owner", episode_id="episode_9",
             client_id="catchuparr-client-9",
-            worker_id="nativeworker", owner_lock_value="native-lock",
-            metadata_owner="native-owner", stream_id="31", account_id="7",
+            worker_id="native:worker.123", owner_lock_value="native:lock.123",
+            metadata_owner="native:owner.123", stream_id="31", account_id="7",
             m3u_profile_id="5", input_profile_id="4", catalog_generation=self.catalog,
             phase="starting", started_at=1000, config_generation=self.generation,
             control_generation=3, fence=8, now=1010,
@@ -89,10 +97,10 @@ class RecorderDiagnosticWriterTests(unittest.TestCase):
         self.assertIn("m3u_profile_id", script)
         self.assertEqual(args[-7:], (
             "starting", "", str(LAST_ERROR_TTL_SECONDS), str(LIVE_TTL_CAP_SECONDS),
-            "catchuparr-client-9", "native-lock", "native-owner",
+            "catchuparr-client-9", "native:lock.123", "native:owner.123",
         ))
-        self.assertTrue(args[10].endswith(":native-owner:heartbeat"))
-        self.assertEqual(args[16], "nativeworker")
+        self.assertTrue(args[10].endswith(":native:owner.123:heartbeat"))
+        self.assertEqual(args[16], "native:worker.123")
 
     def test_invalid_inputs_never_call_redis(self):
         with patch("catchuparr.adapters.recorder_proxy.is_managed_worker_id", return_value=True):
