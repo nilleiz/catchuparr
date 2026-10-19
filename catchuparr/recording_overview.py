@@ -8,6 +8,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from .engine.recorder import (
     ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS,
@@ -50,7 +51,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         generation = None
     if (not channel_ids or control_state is None or generation is None
             or control_state.configuration_generation != generation):
-        return _unknown_all(settings, channel_ids, control_state, "applied_state_unavailable")
+        return _unknown_all(settings, channel_ids, control_state, "applied_state_unavailable", now=instant)
 
     if redis_client is None:
         try:
@@ -78,11 +79,16 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
     for channel_uuid in channel_ids:
         channel = metadata.get(channel_uuid, {})
         diagnostic = diagnostics.get(channel_uuid)
+        scheduled, schedule_error = _scheduled_now(
+            schedule_channels, timezone_name, channel_uuid, instant,
+        )
         evidence = None
         if diagnostic and diagnostic.get("phase") != "error":
             evidence = _indexed_media_since(
                 settings, channel_uuid, diagnostic["started_at"], timestamp,
             )
+        # Keep recorder state and summary priority independent of schedule
+        # filtering. The schedule controls only whether this row is rendered.
         if not redis_ready:
             state, mode, reason = "unknown", "unconfirmed", "redis_unavailable"
         elif diagnostic and diagnostic.get("phase") == "error":
@@ -91,19 +97,15 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
             state, mode, reason = "cleanup_pending", _mode(diagnostic), "recorder_cleanup_pending"
         elif control_state.paused:
             state, mode, reason = "paused", _mode(diagnostic), "recording_paused"
+        elif schedule_error:
+            state, mode, reason = "unknown", _mode(diagnostic), "schedule_unavailable"
+        elif not scheduled:
+            state, mode, reason = "outside_schedule", _mode(diagnostic), "outside_applied_schedule"
         else:
-            scheduled, schedule_error = _scheduled_now(
-                schedule_channels, timezone_name, channel_uuid, instant,
+            state, mode, reason = _state_for_channel(
+                settings, channel_uuid, diagnostic, redis_client, timestamp,
+                evidence=evidence,
             )
-            if schedule_error:
-                state, mode, reason = "unknown", _mode(diagnostic), "schedule_unavailable"
-            elif not scheduled:
-                state, mode, reason = "outside_schedule", _mode(diagnostic), "outside_applied_schedule"
-            else:
-                state, mode, reason = _state_for_channel(
-                    settings, channel_uuid, diagnostic, redis_client, timestamp,
-                    evidence=evidence,
-                )
         source = _source_for_diagnostic(channel_uuid, diagnostic) if diagnostic else None
         if source is not None:
             binding = source_metadata(
@@ -127,6 +129,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
             "mode": mode,
             "reason": reason,
             "source": source,
+            "scheduled_now": scheduled if not schedule_error else None,
         }
         if diagnostic and diagnostic.get("phase") == "error":
             channel_row["error_code"] = diagnostic.get("error_code")
@@ -152,12 +155,18 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         for row in rows
     )
     counts["problems"] = problem_count
-    lines = [f"Problems: {problem_count}"]
-    lines.extend(_message_row(row) for row in rows)
-    if not rows:
-        lines.append("No channels are selected.")
-    message = "Current recordings\n" + "\n".join(lines)
-    return {"status": "ok", "message": message, "channels": rows, "summary": counts}
+    visible = [row for row in rows if row.get("scheduled_now") is True]
+    schedule_unavailable = any(row.get("scheduled_now") is None for row in rows)
+    if schedule_unavailable:
+        message = "Recording schedule unavailable."
+        status = "unavailable"
+    elif visible:
+        message = "\n".join(_message_row(row) for row in visible)
+        status = "ok"
+    else:
+        message = "No recordings scheduled now."
+        status = "ok"
+    return {"status": status, "message": message, "channels": rows, "summary": counts}
 
 
 _STATES = (
@@ -325,36 +334,54 @@ def _safe_identifier(value):
 
 
 def _message_row(row):
-    state = row["state"].replace("_", " ")
-    parts = [f"{_display_name(row)} — {state}"]
+    number = row.get("number")
+    name = _safe_display(row.get("name")) or "Unknown channel"
     source = row.get("source")
-    if source:
-        details = [source.get("mode")]
-        stream_name = source.get("stream_name")
-        stream_id = source.get("stream_id")
-        if stream_name:
-            details.append(f"{stream_name} (id {stream_id})" if stream_id else stream_name)
-        elif stream_id:
-            details.append(f"stream id {stream_id}")
-        provider_name, provider_id = source.get("provider_name"), source.get("provider_id")
-        if provider_name:
-            details.append(f"provider {provider_name} (id {provider_id})" if provider_id else f"provider {provider_name}")
-        profile_name, profile_id = source.get("input_profile_name"), source.get("input_profile_id")
-        if profile_name:
-            details.append(f"Stream profile {profile_name} (id {profile_id})" if profile_id
-                           else f"Stream profile {profile_name}")
-        elif profile_id:
-            details.append(f"Stream profile id {profile_id}")
-        m3u_name, m3u_id = source.get("m3u_profile_name"), source.get("m3u_profile_id")
-        if m3u_name:
-            details.append(f"provider profile {m3u_name} (id {m3u_id})" if m3u_id
-                           else f"provider profile {m3u_name}")
-        parts.append("  Source: " + "; ".join(value for value in details if value))
-    if row.get("last_confirmed_progress_none"):
-        parts.append("  Last confirmed progress: none")
-    elif row.get("last_confirmed_progress_at"):
-        parts.append(f"  Last confirmed progress: {row['last_confirmed_progress_at']}")
-    return "\n".join(parts)
+    m3u_name = _safe_display(source.get("m3u_profile_name")) if isinstance(source, dict) else None
+    if row.get("state") == "recording" and row.get("recent_media_progress") is True:
+        status = "ok"
+    elif row.get("state") == "starting":
+        status = "starting"
+    elif row.get("state") == "paused":
+        status = "failed: paused"
+    elif row.get("state") == "error":
+        status = f"failed: {_compact_error_label(row.get('error_code'))}"
+    elif row.get("state") == "cleanup_pending":
+        status = "failed: cleanup-pending"
+    elif row.get("state") == "no_media_progress":
+        status = "failed: no-media"
+    else:
+        status = "failed: unknown"
+    attached = row.get("state") == "recording" and row.get("recent_media_progress") is True \
+        and row.get("mode") == "borrowed"
+    suffix = ", attached" if attached else ""
+    label = f"#{number}:" if number is not None else "#?:"
+    return f"{label} {name} - {m3u_name or '—'} [{status}{suffix}]"
+
+
+_COMPACT_ERROR_LABELS = {
+    "recorder_worker_stopped": "recorder-stopped",
+    "borrowed_recorder_worker_stopped": "recorder-stopped",
+    "borrow_cleanup_pending": "cleanup-pending",
+    "sharing_cleanup_pending": "cleanup-pending",
+    "sharing_attempt_cleanup_pending": "cleanup-pending",
+    "sharing_attempt_reconciled": "attempt-reconciled",
+    "sharing_observation_failed": "observation-failed",
+    "sharing_projection_failed": "projection-failed",
+    "sharing_registration_failed": "registration-failed",
+    "sharing_binding_lost": "binding-lost",
+    "sharing_recovery_pending": "recovery-pending",
+    "sharing_recovery_failed": "recovery-failed",
+    "sharing_recovery_stale": "recovery-stale",
+    "supervision_failed": "supervision-failed",
+    "control_state_invalid": "control-state-invalid",
+    "schedule_install_failed": "schedule-install-failed",
+    "runtime_disabled": "runtime-disabled",
+}
+
+
+def _compact_error_label(error_code):
+    return _COMPACT_ERROR_LABELS.get(error_code, "unknown")
 
 
 def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now):
@@ -365,6 +392,9 @@ def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now):
 
         snapshot = schedule_channels[channel_uuid]
         parsed = schedule_from_snapshot(snapshot)
+        # schedule_is_active returns early for continuous schedules, so validate
+        # the IANA timezone independently before evaluating every schedule mode.
+        ZoneInfo(timezone_name)
         return schedule_is_active(parsed, timezone_name, now), False
     except Exception:
         return False, True
@@ -379,23 +409,44 @@ def _channel_metadata(channel_ids):
         return {}
 
 
-def _unknown_all(settings, channel_ids, control_state, reason):
+def _unknown_all(settings, channel_ids, control_state, reason, *, now=None):
     metadata = _channel_metadata(channel_ids)
     rows = [
         {"channel_uuid": channel_id, "number": metadata.get(channel_id, {}).get("number"),
          "name": _safe_display(metadata.get(channel_id, {}).get("name")) or "Unknown channel",
          "state": "unknown", "mode": "unconfirmed", "reason": reason, "source": None,
+         "scheduled_now": None,
          "last_confirmed_progress_at": None, "last_confirmed_progress_none": True}
         for channel_id in channel_ids
     ]
     rows.sort(key=_channel_sort_key)
     summary = {name: sum(row["state"] == name for row in rows) for name in _STATES}
     summary["problems"] = len(rows)
+    schedule_config = settings.get("recording_schedule")
+    schedule_channels = schedule_config.get("channels") if isinstance(schedule_config, dict) else None
+    timezone_name = schedule_config.get("timezone") if isinstance(schedule_config, dict) else None
+    now = now or datetime.now(timezone.utc)
+    schedule_unknown = not isinstance(schedule_channels, dict) or not isinstance(timezone_name, str)
+    if not schedule_unknown:
+        try:
+            ZoneInfo(timezone_name)
+        except (ValueError, TypeError, KeyError):
+            schedule_unknown = True
+    for row in rows:
+        scheduled, schedule_error = _scheduled_now(schedule_channels, timezone_name, row["channel_uuid"], now)
+        row["scheduled_now"] = scheduled if not schedule_error else None
+        if schedule_error:
+            row["reason"] = "schedule_unavailable"
+        schedule_unknown = schedule_unknown or schedule_error
+    visible = [row for row in rows if row.get("scheduled_now") is True]
+    message = (
+        "Recording schedule unavailable." if schedule_unknown else
+        "\n".join(_message_row(row) for row in visible) if visible else
+        "No recordings scheduled now."
+    )
     return {
-        "status": "ok",
-        "message": "Current recordings\nProblems: " + str(len(rows)) + "\n" + "\n".join(
-            f"{_message_row(row)}\n  Reason: {reason.replace('_', ' ')}" for row in rows
-        ),
+        "status": "unavailable" if schedule_unknown else "ok",
+        "message": message,
         "channels": rows,
         "summary": summary,
     }
