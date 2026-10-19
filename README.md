@@ -1,9 +1,10 @@
 # Catchuparr
 
 Current-recording and today's schedule action messages use compact rows. The
-row gaps use static character-width estimates calibrated for 17px Lato at
-350px; they do not measure the host's runtime font or viewport. Copied text may
-contain nonbreaking spaces; replace them with ordinary spaces where needed.
+row gaps use static character-width estimates calibrated for 17px Lato with a
+280px target; they do not measure the host's runtime font or viewport. Copied
+text may contain nonbreaking spaces; replace them with ordinary spaces where
+needed.
 
 <p align="center">
   <img src="docs/assets/catchuparr-icon-256.png" width="128" height="128" alt="Catchuparr logo">
