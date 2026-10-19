@@ -39,6 +39,17 @@ class _SyntheticArchiveStore:
 
 
 class RecorderFailoverMediaTests(unittest.TestCase):
+    def test_recorder_task_threading_preserves_observed_event_and_reentrant_lock(self):
+        stop_event = threading.Event()
+        task_threading = probe._recorder_task_threading(stop_event)
+
+        self.assertIs(task_threading.Event(), stop_event)
+        lock = task_threading.RLock()
+        with lock:
+            with lock:
+                self.assertTrue(lock.acquire(blocking=False))
+                lock.release()
+
     def test_thread_database_cleanup_runs_on_normal_and_exceptional_exit(self):
         cleanup_threads = []
 
