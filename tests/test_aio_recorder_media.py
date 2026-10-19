@@ -123,6 +123,22 @@ class RecorderMediaProbeTests(unittest.TestCase):
             for call in calls
         ))
 
+    def test_dedicated_diagnostic_failure_snapshot_is_finite_booleans(self):
+        from scripts.aio_recorder_diagnostics_probe import _dedicated_writer_guard_checks
+
+        class Redis:
+            def hgetall(self, _key):
+                return {}
+
+        checks = _dedicated_writer_guard_checks(
+            Redis(), "synthetic-channel-id", "synthetic-lease-value",
+            "catchuparr:recorder:diagnostic:synthetic-channel-id",
+        )
+        self.assertTrue(checks)
+        self.assertTrue(all(type(value) is bool for value in checks.values()))
+        self.assertFalse(checks["live_record_present"])
+        self.assertFalse(checks["worker_record_present"])
+
     def test_dead_recorder_failure_reports_safe_terminal_task_diagnostics(self):
         thread = threading.Thread(target=lambda: None)
         thread.start()
