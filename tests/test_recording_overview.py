@@ -1,14 +1,19 @@
+import copy
 import sqlite3
+import sys
 import tempfile
+import time
 import unittest
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.configuration import active_configuration_generation
+from catchuparr.plugin import Plugin
 from catchuparr.recording_overview import (
+    ACTION_MESSAGE_SEPARATOR,
     _message_row,
     _safe_display,
     _source_for_diagnostic,
@@ -235,12 +240,92 @@ class RecordingOverviewTests(unittest.TestCase):
             result = current_recordings(
                 self.settings, self.control, redis_client=self.redis, now=self.now,
             )
-        self.assertEqual(result["message"], "#12: Synthetic Channel A - Synthetic Provider Profile [starting]")
+        self.assertEqual(result["message"], "Synthetic Channel A - Synthetic [starting]")
         self.assertEqual(result["channels"][0]["source"]["provider_name"], "Synthetic Provider")
         self.assertEqual(result["channels"][0]["source"]["stream_name"], "Synthetic Stream A")
         self.assertEqual(result["channels"][0]["last_confirmed_progress_at"], None)
         self.assertNotIn("provider Synthetic Provider", result["message"])
         self.assertNotIn("id 17", result["message"])
+
+    def test_current_recordings_action_uses_short_m3u_label_and_padding_only_in_message(self):
+        second = str(uuid.uuid4())
+        active = copy.deepcopy(self.settings)
+        active["channel_uuids"] = f"{self.channel}\n{second}"
+        active["recording_schedule"]["channels"][second] = normalize_schedule(
+            "continuous",
+        ).to_snapshot()
+        control = SimpleNamespace(
+            paused=False,
+            configuration_generation=active_configuration_generation(active),
+        )
+        channels = {
+            self.channel: {"number": 731, "name": "Synthetic Channel A"},
+            second: {"number": 842, "name": "Synthetic Channel B"},
+        }
+        diagnostics = {
+            channel_id: {
+                "phase": "starting", "source": "dedicated", "stream_id": stream_id,
+                "account_id": "account", "m3u_profile_id": profile_id,
+                "input_profile_id": "input", "started_at": time.time() - 5,
+                "error_code": "",
+            }
+            for channel_id, stream_id, profile_id in (
+                (self.channel, "stream-a", "profile-a"),
+                (second, "stream-b", "profile-b"),
+            )
+        }
+        sources = {
+            self.channel: {
+                "stream_name": "Distinct Stream Full Name",
+                "m3u_profile_name": "M3UActual Full Profile",
+                "provider_name": "Synthetic Provider Full Name",
+            },
+            second: {
+                "stream_name": "Different Stream Full Name",
+                "m3u_profile_name": "Alternate Actual Profile",
+                "provider_name": "Other Synthetic Provider",
+            },
+        }
+        core_module = ModuleType("core")
+        core_module.__path__ = []
+        utils_module = ModuleType("core.utils")
+
+        class RedisClientFactory:
+            @staticmethod
+            def get_client():
+                return self.redis
+
+        utils_module.RedisClient = RedisClientFactory
+        with patch("catchuparr.configuration.load_applied_state_readonly",
+                   return_value=(active, control)), \
+             patch.dict(sys.modules, {"core": core_module, "core.utils": utils_module}), \
+             patch("catchuparr.recording_overview._selected_channel_ids",
+                   return_value=[self.channel, second]), \
+             patch("catchuparr.recording_overview._channel_metadata", return_value=channels), \
+             patch("catchuparr.recording_overview.read_recorder_diagnostics",
+                   return_value=diagnostics), \
+             patch("catchuparr.recording_overview.source_metadata",
+                   side_effect=lambda channel_id, *_args: sources[channel_id]):
+            result = Plugin.__new__(Plugin).run("current_recordings", {}, {})
+
+        expected = ACTION_MESSAGE_SEPARATOR.join((
+            "Synthetic Channel A - M3UActual [starting]",
+            "Synthetic Channel B - Alternate [starting]",
+        ))
+        self.assertEqual([row["state"] for row in result["channels"]], ["starting", "starting"])
+        self.assertEqual(result["message"], expected)
+        self.assertNotIn("\n", result["message"])
+        self.assertEqual(result["message"].count("\u00a0"), 200)
+        self.assertNotIn("731", result["message"])
+        self.assertNotIn("842", result["message"])
+        self.assertNotIn("Distinct Stream Full Name", result["message"])
+        self.assertNotIn("M3UActual Full Profile", result["message"])
+        self.assertNotIn("Synthetic Provider Full Name", result["message"])
+        rows = {row["channel_uuid"]: row for row in result["channels"]}
+        self.assertEqual(rows[self.channel]["number"], 731)
+        self.assertEqual(rows[self.channel]["source"]["stream_name"], "Distinct Stream Full Name")
+        self.assertEqual(rows[self.channel]["source"]["m3u_profile_name"], "M3UActual Full Profile")
+        self.assertEqual(result["summary"]["starting"], 2)
 
     def test_active_confirmed_recording_and_borrowed_attachment_compact_status(self):
         started = self.now.timestamp() - 20
@@ -262,7 +347,7 @@ class RecordingOverviewTests(unittest.TestCase):
                 self.settings, self.control, redis_client=self.redis, now=self.now,
             )
         self.assertEqual(result["message"],
-                         "#12: Synthetic Channel A - Synthetic M3U Profile [ok, attached]")
+                         "Synthetic Channel A - Synthetic [ok, attached]")
         self.assertEqual(result["channels"][0]["state"], "recording")
 
     def test_active_error_is_safe_and_unknown_schedule_is_explicit(self):
@@ -270,7 +355,7 @@ class RecordingOverviewTests(unittest.TestCase):
         error[self.channel]["error_code"] = "recorder_worker_stopped"
         result = self._call(error)
         self.assertEqual(result["message"],
-                         "#12: Synthetic Channel A - — [failed: recorder-stopped]")
+                         "Synthetic Channel A - — [failed: recorder-stopped]")
         self.assertNotIn("recorder_worker_stopped", result["message"])
         self.settings["recording_schedule"] = {}
         unknown = self._call(error)
@@ -299,7 +384,7 @@ class RecordingOverviewTests(unittest.TestCase):
             result = current_recordings(
                 self.settings, None, redis_client=self.redis, now=self.now,
             )
-        self.assertEqual(result["message"], "#12: Synthetic Channel A - — [failed: unknown]")
+        self.assertEqual(result["message"], "Synthetic Channel A - — [failed: unknown]")
         self.assertEqual(result["channels"][0]["state"], "unknown")
         self.settings["recording_schedule"] = {}
         unavailable = current_recordings(
@@ -351,18 +436,18 @@ class RecordingOverviewTests(unittest.TestCase):
         self.assertFalse(rows[off_window]["scheduled_now"])
         self.assertEqual(result["summary"]["error"], 2)
         self.assertEqual(result["message"],
-                         "#12: Synthetic Channel A - — [failed: recorder-stopped]")
+                         "Synthetic Channel A - — [failed: recorder-stopped]")
 
     def test_compact_failure_labels_are_fixed_and_state_specific(self):
         row = {"number": 1, "name": "Synthetic Channel", "source": None,
                "state": "no_media_progress"}
-        self.assertEqual(_message_row(row), "#1: Synthetic Channel - — [failed: no-media]")
+        self.assertEqual(_message_row(row), "Synthetic Channel - — [failed: no-media]")
         row["state"] = "cleanup_pending"
-        self.assertEqual(_message_row(row), "#1: Synthetic Channel - — [failed: cleanup-pending]")
+        self.assertEqual(_message_row(row), "Synthetic Channel - — [failed: cleanup-pending]")
         row["state"] = "unknown"
-        self.assertEqual(_message_row(row), "#1: Synthetic Channel - — [failed: unknown]")
+        self.assertEqual(_message_row(row), "Synthetic Channel - — [failed: unknown]")
         row.update(state="error", error_code="unrecognized_private_error")
-        self.assertEqual(_message_row(row), "#1: Synthetic Channel - — [failed: unknown]")
+        self.assertEqual(_message_row(row), "Synthetic Channel - — [failed: unknown]")
         self.assertNotIn("no-tuners", _message_row(row))
 
     def test_source_display_suppresses_urls_and_credentials(self):

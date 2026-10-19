@@ -57,7 +57,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
     if not isinstance(schedules, dict):
         return _error("schedule_unavailable", "Applied recording schedule is unavailable.")
 
-    from .recording_overview import _channel_sort_key, _safe_display
+    from .recording_overview import ACTION_MESSAGE_SEPARATOR, _channel_sort_key, _safe_display
 
     channel_ids = settings.get("channel_uuids", "")
     if isinstance(channel_ids, str):
@@ -135,7 +135,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
     window_count = sum(len(row["windows"]) for row in rows)
     return {
         "status": "ok",
-        "message": "\n".join(lines),
+        "message": ACTION_MESSAGE_SEPARATOR.join(lines),
         "channels": rows,
         "summary": {
             "channel_count": len(rows),
