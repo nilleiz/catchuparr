@@ -313,6 +313,8 @@ def publish_borrowed_recorder_diagnostic(
     episode_id: str,
     client_id: str,
     worker_id: str,
+    owner_lock_value: str,
+    metadata_owner: str,
     stream_id: str,
     account_id: str,
     m3u_profile_id: str,
@@ -332,7 +334,8 @@ def publish_borrowed_recorder_diagnostic(
         if not isinstance(lease_value, str) or not lease_value:
             return False
         if any(not _SAFE_ID.fullmatch(str(value)) for value in (
-            episode_id, client_id, worker_id, stream_id, account_id, m3u_profile_id, input_profile_id,
+            episode_id, client_id, worker_id, owner_lock_value, metadata_owner,
+            stream_id, account_id, m3u_profile_id, input_profile_id,
         )):
             return False
         if not _HEX64.fullmatch(str(config_generation)) or not _HEX64.fullmatch(str(catalog_generation)):
@@ -361,7 +364,7 @@ def publish_borrowed_recorder_diagnostic(
             f"live:channel:{channel_uuid}:clients:{client_id}",
             f"live:channel:{channel_uuid}:client:{client_id}:stop",
             f"live:channel:{channel_uuid}:owner",
-            f"live:worker:{worker_id}:heartbeat",
+            f"live:worker:{metadata_owner}:heartbeat",
             f"live:channel:{channel_uuid}:metadata",
             f"live:channel:{channel_uuid}:stopping",
             lease_value, channel_uuid, episode_id, worker_id, stream_id, account_id,
@@ -371,7 +374,7 @@ def publish_borrowed_recorder_diagnostic(
             hashlib.sha256(worker_id.encode("utf-8")).hexdigest(),
             hashlib.sha256(episode_id.encode("utf-8")).hexdigest(),
             phase, error_code, str(LAST_ERROR_TTL_SECONDS), str(LIVE_TTL_CAP_SECONDS),
-            client_id, worker_id, worker_id,
+            client_id, owner_lock_value, metadata_owner,
         )
         return type(result) is int and result == 1
     except Exception:
