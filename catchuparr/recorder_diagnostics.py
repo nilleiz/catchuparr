@@ -67,7 +67,9 @@ if redis.call('GET', KEYS[1]) ~= ARGV[1]
    or redis.call('HGET', KEYS[7], 'owner') ~= ARGV[19]
    or redis.call('HGET', KEYS[7], 'stream_id') ~= ARGV[4]
    or redis.call('HGET', KEYS[7], 'm3u_profile') ~= ARGV[17]
-   or redis.call('HGET', KEYS[7], 'stream_profile') ~= ARGV[18]
+   or (redis.call('HGET', KEYS[7], 'stream_profile') or '') ~= ARGV[18]
+   or (ARGV[18] == '' and redis.call('HEXISTS', KEYS[7], 'stream_profile') ~= 0)
+   or (ARGV[18] == '' and ARGV[15] ~= 'dedicated')
    or (redis.call('HGET', KEYS[7], 'channel_uuid')
        and redis.call('HGET', KEYS[7], 'channel_uuid') ~= ARGV[2])
    or (redis.call('HGET', KEYS[7], 'state') ~= 'active'
@@ -258,9 +260,11 @@ def publish_recorder_diagnostic(
         if isinstance(native_owner, bytes):
             native_owner = native_owner.decode("utf-8", errors="strict")
         metadata = _hash(redis.hgetall(metadata_key))
-        input_profile_id = metadata.get("stream_profile")
+        input_profile_id = metadata.get("stream_profile", "")
+        input_profile_present = "stream_profile" in metadata
         if (not _SAFE_ID.fullmatch(profile_id)
-                or not _SAFE_ID.fullmatch(input_profile_id or "")
+                or (input_profile_present and not _SAFE_ID.fullmatch(input_profile_id))
+                or (not input_profile_present and source != "dedicated")
                 or not isinstance(native_owner, str)
                 or not _SAFE_NATIVE_OWNER.fullmatch(native_owner)
                 or metadata.get("owner") != native_owner
@@ -459,9 +463,17 @@ def _worker_and_lease_match(redis, worker, record, channel_uuid):
             owner = owner.decode("utf-8", errors="strict")
         heartbeat_key = f"live:worker:{owner}:heartbeat" if owner else ""
         input_profile_id = metadata.get("stream_profile", "")
+        input_profile_present = "stream_profile" in metadata
         return bool(
             profile_id and record.get("m3u_profile_id") == profile_id
-            and input_profile_id and record.get("input_profile_id") == input_profile_id
+            and (
+                (input_profile_present and bool(input_profile_id)
+                 and record.get("input_profile_id") == input_profile_id
+                 and _SAFE_ID.fullmatch(input_profile_id))
+                or (not input_profile_present and not input_profile_id
+                    and record.get("source") == "dedicated"
+                    and record.get("input_profile_id", "") == "")
+            )
             and owner and metadata.get("owner") == owner and int(redis.ttl(owner_key)) > 0
             and redis.exists(heartbeat_key) and int(redis.ttl(heartbeat_key)) > 0
             and not redis.exists(f"live:channel:{worker_id}:stopping")
@@ -570,8 +582,10 @@ def _validated_record(raw, channel_uuid, config_generation, control_state):
                 return None
         elif not record.get("worker_id"):
             return None
+        input_profile_id = record.get("input_profile_id", "")
         if (not _SAFE_ID.fullmatch(record.get("m3u_profile_id", ""))
-                or not _SAFE_ID.fullmatch(record.get("input_profile_id", ""))):
+                or (input_profile_id and not _SAFE_ID.fullmatch(input_profile_id))
+                or (record.get("source") != "dedicated" and not input_profile_id)):
             return None
         return record
     except (TypeError, ValueError, KeyError):
