@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 
@@ -93,7 +94,14 @@ def probe_live_borrowed_diagnostic(redis_client, channel_uuid: str, *, now=None)
         raise AssertionError("borrowed recorder lease is not live")
     live_diagnostic_key = live_key(channel_uuid)
     error_diagnostic_key = last_error_key(channel_uuid)
-    diagnostic = _wait_for_recording(redis_client, live_diagnostic_key, "borrowed")
+    try:
+        diagnostic = _wait_for_recording(redis_client, live_diagnostic_key, "borrowed")
+    except AssertionError:
+        guards = _borrowed_writer_guard_checks(redis_client, grant, lease_value)
+        raise AssertionError(
+            "borrowed recording diagnostic was not confirmed in time; "
+            f"guard_checks={json.dumps(guards, sort_keys=True, separators=(',', ':'))}"
+        ) from None
     saved = {
         live_diagnostic_key: _capture_hash(redis_client, live_diagnostic_key),
         error_diagnostic_key: _capture_hash(redis_client, error_diagnostic_key),
@@ -156,6 +164,142 @@ def probe_live_borrowed_diagnostic(redis_client, channel_uuid: str, *, now=None)
         cleanup()
         raise
     return cleanup
+
+
+def _borrowed_writer_guard_checks(redis_client, grant, lease_value):
+    """Return bounded booleans for the writer's input and Redis CAS guards."""
+    from catchuparr.recorder_diagnostics import _HEX64, _SAFE_ID, _SAFE_NATIVE_OWNER
+
+    channel = grant.channel_uuid
+    lease_key = f"catchuparr:recorder:{channel}"
+    current_key = f"catchuparr:sharing:current:{channel}"
+    episode_key = f"catchuparr:sharing:episode:{channel}"
+    live_diagnostic_key = f"catchuparr:recorder:diagnostic:{channel}"
+    error_diagnostic_key = f"catchuparr:recorder:last-error:{channel}"
+    private_key = f"catchuparr:sharing:private:{channel}"
+    client_set_key = f"live:channel:{channel}:clients"
+    client_key = f"live:channel:{channel}:clients:{grant.client_id}"
+    owner_key = f"live:channel:{channel}:owner"
+    heartbeat_key = f"live:worker:{grant.metadata_owner}:heartbeat"
+    metadata_key = f"live:channel:{channel}:metadata"
+    client_stop_key = f"live:channel:{channel}:client:{grant.client_id}:stop"
+    stopping_key = f"live:channel:{channel}:stopping"
+    checks = {
+        "identifier_shapes_valid": False,
+        "native_owner_shapes_valid": False,
+        "generation_shapes_valid": False,
+        "control_fence_valid": False,
+        "lease_value_present": False,
+        "redis_reads_available": False,
+        "key_types_match": False,
+        "lease_and_episode_live": False,
+        "current_authority_matches": False,
+        "episode_grant_matches": False,
+        "private_client_registered": False,
+        "client_record_live": False,
+        "owner_lock_and_heartbeat_live": False,
+        "metadata_matches": False,
+        "stop_markers_clear": False,
+    }
+    try:
+        checks["identifier_shapes_valid"] = all(
+            isinstance(value, str) and _SAFE_ID.fullmatch(value)
+            for value in (
+                grant.episode_id, grant.client_id, grant.stream_id, grant.account_id,
+                grant.m3u_profile_id, grant.input_profile_id,
+            )
+        )
+        checks["native_owner_shapes_valid"] = all(
+            isinstance(value, str) and _SAFE_NATIVE_OWNER.fullmatch(value)
+            for value in (grant.worker_id, grant.owner_lock_value, grant.metadata_owner)
+        )
+        checks["generation_shapes_valid"] = bool(
+            isinstance(grant.configuration_generation, str)
+            and _HEX64.fullmatch(grant.configuration_generation)
+            and isinstance(grant.catalog_generation, str)
+            and _HEX64.fullmatch(grant.catalog_generation)
+        )
+        checks["control_fence_valid"] = bool(
+            type(grant.control_generation) is int and grant.control_generation >= 0
+            and type(grant.recorder_fence) is int and grant.recorder_fence >= 1
+            and grant.phase in {"active", "wait_return"}
+        )
+        checks["lease_value_present"] = isinstance(lease_value, str) and bool(lease_value)
+        current = _decode_hash(redis_client.hgetall(current_key))
+        episode = _decode_hash(redis_client.hgetall(episode_key))
+        private = _decode_hash(redis_client.hgetall(private_key))
+        client = _decode_hash(redis_client.hgetall(client_key))
+        metadata = _decode_hash(redis_client.hgetall(metadata_key))
+        owner = _text(redis_client.get(owner_key))
+        live_types = tuple(_text(redis_client.type(key)) for key in (
+            lease_key, current_key, episode_key, live_diagnostic_key,
+            error_diagnostic_key, private_key, client_set_key, client_key,
+            client_stop_key, owner_key, heartbeat_key, metadata_key, stopping_key,
+        ))
+        checks["redis_reads_available"] = True
+        checks["key_types_match"] = bool(
+            live_types[0:3] == ("string", "hash", "hash")
+            and live_types[3] in {"none", "hash"}
+            and live_types[4] in {"none", "hash"}
+            and live_types[5:8] == ("hash", "set", "hash")
+            and live_types[8] == "none"
+            and live_types[9:12] == ("string", "string", "hash")
+            and live_types[12] in {"none", "string"}
+        )
+        checks["lease_and_episode_live"] = bool(
+            _text(redis_client.get(lease_key)) == lease_value
+            and int(redis_client.ttl(lease_key)) > 0
+            and int(redis_client.ttl(episode_key)) > 0
+        )
+        checks["current_authority_matches"] = bool(
+            current.get("configuration_generation") == grant.configuration_generation
+            and current.get("control_generation") == str(grant.control_generation)
+            and current.get("catalog_generation") == grant.catalog_generation
+            and int(current.get("authority_revision", "0")) >= 1
+        )
+        episode_fields = {
+            "channel_uuid": channel, "episode_id": grant.episode_id,
+            "worker_id": grant.worker_id, "stream_id": grant.stream_id,
+            "account_id": grant.account_id, "m3u_profile_id": grant.m3u_profile_id,
+            "input_profile_id": grant.input_profile_id,
+            "catalog_generation": grant.catalog_generation,
+            "configuration_generation": grant.configuration_generation,
+            "control_generation": str(grant.control_generation),
+            "recorder_fence": str(grant.recorder_fence),
+            "lease_value": lease_value, "client_id": grant.client_id,
+        }
+        checks["episode_grant_matches"] = bool(
+            all(episode.get(key) == value for key, value in episode_fields.items())
+            and episode.get("phase") in {"active", "wait_return"}
+        )
+        checks["private_client_registered"] = bool(
+            private.get(grant.client_id) == grant.episode_id
+            and redis_client.sismember(client_set_key, grant.client_id)
+        )
+        checks["client_record_live"] = bool(
+            client.get("worker_id") == grant.client_worker_id
+            and client.get("connected_at") == grant.connected_at
+            and int(redis_client.ttl(client_key)) > 0
+        )
+        checks["owner_lock_and_heartbeat_live"] = bool(
+            owner == grant.owner_lock_value
+            and int(redis_client.ttl(owner_key)) > 0
+            and int(redis_client.ttl(heartbeat_key)) > 0
+        )
+        checks["metadata_matches"] = bool(
+            metadata.get("owner") == grant.metadata_owner
+            and metadata.get("stream_id") == grant.stream_id
+            and metadata.get("m3u_profile") == grant.m3u_profile_id
+            and metadata.get("stream_profile") == grant.input_profile_id
+            and metadata.get("state") in {"active", "waiting_for_clients"}
+            and metadata.get("channel_uuid", channel) == channel
+        )
+        checks["stop_markers_clear"] = not bool(
+            redis_client.exists(client_stop_key) or redis_client.exists(stopping_key)
+        )
+    except Exception:
+        pass
+    return checks
 
 
 def _capture_hash(redis_client, key):
