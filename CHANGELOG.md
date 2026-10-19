@@ -12,6 +12,11 @@ included here to explain the feature history leading to 0.4.0.
 - Refreshes both action messages in place with compact scheduled-channel rows;
   structured diagnostic and schedule data remain available to callers. This
   presentation update requires no configuration migration or archive change.
+- Current-recording rows omit channel numbers and use only the first word of
+  the validated M3U profile name.
+- Uses a bounded nonbreaking-space gap between visible rows where the host
+  collapses line breaks. Copied text may retain nonbreaking spaces, which can
+  be replaced with ordinary spaces in the destination.
 
 ## [0.6.2] - Prerelease candidate
 

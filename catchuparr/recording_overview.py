@@ -26,6 +26,7 @@ _SAFE_DISPLAY = re.compile(r"^[^\x00-\x1f\x7f]{1,120}$")
 _SENSITIVE_DISPLAY = re.compile(
     r"(?i)(://|\b[a-z][a-z0-9+.-]*:|\b(?:bearer|authorization|password|api[_ -]?key|access[_ -]?token)\b|[?&](?:token|key|auth)=|\b[a-z0-9.-]+\.(?:com|net|org|io|tv)(?:/|$))"
 )
+ACTION_MESSAGE_SEPARATOR = " " + "\u00a0" * 200 + " "
 
 
 def current_recordings(settings, control_state=None, *, redis_client=None, now=None):
@@ -161,7 +162,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         message = "Recording schedule unavailable."
         status = "unavailable"
     elif visible:
-        message = "\n".join(_message_row(row) for row in visible)
+        message = ACTION_MESSAGE_SEPARATOR.join(_message_row(row) for row in visible)
         status = "ok"
     else:
         message = "No recordings scheduled now."
@@ -334,10 +335,10 @@ def _safe_identifier(value):
 
 
 def _message_row(row):
-    number = row.get("number")
     name = _safe_display(row.get("name")) or "Unknown channel"
     source = row.get("source")
     m3u_name = _safe_display(source.get("m3u_profile_name")) if isinstance(source, dict) else None
+    m3u_first_word = m3u_name.split(maxsplit=1)[0] if m3u_name else None
     if row.get("state") == "recording" and row.get("recent_media_progress") is True:
         status = "ok"
     elif row.get("state") == "starting":
@@ -355,8 +356,7 @@ def _message_row(row):
     attached = row.get("state") == "recording" and row.get("recent_media_progress") is True \
         and row.get("mode") == "borrowed"
     suffix = ", attached" if attached else ""
-    label = f"#{number}:" if number is not None else "#?:"
-    return f"{label} {name} - {m3u_name or '—'} [{status}{suffix}]"
+    return f"{name} - {m3u_first_word or '—'} [{status}{suffix}]"
 
 
 _COMPACT_ERROR_LABELS = {
@@ -441,7 +441,7 @@ def _unknown_all(settings, channel_ids, control_state, reason, *, now=None):
     visible = [row for row in rows if row.get("scheduled_now") is True]
     message = (
         "Recording schedule unavailable." if schedule_unknown else
-        "\n".join(_message_row(row) for row in visible) if visible else
+        ACTION_MESSAGE_SEPARATOR.join(_message_row(row) for row in visible) if visible else
         "No recordings scheduled now."
     )
     return {

@@ -2,10 +2,12 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.configuration import SourceCatalog, apply_configuration, load_applied_state_readonly
 from catchuparr.plugin import Plugin
+from catchuparr.recording_overview import ACTION_MESSAGE_SEPARATOR
 from catchuparr.recording_schedule_overview import today_schedule
 from catchuparr.schedule import normalize_schedule
 
@@ -33,8 +35,9 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.assertEqual([(window["start"], window["end"]) for window in rows[0]["windows"]],
                          [("09:00", "10:00"), ("13:00", "14:00")])
         self.assertEqual(rows[1]["windows"][0]["end"], "24:00")
-        self.assertEqual(result["message"],
-                         "Alpha: 09:00–10:00, 13:00–14:00\nBeta: 00:00–24:00")
+        self.assertEqual(result["message"], ACTION_MESSAGE_SEPARATOR.join((
+            "Alpha: 09:00–10:00, 13:00–14:00", "Beta: 00:00–24:00",
+        )))
 
     def test_empty_day_and_paused_state_visible(self):
         result = today_schedule(settings({"a": {"sunday": []}, "b": "continuous"}),
@@ -51,8 +54,9 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                                 {}, control_state=type("Control", (), {"paused": True})(),
                                 now=datetime(2026, 10, 19, 7, tzinfo=timezone.utc))
         self.assertTrue(result["recording_paused"])
-        self.assertEqual(result["message"],
-                         "Recording paused\nUnknown channel: 09:00–10:00")
+        self.assertEqual(result["message"], ACTION_MESSAGE_SEPARATOR.join((
+            "Recording paused", "Unknown channel: 09:00–10:00",
+        )))
         active = today_schedule(settings({"a": "continuous"}), {},
                                  control_state=type("Control", (), {"paused": False})(),
                                  now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc))
@@ -62,8 +66,9 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                                       control_state=type("Control", (), {"paused": True})(),
                                       now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
         self.assertTrue(paused_empty["recording_paused"])
-        self.assertEqual(paused_empty["message"],
-                         "Recording paused\nNo recordings scheduled today.")
+        self.assertEqual(paused_empty["message"], ACTION_MESSAGE_SEPARATOR.join((
+            "Recording paused", "No recordings scheduled today.",
+        )))
 
     def test_past_current_and_upcoming_statuses(self):
         result = today_schedule(
@@ -178,6 +183,48 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["channels"][0]["name"], "Unknown channel")
         self.assertEqual(result["channels"][0]["windows"][0]["start"], "09:00")
+
+    def test_today_schedule_action_pads_visible_rows_and_keeps_full_structured_rows(self):
+        active = settings({
+            "first": "continuous",
+            "second": "continuous",
+            "free": {"sunday": []},
+        })
+        channels = {
+            "first": {"number": 37, "name": "Synthetic Channel A"},
+            "second": {"number": 42, "name": "Synthetic Channel B"},
+            "free": {"number": 99, "name": "Free Synthetic Channel"},
+        }
+        control = SimpleNamespace(paused=True)
+        with patch("catchuparr.configuration.load_applied_state_readonly",
+                   return_value=(active, control)), \
+             patch("catchuparr.recording_schedule_overview.channel_metadata",
+                   return_value=channels):
+            result = Plugin.__new__(Plugin).run("today_schedule", {}, {})
+
+        expected = ACTION_MESSAGE_SEPARATOR.join((
+            "Recording paused",
+            "Synthetic Channel A: 00:00–24:00",
+            "Synthetic Channel B: 00:00–24:00",
+        ))
+        self.assertEqual(result["message"], expected)
+        self.assertEqual(result["message"].count(ACTION_MESSAGE_SEPARATOR), 2)
+        self.assertEqual(result["message"].count("\u00a0"), 400)
+        self.assertNotIn("\n", result["message"])
+        self.assertNotIn("37", result["message"])
+        self.assertNotIn("42", result["message"])
+        self.assertNotIn("99", result["message"])
+        self.assertNotIn("Free Synthetic Channel", result["message"])
+        self.assertEqual(
+            [(row["channel_uuid"], row["number"], row["name"],
+              [(window["start"], window["end"]) for window in row["windows"]])
+             for row in result["channels"]],
+            [
+                ("first", 37, "Synthetic Channel A", [("00:00", "24:00")]),
+                ("second", 42, "Synthetic Channel B", [("00:00", "24:00")]),
+                ("free", 99, "Free Synthetic Channel", []),
+            ],
+        )
 
     def test_plugin_unavailable_route_keeps_shared_channel_list_shape(self):
         with patch("catchuparr.configuration.load_applied_state_readonly", return_value=(None, None)):
