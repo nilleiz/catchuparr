@@ -429,6 +429,16 @@ def _run_with_thread_database_cleanup(callback, *args, **kwargs):
         _close_current_thread_database_connections()
 
 
+def _recorder_task_threading(stop_event):
+    """Provide the task's threading primitives while observing its stop event."""
+    return types.SimpleNamespace(
+        Event=lambda: stop_event,
+        Lock=threading.Lock,
+        RLock=threading.RLock,
+        Thread=threading.Thread,
+    )
+
+
 def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
     payload = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
     if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
@@ -1250,11 +1260,7 @@ class _RecorderTaskRun:
                 self.results.append(result)
             return result
 
-        task_threading = types.SimpleNamespace(
-            Event=lambda: self.stop_event,
-            Lock=threading.Lock,
-            Thread=threading.Thread,
-        )
+        task_threading = _recorder_task_threading(self.stop_event)
         process_api = types.SimpleNamespace(
             Popen=tracked_popen,
             DEVNULL=subprocess.DEVNULL,
