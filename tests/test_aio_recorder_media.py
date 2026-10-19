@@ -54,13 +54,61 @@ class RecorderMediaProbeTests(unittest.TestCase):
             **common, "mode": "borrowed",
             "input_profile_id": "input-id", "input_profile_name": "input-name",
         }
-        dedicated = {**common, "mode": "dedicated"}
+        dedicated = {**common, "mode": "dedicated", "input_profile_id": None}
         self.assertTrue(probe._overview_source_metadata_matches(borrowed, "borrowed"))
         self.assertTrue(probe._overview_source_metadata_matches(dedicated, "dedicated"))
         self.assertFalse(probe._overview_source_metadata_matches(common | {"mode": "borrowed"}, "borrowed"))
         self.assertFalse(probe._overview_source_metadata_matches(
             dedicated | {"input_profile_id": "unexpected"}, "dedicated",
         ))
+        self.assertFalse(probe._overview_source_metadata_matches(
+            dedicated | {"input_profile_name": None}, "dedicated",
+        ))
+
+    def test_live_overview_metadata_contract_matches_current_recordings_action(self):
+        from catchuparr.configuration import active_configuration_generation
+        from catchuparr.recording_overview import current_recordings
+
+        channel = "synthetic-channel"
+        now = time.time()
+        settings = {
+            "version": 7, "channel_uuids": channel,
+            "archive_root": "/missing-synthetic-archive",
+            "recording_schedule": {},
+        }
+        generation = active_configuration_generation(settings)
+        control = SimpleNamespace(
+            paused=False, configuration_generation=generation,
+        )
+        source_base = {
+            "stream_name": "stream", "stream_id": "stream-id",
+            "provider_name": "provider", "provider_id": "provider-id",
+            "m3u_profile_id": "m3u-id", "m3u_profile_name": "m3u-name",
+        }
+
+        class Redis:
+            def ping(self):
+                return True
+
+        for mode, profile in (
+            ("borrowed", {"input_profile_id": "input-id", "input_profile_name": "input-name"}),
+            ("dedicated", {}),
+        ):
+            diagnostic = {channel: {
+                "phase": "error", "source": mode, "stream_id": "stream-id",
+                "account_id": "provider-id", "m3u_profile_id": "m3u-id",
+                "input_profile_id": profile.get("input_profile_id"),
+                "started_at": now, "error_code": "synthetic",
+            }}
+            with patch("catchuparr.recording_overview._selected_channel_ids", return_value=[channel]), \
+                 patch("catchuparr.recording_overview.read_recorder_diagnostics", return_value=diagnostic), \
+                 patch("catchuparr.recording_overview._channel_metadata", return_value={channel: {"name": "channel"}}), \
+                 patch("catchuparr.recording_overview.source_metadata", return_value={**source_base, **profile}):
+                response = current_recordings(
+                    settings, control, redis_client=Redis(), now=now,
+                )
+            source = response["channels"][0]["source"]
+            self.assertTrue(probe._overview_source_metadata_matches(source, mode))
 
     def test_failed_opening_identity_factory_builds_token_contract(self):
         from catchuparr.sharing_persistence import SharingIntentToken
