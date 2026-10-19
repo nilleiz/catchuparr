@@ -427,6 +427,33 @@ def probe():
 
     require(active is not None, "One Apply must make the active snapshot readable")
     active_path = active_settings_path()
+    # Both overview routes must consume the committed snapshot without changing
+    # configuration/control files or initializing additional state.
+    from catchuparr.plugin import Plugin
+    from catchuparr.recorder_control import control_state_path
+
+    control_path = control_state_path(active_path)
+    active_before = active_path.read_bytes()
+    control_before = control_path.read_bytes()
+    directory_before = set(active_path.parent.iterdir())
+    overview_plugin = Plugin.__new__(Plugin)
+    current_result = overview_plugin.run("current_recordings", {}, {})
+    schedule_result = overview_plugin.run("today_schedule", {}, {})
+    require(isinstance(current_result, dict) and isinstance(current_result.get("channels"), list)
+            and isinstance(current_result.get("summary"), dict),
+            "Current recordings action did not return the shared structured response format")
+    require(all({"channel_uuid", "number", "name", "state", "mode", "reason", "source"}
+                <= set(row) for row in current_result["channels"]),
+            "Current recordings action omitted expected channel state fields")
+    require(isinstance(schedule_result, dict) and isinstance(schedule_result.get("channels"), list)
+            and isinstance(schedule_result.get("summary"), dict),
+            "Today's schedule action did not return the shared structured response format")
+    require(all({"channel_uuid", "number", "name", "windows"} <= set(row)
+                and isinstance(row["windows"], list) for row in schedule_result["channels"]),
+            "Today's schedule action omitted selected channels or window lists")
+    require(active_path.read_bytes() == active_before and control_path.read_bytes() == control_before
+            and set(active_path.parent.iterdir()) == directory_before,
+            "Read-only overview action changed Catchuparr configuration/control files")
     persisted = json.loads(active_path.read_text(encoding="utf-8"))
     validate_active_v7_snapshot(
         active, persisted, tuple(active.get("channel_uuids", "").splitlines()),
@@ -947,9 +974,12 @@ def probe():
         sys.path.insert(0, "/tmp")
         from aio_recorder_media import probe_actual_recorder_media
 
+        # The media probe asserts both live recording modes before fixture teardown.
+        phase("recorder_overviews", "started")
         phase("recorder_media", "started")
         probe_actual_recorder_media(root)
         phase("recorder_media", "complete")
+        phase("recorder_overviews", "complete")
         from aio_recorder_failover import probe_recorder_failover
 
         phase("recorder_failover", "started")

@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Local rolling catch-up archive, start-over and optional live connection sharing for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -117,6 +117,8 @@
     }
   ],
   "actions": [
+    {"id": "current_recordings", "label": "Current recordings", "button_label": "Show recordings"},
+    {"id": "today_schedule", "label": "Today's recording schedule", "button_label": "Show today's schedule"},
     {
       "id": "status",
       "label": "Archive status",

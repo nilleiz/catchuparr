@@ -39,6 +39,17 @@ class _SyntheticArchiveStore:
 
 
 class RecorderFailoverMediaTests(unittest.TestCase):
+    def test_recorder_task_threading_preserves_observed_event_and_reentrant_lock(self):
+        stop_event = threading.Event()
+        task_threading = probe._recorder_task_threading(stop_event)
+
+        self.assertIs(task_threading.Event(), stop_event)
+        lock = task_threading.RLock()
+        with lock:
+            with lock:
+                self.assertTrue(lock.acquire(blocking=False))
+                lock.release()
+
     def test_thread_database_cleanup_runs_on_normal_and_exceptional_exit(self):
         cleanup_threads = []
 
@@ -117,44 +128,44 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         self.assertEqual(stop_lines, set(probe._SUPERVISOR_STOP_REASONS_BY_LINE))
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 270,
+                "catchuparr.tasks", "supervise", 434,
                 {"current_admission": {"status": "ready"}},
             ),
             "lease_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 270,
+                "catchuparr.tasks", "supervise", 434,
                 {"current_admission": {"status": "stale_control"}},
             ),
             "admission_not_ready",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 276, {},
+                "catchuparr.tasks", "supervise", 444, {},
             ),
             "stats_capability_refresh",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 308, {},
+                "catchuparr.tasks", "supervise", 476, {},
             ),
             "attempt_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 316, {},
+                "catchuparr.tasks", "supervise", 484, {},
             ),
             "candidate_currentness",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 320, {},
+                "catchuparr.tasks", "supervise", 488, {},
             ),
             "exception",
         )
         self.assertEqual(
-            probe._safe_supervisor_stop_reason("untrusted", "supervise", 270, {}),
+            probe._safe_supervisor_stop_reason("untrusted", "supervise", 434, {}),
             "unavailable",
         )
 
@@ -264,6 +275,10 @@ class RecorderFailoverMediaTests(unittest.TestCase):
                 input_url="http://user:password@synthetic.invalid/private-token",
             )],
             failures=["task:BorrowBindingLost", "Bearer private-token"],
+            exception_call_sites=[[
+                {"file": "tasks.py", "function": "record_channel", "line": 375,
+                 "locals": "private-token"},
+            ]],
             processes=[FakeProcess()],
             result={"status": "sharing_cleanup_pending", "token": "private-token"},
             thread=FakeThread(),
@@ -276,6 +291,9 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         serialized = json.dumps(diagnostic)
         self.assertEqual(diagnostic["task_status"], "sharing_cleanup_pending")
         self.assertEqual(diagnostic["failure_classes"], ["BorrowBindingLost", "other"])
+        self.assertEqual(diagnostic["exception_call_sites"], [[
+            {"file": "tasks.py", "function": "record_channel", "line": 375},
+        ]])
         self.assertEqual(diagnostic["attempts"], [
             {"status": "no_media", "useful_segments": 0},
         ])
@@ -310,7 +328,7 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             "current_admission": {"status": "stale_configuration"},
         }
         tree = ast.parse("def supervise(current_admission=current_admission):\n    event.set()\n")
-        ast.increment_lineno(tree, 268)
+        ast.increment_lineno(tree, 432)
         exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
         self.assertEqual("tasks.supervisor", event.first_set_source)

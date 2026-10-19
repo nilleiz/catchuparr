@@ -1,11 +1,14 @@
 import ast
 import io
 import json
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -41,6 +44,243 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_live_overview_source_metadata_is_mode_specific(self):
+        common = {
+            "stream_name": "source", "provider_name": "provider",
+            "stream_id": "stream-id", "provider_id": "provider-id",
+            "m3u_profile_id": "m3u-id", "m3u_profile_name": "m3u-name",
+        }
+        borrowed = {
+            **common, "mode": "borrowed",
+            "input_profile_id": "input-id", "input_profile_name": "input-name",
+        }
+        dedicated = {**common, "mode": "dedicated", "input_profile_id": None}
+        self.assertTrue(probe._overview_source_metadata_matches(borrowed, "borrowed"))
+        self.assertTrue(probe._overview_source_metadata_matches(dedicated, "dedicated"))
+        self.assertFalse(probe._overview_source_metadata_matches(common | {"mode": "borrowed"}, "borrowed"))
+        self.assertFalse(probe._overview_source_metadata_matches(
+            dedicated | {"input_profile_id": "unexpected"}, "dedicated",
+        ))
+        self.assertFalse(probe._overview_source_metadata_matches(
+            dedicated | {"input_profile_name": None}, "dedicated",
+        ))
+
+    def test_live_overview_metadata_contract_matches_current_recordings_action(self):
+        from catchuparr.configuration import active_configuration_generation
+        from catchuparr.recording_overview import current_recordings
+
+        channel = "synthetic-channel"
+        now = time.time()
+        settings = {
+            "version": 7, "channel_uuids": channel,
+            "archive_root": "/missing-synthetic-archive",
+            "recording_schedule": {},
+        }
+        generation = active_configuration_generation(settings)
+        control = SimpleNamespace(
+            paused=False, configuration_generation=generation,
+        )
+        source_base = {
+            "stream_name": "stream", "stream_id": "stream-id",
+            "provider_name": "provider", "provider_id": "provider-id",
+            "m3u_profile_id": "m3u-id", "m3u_profile_name": "m3u-name",
+        }
+
+        class Redis:
+            def ping(self):
+                return True
+
+        for mode, profile in (
+            ("borrowed", {"input_profile_id": "input-id", "input_profile_name": "input-name"}),
+            ("dedicated", {}),
+        ):
+            diagnostic = {channel: {
+                "phase": "error", "source": mode, "stream_id": "stream-id",
+                "account_id": "provider-id", "m3u_profile_id": "m3u-id",
+                "input_profile_id": profile.get("input_profile_id"),
+                "started_at": now, "error_code": "synthetic",
+            }}
+            with patch("catchuparr.recording_overview._selected_channel_ids", return_value=[channel]), \
+                 patch("catchuparr.recording_overview.read_recorder_diagnostics", return_value=diagnostic), \
+                 patch("catchuparr.recording_overview._channel_metadata", return_value={channel: {"name": "channel"}}), \
+                 patch("catchuparr.recording_overview.source_metadata", return_value={**source_base, **profile}):
+                response = current_recordings(
+                    settings, control, redis_client=Redis(), now=now,
+                )
+            source = response["channels"][0]["source"]
+            self.assertTrue(probe._overview_source_metadata_matches(source, mode))
+
+    def test_failed_opening_identity_factory_builds_token_contract(self):
+        from catchuparr.sharing_persistence import SharingIntentToken
+        from catchuparr.sharing_planner import SharingAction
+
+        identity = probe._failed_opening_identity(
+            "channel-recovery-synthetic", "owner-recovery-synthetic",
+            SimpleNamespace(id="stream-recovery-synthetic", m3u_account_id="account-recovery-synthetic"),
+            {"m3u_profile": "m3u-recovery-synthetic", "stream_profile": "input-recovery-synthetic"},
+        )
+        token = SharingIntentToken(
+            channel_uuid="channel-recovery-synthetic", revision=1, intent_epoch=1,
+            action=SharingAction.ATTACH_BORROW,
+            configuration_generation="config-recovery-synthetic",
+            control_generation=1, recorder_fence=0,
+            target_identity=identity, target_admitted=True, not_before=1.0,
+        )
+        self.assertEqual(8, len(token.target_identity))
+        self.assertEqual("channel-recovery-synthetic", token.target_identity[0])
+
+    def test_live_readonly_probe_allows_concurrent_archive_append_and_denies_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            configured_archive_root = Path(directory) / "synthetic-live-archive"
+            configured_archive_root.mkdir()
+            archive_db = configured_archive_root / "archive.sqlite3"
+            with sqlite3.connect(archive_db) as database:
+                database.execute("CREATE TABLE segments (created_at INTEGER)")
+                database.execute("INSERT INTO segments VALUES (1)")
+
+            def action():
+                uri = f"file:{archive_db}?mode=ro"
+                with sqlite3.connect(uri, uri=True) as database:
+                    database.execute("PRAGMA query_only=ON")
+                    rows = database.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+                def append_segment():
+                    with sqlite3.connect(archive_db) as writer:
+                        writer.execute("INSERT INTO segments VALUES (2)")
+
+                append = threading.Thread(target=append_segment)
+                append.start()
+                append.join(timeout=2)
+                self.assertFalse(append.is_alive())
+                return rows
+
+            rows = probe._run_current_recordings_readonly(action, archive_db)
+            self.assertEqual(1, rows)
+            with sqlite3.connect(archive_db) as database:
+                self.assertEqual(2, database.execute(
+                    "SELECT COUNT(*) FROM segments",
+                ).fetchone()[0])
+
+            def attempted_write():
+                with sqlite3.connect(f"file:{archive_db}?mode=ro", uri=True) as database:
+                    database.execute("PRAGMA query_only=ON")
+                    database.execute("UPDATE segments SET created_at=3")
+
+            with self.assertRaises(sqlite3.DatabaseError):
+                probe._run_current_recordings_readonly(attempted_write, archive_db)
+
+    def test_live_overview_calls_use_the_configured_nested_archive_root(self):
+        source = (Path(__file__).parents[1] / "scripts/aio_recorder_media.py").read_text()
+        tree = ast.parse(source)
+        probe_function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "probe_actual_live_archive_isolation"
+        )
+        calls = [
+            node for node in ast.walk(probe_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_assert_live_overview"
+        ]
+        self.assertEqual(2, len(calls))
+        self.assertTrue(all(
+            isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "archive_root"
+            for call in calls
+        ))
+
+    def test_dedicated_diagnostic_failure_snapshot_is_finite_booleans(self):
+        from scripts.aio_recorder_diagnostics_probe import _dedicated_writer_guard_checks
+
+        class Redis:
+            def hgetall(self, _key):
+                return {}
+
+        checks = _dedicated_writer_guard_checks(
+            Redis(), "synthetic-channel-id", "synthetic-lease-value",
+            "catchuparr:recorder:diagnostic:synthetic-channel-id",
+        )
+        self.assertTrue(checks)
+        self.assertTrue(all(type(value) is bool for value in checks.values()))
+        self.assertFalse(checks["live_record_present"])
+        self.assertFalse(checks["current_attempt_record_found"])
+
+    def test_dedicated_failure_snapshot_checks_current_worker_not_stale_borrow(self):
+        from scripts.aio_recorder_diagnostics_probe import _dedicated_writer_guard_checks
+
+        channel = "synthetic-channel-id"
+        lease_value = "synthetic-lease-value"
+        worker_id = "catchuparr-r" + "a" * 40
+        worker_key = f"catchuparr:recorder-proxy:worker:{worker_id}"
+        worker = {
+            "channel_uuid": channel, "worker_id": worker_id,
+            "lease_key": f"catchuparr:recorder:{channel}",
+            "lease_value": lease_value, "stream_id": "stream-synthetic",
+            "account_id": "account-synthetic", "config_generation": "a" * 64,
+            "control_generation": "1", "lease_fence": "2", "profile_id": "5",
+            "state": "active",
+        }
+
+        class Redis:
+            def __init__(self, scanned_keys):
+                self.scanned_keys = scanned_keys
+
+            def hgetall(self, key):
+                if isinstance(key, bytes):
+                    key = key.decode()
+                if key == f"catchuparr:recorder:diagnostic:{channel}":
+                    return {b"phase": b"recording", b"source": b"borrowed"}
+                if key == worker_key:
+                    return {key.encode(): value.encode() for key, value in worker.items()}
+                if key == f"live:channel:{worker_id}:metadata":
+                    return {
+                        b"owner": b"native-owner-synthetic",
+                        b"stream_id": b"stream-synthetic", b"m3u_profile": b"5",
+                        b"state": b"active",
+                    }
+                return {}
+
+            def scan_iter(self, *, match, count):
+                self.assertion = (match, count)
+                return self.scanned_keys
+
+            def get(self, key):
+                if key == f"catchuparr:recorder:{channel}":
+                    return lease_value
+                if key == f"live:channel:{worker_id}:owner":
+                    return b"native-owner-synthetic"
+                return None
+
+            def ttl(self, _key):
+                return 30
+
+            def exists(self, _key):
+                return 0
+
+        for scanned_key in (worker_key, worker_key.encode()):
+            with self.subTest(scanned_key_type=type(scanned_key).__name__):
+                checks = _dedicated_writer_guard_checks(
+                    Redis([scanned_key]), channel, lease_value,
+                    f"catchuparr:recorder:diagnostic:{channel}",
+                )
+                self.assertTrue(checks["current_attempt_record_found"])
+                self.assertTrue(checks["current_attempt_lease_matches"])
+                self.assertFalse(checks["live_record_matches_current_attempt"])
+                self.assertTrue(checks["current_attempt_native_owner_heartbeat_live"])
+                self.assertTrue(checks["current_attempt_m3u_profile_matches"])
+                self.assertTrue(checks["current_attempt_input_profile_absent"])
+                self.assertTrue(checks["current_attempt_profile_matches"])
+                self.assertTrue(all(type(value) is bool for value in checks.values()))
+
+        for scanned_keys in ([], [worker_key, worker_key.encode()]):
+            with self.subTest(scanned_key_count=len(scanned_keys)):
+                checks = _dedicated_writer_guard_checks(
+                    Redis(scanned_keys), channel, lease_value,
+                    f"catchuparr:recorder:diagnostic:{channel}",
+                )
+                self.assertFalse(checks["current_attempt_record_found"])
+                self.assertFalse(checks["current_attempt_lease_matches"])
+
     def test_dead_recorder_failure_reports_safe_terminal_task_diagnostics(self):
         thread = threading.Thread(target=lambda: None)
         thread.start()
@@ -128,7 +368,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         tree = ast.parse(
             "def supervise(current_admission=current_admission):\n    stop_event.set()\n"
         )
-        ast.increment_lineno(tree, 268)
+        ast.increment_lineno(tree, 432)
         exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
         diagnostic = probe._recorder_task_early_exit_diagnostic(

@@ -591,6 +591,11 @@ class RecorderBorrowCoordinator:
                 assigned_sources=self.assigned_sources,
                 observed_at=now,
             )
+        except Exception as exc:
+            from .logging_utils import error
+
+            error("sharing_observation_failed", exc, callsite="native_observation")
+            return None
         finally:
             try:
                 from django.db import close_old_connections
@@ -879,21 +884,35 @@ def acknowledge_opened_borrow(
 
 _pending_open_cleanup_lock = threading.Lock()
 _pending_open_cleanups: dict[str, Any] = {}
+_pending_open_cleanup_channels: dict[str, str] = {}
+_pending_open_cleanup_locks: dict[str, threading.Lock] = {}
 
 
 class _RetainedCleanup:
     """Keep a task-local manager and exact retry callback alive across requests."""
 
-    def __init__(self, retry: Callable[[], bool]) -> None:
+    def __init__(self, retry: Callable[[], bool], *, channel_uuid: str) -> None:
         self._retry = retry
+        self.channel_uuid = str(channel_uuid)
 
     def retry_cleanup(self) -> bool:
         return self._retry() is True
 
 
-def _retain_durable_cleanup(episode_id: str, operation: Any) -> None:
+def _retain_durable_cleanup(
+    episode_id: str, operation: Any, *, channel_uuid: str,
+) -> None:
+    _store_retained_cleanup(episode_id, operation, channel_uuid=channel_uuid)
+
+
+def _store_retained_cleanup(episode_id: str, operation: Any, *, channel_uuid: str) -> None:
     with _pending_open_cleanup_lock:
-        _pending_open_cleanups[episode_id] = operation
+        operation_lock = _pending_open_cleanup_locks.setdefault(episode_id, threading.Lock())
+    with operation_lock:
+        with _pending_open_cleanup_lock:
+            _pending_open_cleanup_locks[episode_id] = operation_lock
+            _pending_open_cleanups[episode_id] = operation
+            _pending_open_cleanup_channels[episode_id] = str(channel_uuid)
 
 
 def retain_open_cleanup_pending(error: BaseException) -> None:
@@ -906,8 +925,11 @@ def retain_open_cleanup_pending(error: BaseException) -> None:
     episode_id = getattr(episode, "episode_id", None)
     if not isinstance(episode_id, str) or not episode_id:
         return
-    with _pending_open_cleanup_lock:
-        _pending_open_cleanups[episode_id] = error
+    channel_uuid = getattr(episode, "channel_uuid", None)
+    _store_retained_cleanup(
+        episode_id, error,
+        channel_uuid=(channel_uuid if isinstance(channel_uuid, str) and channel_uuid else ""),
+    )
 
 
 def retain_session_cleanup_pending(session: BorrowedReaderSession) -> None:
@@ -916,35 +938,53 @@ def retain_session_cleanup_pending(session: BorrowedReaderSession) -> None:
     episode_id = getattr(ack, "episode_id", None)
     if not isinstance(episode_id, str) or not episode_id:
         return
-    with _pending_open_cleanup_lock:
-        _pending_open_cleanups[episode_id] = session
+    channel_uuid = getattr(ack, "channel_uuid", None)
+    _store_retained_cleanup(
+        episode_id, session,
+        channel_uuid=(channel_uuid if isinstance(channel_uuid, str) and channel_uuid else ""),
+    )
 
 
-def retry_pending_open_cleanups() -> tuple[int, int]:
+def retry_pending_open_cleanups(
+    *, channel_uuid: str | None = None, episode_id: str | None = None,
+) -> tuple[int, int]:
     """Retry retained exact cleanup handles; never infer closure from a timeout."""
     completed = 0
     pending = 0
     with _pending_open_cleanup_lock:
-        items = tuple(_pending_open_cleanups.items())
-    for episode_id, operation in items:
-        try:
-            done = operation.retry_cleanup() is True
-        except Exception:
-            done = False
-        with _pending_open_cleanup_lock:
-            if _pending_open_cleanups.get(episode_id) is not operation:
-                continue
-            if done:
-                del _pending_open_cleanups[episode_id]
-                completed += 1
-            else:
-                pending += 1
+        items = tuple(
+            (key, value, _pending_open_cleanup_locks.setdefault(key, threading.Lock()))
+            for key, value in _pending_open_cleanups.items()
+            if (episode_id is None or key == episode_id)
+            and (channel_uuid is None
+                 or _pending_open_cleanup_channels.get(key) == str(channel_uuid))
+        )
+    for episode_id, operation, operation_lock in items:
+        with operation_lock:
+            with _pending_open_cleanup_lock:
+                if _pending_open_cleanups.get(episode_id) is not operation:
+                    continue
+            try:
+                done = operation.retry_cleanup() is True
+            except Exception:
+                done = False
+            with _pending_open_cleanup_lock:
+                if _pending_open_cleanups.get(episode_id) is not operation:
+                    continue
+                if done:
+                    del _pending_open_cleanups[episode_id]
+                    _pending_open_cleanup_channels.pop(episode_id, None)
+                    _pending_open_cleanup_locks.pop(episode_id, None)
+                    completed += 1
+                else:
+                    pending += 1
     return completed, pending
 
 
 def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                                 now: float | None = None, stale_after: float = 120.0,
-                                episode_id: str | None = None) -> tuple[int, int]:
+                                episode_id: str | None = None,
+                                channel_uuid: str | None = None) -> tuple[int, int]:
     """Rebuild exact cleanup ownership from SQLite after a web worker restart.
 
     This runs only at route setup, never in the TS byte loop. Stale opening
@@ -972,19 +1012,32 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
             or isinstance(stale_after, bool) or not isinstance(stale_after, (int, float))
             or not math.isfinite(float(stale_after)) or stale_after < 0):
         return 0, 0
+    retained_completed, retained_pending = retry_pending_open_cleanups(
+        channel_uuid=channel_uuid, episode_id=episode_id,
+    )
     try:
         candidates = ledger.registration_recovery_candidates(
             stale_opening_before=float(observed_at) - float(stale_after),
-            episode_id=episode_id,
+            episode_id=episode_id, channel_uuid=channel_uuid,
         )
         text_backend = redis_backend_signature(redis_text)
     except Exception:
         return 0, 1
     with _pending_open_cleanup_lock:
         retained_ids = set(_pending_open_cleanups)
-    completed = pending = 0
+        retained_for_scope = {
+            key for key in retained_ids
+            if (episode_id is None or key == episode_id)
+            and (channel_uuid is None
+                 or _pending_open_cleanup_channels.get(key) == str(channel_uuid))
+        }
+    completed = retained_completed
+    pending = retained_pending
     for snapshot, registration in candidates:
         if snapshot.episode_id in retained_ids:
+            if snapshot.episode_id not in retained_for_scope:
+                pending += 1
+                retained_for_scope.add(snapshot.episode_id)
             continue
         manager = None
         owns_manager = False
@@ -1092,7 +1145,9 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                     return exact_close()
 
                 _retain_durable_cleanup(
-                    exact_snapshot.episode_id, _RetainedCleanup(retry_owned_cleanup),
+                    exact_snapshot.episode_id,
+                    _RetainedCleanup(retry_owned_cleanup, channel_uuid=exact_snapshot.channel_uuid),
+                    channel_uuid=exact_snapshot.channel_uuid,
                 )
                 manager = None
 
@@ -1139,7 +1194,10 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                     if not stop_rejected_manager():
                         _retain_durable_cleanup(
                             snapshot.episode_id,
-                            _RetainedCleanup(stop_rejected_manager),
+                            _RetainedCleanup(
+                                stop_rejected_manager, channel_uuid=snapshot.channel_uuid,
+                            ),
+                            channel_uuid=snapshot.channel_uuid,
                         )
                     manager = None
                     pending += 1
@@ -1164,6 +1222,13 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
                         backend_signature=registration.backend_signature,
                     )
                 if ack is None:
+                    if registration.status == "registered":
+                        from .logging_utils import error
+
+                        error(
+                            "sharing_registration_failed",
+                            callsite="attempt_reconciliation",
+                        )
                     def clean_unregistered(
                         exact_opening=opening,
                         exact_catalog=catalog_generation,
@@ -1318,7 +1383,10 @@ def retry_durable_open_cleanups(ledger: BorrowEpisodeLedger, redis_text: Any, *,
 
                 _retain_durable_cleanup(
                     exact_snapshot.episode_id,
-                    _RetainedCleanup(retry_after_exception),
+                    _RetainedCleanup(
+                        retry_after_exception, channel_uuid=exact_snapshot.channel_uuid,
+                    ),
+                    channel_uuid=exact_snapshot.channel_uuid,
                 )
                 manager = None
     return completed, pending
@@ -1437,6 +1505,9 @@ def prepare_borrow_opening(
                 last_switch_at=last_switch_at,
             )
             if not projected:
+                from .logging_utils import error
+
+                error("sharing_projection_failed", callsite="opening_projection")
                 raise BorrowEpisodeRejected("native opening projection was not acknowledged")
             capability = sign_borrow_capability(
                 secret=capability_secret,
@@ -1460,7 +1531,7 @@ def prepare_borrow_opening(
             return PreparedBorrowOpening(
                 episode.episode_id, episode.version, episode.client_id, capability,
             )
-        except Exception:
+        except Exception as exc:
             # The opening is not retried. Close only after exact native evidence
             # says the projection and client resources are absent.
             closed = False
@@ -1483,6 +1554,10 @@ def prepare_borrow_opening(
                     )
                 except Exception:
                     closed = False
+            if not closed:
+                from .logging_utils import error
+
+                error("sharing_cleanup_pending", exc, callsite="opening_cleanup")
             try:
                 episode_ledger.revoke(
                     episode.episode_id,
@@ -1584,7 +1659,7 @@ def open_borrow_session(capability: SignedBorrowCapability) -> BorrowedReaderSes
         _django_secret(), user_id=capability.user_id, now=time.time(),
     ):
         raise BorrowEpisodeRejected("signed sharing capability is invalid or expired")
-    retry_pending_open_cleanups()
+    retry_pending_open_cleanups(channel_uuid=capability.channel_uuid)
     from core.utils import RedisClient
 
     from .configuration import load_applied_state

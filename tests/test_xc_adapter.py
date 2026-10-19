@@ -84,22 +84,14 @@ def modules():
 
 
 class XCHookInstallTests(unittest.TestCase):
-    def test_version_matrix_accepts_inspected_releases_and_rejects_unknown(self):
-        for version in ("0.32.0",):
+    def test_version_guard_accepts_minimum_and_newer_versions(self):
+        for version in ("0.32.0", "0.32.1", "0.33.0", "1.0.0"):
             with self.subTest(version=version):
                 output, timeshift, _ = modules()
                 result = install_xc_hooks(
                     output, timeshift, dispatcharr_version=version, callbacks=XCCallbacks(),
                 )
                 self.assertTrue(result.installed)
-        output, timeshift, _ = modules()
-        original = output._xc_channel_entry
-        result = install_xc_hooks(
-            output, timeshift, dispatcharr_version="0.33.0", callbacks=XCCallbacks(),
-        )
-        self.assertFalse(result.installed)
-        self.assertIs(output._xc_channel_entry, original)
-
     def test_rejects_dispatcharr_below_minimum(self):
         output, timeshift, _ = modules()
         original = output._xc_channel_entry
