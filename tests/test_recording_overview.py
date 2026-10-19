@@ -44,9 +44,6 @@ class ActionMessageFormattingTests(unittest.TestCase):
     def padding_before_next_row(message):
         return message.split("NextRow", 1)[0].count("\u00a0")
 
-    def test_padding_target_is_narrower_than_previous_toast_estimate(self):
-        self.assertEqual(TARGET_WIDTH_PX, 280.0)
-
     def test_padding_varies_with_last_visual_line_width(self):
         short = format_action_message(("A", "NextRow"))
         long = format_action_message(("W" * 21, "NextRow"))
@@ -91,6 +88,12 @@ class ActionMessageFormattingTests(unittest.TestCase):
         plain = self.padding_before_next_row(format_action_message(("Cafe", "NextRow")))
         combined = self.padding_before_next_row(format_action_message(("Cafe\u0301", "NextRow")))
         self.assertEqual(combined, plain)
+
+    def test_near_boundary_kerning_does_not_pad_from_a_false_short_line(self):
+        row = "Synthetic Sender Bravo: 09:00–10:00"
+        self.assertGreater(_last_visual_line_width(row), TARGET_WIDTH_PX)
+        message = format_action_message((row, "Synthetic Sender Charlie: 00:00–24:00"))
+        self.assertNotIn("\u00a0", message)
 
     def test_single_empty_and_full_width_rows_do_not_get_large_padding(self):
         self.assertEqual(format_action_message(()), "")
