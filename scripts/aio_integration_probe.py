@@ -445,12 +445,20 @@ def probe():
     require(all({"channel_uuid", "number", "name", "state", "mode", "reason", "source"}
                 <= set(row) for row in current_result["channels"]),
             "Current recordings action omitted expected channel state fields")
+    require("Current recordings" not in current_result.get("message", "")
+            and "Problems:" not in current_result.get("message", "")
+            and "Last confirmed progress" not in current_result.get("message", ""),
+            "Current recordings action returned the expanded diagnostic message")
     require(isinstance(schedule_result, dict) and isinstance(schedule_result.get("channels"), list)
             and isinstance(schedule_result.get("summary"), dict),
             "Today's schedule action did not return the shared structured response format")
     require(all({"channel_uuid", "number", "name", "windows"} <= set(row)
                 and isinstance(row["windows"], list) for row in schedule_result["channels"]),
             "Today's schedule action omitted selected channels or window lists")
+    require("Today's recording schedule" not in schedule_result.get("message", "")
+            and "Pause state unknown" not in schedule_result.get("message", "")
+            and "No recording windows planned" not in schedule_result.get("message", ""),
+            "Today's schedule action returned the expanded schedule message")
     require(active_path.read_bytes() == active_before and control_path.read_bytes() == control_before
             and set(active_path.parent.iterdir()) == directory_before,
             "Read-only overview action changed Catchuparr configuration/control files")
