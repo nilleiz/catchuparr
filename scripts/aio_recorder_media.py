@@ -21,6 +21,15 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _failed_opening_identity(channel_uuid, native_owner, stream, metadata):
+    """Build the exact channel identity used by the recovery fixture."""
+    return (
+        str(channel_uuid), str(native_owner), str(native_owner),
+        str(native_owner), str(stream.id), str(stream.m3u_account_id),
+        metadata["m3u_profile"], metadata["stream_profile"],
+    )
+
+
 def _run_current_recordings_readonly(action, archive_db):
     """Run the action while an SQLite authorizer watches its archive reads."""
     import sqlite3
@@ -4912,10 +4921,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         sharing_episode_ledger = BorrowEpisodeLedger(
             archive_root / ".catchuparr-sharing.sqlite3",
         )
-        sharing_identity = (
-            str(channel.uuid), str(native_owner), str(native_owner),
-            str(stream_a.id), str(stream_a.m3u_account_id),
-            source_metadata["m3u_profile"], source_metadata["stream_profile"],
+        sharing_identity = _failed_opening_identity(
+            channel.uuid, native_owner, stream_a, source_metadata,
         )
         failed_token = SharingIntentToken(
             channel_uuid=str(channel.uuid), revision=1, intent_epoch=9000,
