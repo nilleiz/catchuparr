@@ -15,7 +15,7 @@ included here to explain the feature history leading to 0.4.0.
 - Current-recording rows omit channel numbers and use only the first word of
   the validated M3U profile name.
 - Sizes the nonbreaking-space gap between visible rows from static 17px Lato
-  measurements with a 280px target. This is a width estimate, not a
+  measurements calibrated to a 350px row. This is a width estimate, not a
   runtime viewport measurement. Copied text may retain nonbreaking spaces,
   which can be replaced with ordinary spaces in the destination.
 - A manually dispatched CI run can explicitly skip native AIO for package/unit
