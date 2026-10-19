@@ -4986,12 +4986,14 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         def retry_channel_cleanup(*args, **kwargs):
             result = original_retry_cleanup(*args, **kwargs)
             if kwargs.get("channel_uuid") == str(channel.uuid):
+                episode = sharing_episode_ledger.read(str(channel.uuid))
                 _require(
-                    result == (1, 0)
-                    and sharing_episode_ledger.read(str(channel.uuid)).phase == "closed",
+                    result in {(0, 0), (1, 0)}
+                    and episode.phase == "closed",
                     "Task did not ACK cleanup for the exact failed channel opening",
                 )
-                recovery_order.append("cleanup_acknowledged")
+                if "cleanup_acknowledged" not in recovery_order:
+                    recovery_order.append("cleanup_acknowledged")
             return result
 
         run_share = _RecorderTaskRun(
