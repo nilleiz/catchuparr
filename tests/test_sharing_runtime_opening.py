@@ -1,6 +1,7 @@
 import importlib
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from dataclasses import replace
@@ -9,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from catchuparr.sharing_episode import BorrowEpisodeLedger
+from catchuparr.sharing_episode import BorrowEpisodeLedger, BorrowEpisodeRejected
 from catchuparr.sharing_persistence import SharingIntentLedger
 from catchuparr.sharing_planner import (
     BorrowTarget,
@@ -85,6 +86,75 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_failed_opening_ack_is_exact_and_later_cleanup_is_ignored(self):
+        from scripts.aio_recorder_media import _ack_failed_opening_cleanup
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-exact-ack-synthetic",
+        )
+        closed = self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        self.assertTrue(_ack_failed_opening_cleanup(
+            self.episode_ledger, CHANNEL, opening.episode_id, (0, 0),
+            acknowledged=False,
+        ))
+
+        # A new active cleanup after the original ACK must not be checked
+        # against the old episode identity or completion count.
+        next_state = replace(self.saved.state, intent_epoch=self.saved.state.intent_epoch + 1)
+        next_saved = self.intent_ledger.save(
+            next_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=self.saved.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        replacement = self.episode_ledger.begin_open(
+            next_saved.intent, lease_digest=sha256((LEASE + "-next").encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-next-ack-synthetic",
+            expected_version=closed.version,
+        )
+        self.assertTrue(_ack_failed_opening_cleanup(
+            self.episode_ledger, CHANNEL, opening.episode_id, (0, 1),
+            acknowledged=True,
+        ))
+        self.assertEqual("opening", self.episode_ledger.read(CHANNEL).phase)
+        self.assertEqual(replacement.episode_id, self.episode_ledger.read(CHANNEL).episode_id)
+
+    def test_failed_opening_ack_rejects_closed_replacement_episode(self):
+        from scripts.aio_recorder_media import _ack_failed_opening_cleanup
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-replaced-ack-synthetic",
+        )
+        closed = self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        next_state = replace(self.saved.state, intent_epoch=self.saved.state.intent_epoch + 1)
+        next_saved = self.intent_ledger.save(
+            next_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=self.saved.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        replacement = self.episode_ledger.begin_open(
+            next_saved.intent, lease_digest=sha256((LEASE + "-replacement").encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-replacement-ack-synthetic",
+            expected_version=closed.version,
+        )
+        replacement_closed = self.episode_ledger.revoke(
+            replacement.episode_id, expected_version=replacement.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        self.assertEqual("closed", replacement_closed.phase)
+        with self.assertRaisesRegex(RuntimeError, "exact failed channel opening"):
+            _ack_failed_opening_cleanup(
+                self.episode_ledger, CHANNEL, opening.episode_id, (0, 0),
+                acknowledged=False,
+            )
+
     def prepare(self, *, project=True, close=True, validate=lambda _token: True):
         with patch(
             "catchuparr.sharing_runtime.project_opening_episode", return_value=project,
@@ -133,6 +203,68 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         second, _projector, _cleanup = self.prepare()
         self.assertEqual((False, None), second)
         projector.assert_called_once()
+
+    def test_failed_opening_retries_use_closed_episode_cas_and_new_intent(self):
+        from catchuparr.adapters.sharing_native import NativeClientRegistrationAck
+
+        first = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-runtime-failed-opening-synthetic",
+            expected_version=None,
+        )
+        attempt = self.episode_ledger.prepare_registration(
+            first, local_worker_id="worker-runtime-opening-synthetic",
+            backend_signature="a" * 64, user_agent="Synthetic cleanup fixture",
+            client_ip="127.0.0.1",
+        )
+        ack = NativeClientRegistrationAck(
+            channel_uuid=CHANNEL, episode_id=first.episode_id,
+            client_id=attempt.client_id, local_worker_id=attempt.local_worker_id,
+            redis_backend_signature=attempt.backend_signature,
+            connected_at="105.0", projection_version=first.version + 1,
+            user_agent=attempt.user_agent, client_ip=attempt.client_ip,
+        )
+        self.episode_ledger.record_registration_ack(first.episode_id, ack)
+        pending = self.episode_ledger.revoke(
+            first.episode_id, expected_version=first.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        self.assertEqual("cleanup_pending", pending.phase)
+        with self.assertRaisesRegex(BorrowEpisodeRejected, "previous episode cleanup"):
+            self.episode_ledger.begin_open(
+                self.saved.intent,
+                lease_digest=sha256(LEASE.encode()).hexdigest(),
+                identity=IDENTITY,
+                client_id="catchuparr-client-runtime-retry-synthetic",
+                expected_version=pending.version,
+            )
+
+        closed = self.episode_ledger.revoke(
+            first.episode_id, expected_version=pending.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        # A genuinely new planner intent advances the persisted epoch/revision;
+        # the episode ledger then admits it only against the exact closed row.
+        next_state = replace(self.saved.state, intent_epoch=self.saved.state.intent_epoch + 1)
+        next_saved = self.intent_ledger.save(
+            next_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=self.saved.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        self.assertGreater(next_saved.intent.revision, self.saved.intent.revision)
+        self.assertGreater(next_saved.intent.intent_epoch, self.saved.intent.intent_epoch)
+        second = self.episode_ledger.begin_open(
+            next_saved.intent,
+            lease_digest=sha256((LEASE + "-next").encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-runtime-retry-synthetic",
+            expected_version=closed.version,
+        )
+        self.assertEqual("opening", second.phase)
+        self.assertEqual(closed.version + 1, second.version)
+        self.assertEqual(next_saved.intent.intent_epoch, second.intent_epoch)
 
     def test_consumed_attach_recovers_only_after_exact_episode_and_native_absence(self):
         opening = self.episode_ledger.begin_open(
@@ -669,6 +801,322 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         rebuilt_ack = cleanup.call_args.args[1]
         self.assertEqual(ack.client_id, rebuilt_ack.client_id)
         self.assertEqual(ack.connected_at, rebuilt_ack.connected_at)
+
+    def test_channel_scoped_cleanup_leaves_other_and_live_opening_untouched(self):
+        from catchuparr.sharing_runtime import retry_durable_open_cleanups
+
+        target_opening = self.episode_ledger.begin_open(
+            self.saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-target-cleanup-synthetic",
+        )
+        target_registration = self.episode_ledger.prepare_registration(
+            target_opening, local_worker_id="catchuparr-reader-target-cleanup-synthetic",
+            backend_signature="a" * 64, user_agent="Catchuparr reader",
+            client_ip="127.0.0.1",
+        )
+        target_ack = SimpleNamespace(
+            episode_id=target_opening.episode_id, channel_uuid=CHANNEL,
+            client_id=target_registration.client_id,
+            local_worker_id=target_registration.local_worker_id,
+            redis_backend_signature=target_registration.backend_signature,
+            connected_at="105.5", projection_version=target_opening.version + 1,
+            user_agent=target_registration.user_agent,
+            client_ip=target_registration.client_ip,
+        )
+        self.episode_ledger.record_registration_ack(target_opening.episode_id, target_ack)
+        self.episode_ledger.revoke(
+            target_opening.episode_id, expected_version=target_opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+
+        other_channel = "channel-runtime-cleanup-other-synthetic"
+        other_identity = (other_channel, *IDENTITY[1:])
+        other_state = replace(
+            attach_state(), channel_uuid=other_channel,
+            candidate_identity=other_identity,
+            candidate_connection_identity=other_identity,
+        )
+        other_saved = self.intent_ledger.save(
+            other_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=None, target_identity=other_identity,
+            target_admitted=True, not_before=105.0,
+        )
+        other_opening = self.episode_ledger.begin_open(
+            other_saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=other_identity, client_id="catchuparr-client-other-cleanup-synthetic",
+        )
+        self.episode_ledger.revoke(
+            other_opening.episode_id, expected_version=other_opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+
+        live_channel = "channel-runtime-live-opening-synthetic"
+        live_identity = (live_channel, *IDENTITY[1:])
+        live_state = replace(
+            attach_state(), channel_uuid=live_channel, intent_epoch=7,
+            candidate_identity=live_identity,
+            candidate_connection_identity=live_identity,
+        )
+        live_saved = self.intent_ledger.save(
+            live_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=None, target_identity=live_identity,
+            target_admitted=True, not_before=105.0,
+        )
+        live_opening = self.episode_ledger.begin_open(
+            live_saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=live_identity,
+            client_id="catchuparr-client-live-opening-synthetic",
+        )
+
+        class Manager:
+            def __init__(self, *, channel_id, redis_client, worker_id):
+                self.channel_id = channel_id
+                self.redis_client = redis_client
+                self.worker_id = worker_id
+
+            def stop(self):
+                return None
+
+        client_manager = types.ModuleType("apps.proxy.live_proxy.client_manager")
+        client_manager.ClientManager = Manager
+        modules = {
+            "apps": types.ModuleType("apps"),
+            "apps.proxy": types.ModuleType("apps.proxy"),
+            "apps.proxy.live_proxy": types.ModuleType("apps.proxy.live_proxy"),
+            "apps.proxy.live_proxy.client_manager": client_manager,
+        }
+        with patch.dict(sys.modules, modules), patch(
+            "catchuparr.adapters.sharing_reader.redis_backend_signature",
+            return_value=target_registration.backend_signature,
+        ), patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_grant",
+            return_value=None,
+        ), patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_cleanup_binding",
+            return_value=None,
+        ), patch(
+            "catchuparr.adapters.sharing_native.cleanup_borrowed_client",
+            return_value=True,
+        ) as cleanup:
+            self.assertEqual((1, 0), retry_durable_open_cleanups(
+                self.episode_ledger, object(), now=300.0,
+                stale_after=1000.0, channel_uuid=CHANNEL,
+            ))
+            # Startup can already have ACKed the cleanup before another
+            # recovery entry point runs. That retry is a successful no-op.
+            self.assertEqual((0, 0), retry_durable_open_cleanups(
+                self.episode_ledger, object(), now=301.0,
+                stale_after=1000.0, channel_uuid=CHANNEL,
+            ))
+        cleanup.assert_called_once()
+        self.assertEqual(target_registration.client_id, cleanup.call_args.args[1].client_id)
+        self.assertEqual("closed", self.episode_ledger.read(CHANNEL).phase)
+        self.assertEqual("cleanup_pending", self.episode_ledger.read(other_channel).phase)
+        live_after = self.episode_ledger.read(live_channel)
+        self.assertEqual("opening", live_after.phase)
+        self.assertEqual(live_opening.episode_id, live_after.episode_id)
+
+        # The consumed ATTACH remains consumed through cleanup. The new task
+        # first recovers that exact closed opening, then observes the same
+        # still-present viewer and may create a fresh claim on a later poll.
+        coordinator = object.__new__(RecorderBorrowCoordinator)
+        coordinator.channel_uuid = CHANNEL
+        coordinator.redis = object()
+        coordinator.intent_ledger = self.intent_ledger
+        coordinator.episode_ledger = self.episode_ledger
+        coordinator.state_record = self.saved
+        coordinator.configuration_generation = "config-synthetic"
+        coordinator.control_generation = 2
+        coordinator.recorder_fence = 7
+        coordinator.lease_value = LEASE
+        coordinator.catalog_generation = "catalog-synthetic"
+        coordinator.assigned_sources = ()
+        coordinator.dedicated_source_available = False
+        coordinator._recovery_is_current = lambda *_args: True
+        active = {"connection_sharing": {CHANNEL: {
+            "enabled": True, "live_stability_seconds": 0,
+            "last_viewer_return_seconds": 0, "min_switch_interval_seconds": 0,
+        }}}
+        with patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_grant",
+            return_value=None,
+        ), patch(
+            "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+            return_value=SimpleNamespace(state="known_revoked"),
+        ), patch(
+            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            return_value=True,
+        ):
+            self.assertIsNone(coordinator.poll(active=active, control_generation=2))
+        self.assertIsNone(coordinator.state_record.intent)
+        prepared_sentinel = object()
+        with patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_grant",
+            return_value=None,
+        ), patch(
+            "catchuparr.configuration._sharing_catalog_generation",
+            return_value="catalog-synthetic",
+        ), patch(
+            "catchuparr.recorder_proxy.configuration_generation",
+            return_value="config-synthetic",
+        ), patch(
+            "catchuparr.sharing_runtime.observe_native_connection",
+            return_value=SimpleNamespace(target=target()),
+        ), patch(
+            "catchuparr.sharing_runtime.prepare_borrow_opening",
+            return_value=(True, prepared_sentinel),
+        ) as prepare_open, patch(
+            "catchuparr.sharing_runtime._django_secret",
+            return_value="synthetic-secret",
+        ):
+            self.assertIs(
+                prepared_sentinel,
+                coordinator.poll(active=active, control_generation=2),
+            )
+        recovered_token = prepare_open.call_args.args[3]
+        self.assertEqual(SharingAction.ATTACH_BORROW, recovered_token.action)
+        self.assertGreater(recovered_token.intent_epoch, self.saved.state.intent_epoch)
+
+    def test_retained_cleanup_is_retried_for_its_channel_and_blocks_until_ack(self):
+        from catchuparr.sharing_runtime import (
+            _pending_open_cleanup_channels,
+            _pending_open_cleanup_lock,
+            _pending_open_cleanups,
+            _retain_durable_cleanup,
+            retry_durable_open_cleanups,
+        )
+
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY, client_id="catchuparr-client-retained-channel-synthetic",
+        )
+        registration = self.episode_ledger.prepare_registration(
+            opening, local_worker_id="catchuparr-worker-retained-channel-synthetic",
+            backend_signature="b" * 64, user_agent="Synthetic reader", client_ip="127.0.0.1",
+        )
+        ack = SimpleNamespace(
+            episode_id=opening.episode_id, channel_uuid=CHANNEL,
+            client_id=registration.client_id,
+            local_worker_id=registration.local_worker_id,
+            redis_backend_signature=registration.backend_signature,
+            connected_at="105.5", projection_version=opening.version + 1,
+            user_agent=registration.user_agent, client_ip=registration.client_ip,
+        )
+        self.episode_ledger.record_registration_ack(opening.episode_id, ack)
+        self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+
+        other_channel = "channel-runtime-retained-other-synthetic"
+        other_calls = []
+
+        class Retry:
+            def __init__(self):
+                self.calls = 0
+                self.succeed = False
+
+            def retry_cleanup(self):
+                self.calls += 1
+                if not self.succeed:
+                    return False
+                current = self_episode_ledger.read(CHANNEL)
+                self_episode_ledger.revoke(
+                    current.episode_id, expected_version=current.version,
+                    reason="closed", cleanup_acknowledged=True,
+                )
+                return True
+
+        class OtherRetry:
+            def retry_cleanup(self):
+                other_calls.append("retried")
+                return False
+
+        retained = Retry()
+        self_episode_ledger = self.episode_ledger
+        _retain_durable_cleanup(opening.episode_id, retained, channel_uuid=CHANNEL)
+        other_id = "episode-runtime-retained-other-synthetic"
+        _retain_durable_cleanup(other_id, OtherRetry(), channel_uuid=other_channel)
+        try:
+            with patch(
+                "catchuparr.adapters.sharing_reader.redis_backend_signature",
+                return_value="b" * 64,
+            ):
+                self.assertEqual((0, 1), retry_durable_open_cleanups(
+                    self.episode_ledger, object(), now=300.0, channel_uuid=CHANNEL,
+                ))
+                self.assertEqual(1, retained.calls)
+                self.assertEqual([], other_calls)
+                self.assertEqual("cleanup_pending", self.episode_ledger.read(CHANNEL).phase)
+
+                # Replace with the exact durable operation's successful ACK;
+                # the next startup recovery must retry it before observation.
+                retained.succeed = True
+                self.assertEqual((1, 0), retry_durable_open_cleanups(
+                    self.episode_ledger, object(), now=301.0, channel_uuid=CHANNEL,
+                ))
+                self.assertEqual(2, retained.calls)
+                self.assertEqual([], other_calls)
+        finally:
+            with _pending_open_cleanup_lock:
+                _pending_open_cleanups.pop(opening.episode_id, None)
+                _pending_open_cleanup_channels.pop(opening.episode_id, None)
+                _pending_open_cleanups.pop(other_id, None)
+                _pending_open_cleanup_channels.pop(other_id, None)
+
+    def test_retained_cleanup_retry_is_serialized_per_episode(self):
+        from catchuparr.sharing_runtime import (
+            _pending_open_cleanup_channels,
+            _pending_open_cleanup_lock,
+            _pending_open_cleanup_locks,
+            _pending_open_cleanups,
+            _retain_durable_cleanup,
+            retry_pending_open_cleanups,
+        )
+
+        episode_id = "episode-runtime-retained-concurrency-synthetic"
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Retry:
+            def __init__(self):
+                self.calls = 0
+
+            def retry_cleanup(self):
+                self.calls += 1
+                entered.set()
+                if not release.wait(2):
+                    return False
+                return True
+
+        operation = Retry()
+        _retain_durable_cleanup(episode_id, operation, channel_uuid=CHANNEL)
+        results = []
+        first = threading.Thread(
+            target=lambda: results.append(retry_pending_open_cleanups(channel_uuid=CHANNEL)),
+        )
+        second = threading.Thread(
+            target=lambda: results.append(retry_pending_open_cleanups(channel_uuid=CHANNEL)),
+        )
+        try:
+            first.start()
+            self.assertTrue(entered.wait(2))
+            second.start()
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(1, operation.calls)
+            self.assertEqual([(0, 0), (1, 0)], sorted(results))
+        finally:
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+            with _pending_open_cleanup_lock:
+                _pending_open_cleanups.pop(episode_id, None)
+                _pending_open_cleanup_channels.pop(episode_id, None)
+                _pending_open_cleanup_locks.pop(episode_id, None)
 
     def test_durable_cleanup_scanner_fences_uncertain_registration_before_stop(self):
         from catchuparr.sharing_runtime import (

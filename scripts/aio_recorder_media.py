@@ -21,6 +21,207 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _failed_opening_identity(channel_uuid, native_owner, stream, metadata):
+    """Build the exact channel identity used by the recovery fixture."""
+    return (
+        str(channel_uuid), str(native_owner), str(native_owner),
+        str(native_owner), str(stream.id), str(stream.m3u_account_id),
+        metadata["m3u_profile"], metadata["stream_profile"],
+    )
+
+
+def _ack_failed_opening_cleanup(ledger, channel_uuid, episode_id, result, *, acknowledged):
+    """Validate only the first ACK for the exact seeded failed opening."""
+    if acknowledged:
+        return True
+    episode = ledger.read(str(channel_uuid))
+    _require(
+        result in {(0, 0), (1, 0)}
+        and episode.episode_id == episode_id
+        and episode.phase == "closed",
+        "Task did not ACK cleanup for the exact failed channel opening",
+    )
+    return True
+
+
+def _run_current_recordings_readonly(action, archive_db):
+    """Run the action while an SQLite authorizer watches its archive reads."""
+    import sqlite3
+    from urllib.parse import unquote, urlsplit
+
+    from catchuparr import recording_overview
+
+    archive_path = Path(archive_db).resolve()
+    original_connect = recording_overview.sqlite3.connect
+    action_thread_id = threading.get_ident()
+    inspected = []
+    attempted_writes = []
+    write_actions = {
+        getattr(sqlite3, name) for name in (
+            "SQLITE_INSERT", "SQLITE_UPDATE", "SQLITE_DELETE",
+            "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX",
+            "SQLITE_CREATE_TEMP_TABLE", "SQLITE_CREATE_TEMP_TRIGGER",
+            "SQLITE_CREATE_TEMP_VIEW", "SQLITE_CREATE_TRIGGER", "SQLITE_CREATE_VIEW",
+            "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE", "SQLITE_DROP_TEMP_INDEX",
+            "SQLITE_DROP_TEMP_TABLE", "SQLITE_DROP_TEMP_TRIGGER", "SQLITE_DROP_TEMP_VIEW",
+            "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VIEW", "SQLITE_ALTER_TABLE",
+            "SQLITE_REINDEX", "SQLITE_ANALYZE", "SQLITE_CREATE_VTABLE",
+            "SQLITE_DROP_VTABLE", "SQLITE_ATTACH", "SQLITE_DETACH",
+        ) if hasattr(sqlite3, name)
+    }
+
+    class GuardedConnection:
+        def __init__(self, connection, observation):
+            self._connection = connection
+            self._observation = observation
+
+        def execute(self, statement, *args, **kwargs):
+            result = self._connection.execute(statement, *args, **kwargs)
+            if statement.strip().upper() == "PRAGMA QUERY_ONLY=ON":
+                self._observation["query_only"] = bool(
+                    self._connection.execute("PRAGMA query_only").fetchone()[0]
+                )
+            return result
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def guarded_connect(database, *args, **kwargs):
+        if threading.get_ident() != action_thread_id:
+            return original_connect(database, *args, **kwargs)
+        value = str(database)
+        parsed_path = unquote(urlsplit(value).path) if value.startswith("file:") else value
+        try:
+            is_archive = Path(parsed_path).resolve() == archive_path
+        except (OSError, ValueError):
+            is_archive = False
+        connection = original_connect(database, *args, **kwargs)
+        if not is_archive:
+            return connection
+        uri_readonly = value.startswith("file:") and "mode=ro" in value.split("?", 1)[-1].split("&")
+        observation = {"uri_readonly": uri_readonly, "query_only": False}
+
+        def authorize(action_code, arg1, arg2, _database, _trigger):
+            if action_code in write_actions:
+                attempted_writes.append(str(arg1 or "unknown"))
+                return sqlite3.SQLITE_DENY
+            if action_code == getattr(sqlite3, "SQLITE_PRAGMA", None) and arg2 is not None:
+                allowed_query_only = (
+                    str(arg1 or "").lower() == "query_only"
+                    and str(arg2).upper() == "ON"
+                )
+                if not allowed_query_only:
+                    attempted_writes.append("pragma")
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(authorize)
+        inspected.append(observation)
+        return GuardedConnection(connection, observation)
+
+    recording_overview.sqlite3.connect = guarded_connect
+    try:
+        result = action()
+    finally:
+        recording_overview.sqlite3.connect = original_connect
+    _require(bool(inspected), "Current recordings did not inspect the archive index")
+    _require(all(item["uri_readonly"] and item["query_only"] for item in inspected),
+             "Current recordings archive connection was not read-only/query-only")
+    _require(not attempted_writes,
+             "Current recordings attempted to change the archive index")
+    return result
+
+
+def _overview_source_metadata_matches(source, expected_mode):
+    if not isinstance(source, dict) or source.get("mode") != expected_mode:
+        return False
+    if not all(source.get(field) for field in (
+        "stream_name", "provider_name", "stream_id", "provider_id",
+        "m3u_profile_id", "m3u_profile_name",
+    )):
+        return False
+    profile_fields = ("input_profile_id", "input_profile_name")
+    if expected_mode == "borrowed":
+        return all(source.get(field) for field in profile_fields)
+    if expected_mode == "dedicated":
+        # The diagnostic skeleton has an input ID placeholder; source_metadata
+        # omits both profile bindings when Dispatcharr initialized with None.
+        return source.get("input_profile_id") is None and "input_profile_name" not in source
+    return False
+
+
+def _assert_live_overview(archive_root, active_path, control_path, channel_uuid, expected_mode):
+    """Validate read-only current-recording output while a real attempt is live."""
+    import hashlib
+    from datetime import datetime, timezone
+
+    from catchuparr.plugin import Plugin
+
+    archive_root = Path(archive_root)
+    archive_db = archive_root / "archive.sqlite3"
+    outbox_db = active_path.with_name(".catchuparr-sharing-authority.sqlite3")
+
+    def file_digest(path):
+        try:
+            return hashlib.sha256(path.read_bytes()).digest()
+        except FileNotFoundError:
+            return None
+
+    def state_snapshot():
+        return (
+            active_path.read_bytes(), control_path.read_bytes(),
+            file_digest(outbox_db),
+        )
+
+    before = state_snapshot()
+    result = _run_current_recordings_readonly(
+        lambda: Plugin.__new__(Plugin).run("current_recordings", {}, {}),
+        archive_db,
+    )
+    after = state_snapshot()
+    _require(before == after,
+             "Current recordings overview changed applied configuration or outbox state")
+    _require(result.get("status") == "ok" and isinstance(result.get("channels"), list),
+             "Current recordings overview did not return applied channel rows")
+    rows = {row.get("channel_uuid"): row for row in result["channels"]}
+    row = rows.get(str(channel_uuid))
+    _require(row is not None and row.get("state") == "recording"
+             and row.get("mode") == expected_mode,
+             f"Live {expected_mode} overview did not confirm indexed recorder progress")
+    progress = row.get("last_confirmed_progress_at")
+    try:
+        parsed = datetime.fromisoformat(progress.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        parsed = None
+    _require(isinstance(parsed, datetime) and parsed.tzinfo is not None
+             and parsed.utcoffset() == timezone.utc.utcoffset(parsed),
+             "Current recordings overview omitted UTC media progress time")
+    source = row.get("source")
+    _require(
+        _overview_source_metadata_matches(source, expected_mode),
+        "Current recordings overview omitted exact source/provider/profile metadata",
+    )
+    _require("://" not in str(source) and "token" not in str(source).lower(),
+             "Current recordings overview leaked a URL or credential-like value")
+    _require(type(row.get("indexed_segments_since_attempt")) is int
+             and row["indexed_segments_since_attempt"] > 0
+             and row.get("recent_media_progress") is True,
+             "Current recordings overview did not confirm a fresh indexed segment")
+    expected_problems = sum(
+        item.get("state") in {"unknown", "error", "cleanup_pending", "no_media_progress"}
+        for item in result["channels"]
+    )
+    _require(result.get("summary", {}).get("problems") == expected_problems,
+             "Current recordings summary problem count disagrees with channel states")
+
+
 def global_sharing_draft(
     settings: dict, *, enabled: bool, live_stability_seconds: int,
     last_viewer_return_seconds: int, min_switch_interval_seconds: int,
@@ -551,6 +752,28 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
         ),
         "task_status": task_status,
         "failure_classes": failure_classes,
+        "exception_call_sites": [
+            [
+                {
+                    "file": (
+                        frame.get("file")[:80]
+                        if isinstance(frame.get("file"), str) else None
+                    ),
+                    "function": (
+                        frame.get("function")[:80]
+                        if isinstance(frame.get("function"), str) else None
+                    ),
+                    "line": (
+                        frame.get("line")
+                        if type(frame.get("line")) is int else None
+                    ),
+                }
+                for frame in call_sites[-8:]
+                if isinstance(frame, dict)
+            ]
+            for call_sites in getattr(run, "exception_call_sites", ())[-4:]
+            if isinstance(call_sites, list)
+        ],
         "attempts": attempt_summaries,
         "attempt_count": len(inputs),
         "process_exit_codes": process_exit_codes,
@@ -3324,7 +3547,10 @@ def _probe_running_recorder_controls(
 
         with patch.object(tasks.record_channel, "apply_async", side_effect=capture):
             result = tasks.reconcile_recorders.run()
-        _require(result == {"queued": 1} and len(captured) == 1,
+        _require(
+            isinstance(result, dict)
+            and result.get("queued") == 1
+            and len(captured) == 1,
                  "Real recorder reconciliation did not queue exactly the selected channel")
         args, queue = captured[0]
         _require(queue == "dvr" and len(args) == 3 and str(args[0]) == channel_uuid,
@@ -3425,7 +3651,9 @@ def _probe_running_recorder_controls(
     with patch.object(tasks.record_channel, "apply_async", side_effect=capture_pause_reconcile):
         pause_reconcile_result = tasks.reconcile_recorders.run()
     _require(
-        pause_reconcile_result == {"queued": 0} and not pause_reconcile_dispatches,
+        isinstance(pause_reconcile_result, dict)
+        and pause_reconcile_result.get("queued") == 0
+        and not pause_reconcile_dispatches,
         "Paused real reconciliation queued another recorder task",
     )
     _require(
@@ -3733,6 +3961,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         active_settings_path,
         apply_configuration,
         load_active_configuration,
+        load_applied_state,
     )
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.recorder_control import control_deny_path, control_state_path
@@ -4703,28 +4932,132 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and share_active_baseline["source-b.ts"] == 0,
             "Sharing fixture did not start with only the existing live A connection",
         )
+        # Leave one exact registered opening durably awaiting cleanup. The
+        # next recorder task must close this channel-local residue before its
+        # first native observation, then attach to this same ordinary viewer.
+        from hashlib import sha256
+
+        from catchuparr.adapters.sharing_native import NativeClientRegistrationAck
+        from catchuparr.adapters.sharing_reader import redis_backend_signature
+        from catchuparr.recorder_proxy import configuration_generation
+        from catchuparr.sharing_episode import BorrowEpisodeLedger
+        from catchuparr.sharing_persistence import SharingIntentToken
+        from catchuparr.sharing_planner import SharingAction
+
+        sharing_active, sharing_control = load_applied_state(active_path)
+        _require(sharing_active is not None, "Sharing recovery snapshot is unavailable")
+        sharing_episode_ledger = BorrowEpisodeLedger(
+            archive_root / ".catchuparr-sharing.sqlite3",
+        )
+        prior_episode = sharing_episode_ledger.read(str(channel.uuid))
+        _require(
+            prior_episode.phase == "closed",
+            "Failed-opening fixture requires the prior channel episode cleanup ACK",
+        )
+        sharing_identity = _failed_opening_identity(
+            channel.uuid, native_owner, stream_a, source_metadata,
+        )
+        failed_token = SharingIntentToken(
+            channel_uuid=str(channel.uuid), revision=1, intent_epoch=9000,
+            action=SharingAction.ATTACH_BORROW,
+            configuration_generation=configuration_generation(sharing_active),
+            control_generation=sharing_control.generation,
+            recorder_fence=0, target_identity=sharing_identity,
+            target_admitted=True, not_before=time.time(),
+        )
+        failed_opening = sharing_episode_ledger.begin_open(
+            failed_token,
+            lease_digest=sha256(b"synthetic expired opening lease").hexdigest(),
+            identity=sharing_identity,
+            client_id="catchuparr-client-synthetic-failed-opening",
+            expected_version=prior_episode.version,
+        )
+        failed_registration = sharing_episode_ledger.prepare_registration(
+            failed_opening, local_worker_id=str(worker_id),
+            backend_signature=redis_backend_signature(redis_client),
+            user_agent="Synthetic recorder cleanup test", client_ip="127.0.0.1",
+        )
+        failed_ack = NativeClientRegistrationAck(
+            channel_uuid=str(channel.uuid), episode_id=failed_opening.episode_id,
+            client_id=failed_registration.client_id,
+            local_worker_id=failed_registration.local_worker_id,
+            redis_backend_signature=failed_registration.backend_signature,
+            connected_at=str(time.time()),
+            projection_version=failed_opening.version + 1,
+            user_agent=failed_registration.user_agent,
+            client_ip=failed_registration.client_ip,
+        )
+        sharing_episode_ledger.record_registration_ack(
+            failed_opening.episode_id, failed_ack,
+        )
+        sharing_episode_ledger.revoke(
+            failed_opening.episode_id,
+            expected_version=failed_opening.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        recovery_order = []
+        failed_opening_acknowledged = False
+        from catchuparr import sharing_runtime as sharing_runtime_module
+
+        original_retry_cleanup = sharing_runtime_module.retry_durable_open_cleanups
+        original_native_observation = sharing_runtime_module.observe_native_connection
+
+        def observe_after_channel_cleanup(*args, **kwargs):
+            observed_channel = args[1] if len(args) > 1 else kwargs.get("channel_uuid")
+            if str(observed_channel) == str(channel.uuid):
+                _require(
+                    failed_opening_acknowledged,
+                    "Native viewer observation ran before failed-opening cleanup ACK",
+                )
+                if "native_observation" not in recovery_order:
+                    recovery_order.append("native_observation")
+            return original_native_observation(*args, **kwargs)
+
+        def retry_channel_cleanup(*args, **kwargs):
+            nonlocal failed_opening_acknowledged
+            result = original_retry_cleanup(*args, **kwargs)
+            if kwargs.get("channel_uuid") == str(channel.uuid):
+                _ack_failed_opening_cleanup(
+                    sharing_episode_ledger, channel.uuid,
+                    failed_opening.episode_id, result,
+                    acknowledged=failed_opening_acknowledged,
+                )
+                if not failed_opening_acknowledged:
+                    failed_opening_acknowledged = True
+                    recovery_order.append("cleanup_acknowledged")
+            return result
+
         run_share = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
         )
-        run_share.start()
-        harnesses.append(run_share)
+        with patch.object(
+            sharing_runtime_module, "retry_durable_open_cleanups", retry_channel_cleanup,
+        ), patch.object(
+            sharing_runtime_module, "observe_native_connection", observe_after_channel_cleanup,
+        ):
+            run_share.start()
+            harnesses.append(run_share)
 
-        borrow_headers = None
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
-            with run_share._lock:
-                borrow_headers = next(
-                    (dict(headers) for headers in run_share.input_headers
-                     if "X-Catchuparr-Borrow" in headers),
-                    None,
-                )
-            if borrow_headers is not None:
-                break
-            if run_share.failures:
-                raise RuntimeError("Sharing recorder failed before opening a native borrow")
-            time.sleep(0.1)
+            borrow_headers = None
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                with run_share._lock:
+                    borrow_headers = next(
+                        (dict(headers) for headers in run_share.input_headers
+                         if "X-Catchuparr-Borrow" in headers),
+                        None,
+                    )
+                if borrow_headers is not None:
+                    break
+                if run_share.failures:
+                    raise RuntimeError("Sharing recorder failed before opening a native borrow")
+                time.sleep(0.1)
         _require(borrow_headers is not None,
                  "Sharing recorder did not request the signed native-buffer route")
+        _require(
+            recovery_order[:2] == ["cleanup_acknowledged", "native_observation"],
+            "New recorder did not recover the channel opening before observing its viewer",
+        )
         _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 2,
             expected_local=1, timeout=30,
@@ -4770,6 +5103,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             cooperative_sleep=gevent_sleep,
         )
         _require(bool(borrowed_segments), "Borrowed live A did not reach the archive")
+        from aio_recorder_diagnostics_probe import probe_live_borrowed_diagnostic
+
+        borrowed_diagnostic_cleanup = probe_live_borrowed_diagnostic(redis_client, worker_id)
+        try:
+            _assert_live_overview(
+                archive_root, active_path, control_path, worker_id, "borrowed",
+            )
+        finally:
+            borrowed_diagnostic_cleanup()
 
         # A consumed opening capability cannot be replayed into a second
         # reader, even while its first reader remains active.
@@ -4924,6 +5266,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             cooperative_sleep=gevent_sleep,
         )
         _require(bool(returned_segments), "Recorder did not return to allowed source B")
+        from aio_recorder_diagnostics_probe import probe_live_dedicated_diagnostic
+
+        dedicated_diagnostic_cleanup = probe_live_dedicated_diagnostic(redis_client, worker_id)
+        try:
+            _assert_live_overview(
+                archive_root, active_path, control_path, worker_id, "dedicated",
+            )
+        finally:
+            dedicated_diagnostic_cleanup()
         with run_share._lock:
             share_results = list(run_share.results)
         _require(

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import types
 import uuid
 from collections.abc import Mapping
@@ -428,6 +429,16 @@ def _run_with_thread_database_cleanup(callback, *args, **kwargs):
         _close_current_thread_database_connections()
 
 
+def _recorder_task_threading(stop_event):
+    """Provide the task's threading primitives while observing its stop event."""
+    return types.SimpleNamespace(
+        Event=lambda: stop_event,
+        Lock=threading.Lock,
+        RLock=threading.RLock,
+        Thread=threading.Thread,
+    )
+
+
 def _emit_timeout_diagnostic(diagnostic: dict[str, object]) -> None:
     payload = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
     if len(payload.encode("utf-8")) > FAILOVER_DIAGNOSTIC_MAX_BYTES:
@@ -442,11 +453,13 @@ def _recorder_task_exit_diagnostic(run) -> dict[str, object]:
         results = list(getattr(run, "results", ()))
         failures = list(getattr(run, "failures", ()))
         processes = list(getattr(run, "processes", ()))
+        exception_call_sites = list(getattr(run, "exception_call_sites", ()))
     else:
         with lock:
             results = list(getattr(run, "results", ()))
             failures = list(getattr(run, "failures", ()))
             processes = list(getattr(run, "processes", ()))
+            exception_call_sites = list(getattr(run, "exception_call_sites", ()))
 
     allowed_statuses = {
         "stopped", "switch_requested", "media_stalled", "exited", "no_media",
@@ -483,6 +496,27 @@ def _recorder_task_exit_diagnostic(run) -> dict[str, object]:
     return {
         "task_status": task_status,
         "failure_classes": failure_classes,
+        "exception_call_sites": [
+            [
+                {
+                    "file": (
+                        frame.get("file")[:80]
+                        if isinstance(frame, dict) and isinstance(frame.get("file"), str)
+                        else None
+                    ),
+                    "function": (
+                        frame.get("function")[:80]
+                        if isinstance(frame, dict) and isinstance(frame.get("function"), str)
+                        else None
+                    ),
+                    "line": frame.get("line") if isinstance(frame, dict) and type(frame.get("line")) is int else None,
+                }
+                for frame in call_sites[-8:]
+                if isinstance(frame, dict)
+            ]
+            for call_sites in exception_call_sites[-4:]
+            if isinstance(call_sites, list)
+        ],
         "attempts": _recorder_attempt_summary(results),
         "process_exit_codes": process_exit_codes,
         "stop_requested": bool(stop_event is not None and stop_event.is_set()),
@@ -1075,11 +1109,11 @@ def _safe_supervisor_admission_status(module_name, function_name, frame_locals) 
 
 
 _SUPERVISOR_STOP_REASONS_BY_LINE = {
-    270: "admission_or_lease_renewal",
-    276: "stats_capability_refresh",
-    308: "attempt_renewal",
-    316: "candidate_currentness",
-    320: "exception",
+    434: "admission_or_lease_renewal",
+    444: "stats_capability_refresh",
+    476: "attempt_renewal",
+    484: "candidate_currentness",
+    488: "exception",
 }
 
 
@@ -1147,6 +1181,7 @@ class _RecorderTaskRun:
         self.results: list[object] = []
         self.result: dict | None = None
         self.failures: list[str] = []
+        self.exception_call_sites: list[list[dict[str, object]]] = []
         self.processes: list[object] = []
         # Keep synthetic route credentials in memory solely for replay-denial
         # checks. They are never printed, serialized, or included in receipts.
@@ -1225,11 +1260,7 @@ class _RecorderTaskRun:
                 self.results.append(result)
             return result
 
-        task_threading = types.SimpleNamespace(
-            Event=lambda: self.stop_event,
-            Lock=threading.Lock,
-            Thread=threading.Thread,
-        )
+        task_threading = _recorder_task_threading(self.stop_event)
         process_api = types.SimpleNamespace(
             Popen=tracked_popen,
             DEVNULL=subprocess.DEVNULL,
@@ -1254,6 +1285,17 @@ class _RecorderTaskRun:
             except Exception as exc:
                 with self._lock:
                     self.failures.append(f"task:{type(exc).__name__}")
+                    # Keep finite source locations only. Exception text and
+                    # traceback locals can contain credentials or user data.
+                    frames = traceback.extract_tb(exc.__traceback__)[-8:]
+                    self.exception_call_sites.append([
+                        {
+                            "file": frame.filename.rsplit("/", 1)[-1][:80],
+                            "function": frame.name[:80],
+                            "line": frame.lineno if type(frame.lineno) is int else None,
+                        }
+                        for frame in frames
+                    ])
 
         self.thread = threading.Thread(
             target=invoke,

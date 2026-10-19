@@ -1581,6 +1581,64 @@ def load_stats_configuration(active_path: Path | None = None) -> dict[str, Any] 
         handle.close()
 
 
+def load_applied_state_readonly(active_path: Path | None = None):
+    """Read the applied snapshot and control state without creating or repairing files.
+
+    Returns ``(active_view, control_state)``. The control state is ``None``
+    whenever its validity cannot be established, while a valid applied view
+    remains available for read-only overview actions.
+    """
+    from .recorder_control import (
+        _deny_marker_exists,
+        _parse_state,
+        control_deny_path,
+        control_state_path,
+    )
+
+    path = Path(active_path) if active_path is not None else active_settings_path()
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    try:
+        handle = lock_path.open("rb")
+    except FileNotFoundError:
+        return None, None
+    acquired = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return None, None
+        acquired = True
+        try:
+            if _activation_uncertain_exists(path):
+                return None, None
+            activation = _read_activation_state_locked(path)
+            if activation is not None:
+                return None, None
+            active = _load_active_configuration_locked(path)
+        except (OSError, ValueError):
+            return None, None
+        control = None
+        if active is not None:
+            try:
+                if _deny_marker_exists(control_deny_path(path)):
+                    return active, None
+                raw = json.loads(control_state_path(path).read_text(encoding="utf-8"))
+                control = _parse_state(raw)
+                if (active.get("version", 0) >= 4 and
+                        control.configuration_generation != active_configuration_generation(active)):
+                    control = None
+            except (OSError, ValueError):
+                control = None
+        # _load_active_configuration_locked already returns the flattened
+        # runtime view. Reapplying the persisted-document converter here
+        # breaks v7 snapshots because that view has no nested ``settings``.
+        return active, control
+    finally:
+        if acquired:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
 def recover_interrupted_activation(active_path: Path | None = None) -> None:
     """Resolve a surviving activation only after validating a complete bundle."""
     path = Path(active_path) if active_path is not None else active_settings_path()

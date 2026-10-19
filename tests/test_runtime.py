@@ -236,12 +236,12 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual("paused", paused["channels"][0]["recorder_reason"])
 
     def test_runtime_version_matrix(self):
-        for version in ("0.32.0",):
+        for version in ("0.32.0", "0.32.1", "0.33.0", "1.0.0"):
             with self.subTest(version=version), patch.dict(
                 sys.modules, {"version": types.SimpleNamespace(__version__=version)}
             ):
                 require_supported_version()
-        for version in ("0.31.0", "0.33.0"):
+        for version in ("0.31.9", "0.32.0-rc.1", "not-a-version"):
             with self.subTest(version=version), patch.dict(
                 sys.modules, {"version": types.SimpleNamespace(__version__=version)}
             ):

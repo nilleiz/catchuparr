@@ -35,6 +35,43 @@ _EVENTS = frozenset({
     "control_state_invalid",
     "setting_invalid",
     "error_suppressed",
+    "sharing_observation_failed",
+    "sharing_projection_failed",
+    "sharing_registration_failed",
+    "sharing_binding_lost",
+    "sharing_cleanup_pending",
+    "sharing_recovery_failed",
+    "sharing_recovery_stale",
+    "sharing_attempt_cleanup_pending",
+    "sharing_attempt_reconciled",
+    "sharing_return_recovery_pending",
+})
+_ERROR_CATEGORIES = frozenset({
+    "configuration_recovery_failed",
+    "route_install_failed",
+    "schedule_install_failed",
+    "xc_install_failed",
+    "xc_uninstall_failed",
+    "scheduler_disable_failed",
+    "route_uninstall_failed",
+    "stats_hook_install_failed",
+    "stats_hook_uninstall_failed",
+    "control_state_invalid",
+    "supervision_failed",
+    "recorder_worker_stopped",
+    "borrowed_recorder_worker_stopped",
+    "borrow_cleanup_pending",
+    "sharing_attempt_cleanup_pending",
+    "sharing_attempt_reconciled",
+    "sharing_observation_failed",
+    "sharing_projection_failed",
+    "sharing_registration_failed",
+    "sharing_binding_lost",
+    "sharing_cleanup_pending",
+    "sharing_recovery_failed",
+    "sharing_recovery_stale",
+    "sharing_return_recovery_pending",
+    "diagnostic_category_invalid",
 })
 _STATE_KEYS = frozenset({
     "generation", "config_generation", "control_generation", "channel_count",
@@ -43,6 +80,18 @@ _STATE_KEYS = frozenset({
 })
 _SAFE_REASONS = frozenset({
     "version", "proxy_api", "cleanup_guard", "xc_hooks", "xc_uninstall", "log_level",
+})
+_SAFE_ERROR_CALLSITES = frozenset({
+    "native_observation", "opening_projection", "opening_cleanup",
+    "startup_recovery", "startup_admission", "return_recovery",
+    "recorder_supervisor", "borrowed_worker", "borrowed_cleanup",
+    "dedicated_worker", "attempt_reconciliation", "schedule_validation",
+    "control_state_read", "reconcile_cleanup",
+})
+_SAFE_EXCEPTION_CLASSES = frozenset({
+    "AttributeError", "ConnectionError", "IntegrityError", "KeyError",
+    "LookupError", "OperationalError", "OSError", "PermissionError",
+    "RuntimeError", "TimeoutError", "TypeError", "ValueError",
 })
 
 
@@ -101,31 +150,49 @@ def event(name: str, level: int = logging.INFO, **state: object) -> None:
     logging.getLogger("catchuparr").log(level, "[Catchuparr] %s%s", name, suffix)
 
 
-def error(category: str) -> None:
-    """Rate-limit a fixed error category without retaining arbitrary messages."""
-    if category not in _EVENTS:
-        category = "runtime_disabled"
+def error(category: str, exception: BaseException | None = None, *, callsite: str | None = None) -> None:
+    """Log an allowlisted cause and exception class without exception text."""
+    if category not in _ERROR_CATEGORIES:
+        category = "diagnostic_category_invalid"
+    if callsite is None:
+        safe_callsite = "unspecified"
+    else:
+        safe_callsite = callsite if callsite in _SAFE_ERROR_CALLSITES else "unknown"
+    exception_class = "none"
+    if exception is not None:
+        name = type(exception).__name__
+        exception_class = name if name in _SAFE_EXCEPTION_CLASSES else "Other"
+    window_key = (
+        category if safe_callsite == "unspecified" and exception_class == "none"
+        else f"{category}|{safe_callsite}|{exception_class}"
+    )
     now = time.monotonic()
     suppressed = 0
     log_initial = False
     with _error_lock:
-        window = _error_windows.get(category)
+        window = _error_windows.get(window_key)
         if window is None:
             if len(_error_windows) >= MAX_ERROR_CATEGORIES:
                 oldest = min(_error_windows, key=lambda item: _error_windows[item].started_at)
                 del _error_windows[oldest]
-            _error_windows[category] = _ErrorWindow(now)
+            _error_windows[window_key] = _ErrorWindow(now)
             log_initial = True
         elif now - window.started_at < ERROR_WINDOW_SECONDS:
             window.count += 1
         else:
             suppressed = window.count
-            _error_windows[category] = _ErrorWindow(now)
+            _error_windows[window_key] = _ErrorWindow(now)
             log_initial = True
     target = logging.getLogger("catchuparr")
+    details = ""
+    if safe_callsite != "unspecified":
+        details += f" cause={safe_callsite}"
+    if exception_class != "none":
+        details += f" exception={exception_class}"
     if suppressed:
         target.error(
-            "[Catchuparr] error_suppressed category=%s count=%d", category, suppressed
+            "[Catchuparr] error_suppressed category=%s%s count=%d",
+            category, details, suppressed,
         )
     if log_initial:
-        target.error("[Catchuparr] %s", category)
+        target.error("[Catchuparr] %s%s", category, details)

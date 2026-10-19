@@ -114,15 +114,26 @@ class ArchiveTSPlaybackTests(unittest.TestCase):
 
     def test_live_stream_has_bounded_idle_wait_when_recorder_has_stopped(self):
         self.add_segment("first.ts", 0, b"first")
+        fake_clock = [0.0]
+        sleeps = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            fake_clock[0] += seconds
+
         idle_response = self.request(
             end=self.start + timedelta(hours=8), live=True, live_follow_seconds=0.05,
         )
-        before = time.monotonic()
-        try:
-            self.assertEqual(b"".join(idle_response.body), b"first")
-        finally:
-            idle_response.close()
-        self.assertLess(time.monotonic() - before, 0.5)
+        with (
+            patch("catchuparr.ts_http.time.monotonic", side_effect=lambda: fake_clock[0]),
+            patch("catchuparr.ts_http.time.sleep", side_effect=fake_sleep),
+        ):
+            try:
+                self.assertEqual(b"".join(idle_response.body), b"first")
+            finally:
+                idle_response.close()
+        self.assertEqual([0.05], sleeps)
+        self.assertEqual(0.05, fake_clock[0])
 
     def test_live_stream_follows_healthy_segment_delayed_beyond_ten_seconds(self):
         self.add_segment("first.ts", 0, b"first")
