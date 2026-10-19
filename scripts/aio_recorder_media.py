@@ -4921,6 +4921,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         sharing_episode_ledger = BorrowEpisodeLedger(
             archive_root / ".catchuparr-sharing.sqlite3",
         )
+        prior_episode = sharing_episode_ledger.read(str(channel.uuid))
+        _require(
+            prior_episode.phase == "closed",
+            "Failed-opening fixture requires the prior channel episode cleanup ACK",
+        )
         sharing_identity = _failed_opening_identity(
             channel.uuid, native_owner, stream_a, source_metadata,
         )
@@ -4937,6 +4942,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             lease_digest=sha256(b"synthetic expired opening lease").hexdigest(),
             identity=sharing_identity,
             client_id="catchuparr-client-synthetic-failed-opening",
+            expected_version=prior_episode.version,
         )
         failed_registration = sharing_episode_ledger.prepare_registration(
             failed_opening, local_worker_id=str(worker_id),
