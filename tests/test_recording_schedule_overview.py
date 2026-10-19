@@ -1,13 +1,13 @@
-import unittest
 import tempfile
-from unittest.mock import patch
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+from catchuparr.configuration import load_applied_state_readonly
+from catchuparr.plugin import Plugin
 from catchuparr.recording_schedule_overview import today_schedule
 from catchuparr.schedule import normalize_schedule
-from catchuparr.plugin import Plugin
-from catchuparr.configuration import load_applied_state_readonly
 
 
 def settings(schedule, timezone_name="Europe/Berlin"):

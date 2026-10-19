@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from decimal import Decimal
 from datetime import datetime, time, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from .schedule import schedule_from_snapshot
