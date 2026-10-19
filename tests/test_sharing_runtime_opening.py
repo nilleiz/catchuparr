@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from catchuparr.sharing_episode import BorrowEpisodeLedger
+from catchuparr.sharing_episode import BorrowEpisodeLedger, BorrowEpisodeRejected
 from catchuparr.sharing_persistence import SharingIntentLedger
 from catchuparr.sharing_planner import (
     BorrowTarget,
@@ -134,6 +134,68 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         second, _projector, _cleanup = self.prepare()
         self.assertEqual((False, None), second)
         projector.assert_called_once()
+
+    def test_failed_opening_retries_use_closed_episode_cas_and_new_intent(self):
+        from catchuparr.adapters.sharing_native import NativeClientRegistrationAck
+
+        first = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-runtime-failed-opening-synthetic",
+            expected_version=None,
+        )
+        attempt = self.episode_ledger.prepare_registration(
+            first, local_worker_id="worker-runtime-opening-synthetic",
+            backend_signature="a" * 64, user_agent="Synthetic cleanup fixture",
+            client_ip="127.0.0.1",
+        )
+        ack = NativeClientRegistrationAck(
+            channel_uuid=CHANNEL, episode_id=first.episode_id,
+            client_id=attempt.client_id, local_worker_id=attempt.local_worker_id,
+            redis_backend_signature=attempt.backend_signature,
+            connected_at="105.0", projection_version=first.version + 1,
+            user_agent=attempt.user_agent, client_ip=attempt.client_ip,
+        )
+        self.episode_ledger.record_registration_ack(first.episode_id, ack)
+        pending = self.episode_ledger.revoke(
+            first.episode_id, expected_version=first.version,
+            reason="cleanup_pending", cleanup_acknowledged=False,
+        )
+        self.assertEqual("cleanup_pending", pending.phase)
+        with self.assertRaisesRegex(BorrowEpisodeRejected, "previous episode cleanup"):
+            self.episode_ledger.begin_open(
+                self.saved.intent,
+                lease_digest=sha256(LEASE.encode()).hexdigest(),
+                identity=IDENTITY,
+                client_id="catchuparr-client-runtime-retry-synthetic",
+                expected_version=pending.version,
+            )
+
+        closed = self.episode_ledger.revoke(
+            first.episode_id, expected_version=pending.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        # A genuinely new planner intent advances the persisted epoch/revision;
+        # the episode ledger then admits it only against the exact closed row.
+        next_state = replace(self.saved.state, intent_epoch=self.saved.state.intent_epoch + 1)
+        next_saved = self.intent_ledger.save(
+            next_state, action=SharingAction.ATTACH_BORROW,
+            expected_revision=self.saved.revision, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        self.assertGreater(next_saved.intent.revision, self.saved.intent.revision)
+        self.assertGreater(next_saved.intent.intent_epoch, self.saved.intent.intent_epoch)
+        second = self.episode_ledger.begin_open(
+            next_saved.intent,
+            lease_digest=sha256((LEASE + "-next").encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-runtime-retry-synthetic",
+            expected_version=closed.version,
+        )
+        self.assertEqual("opening", second.phase)
+        self.assertEqual(closed.version + 1, second.version)
+        self.assertEqual(next_saved.intent.intent_epoch, second.intent_epoch)
 
     def test_consumed_attach_recovers_only_after_exact_episode_and_native_absence(self):
         opening = self.episode_ledger.begin_open(
