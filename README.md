@@ -323,10 +323,14 @@ programme changes in the intended client before relying on this path.
 | **Resume recording** | Re-enable recording according to the applied configuration and schedule. |
 
 Current recordings shows only channels scheduled at the current time, with a
-compact recorder and source status. Today's recording schedule lists channels
-with today's windows. Both actions retain their structured channel and summary
-fields for callers that need the full details.
-The host UI may not preserve line breaks in action messages.
+compact recorder and source status. Its message omits channel numbers and uses
+the first word of the validated M3U profile name; full numbers and names remain
+in the structured rows. Today's recording schedule lists channels with today's
+windows. Both actions retain their structured channel and summary fields for
+callers that need the full details.
+The host may collapse message line breaks; visible rows use a bounded
+nonbreaking-space gap. Copying the message may retain nonbreaking spaces, which
+can be replaced with ordinary spaces in the destination text.
 
 ## Troubleshooting
 
