@@ -44,6 +44,25 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_failed_opening_identity_factory_builds_token_contract(self):
+        from catchuparr.sharing_persistence import SharingIntentToken
+        from catchuparr.sharing_planner import SharingAction
+
+        identity = probe._failed_opening_identity(
+            "channel-recovery-synthetic", "owner-recovery-synthetic",
+            SimpleNamespace(id="stream-recovery-synthetic", m3u_account_id="account-recovery-synthetic"),
+            {"m3u_profile": "m3u-recovery-synthetic", "stream_profile": "input-recovery-synthetic"},
+        )
+        token = SharingIntentToken(
+            channel_uuid="channel-recovery-synthetic", revision=1, intent_epoch=1,
+            action=SharingAction.ATTACH_BORROW,
+            configuration_generation="config-recovery-synthetic",
+            control_generation=1, recorder_fence=0,
+            target_identity=identity, target_admitted=True, not_before=1.0,
+        )
+        self.assertEqual(8, len(token.target_identity))
+        self.assertEqual("channel-recovery-synthetic", token.target_identity[0])
+
     def test_live_readonly_probe_allows_concurrent_archive_append_and_denies_writes(self):
         with tempfile.TemporaryDirectory() as directory:
             archive_db = Path(directory) / "archive.sqlite3"
