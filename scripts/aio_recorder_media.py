@@ -151,7 +151,9 @@ def _overview_source_metadata_matches(source, expected_mode):
     if expected_mode == "borrowed":
         return all(source.get(field) for field in profile_fields)
     if expected_mode == "dedicated":
-        return all(field not in source for field in profile_fields)
+        # The diagnostic skeleton has an input ID placeholder; source_metadata
+        # omits both profile bindings when Dispatcharr initialized with None.
+        return source.get("input_profile_id") is None and "input_profile_name" not in source
     return False
 
 
