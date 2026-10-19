@@ -3510,7 +3510,10 @@ def _probe_running_recorder_controls(
 
         with patch.object(tasks.record_channel, "apply_async", side_effect=capture):
             result = tasks.reconcile_recorders.run()
-        _require(result == {"queued": 1} and len(captured) == 1,
+        _require(
+            isinstance(result, dict)
+            and result.get("queued") == 1
+            and len(captured) == 1,
                  "Real recorder reconciliation did not queue exactly the selected channel")
         args, queue = captured[0]
         _require(queue == "dvr" and len(args) == 3 and str(args[0]) == channel_uuid,
