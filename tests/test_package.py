@@ -17,6 +17,7 @@ class PackageTest(unittest.TestCase):
         with ZipFile(archive_path) as archive:
             names = archive.namelist()
             self.assertIn("catchuparr/plugin.py", names)
+            self.assertIn("catchuparr/action_messages.py", names)
             self.assertIn("catchuparr/plugin.json", names)
             self.assertIn("catchuparr/logo.png", names)
             for module in REQUIRED_MODULES:

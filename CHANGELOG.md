@@ -14,9 +14,13 @@ included here to explain the feature history leading to 0.4.0.
   presentation update requires no configuration migration or archive change.
 - Current-recording rows omit channel numbers and use only the first word of
   the validated M3U profile name.
-- Uses a bounded nonbreaking-space gap between visible rows where the host
-  collapses line breaks. Copied text may retain nonbreaking spaces, which can
-  be replaced with ordinary spaces in the destination.
+- Sizes the nonbreaking-space gap between visible rows from static 17px Lato
+  measurements calibrated to a 350px row. This is a width estimate, not a
+  runtime viewport measurement. Copied text may retain nonbreaking spaces,
+  which can be replaced with ordinary spaces in the destination.
+- A manually dispatched CI run can explicitly skip native AIO for package/unit
+  validation only; pull-request defaults and release evidence requirements are
+  unchanged.
 
 ## [0.6.2] - Prerelease candidate
 

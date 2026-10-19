@@ -1,4 +1,5 @@
 import copy
+import re
 import sqlite3
 import sys
 import tempfile
@@ -10,10 +11,15 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+from catchuparr.action_messages import (
+    NBSP_WIDTH_PX,
+    TARGET_WIDTH_PX,
+    _last_visual_line_width,
+    format_action_message,
+)
 from catchuparr.configuration import active_configuration_generation
 from catchuparr.plugin import Plugin
 from catchuparr.recording_overview import (
-    ACTION_MESSAGE_SEPARATOR,
     _message_row,
     _safe_display,
     _source_for_diagnostic,
@@ -31,6 +37,51 @@ class OverviewRedis:
 
     def hgetall(self, _key):
         return {}
+
+
+class ActionMessageFormattingTests(unittest.TestCase):
+    @staticmethod
+    def padding_before_next_row(message):
+        return message.split("NextRow", 1)[0].count("\u00a0")
+
+    def test_padding_varies_with_last_visual_line_width(self):
+        short = format_action_message(("A", "NextRow"))
+        long = format_action_message(("W" * 21, "NextRow"))
+        short_padding = self.padding_before_next_row(short)
+        long_padding = self.padding_before_next_row(long)
+        self.assertGreater(short_padding, long_padding)
+        self.assertEqual(long_padding, 0)
+        self.assertLessEqual(short_padding, int(TARGET_WIDTH_PX / NBSP_WIDTH_PX))
+
+    def test_wrapped_long_row_pads_from_its_last_visual_line(self):
+        row = "Synthetic Channel: " + ", ".join(
+            f"{hour:02}:00–{hour + 1:02}:00" for hour in range(9, 17)
+        )
+        message = format_action_message((row, "NextRow"))
+        padding = self.padding_before_next_row(message)
+        self.assertGreater(_last_visual_line_width(row), 0)
+        self.assertLess(_last_visual_line_width(row), TARGET_WIDTH_PX)
+        self.assertGreater(padding, 0)
+        short_padding = self.padding_before_next_row(format_action_message(("A", "NextRow")))
+        self.assertLess(padding, short_padding)
+        self.assertGreater(len(row.split(", ")), 1)
+
+    def test_east_asian_fallback_uses_wider_estimate(self):
+        ascii_padding = self.padding_before_next_row(format_action_message(("A", "NextRow")))
+        east_asian_padding = self.padding_before_next_row(format_action_message(("漢", "NextRow")))
+        self.assertLess(east_asian_padding, ascii_padding)
+
+    def test_combining_mark_has_zero_extra_estimated_width(self):
+        plain = self.padding_before_next_row(format_action_message(("Cafe", "NextRow")))
+        combined = self.padding_before_next_row(format_action_message(("Cafe\u0301", "NextRow")))
+        self.assertEqual(combined, plain)
+
+    def test_single_empty_and_full_width_rows_do_not_get_large_padding(self):
+        self.assertEqual(format_action_message(()), "")
+        self.assertEqual(format_action_message(("OnlyRow",)), "OnlyRow")
+        full = format_action_message(("W" * 21, "NextRow"))
+        self.assertNotIn("\u00a0", full)
+        self.assertNotIn("\n", full)
 
 
 class RecordingOverviewTests(unittest.TestCase):
@@ -308,14 +359,21 @@ class RecordingOverviewTests(unittest.TestCase):
                    side_effect=lambda channel_id, *_args: sources[channel_id]):
             result = Plugin.__new__(Plugin).run("current_recordings", {}, {})
 
-        expected = ACTION_MESSAGE_SEPARATOR.join((
+        expected = format_action_message((
             "Synthetic Channel A - M3UActual [starting]",
             "Synthetic Channel B - Alternate [starting]",
         ))
         self.assertEqual([row["state"] for row in result["channels"]], ["starting", "starting"])
         self.assertEqual(result["message"], expected)
+        self.assertEqual(
+            re.split(r" \u00a0+ ", result["message"]),
+            ["Synthetic Channel A - M3UActual [starting]",
+             "Synthetic Channel B - Alternate [starting]"],
+        )
         self.assertNotIn("\n", result["message"])
-        self.assertEqual(result["message"].count("\u00a0"), 200)
+        padding = result["message"].split("Synthetic Channel B", 1)[0].count("\u00a0")
+        self.assertGreater(padding, 0)
+        self.assertLess(padding, 200)
         self.assertNotIn("731", result["message"])
         self.assertNotIn("842", result["message"])
         self.assertNotIn("Distinct Stream Full Name", result["message"])

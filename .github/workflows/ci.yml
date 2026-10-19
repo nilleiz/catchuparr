@@ -3,6 +3,12 @@ name: CI
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      skip_native:
+        description: "Skip native AIO for package/unit-only validation; this cannot provide release evidence"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -40,8 +46,11 @@ jobs:
           --head-sha "$PR_HEAD_SHA"
           --output "$GITHUB_OUTPUT"
       - name: Synthetic playback in actual Dispatcharr AIO
-        if: steps.classify.outputs.full == 'true'
+        if: steps.classify.outputs.full == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.skip_native)
         run: python scripts/run_aio_integration.py --image ${{ matrix.image }}
+      - name: Record explicit manual native AIO skip
+        if: github.event_name == 'workflow_dispatch' && inputs.skip_native
+        run: echo "::notice title=Native AIO explicitly skipped::This manually requested run is package/unit validation only and cannot satisfy release acceptance."
       - name: Record infrastructure-only validation
         if: steps.classify.outputs.full == 'false'
         run: echo "Native AIO skipped for allowlisted infrastructure-only changes. Release evidence still requires a successful native playback step."
