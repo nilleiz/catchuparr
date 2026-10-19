@@ -515,7 +515,7 @@ def _borrowed_grant_match(redis, record, channel_uuid):
         owner = redis.get(owner_key)
         if isinstance(owner, bytes):
             owner = owner.decode("utf-8", errors="strict")
-        heartbeat_key = f"live:worker:{grant.worker_id}:heartbeat"
+        heartbeat_key = f"live:worker:{grant.metadata_owner}:heartbeat"
         if (owner != grant.owner_lock_value
                 or int(redis.ttl(owner_key)) <= 0
                 or not redis.exists(heartbeat_key)
