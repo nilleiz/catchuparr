@@ -137,7 +137,64 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertTrue(checks)
         self.assertTrue(all(type(value) is bool for value in checks.values()))
         self.assertFalse(checks["live_record_present"])
-        self.assertFalse(checks["worker_record_present"])
+        self.assertFalse(checks["current_attempt_record_found"])
+
+    def test_dedicated_failure_snapshot_checks_current_worker_not_stale_borrow(self):
+        from scripts.aio_recorder_diagnostics_probe import _dedicated_writer_guard_checks
+
+        channel = "synthetic-channel-id"
+        lease_value = "synthetic-lease-value"
+        worker_id = "catchuparr-r" + "a" * 40
+        worker_key = f"catchuparr:recorder-proxy:worker:{worker_id}"
+        worker = {
+            "channel_uuid": channel, "worker_id": worker_id,
+            "lease_key": f"catchuparr:recorder:{channel}",
+            "lease_value": lease_value, "stream_id": "stream-synthetic",
+            "account_id": "account-synthetic", "config_generation": "a" * 64,
+            "control_generation": "1", "lease_fence": "2", "profile_id": "5",
+            "state": "active",
+        }
+
+        class Redis:
+            def hgetall(self, key):
+                if key == f"catchuparr:recorder:diagnostic:{channel}":
+                    return {b"phase": b"recording", b"source": b"borrowed"}
+                if key == worker_key:
+                    return {key.encode(): value.encode() for key, value in worker.items()}
+                if key == f"live:channel:{worker_id}:metadata":
+                    return {
+                        b"owner": b"native-owner-synthetic",
+                        b"stream_id": b"stream-synthetic", b"m3u_profile": b"5",
+                        b"stream_profile": b"4", b"state": b"active",
+                    }
+                return {}
+
+            def scan_iter(self, *, match, count):
+                self.assertion = (match, count)
+                return [worker_key]
+
+            def get(self, key):
+                if key == f"catchuparr:recorder:{channel}":
+                    return lease_value
+                if key == f"live:channel:{worker_id}:owner":
+                    return b"native-owner-synthetic"
+                return None
+
+            def ttl(self, _key):
+                return 30
+
+            def exists(self, _key):
+                return 0
+
+        checks = _dedicated_writer_guard_checks(
+            Redis(), channel, lease_value,
+            f"catchuparr:recorder:diagnostic:{channel}",
+        )
+        self.assertTrue(checks["current_attempt_record_found"])
+        self.assertTrue(checks["current_attempt_lease_matches"])
+        self.assertFalse(checks["live_record_matches_current_attempt"])
+        self.assertTrue(checks["current_attempt_native_owner_heartbeat_live"])
+        self.assertTrue(all(type(value) is bool for value in checks.values()))
 
     def test_dead_recorder_failure_reports_safe_terminal_task_diagnostics(self):
         thread = threading.Thread(target=lambda: None)
