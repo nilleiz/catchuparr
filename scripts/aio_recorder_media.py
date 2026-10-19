@@ -139,6 +139,22 @@ def _run_current_recordings_readonly(action, archive_db):
     return result
 
 
+def _overview_source_metadata_matches(source, expected_mode):
+    if not isinstance(source, dict) or source.get("mode") != expected_mode:
+        return False
+    if not all(source.get(field) for field in (
+        "stream_name", "provider_name", "stream_id", "provider_id",
+        "m3u_profile_id", "m3u_profile_name",
+    )):
+        return False
+    profile_fields = ("input_profile_id", "input_profile_name")
+    if expected_mode == "borrowed":
+        return all(source.get(field) for field in profile_fields)
+    if expected_mode == "dedicated":
+        return all(field not in source for field in profile_fields)
+    return False
+
+
 def _assert_live_overview(archive_root, active_path, control_path, channel_uuid, expected_mode):
     """Validate read-only current-recording output while a real attempt is live."""
     import hashlib
@@ -187,11 +203,7 @@ def _assert_live_overview(archive_root, active_path, control_path, channel_uuid,
              "Current recordings overview omitted UTC media progress time")
     source = row.get("source")
     _require(
-        isinstance(source, dict) and source.get("mode") == expected_mode
-        and source.get("stream_name") and source.get("provider_name")
-        and source.get("stream_id") and source.get("provider_id")
-        and source.get("input_profile_id") and source.get("input_profile_name")
-        and source.get("m3u_profile_id") and source.get("m3u_profile_name"),
+        _overview_source_metadata_matches(source, expected_mode),
         "Current recordings overview omitted exact source/provider/profile metadata",
     )
     _require("://" not in str(source) and "token" not in str(source).lower(),
