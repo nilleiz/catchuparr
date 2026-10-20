@@ -1173,7 +1173,15 @@ class _ObservedRecorderStopEvent(threading.Event):
 class _RecorderTaskRun:
     """Run the real recorder task with bounded engine timeouts and stop control."""
 
-    def __init__(self, channel_uuid: str, *, startup_timeout: float, media_idle_timeout: float):
+    def __init__(
+        self,
+        channel_uuid: str,
+        *,
+        startup_timeout: float,
+        media_idle_timeout: float,
+        fail_borrow_after_next_media: bool = False,
+        defer_borrow_failure_until_armed: bool = False,
+    ):
         self.channel_uuid = str(channel_uuid)
         self.startup_timeout = float(startup_timeout)
         self.media_idle_timeout = float(media_idle_timeout)
@@ -1186,9 +1194,14 @@ class _RecorderTaskRun:
         # Keep synthetic route credentials in memory solely for replay-denial
         # checks. They are never printed, serialized, or included in receipts.
         self.input_headers: list[dict[str, str]] = []
+        self.input_header_times: list[float] = []
+        self.fail_borrow_after_next_media = bool(fail_borrow_after_next_media)
+        self.defer_borrow_failure_until_armed = bool(defer_borrow_failure_until_armed)
+        self.borrow_failure_media_at: float | None = None
         self._lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self._patchers = []
+        self._candidate_processes: dict[int, object] = {}
         self.expected_generation: str | None = None
         self.expected_control_generation: int | None = None
 
@@ -1232,6 +1245,7 @@ class _RecorderTaskRun:
             process = original_popen(*args, **kwargs)
             with self._lock:
                 self.processes.append(process)
+                self._candidate_processes[threading.get_ident()] = process
             return process
 
         def bounded_run_candidate(recorder, stop_event, **native_timeouts):
@@ -1239,6 +1253,39 @@ class _RecorderTaskRun:
             if isinstance(headers, dict):
                 with self._lock:
                     self.input_headers.append(dict(headers))
+                    self.input_header_times.append(time.time())
+            on_first_media = native_timeouts.get("on_first_media")
+            is_borrow = (
+                isinstance(headers, dict)
+                and "X-Catchuparr-Borrow" in headers
+                and (
+                    self.fail_borrow_after_next_media
+                    or self.defer_borrow_failure_until_armed
+                )
+            )
+            if is_borrow and on_first_media is not None:
+                def fail_after_first_media(media_at):
+                    result = on_first_media(media_at)
+                    with self._lock:
+                        inject_failure = (
+                            self.fail_borrow_after_next_media
+                            and self.borrow_failure_media_at is None
+                        )
+                        defer_ack = (
+                            self.defer_borrow_failure_until_armed
+                            and not self.fail_borrow_after_next_media
+                            and self.borrow_failure_media_at is None
+                        )
+                        if inject_failure:
+                            self.borrow_failure_media_at = float(media_at)
+                        process = self._candidate_processes.get(threading.get_ident())
+                    if inject_failure and process is not None and process.poll() is None:
+                        process.kill()
+                    if defer_ack:
+                        return False
+                    return result
+
+                native_timeouts["on_first_media"] = fail_after_first_media
             try:
                 result = original_run_candidate(
                     recorder,
@@ -1256,6 +1303,9 @@ class _RecorderTaskRun:
                 with self._lock:
                     self.failures.append(type(exc).__name__)
                 raise
+            finally:
+                with self._lock:
+                    self._candidate_processes.pop(threading.get_ident(), None)
             with self._lock:
                 self.results.append(result)
             return result

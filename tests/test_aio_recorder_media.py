@@ -44,6 +44,40 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_failure_return_ack_requires_exact_admitted_and_normal_deadline_window(self):
+        token = SimpleNamespace(
+            action=SimpleNamespace(value="return_to_allowed"),
+            revision=4, channel_uuid="channel",
+            configuration_generation="config", control_generation=7,
+            recorder_fence=9, intent_epoch=12, not_before=200.0,
+        )
+        state = SimpleNamespace(
+            last_viewer_left_at=200.0, last_switch_at=190.0,
+            recorder_fence=9, intent_epoch=12,
+        )
+        recovered = SimpleNamespace(intent=token, revision=4, state=state)
+        committed_state = SimpleNamespace(
+            phase=SimpleNamespace(value="dedicated"), pending_action=None,
+            last_switch_at=201.0, intent_epoch=12,
+            configuration_generation="config", control_generation=7,
+            recorder_fence=9,
+        )
+        committed = SimpleNamespace(revision=5, intent=None, state=committed_state)
+        check = probe._failure_return_ack_matches_admitted_window
+        args = (token, recovered, token, 201.0, committed)
+        kwargs = {
+            "channel_uuid": "channel", "configuration_generation": "config",
+            "control_generation": 7,
+            "return_seconds": 1800.0, "minimum_switch_seconds": 60.0,
+        }
+        self.assertTrue(check(*args, **kwargs))
+        self.assertFalse(check(*args[:3], 199.0, committed, **kwargs))
+        self.assertFalse(check(*args[:3], 200.0 + 1800.0, committed, **kwargs))
+        self.assertFalse(check(
+            token, recovered, token, 201.0,
+            SimpleNamespace(revision=6, intent=None, state=committed_state), **kwargs,
+        ))
+
     def test_supervisor_return_ack_wait_requires_order_completion_and_live_task(self):
         expected = (
             "media_callback_lost_ack", "supervisor_ack", "poll_after_supervisor_ack",
