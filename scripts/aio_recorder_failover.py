@@ -1181,6 +1181,7 @@ class _RecorderTaskRun:
         media_idle_timeout: float,
         fail_borrow_after_next_media: bool = False,
         defer_borrow_failure_until_armed: bool = False,
+        hold_borrow_failure_result: bool = False,
     ):
         self.channel_uuid = str(channel_uuid)
         self.startup_timeout = float(startup_timeout)
@@ -1197,7 +1198,10 @@ class _RecorderTaskRun:
         self.input_header_times: list[float] = []
         self.fail_borrow_after_next_media = bool(fail_borrow_after_next_media)
         self.defer_borrow_failure_until_armed = bool(defer_borrow_failure_until_armed)
+        self.hold_borrow_failure_result = bool(hold_borrow_failure_result)
         self.borrow_failure_media_at: float | None = None
+        self.borrow_failure_result_held = False
+        self.borrow_failure_result_release = threading.Event()
         self._lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self._patchers = []
@@ -1299,6 +1303,16 @@ class _RecorderTaskRun:
                         if key in native_timeouts
                     },
                 )
+                if (
+                    is_borrow
+                    and self.hold_borrow_failure_result
+                    and self.borrow_failure_media_at is not None
+                ):
+                    with self._lock:
+                        self.borrow_failure_result_held = True
+                    self.borrow_failure_result_release.wait()
+                    with self._lock:
+                        self.borrow_failure_result_held = False
             except Exception as exc:
                 with self._lock:
                     self.failures.append(type(exc).__name__)

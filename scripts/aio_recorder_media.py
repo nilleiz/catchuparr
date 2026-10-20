@@ -3312,6 +3312,100 @@ def _failure_return_ack_matches_admitted_window(
         return False
 
 
+def _failure_cleanup_ack_conditions(
+    episode,
+    capability,
+    *,
+    expected_client_id: str,
+    projection_state: str,
+    projection_episode_id: str | None,
+    projection_client_id: str | None,
+    projection_version: int | None,
+    projection_binding_matches: bool,
+    native_registration_absent: bool,
+    task_result_held: bool,
+    task_alive: bool,
+    task_has_no_unexpected_failure: bool,
+) -> dict[str, bool]:
+    """Require read-only exact native and durable cleanup before task resume."""
+    episode_closed = episode is not None and episode.phase == "closed"
+    episode_binding_matches = bool(
+        episode is not None
+        and episode.episode_id == capability.episode_id
+        and episode.channel_uuid == capability.channel_uuid
+        and episode.configuration_generation == capability.configuration_generation
+        and episode.control_generation == capability.control_generation
+        and episode.recorder_fence == capability.recorder_fence
+        and episode.intent_epoch == capability.intent_epoch
+        and episode.identity == capability.connection_identity
+        and episode.client_id == expected_client_id
+    )
+    episode_version_advanced = bool(
+        episode is not None
+        and type(episode.version) is int
+        and episode.version > capability.episode_version
+    )
+    projection_revoked = projection_state in {"absent", "known_revoked"}
+    projection_absent = projection_state == "absent"
+    projection_identity_matches = bool(
+        projection_absent
+        or (
+            projection_state == "known_revoked"
+            and projection_episode_id == capability.episode_id
+            and projection_client_id == expected_client_id
+            and projection_binding_matches
+        )
+    )
+    projection_version_nonregressing = bool(
+        projection_absent
+        or (
+            projection_state == "known_revoked"
+        and type(projection_version) is int
+            and episode is not None
+        and type(episode.version) is int
+            and projection_version >= episode.version
+        )
+    )
+    return {
+        "task_result_held": bool(task_result_held),
+        "task_alive": bool(task_alive),
+        "task_has_no_unexpected_failure": bool(task_has_no_unexpected_failure),
+        "episode_closed": bool(episode_closed),
+        "exact_episode_binding": bool(episode_binding_matches),
+        "episode_version_advanced": bool(episode_version_advanced),
+        "projection_revoked_or_absent": bool(projection_revoked),
+        "exact_projection_binding": bool(projection_identity_matches),
+        "projection_version_nonregressing": bool(projection_version_nonregressing),
+        "exact_native_registration_absent": bool(native_registration_absent),
+    }
+
+
+def _wait_for_failure_cleanup_ack(
+    snapshot_reader,
+    timeout_seconds: float,
+    *,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_interval: float = 0.1,
+):
+    """Wait for exact native cleanup, failing immediately if its task exits."""
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        snapshot = snapshot_reader()
+        conditions = snapshot.get("conditions", {})
+        if conditions and all(conditions.values()):
+            return True, snapshot
+        if (
+            conditions.get("task_alive") is False
+            or conditions.get("task_has_no_unexpected_failure") is False
+        ):
+            return False, snapshot
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, snapshot
+        sleep(min(poll_interval, remaining))
+
+
 def _native_source_metadata(redis_client, metadata_key) -> dict[str, str]:
     raw = redis_client.hgetall(metadata_key)
     relevant = {}
@@ -6722,6 +6816,12 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
 
         from unittest.mock import patch
 
+        from catchuparr.adapters.sharing_native import (
+            episode_projection_key,
+            native_registration_is_absent,
+            observe_native_episode_for_authority_drain,
+            read_native_episode_cleanup_binding,
+        )
         from catchuparr.sharing_runtime import RecorderBorrowCoordinator
 
         return_ack_events = []
@@ -6779,6 +6879,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         run_restart = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
             defer_borrow_failure_until_armed=True,
+            hold_borrow_failure_result=True,
         )
         return_ack_patch_started = False
         return_poll_patch_started = False
@@ -6909,29 +7010,135 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # proof, then fail only its next committed segment.
         run_restart.fail_borrow_after_next_media = True
 
-        def borrow_failure_callback_snapshot():
+        def borrow_failure_result_snapshot():
             with run_restart._lock:
                 media_at = run_restart.borrow_failure_media_at
                 failures = list(run_restart.failures)
+                result_held = run_restart.borrow_failure_result_held
+                task_alive = run_restart.thread is not None and run_restart.thread.is_alive()
             return {
                 "conditions": {
-                    "failure_callback_after_media": media_at is not None,
-                    "no_unexpected_task_failure": not failures,
+                    "failure_callback_after_media": bool(media_at is not None),
+                    "task_result_held": bool(result_held),
+                    "task_alive": bool(task_alive),
+                    "task_has_no_unexpected_failure": bool(not failures),
                 },
-                "failure_callback_seen": media_at is not None,
+                "stage": (
+                    "result_held_after_media_callback" if result_held
+                    else "waiting_for_result_after_media_callback"
+                ),
             }
 
-        failure_callback_ready, failure_callback_readiness = _wait_for_readiness_snapshot(
-            borrow_failure_callback_snapshot, run_restart.media_idle_timeout,
-            monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.05,
-        )
-        _require_with_failure_diagnostic(
-            failure_callback_ready,
-            "The native borrow did not reach its bounded injected failure after media",
-            lambda: failure_callback_readiness,
-            diagnostic_label="CATCHUPARR_BORROW_FAILURE_CALLBACK_DIAGNOSTIC",
-        )
+        failure_result_held = False
+        try:
+            failure_result_held, failure_result_readiness = _wait_for_failure_cleanup_ack(
+                borrow_failure_result_snapshot, run_restart.media_idle_timeout,
+                monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.05,
+            )
+            _require_with_failure_diagnostic(
+                failure_result_held,
+                "Borrowed failure result did not reach its held post-reap boundary",
+                lambda: failure_result_readiness,
+                diagnostic_label="CATCHUPARR_FAILURE_RESULT_BARRIER_DIAGNOSTIC",
+            )
+        finally:
+            if not failure_result_held:
+                run_restart.borrow_failure_result_release.set()
+
         failure_media_at = run_restart.borrow_failure_media_at
+
+        def failure_cleanup_snapshot():
+            with run_restart._lock:
+                task_result_held = run_restart.borrow_failure_result_held
+                task_alive = run_restart.thread is not None and run_restart.thread.is_alive()
+                no_unexpected_failure = not run_restart.failures
+            try:
+                exact_episode = sharing_episode_ledger.read(worker_id)
+            except Exception:
+                exact_episode = None
+            try:
+                projection = observe_native_episode_for_authority_drain(
+                    redis_client, worker_id,
+                )
+            except Exception:
+                projection = None
+            projection_state = getattr(projection, "state", "unknown")
+            projection_id = None
+            projection_client = None
+            projection_version = None
+            projection_binding_matches = projection_state == "absent"
+            if projection_state == "known_revoked":
+                try:
+                    raw_projection = redis_client.hgetall(episode_projection_key(worker_id)) or {}
+                    projection_fields = {
+                        _redis_text(key): _redis_text(value)
+                        for key, value in raw_projection.items()
+                    }
+                    projection_id = projection_fields.get("episode_id")
+                    projection_client = projection_fields.get("client_id")
+                    raw_version = projection_fields.get("version", "")
+                    projection_version = (
+                        int(raw_version) if raw_version.isdecimal() else None
+                    )
+                    projection_binding_matches = (
+                        exact_episode is not None
+                        and read_native_episode_cleanup_binding(
+                            redis_client, exact_episode,
+                        ) == second_capability.catalog_generation
+                    )
+                except Exception:
+                    projection_binding_matches = False
+            try:
+                native_absent = native_registration_is_absent(
+                    redis_client,
+                    channel_uuid=worker_id,
+                    client_id=second_borrow_client_id,
+                )
+            except Exception:
+                native_absent = False
+            conditions = _failure_cleanup_ack_conditions(
+                exact_episode, second_capability,
+                expected_client_id=second_borrow_client_id,
+                projection_state=(
+                    projection_state if projection_state in {"absent", "known_revoked"}
+                    else "unknown"
+                ),
+                projection_episode_id=projection_id,
+                projection_client_id=projection_client,
+                projection_version=projection_version,
+                projection_binding_matches=projection_binding_matches,
+                native_registration_absent=native_absent,
+                task_result_held=task_result_held,
+                task_alive=task_alive,
+                task_has_no_unexpected_failure=no_unexpected_failure,
+            )
+            stage = (
+                "native_cleanup_acknowledged" if all(conditions.values())
+                else "native_disconnect_cleanup_pending"
+            )
+            return {"conditions": conditions, "stage": stage}
+
+        failure_cleanup_timeout = _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
+        failure_cleanup_ready = False
+        try:
+            failure_cleanup_ready, failure_cleanup_readiness = (
+                _wait_for_failure_cleanup_ack(
+                    failure_cleanup_snapshot, failure_cleanup_timeout,
+                    monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
+                )
+            )
+            _require_with_failure_diagnostic(
+                failure_cleanup_ready,
+                "Exact native borrow cleanup was not acknowledged before failure RETURN",
+                lambda: failure_cleanup_readiness,
+                diagnostic_label="CATCHUPARR_FAILURE_CLEANUP_ACK_DIAGNOSTIC",
+            )
+        finally:
+            run_restart.borrow_failure_result_release.set()
         failure_return_holder = {}
 
         def failure_return_snapshot():
@@ -7254,6 +7461,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         primary_exception = error
         raise
     finally:
+        if locals().get("run_restart") is not None:
+            run_restart.borrow_failure_result_release.set()
         if locals().get("return_poll_patch_started"):
             try:
                 return_poll_patch.stop()
