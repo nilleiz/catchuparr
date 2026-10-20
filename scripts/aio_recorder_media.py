@@ -3316,37 +3316,84 @@ def _healthy_borrow_gate_snapshot(
     *,
     previous_client_is_distinct: bool,
     recorder_client_verified: bool,
+    native_registration_present: bool,
     native_manager_running: bool,
     native_owner_present: bool,
+    native_owner_matches_expected: bool,
+    source_metadata_matches_expected: bool,
+    global_native_client_count: int,
+    local_native_client_count: int,
     source_a_request_delta: int,
     source_a_active_count: int,
     source_b_active_count: int,
     task_alive: bool,
     task_has_no_unexpected_failure: bool,
+    stage: str = "before_fault_arming",
 ) -> dict[str, bool | int | str]:
     """Return finite, identifier-free evidence for the early A borrow gate."""
     checks = {
         "new_client_identity": bool(previous_client_is_distinct),
         "recorder_client_verified": bool(recorder_client_verified),
+        "native_registration_present": bool(native_registration_present),
         "native_manager_running": bool(native_manager_running),
         "native_owner_present": bool(native_owner_present),
+        "native_owner_matches_expected": bool(native_owner_matches_expected),
+        "source_metadata_matches_expected": bool(source_metadata_matches_expected),
+        "global_native_client_count": int(global_native_client_count),
+        "local_native_client_count": int(local_native_client_count),
         "exact_A_request_delta": int(source_a_request_delta),
         "A_active_count": int(source_a_active_count),
         "B_active_count": int(source_b_active_count),
         "task_alive": bool(task_alive),
         "task_has_no_unexpected_failure": bool(task_has_no_unexpected_failure),
-        "stage": "before_fault_arming",
+        "stage": stage,
     }
     checks["healthy_borrow_gate_passed"] = bool(
         checks["new_client_identity"]
         and checks["recorder_client_verified"]
+        and checks["native_registration_present"]
         and checks["native_manager_running"]
         and checks["native_owner_present"]
+        and checks["native_owner_matches_expected"]
+        and checks["source_metadata_matches_expected"]
+        and checks["global_native_client_count"] == 2
+        and checks["local_native_client_count"] == 1
         and checks["exact_A_request_delta"] == 1
         and checks["A_active_count"] == 1
         and checks["B_active_count"] == 0
+        and checks["task_alive"]
+        and checks["task_has_no_unexpected_failure"]
     )
     return checks
+
+
+def _wait_for_healthy_borrow_gate(
+    snapshot_reader,
+    timeout_seconds: float,
+    *,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_interval: float = 0.1,
+):
+    """Wait for exact native registration and A provider state, failing closed."""
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        snapshot = snapshot_reader()
+        if snapshot.get("healthy_borrow_gate_passed"):
+            return True, snapshot
+        if (
+            snapshot.get("new_client_identity") is False
+            or snapshot.get("exact_A_request_delta", 0) > 1
+            or snapshot.get("global_native_client_count", 0) > 2
+            or snapshot.get("local_native_client_count", 0) > 1
+            or snapshot.get("task_alive") is False
+            or snapshot.get("task_has_no_unexpected_failure") is False
+        ):
+            return False, snapshot
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, snapshot
+        sleep(min(poll_interval, remaining))
 
 
 def _failure_cleanup_ack_conditions(
@@ -6918,6 +6965,59 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             defer_borrow_failure_until_armed=True,
             hold_borrow_failure_result=True,
         )
+
+        def read_healthy_borrow_gate_snapshot(
+            *, client_id, previous_client_id, request_baseline, stage,
+        ):
+            with run_restart._lock:
+                task_alive = run_restart.thread is not None and run_restart.thread.is_alive()
+                task_has_no_unexpected_failure = not run_restart.failures
+            client_key = f"live:channel:{worker_id}:clients:{client_id}"
+            clients_key = RedisKeys.clients(worker_id)
+            registered_client_ids = {
+                _redis_text(value) for value in redis_client.smembers(clients_key)
+            }
+            native_registration_present = bool(
+                redis_client.exists(client_key)
+                and client_id in registered_client_ids
+            )
+            client_manager = native_server.client_managers.get(worker_id)
+            local_native_client_count = (
+                int(client_manager.get_client_count())
+                if client_manager is not None else -1
+            )
+            native_manager = native_server.stream_managers.get(worker_id)
+            owner_value = redis_client.get(RedisKeys.channel_owner(worker_id))
+            source_counts, active_counts = source_server.snapshot()
+            return _healthy_borrow_gate_snapshot(
+                previous_client_is_distinct=client_id != previous_client_id,
+                recorder_client_verified=catchuparr_stats._is_recorder_client(
+                    worker_id, client_id,
+                ),
+                native_registration_present=native_registration_present,
+                native_manager_running=(
+                    native_manager is not None and native_manager.running
+                ),
+                native_owner_present=owner_value is not None,
+                native_owner_matches_expected=(
+                    owner_value is not None
+                    and _redis_text(owner_value) == _redis_text(native_server.worker_id)
+                ),
+                source_metadata_matches_expected=(
+                    _native_source_metadata(redis_client, metadata_key) == source_metadata
+                ),
+                global_native_client_count=len(registered_client_ids),
+                local_native_client_count=local_native_client_count,
+                source_a_request_delta=(
+                    source_counts["source-a.ts"] - request_baseline
+                ),
+                source_a_active_count=active_counts["source-a.ts"],
+                source_b_active_count=active_counts["source-b.ts"],
+                task_alive=task_alive,
+                task_has_no_unexpected_failure=task_has_no_unexpected_failure,
+                stage=stage,
+            )
+
         return_ack_patch_started = False
         return_poll_patch_started = False
         try:
@@ -7010,41 +7110,21 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             gevent_sleep(0.1)
         _require(post_restart_borrow_headers is not None,
                  "Restarted task did not borrow the post-restart A viewer")
-        _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 2,
-            expected_local=1, timeout=20,
-        )
         second_capability = decode_borrow_capability(
             post_restart_borrow_headers["X-Catchuparr-Borrow"],
         )
         second_borrow_client_id = f"catchuparr-client-{second_capability.nonce}"
-        second_native_manager = native_server.stream_managers.get(worker_id)
-        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
-        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
-        second_source_counts, second_active_counts = source_server.snapshot()
-        second_borrow_client_verified = catchuparr_stats._is_recorder_client(
-            worker_id, second_borrow_client_id,
-        )
-        with run_restart._lock:
-            second_task_alive = run_restart.thread is not None and run_restart.thread.is_alive()
-            second_task_has_no_unexpected_failure = not run_restart.failures
-        second_borrow_gate = _healthy_borrow_gate_snapshot(
-            previous_client_is_distinct=second_borrow_client_id != borrow_client_id,
-            recorder_client_verified=second_borrow_client_verified,
-            native_manager_running=(
-                second_native_manager is not None and second_native_manager.running
+        second_borrow_gate_ready, second_borrow_gate = _wait_for_healthy_borrow_gate(
+            lambda: read_healthy_borrow_gate_snapshot(
+                client_id=second_borrow_client_id,
+                previous_client_id=borrow_client_id,
+                request_baseline=second_cycle_a_baseline,
+                stage="before_fault_arming",
             ),
-            native_owner_present=second_native_owner is not None,
-            source_a_request_delta=(
-                second_source_counts["source-a.ts"] - second_cycle_a_baseline
-            ),
-            source_a_active_count=second_active_counts["source-a.ts"],
-            source_b_active_count=second_active_counts["source-b.ts"],
-            task_alive=second_task_alive,
-            task_has_no_unexpected_failure=second_task_has_no_unexpected_failure,
+            20.0, monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
         )
         _require_with_failure_diagnostic(
-            second_borrow_gate["healthy_borrow_gate_passed"],
+            second_borrow_gate_ready,
             "Post-restart borrow opened another provider source instead of reading A",
             lambda: second_borrow_gate,
             diagnostic_label="CATCHUPARR_POST_RESTART_BORROW_GATE_DIAGNOSTIC",
@@ -7339,10 +7419,6 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             lambda: normal_reattach_snapshot,
             diagnostic_label="CATCHUPARR_POST_RETURN_REATTACH_DIAGNOSTIC",
         )
-        _require(
-            len(source_server.request_times("source-a.ts")) == second_cycle_a_baseline + 1,
-            "Post-failure reattach opened an extra native provider connection",
-        )
         post_failure_borrow_headers = None
         with run_restart._lock:
             borrowed_header_pairs = [
@@ -7356,24 +7432,33 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                  "Post-failure normal reattach omitted its native borrow capability")
         post_failure_borrow_headers = borrowed_header_pairs[1][0]
         post_restart_borrow_headers = post_failure_borrow_headers
+        previous_failure_borrow_client_id = second_borrow_client_id
         second_capability = decode_borrow_capability(
             post_restart_borrow_headers["X-Catchuparr-Borrow"],
         )
         second_borrow_client_id = f"catchuparr-client-{second_capability.nonce}"
+        post_failure_borrow_gate_ready, post_failure_borrow_gate = (
+            _wait_for_healthy_borrow_gate(
+                lambda: read_healthy_borrow_gate_snapshot(
+                    client_id=second_borrow_client_id,
+                    previous_client_id=previous_failure_borrow_client_id,
+                    request_baseline=second_cycle_a_baseline,
+                    stage="after_normal_reattach_deadline",
+                ),
+                20.0, monotonic=time.monotonic, sleep=gevent_sleep,
+                poll_interval=0.1,
+            )
+        )
+        _require_with_failure_diagnostic(
+            post_failure_borrow_gate_ready,
+            "Post-failure normal reattach opened a provider source instead of reading A",
+            lambda: post_failure_borrow_gate,
+            diagnostic_label="CATCHUPARR_POST_FAILURE_BORROW_GATE_DIAGNOSTIC",
+        )
         second_native_manager = native_server.stream_managers.get(worker_id)
         second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
         second_source_metadata = _native_source_metadata(redis_client, metadata_key)
         second_source_counts, second_active_counts = source_server.snapshot()
-        _require(
-            second_borrow_client_id != borrow_client_id
-            and catchuparr_stats._is_recorder_client(worker_id, second_borrow_client_id)
-            and second_native_manager is not None and second_native_manager.running
-            and second_native_owner is not None
-            and second_source_counts["source-a.ts"] == second_cycle_a_baseline + 1
-            and second_active_counts["source-a.ts"] == 1
-            and second_active_counts["source-b.ts"] == 0,
-            "Post-failure normal reattach opened a provider source instead of reading A",
-        )
         final_a_request_total = second_cycle_a_baseline + 1
         run_share = run_restart
         share_b_request_baseline = restart_request_baseline
