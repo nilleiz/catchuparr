@@ -3312,6 +3312,43 @@ def _failure_return_ack_matches_admitted_window(
         return False
 
 
+def _healthy_borrow_gate_snapshot(
+    *,
+    previous_client_is_distinct: bool,
+    recorder_client_verified: bool,
+    native_manager_running: bool,
+    native_owner_present: bool,
+    source_a_request_delta: int,
+    source_a_active_count: int,
+    source_b_active_count: int,
+    task_alive: bool,
+    task_has_no_unexpected_failure: bool,
+) -> dict[str, bool | int | str]:
+    """Return finite, identifier-free evidence for the early A borrow gate."""
+    checks = {
+        "new_client_identity": bool(previous_client_is_distinct),
+        "recorder_client_verified": bool(recorder_client_verified),
+        "native_manager_running": bool(native_manager_running),
+        "native_owner_present": bool(native_owner_present),
+        "exact_A_request_delta": int(source_a_request_delta),
+        "A_active_count": int(source_a_active_count),
+        "B_active_count": int(source_b_active_count),
+        "task_alive": bool(task_alive),
+        "task_has_no_unexpected_failure": bool(task_has_no_unexpected_failure),
+        "stage": "before_fault_arming",
+    }
+    checks["healthy_borrow_gate_passed"] = bool(
+        checks["new_client_identity"]
+        and checks["recorder_client_verified"]
+        and checks["native_manager_running"]
+        and checks["native_owner_present"]
+        and checks["exact_A_request_delta"] == 1
+        and checks["A_active_count"] == 1
+        and checks["B_active_count"] == 0
+    )
+    return checks
+
+
 def _failure_cleanup_ack_conditions(
     episode,
     capability,
@@ -6985,15 +7022,32 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
         second_source_metadata = _native_source_metadata(redis_client, metadata_key)
         second_source_counts, second_active_counts = source_server.snapshot()
-        _require(
-            second_borrow_client_id != borrow_client_id
-            and catchuparr_stats._is_recorder_client(worker_id, second_borrow_client_id)
-            and second_native_manager is not None and second_native_manager.running
-            and second_native_owner is not None
-            and second_source_counts["source-a.ts"] == second_cycle_a_baseline + 1
-            and second_active_counts["source-a.ts"] == 1
-            and second_active_counts["source-b.ts"] == 0,
+        second_borrow_client_verified = catchuparr_stats._is_recorder_client(
+            worker_id, second_borrow_client_id,
+        )
+        with run_restart._lock:
+            second_task_alive = run_restart.thread is not None and run_restart.thread.is_alive()
+            second_task_has_no_unexpected_failure = not run_restart.failures
+        second_borrow_gate = _healthy_borrow_gate_snapshot(
+            previous_client_is_distinct=second_borrow_client_id != borrow_client_id,
+            recorder_client_verified=second_borrow_client_verified,
+            native_manager_running=(
+                second_native_manager is not None and second_native_manager.running
+            ),
+            native_owner_present=second_native_owner is not None,
+            source_a_request_delta=(
+                second_source_counts["source-a.ts"] - second_cycle_a_baseline
+            ),
+            source_a_active_count=second_active_counts["source-a.ts"],
+            source_b_active_count=second_active_counts["source-b.ts"],
+            task_alive=second_task_alive,
+            task_has_no_unexpected_failure=second_task_has_no_unexpected_failure,
+        )
+        _require_with_failure_diagnostic(
+            second_borrow_gate["healthy_borrow_gate_passed"],
             "Post-restart borrow opened another provider source instead of reading A",
+            lambda: second_borrow_gate,
+            diagnostic_label="CATCHUPARR_POST_RESTART_BORROW_GATE_DIAGNOSTIC",
         )
         # Let the existing native registration and provider-isolation checks
         # observe the healthy borrow before causing its one-shot failure.
