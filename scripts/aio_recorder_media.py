@@ -3161,6 +3161,112 @@ def _wait_for_indexed_tone(
     raise RuntimeError("Synthetic recorder did not index the expected decoded source in time")
 
 
+def _wait_for_supervisor_return_ack(
+    run,
+    events_reader,
+    snapshots_reader,
+    *,
+    timeout: float,
+    cooperative_sleep=None,
+    monotonic=time.monotonic,
+    emit=print,
+):
+    """Wait for the lost callback ACK, supervisor ACK, then its following poll."""
+    expected = (
+        "media_callback_lost_ack", "supervisor_ack", "poll_after_supervisor_ack",
+    )
+    deadline = monotonic() + float(timeout)
+    sleep = cooperative_sleep or time.sleep
+
+    def fail(condition, message):
+        events = tuple(events_reader())
+        event_state = (
+            "expected_prefix" if events == expected[:len(events)]
+            else "invalid_order"
+        )
+        _require_with_failure_diagnostic(
+            False, message,
+            lambda: {
+                "condition": condition,
+                "event_state": event_state,
+                "task": _recorder_task_early_exit_diagnostic(run),
+            },
+            emit=emit,
+            diagnostic_label="CATCHUPARR_SUPERVISOR_RETURN_ACK_DIAGNOSTIC",
+        )
+
+    while True:
+        events = tuple(events_reader())
+        if events != expected[:len(events)]:
+            fail("event_order", "Supervisor RETURN ACK events were missing or out of order")
+        with run._lock:
+            failures = bool(run.failures)
+        if failures:
+            fail("task_failure", "Recorder task failed before supervisor RETURN ACK completed")
+        if events == expected:
+            snapshots = tuple(snapshots_reader())
+            if len(snapshots) == 1 and snapshots[0] is not None:
+                return snapshots[0]
+            fail("ack_snapshot", "Supervisor RETURN ACK did not capture one committed ledger snapshot")
+        if run.thread is None or not run.thread.is_alive():
+            fail("task_exit", "Recorder task ended before supervisor RETURN ACK completed")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            fail("timeout", "Supervisor RETURN ACK did not complete before its bounded timeout")
+        sleep(min(0.1, remaining))
+
+
+def _return_ack_matches_recovered_token(
+    original_token,
+    recovered_record,
+    ack_token,
+    committed_record,
+    *,
+    channel_uuid: str,
+    configuration_generation: str,
+    control_generation: int,
+) -> bool:
+    """Check one exact ACK after a RETURN was rebound to the replacement fence."""
+    try:
+        recovered_state = recovered_record.state
+        committed_state = committed_record.state
+        return bool(
+            original_token.action.value == "return_to_allowed"
+            and ack_token.action.value == "return_to_allowed"
+            and recovered_record.intent == ack_token
+            and recovered_record.revision == original_token.revision + 1
+            and ack_token.revision == recovered_record.revision
+            and ack_token.channel_uuid == channel_uuid == original_token.channel_uuid
+            and ack_token.configuration_generation == configuration_generation
+            and ack_token.configuration_generation == original_token.configuration_generation
+            and ack_token.control_generation == control_generation
+            and ack_token.control_generation == original_token.control_generation
+            and ack_token.not_before == original_token.not_before
+            and ack_token.intent_epoch == original_token.intent_epoch + 1
+            and ack_token.recorder_fence > original_token.recorder_fence
+            and ack_token.target_identity is None
+            and ack_token.target_admitted is False
+            and recovered_state.phase.value == "wait_return"
+            and recovered_state.pending_action.value == "return_to_allowed"
+            and recovered_state.intent_epoch == ack_token.intent_epoch
+            and recovered_state.configuration_generation == ack_token.configuration_generation
+            and recovered_state.control_generation == ack_token.control_generation
+            and recovered_state.recorder_fence == ack_token.recorder_fence
+            and committed_record.revision == ack_token.revision + 1
+            and committed_record.intent is None
+            and committed_state.phase.value == "dedicated"
+            and committed_state.pending_action is None
+            and committed_state.intent_epoch == ack_token.intent_epoch
+            and committed_state.configuration_generation == ack_token.configuration_generation
+            and committed_state.control_generation == ack_token.control_generation
+            and committed_state.recorder_fence == ack_token.recorder_fence
+            and committed_state.last_switch_at is not None
+            and committed_state.last_switch_at >= ack_token.not_before
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _native_source_metadata(redis_client, metadata_key) -> dict[str, str]:
     raw = redis_client.hgetall(metadata_key)
     relevant = {}
@@ -6535,51 +6641,21 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         source_server.set_mode("source-b.ts", "continuous")
         restart_b_media_baseline = {segment.id for segment in store.segments(worker_id)}
         restart_request_baseline = len(source_server.request_times("source-b.ts"))
-        run_restart = _RecorderTaskRun(
-            worker_id, startup_timeout=45, media_idle_timeout=25,
-        )
-        run_restart.start()
-        harnesses.append(run_restart)
-        restarted_return_request_deadline = time.monotonic() + 150
-        while time.monotonic() < restarted_return_request_deadline:
-            if len(source_server.request_times("source-b.ts")) > restart_request_baseline:
-                break
-            if run_restart.failures:
-                raise RuntimeError("Replacement task failed before retrying the pending RETURN")
-            gevent_sleep(0.1)
-        _require(
-            len(source_server.request_times("source-b.ts")) > restart_request_baseline,
-            "Replacement task did not resume the pending allowed B source",
-        )
-        restart_returned_segments = _wait_for_indexed_tone(
-            run_restart, store, worker_id, ffmpeg, ffprobe,
-            expected_hz=880, existing_ids=restart_b_media_baseline,
-            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
-        )
-        _require(bool(restart_returned_segments),
-                 "Restarted RETURN did not archive useful B media")
-        restart_committed = return_ledger.read(worker_id)
-        _require(
-            restart_committed is not None
-            and restart_committed.intent is None
-            and restart_committed.state.phase.value == "dedicated"
-            and restart_committed.state.last_switch_at is not None
-            and restart_committed.state.last_switch_at >= pending_return.not_before,
-            "The restarted task did not commit the RETURN on its first useful B media",
-        )
-        # The replacement task now borrows a fresh ordinary A viewer. Keep it
-        # alive through Pause to prove cleanup leaves the native viewer intact.
+
+        # Keep an ordinary A viewer present while the allowed B attempt gets
+        # its first media. The return ACK must be recovered by the supervisor,
+        # then that same pass must observe this viewer before its next wait.
         second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
         live_response = _open_after_readiness(
             lambda: wait_for_native_a_teardown(second_borrow_client_id),
             lambda: client.get(
                 f"/proxy/ts/stream/{channel.uuid}",
                 HTTP_HOST="localhost",
-                HTTP_USER_AGENT="Synthetic post-restart ordinary viewer",
+                HTTP_USER_AGENT="Synthetic post-return ordinary viewer",
             ),
         )
         _require(live_response.status_code == 200,
-                 "Post-restart ordinary A viewer could not open")
+                 "Post-return ordinary A viewer could not open")
         live_session, post_restart_native_buffer = _create_native_live_reader_session(
             live_response, native_server, worker_id,
         )
@@ -6587,27 +6663,126 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         post_restart_ordinary_identity = _wait_for_native_client_count(
             redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
             return_identity=True,
-            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
-                run_restart,
-                worker_id=worker_id,
-                channel_uuid=str(channel.uuid),
-                decode_capability=decode_borrow_capability,
-                is_server_verified=catchuparr_stats._is_recorder_client,
-            ),
         )
         _wait_for_native_active(
             redis_client, native_server, worker_id, redis_keys=RedisKeys,
             metadata_field=ChannelMetadataField,
             channel_state=ChannelState, timeout=45,
             expected_ordinary_identity=post_restart_ordinary_identity,
-            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
-                run_restart,
-                worker_id=worker_id,
-                channel_uuid=str(channel.uuid),
-                decode_capability=decode_borrow_capability,
-                is_server_verified=catchuparr_stats._is_recorder_client,
-            ),
         )
+
+        from unittest.mock import patch
+
+        from catchuparr.sharing_runtime import RecorderBorrowCoordinator
+
+        return_ack_events = []
+        return_ack_snapshots = []
+        return_ack_lock = threading.Lock()
+        real_acknowledge_return_media = RecorderBorrowCoordinator.acknowledge_return_media
+        real_coordinator_poll = RecorderBorrowCoordinator.poll
+
+        def fail_first_return_ack(self, prepared, token, attempt, candidate, *, media_at):
+            with return_ack_lock:
+                if not return_ack_events:
+                    return_ack_events.append("media_callback_lost_ack")
+                    return False
+            if threading.current_thread().name != f"catchuparr-{worker_id}":
+                # FFmpeg retries its callback on later segments. Keep those
+                # attempts pending so only the periodic supervisor can recover
+                # this synthetic lost ACK.
+                return False
+            recovered_return = return_ledger.read(worker_id)
+            result = real_acknowledge_return_media(
+                self, prepared, token, attempt, candidate, media_at=media_at,
+            )
+            if result:
+                committed = return_ledger.read(worker_id)
+                with return_ack_lock:
+                    if "supervisor_ack" not in return_ack_events:
+                        return_ack_snapshots.append((token, recovered_return, committed))
+                        return_ack_events.append("supervisor_ack")
+            return result
+
+        def observe_after_return_ack(self, **kwargs):
+            with return_ack_lock:
+                if ("supervisor_ack" in return_ack_events
+                        and "poll_after_supervisor_ack" not in return_ack_events):
+                    return_ack_events.append("poll_after_supervisor_ack")
+            return real_coordinator_poll(self, **kwargs)
+
+        def read_return_ack_events():
+            with return_ack_lock:
+                return tuple(return_ack_events)
+
+        def read_return_ack_snapshots():
+            with return_ack_lock:
+                return tuple(return_ack_snapshots)
+
+        return_ack_patch = patch.object(
+            RecorderBorrowCoordinator, "acknowledge_return_media",
+            fail_first_return_ack,
+        )
+        return_poll_patch = patch.object(
+            RecorderBorrowCoordinator, "poll", observe_after_return_ack,
+        )
+        run_restart = _RecorderTaskRun(
+            worker_id, startup_timeout=45, media_idle_timeout=25,
+        )
+        return_ack_patch_started = False
+        return_poll_patch_started = False
+        try:
+            return_ack_patch.start()
+            return_ack_patch_started = True
+            return_poll_patch.start()
+            return_poll_patch_started = True
+            run_restart.start()
+            harnesses.append(run_restart)
+            restarted_return_request_deadline = time.monotonic() + 150
+            while time.monotonic() < restarted_return_request_deadline:
+                if len(source_server.request_times("source-b.ts")) > restart_request_baseline:
+                    break
+                if run_restart.failures:
+                    raise RuntimeError(
+                        "Replacement task failed before retrying the pending RETURN"
+                    )
+                gevent_sleep(0.1)
+            _require(
+                len(source_server.request_times("source-b.ts")) > restart_request_baseline,
+                "Replacement task did not resume the pending allowed B source",
+            )
+            restart_returned_segments = _wait_for_indexed_tone(
+                run_restart, store, worker_id, ffmpeg, ffprobe,
+                expected_hz=880, existing_ids=restart_b_media_baseline,
+                minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+            )
+            _require(bool(restart_returned_segments),
+                     "Restarted RETURN did not archive useful B media")
+            # The worker checks its supervisor every ten seconds. Allow one
+            # interval plus a small cooperative scheduling margin.
+            supervisor_ack_timeout = 10.0 + 2.0
+            restart_ack_evidence = _wait_for_supervisor_return_ack(
+                run_restart,
+                read_return_ack_events,
+                read_return_ack_snapshots,
+                timeout=supervisor_ack_timeout,
+                cooperative_sleep=gevent_sleep,
+            )
+            ack_token, recovered_return_record, restart_committed = restart_ack_evidence
+            _require(
+                _return_ack_matches_recovered_token(
+                    pending_return, recovered_return_record, ack_token,
+                    restart_committed,
+                    channel_uuid=worker_id,
+                    configuration_generation=run_restart.expected_generation,
+                    control_generation=run_restart.expected_control_generation,
+                ),
+                "The restarted task did not commit the recovered RETURN with its exact token",
+            )
+        finally:
+            if return_poll_patch_started:
+                return_poll_patch.stop()
+            if return_ack_patch_started:
+                return_ack_patch.stop()
         post_restart_first_media, _post_restart_media_index = _read_after_current_buffer_head(
             live_session, post_restart_native_buffer,
             minimum_bytes=188 * 100, timeout=20,

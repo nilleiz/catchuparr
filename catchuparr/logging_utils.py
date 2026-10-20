@@ -45,6 +45,9 @@ _EVENTS = frozenset({
     "sharing_attempt_cleanup_pending",
     "sharing_attempt_reconciled",
     "sharing_return_recovery_pending",
+    "sharing_return_cleanup_pending",
+    "sharing_return_media_unconfirmed",
+    "sharing_return_binding_stale",
 })
 _ERROR_CATEGORIES = frozenset({
     "configuration_recovery_failed",
@@ -71,6 +74,9 @@ _ERROR_CATEGORIES = frozenset({
     "sharing_recovery_failed",
     "sharing_recovery_stale",
     "sharing_return_recovery_pending",
+    "sharing_return_cleanup_pending",
+    "sharing_return_media_unconfirmed",
+    "sharing_return_binding_stale",
     "diagnostic_category_invalid",
 })
 _STATE_KEYS = frozenset({
@@ -82,7 +88,7 @@ _SAFE_REASONS = frozenset({
     "version", "proxy_api", "cleanup_guard", "xc_hooks", "xc_uninstall", "log_level",
 })
 _SAFE_ERROR_CALLSITES = frozenset({
-    "native_observation", "opening_projection", "opening_cleanup",
+    "native_observation", "opening_projection", "opening_cleanup", "return_completion",
     "startup_recovery", "startup_admission", "return_recovery",
     "recorder_supervisor", "borrowed_worker", "borrowed_cleanup",
     "dedicated_worker", "attempt_reconciliation", "schedule_validation",
@@ -92,6 +98,7 @@ _SAFE_EXCEPTION_CLASSES = frozenset({
     "AttributeError", "ConnectionError", "IntegrityError", "KeyError",
     "LookupError", "OperationalError", "OSError", "PermissionError",
     "RuntimeError", "TimeoutError", "TypeError", "ValueError",
+    "BorrowEpisodeRejected", "StaleSharingIntent",
 })
 
 

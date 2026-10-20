@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Local rolling catch-up archive, start-over and optional live connection sharing for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
