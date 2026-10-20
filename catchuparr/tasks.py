@@ -63,19 +63,18 @@ def _complete_return_media(
     with attempt_state_lock:
         if attempt_state.get("attempt") is not attempt:
             return False
-        captured_state_was_cleared = (
-            attempt_state.get("return_prepared") is None
-            and attempt_state.get("return_token") is None
-        )
-        if (not captured_state_was_cleared
-                and (attempt_state.get("return_prepared") is not prepared
-                     or attempt_state.get("return_token") != token)):
+        completed = attempt_state.get("completed_return_media")
+        if (completed is not None and completed[0] is attempt
+                and completed[1] is prepared and completed[2] is token
+                and completed[3] is candidate):
+            return True
+        if (attempt_state.get("return_prepared") is not prepared
+                or attempt_state.get("return_token") != token):
             return False
         first_media_at = attempt_state.get("return_media_at")
         if first_media_at is None:
             first_media_at = float(media_at)
-            if not captured_state_was_cleared:
-                attempt_state["return_media_at"] = first_media_at
+            attempt_state["return_media_at"] = first_media_at
     acknowledged = sharing_coordinator.acknowledge_return_media(
         prepared, token, attempt, candidate, media_at=first_media_at,
     )
@@ -84,6 +83,9 @@ def _complete_return_media(
             if (attempt_state.get("attempt") is attempt
                     and attempt_state.get("return_prepared") is prepared
                     and attempt_state.get("return_token") == token):
+                attempt_state["completed_return_media"] = (
+                    attempt, prepared, token, candidate, first_media_at,
+                )
                 attempt_state["return_prepared"] = None
                 attempt_state["return_token"] = None
                 attempt_state["return_media_at"] = None
@@ -314,7 +316,8 @@ def record_channel(
     attempt_state = {
         "attempt": None, "candidate": None, "switch": None, "borrow": None,
         "active_borrow": None, "return_prepared": None, "return_token": None,
-        "return_media_at": None, "diagnostic": None,
+        "return_media_at": None, "completed_return_media": None,
+        "diagnostic": None,
     }
 
     def publish_dedicated_diagnostic(
@@ -798,6 +801,7 @@ def record_channel(
                         attempt_state["attempt"] = attempt
                         attempt_state["candidate"] = candidate
                         attempt_state["switch"] = attempt_switch
+                        attempt_state["completed_return_media"] = None
                         attempt_state["return_prepared"] = return_prepared
                         attempt_state["return_token"] = return_token
                         attempt_state["return_media_at"] = None
@@ -884,6 +888,7 @@ def record_channel(
                                 attempt_state["attempt"] = None
                                 attempt_state["candidate"] = None
                                 attempt_state["switch"] = None
+                                attempt_state["completed_return_media"] = None
                                 attempt_state["return_token"] = None
                                 attempt_state["return_media_at"] = None
                             current_diagnostic = attempt_state.get("diagnostic")

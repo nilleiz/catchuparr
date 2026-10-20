@@ -171,6 +171,9 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         stack.enter_context(patch.object(
             sharing_runtime, "borrow_return_cleanup_acknowledged", return_value=cleanup,
         ))
+        stack.enter_context(patch.object(
+            sharing_runtime, "borrow_cleanup_acknowledged", return_value=cleanup,
+        ))
         stack.enter_context(patch("catchuparr.configuration._sharing_catalog_generation",
                                   return_value="catalog-synthetic"))
         stack.enter_context(patch("catchuparr.recorder_proxy.candidate_is_current",
@@ -613,6 +616,63 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             # A second supervisor observation cannot issue the consumed claim again.
             self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
             prepare.assert_called_once()
+
+    def test_late_return_callback_after_poll_revisions_uses_exact_local_completion(self):
+        coordinator, prepared, pending, receipt = self._pending_return()
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        active = {"connection_sharing": {CHANNEL: {
+            "enabled": True, "live_stability_seconds": 100,
+            "last_viewer_return_seconds": 30, "min_switch_interval_seconds": 60,
+        }}}
+        coordinator.active = active
+        coordinator.assigned_sources = ()
+        stop_event = threading.Event()
+        attempt_state = {
+            "attempt": attempt, "return_prepared": prepared,
+            "return_token": pending.intent, "return_media_at": 270.0,
+            "completed_return_media": None,
+        }
+        fake_celery = types.ModuleType("celery")
+        fake_celery.shared_task = lambda *, name: lambda function: function
+        with patch.dict(sys.modules, {"celery": fake_celery}):
+            tasks = importlib.import_module("catchuparr.tasks")
+        with self._return_guards(coordinator):
+            self.assertTrue(tasks._complete_return_media(
+                threading.RLock(), attempt_state, coordinator, stop_event,
+                attempt, prepared, pending.intent, candidate, 270.0,
+            ))
+
+        native_observation = SimpleNamespace(target=target())
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=native_observation),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=336.0),
+        ):
+            self.assertIsNone(coordinator.poll(active=active, control_generation=2))
+            self.assertIsNone(coordinator.poll(active=active, control_generation=2))
+        after_poll = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(pending.revision + 3, after_poll.revision)
+
+        self.assertTrue(tasks._complete_return_media(
+            threading.RLock(), attempt_state, coordinator, stop_event,
+            attempt, prepared, pending.intent, candidate, 271.0,
+        ))
+        self.assertFalse(stop_event.is_set())
+        wrong_attempt = self._return_attempt()
+        self.assertFalse(tasks._complete_return_media(
+            threading.RLock(), attempt_state, coordinator, stop_event,
+            wrong_attempt, prepared, pending.intent, candidate, 271.0,
+        ))
+        self.assertFalse(stop_event.is_set())
+        self.assertEqual(after_poll.revision, self.intent_ledger.read(CHANNEL).revision)
 
     def test_return_commit_lost_response_is_idempotent(self):
         coordinator, _opening, pending, receipt = self._pending_return()
