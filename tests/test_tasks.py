@@ -255,11 +255,12 @@ class RecorderTaskTests(unittest.TestCase):
             candidate = {"id": "synthetic-stream"}
             state = {
                 "attempt": attempt,
-                # The supervisor has already committed the exact completion
-                # and cleared these fields while the media callback was in flight.
+                # The supervisor committed this exact completion and cleared
+                # the pending fields while the media callback was in flight.
                 "return_prepared": None,
                 "return_token": None,
                 "return_media_at": None,
+                "completed_return_media": (attempt, prepared, token, candidate, 270.0),
             }
             stop_event = SimpleNamespace(set=lambda: self.fail("stale callback stopped current attempt"))
 
@@ -279,15 +280,14 @@ class RecorderTaskTests(unittest.TestCase):
                 threading.RLock(), state, coordinator, stop_event,
                 attempt, prepared, token, candidate, 270.0,
             ))
-            self.assertEqual(1, len(coordinator.acknowledgements))
-            self.assertEqual(270.0, coordinator.acknowledgements[0][1])
+            self.assertEqual([], coordinator.acknowledgements)
 
             state["attempt"] = object()
             self.assertFalse(tasks._complete_return_media(
                 threading.RLock(), state, coordinator, stop_event,
                 attempt, prepared, token, candidate, 270.0,
             ))
-            self.assertEqual(1, len(coordinator.acknowledgements))
+            self.assertEqual([], coordinator.acknowledgements)
 
     def test_admission_uses_one_snapshot_for_schedule_and_archive_settings(self):
         import uuid
