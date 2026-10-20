@@ -44,6 +44,35 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_healthy_borrow_gate_diagnostic_preserves_exact_provider_predicate(self):
+        baseline = {
+            "previous_client_is_distinct": True,
+            "recorder_client_verified": True,
+            "native_manager_running": True,
+            "native_owner_present": True,
+            "source_a_request_delta": 1,
+            "source_a_active_count": 1,
+            "source_b_active_count": 0,
+            "task_alive": True,
+            "task_has_no_unexpected_failure": True,
+        }
+        passing = probe._healthy_borrow_gate_snapshot(**baseline)
+        self.assertTrue(passing["healthy_borrow_gate_passed"])
+        self.assertEqual(passing["exact_A_request_delta"], 1)
+        self.assertEqual(passing["A_active_count"], 1)
+        self.assertEqual(passing["B_active_count"], 0)
+        self.assertEqual(passing["stage"], "before_fault_arming")
+
+        for changed in (
+            {"source_a_request_delta": 2},
+            {"recorder_client_verified": False},
+            {"previous_client_is_distinct": False},
+            {"native_owner_present": False},
+            {"native_manager_running": False},
+        ):
+            diagnostic = probe._healthy_borrow_gate_snapshot(**(baseline | changed))
+            self.assertFalse(diagnostic["healthy_borrow_gate_passed"])
+
     def test_failure_return_ack_requires_exact_admitted_and_normal_deadline_window(self):
         token = SimpleNamespace(
             action=SimpleNamespace(value="return_to_allowed"),
