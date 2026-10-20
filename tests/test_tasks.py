@@ -242,6 +242,53 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertEqual("recording", state["diagnostic"]["phase"])
             self.assertEqual([("refresh", "starting", 10.0), ("media", "recording")], events)
 
+    def test_late_media_callback_accepts_only_supervisor_cleared_same_attempt(self):
+        with _isolated_plugin_modules({
+            "celery": _fake_module(
+                "celery", shared_task=lambda *, name: lambda function: function,
+            ),
+        }):
+            tasks = importlib.import_module("catchuparr.tasks")
+            attempt = object()
+            prepared = object()
+            token = object()
+            candidate = {"id": "synthetic-stream"}
+            state = {
+                "attempt": attempt,
+                # The supervisor has already committed the exact completion
+                # and cleared these fields while the media callback was in flight.
+                "return_prepared": None,
+                "return_token": None,
+                "return_media_at": None,
+            }
+            stop_event = SimpleNamespace(set=lambda: self.fail("stale callback stopped current attempt"))
+
+            class Coordinator:
+                def __init__(self):
+                    self.acknowledgements = []
+
+                def acknowledge_return_media(self, *args, media_at):
+                    self.acknowledgements.append((args, media_at))
+                    return True
+
+                def return_ack_retryable(self, *_args, **_kwargs):
+                    self.fail("successful idempotent ACK should not need retry")
+
+            coordinator = Coordinator()
+            self.assertTrue(tasks._complete_return_media(
+                threading.RLock(), state, coordinator, stop_event,
+                attempt, prepared, token, candidate, 270.0,
+            ))
+            self.assertEqual(1, len(coordinator.acknowledgements))
+            self.assertEqual(270.0, coordinator.acknowledgements[0][1])
+
+            state["attempt"] = object()
+            self.assertFalse(tasks._complete_return_media(
+                threading.RLock(), state, coordinator, stop_event,
+                attempt, prepared, token, candidate, 270.0,
+            ))
+            self.assertEqual(1, len(coordinator.acknowledgements))
+
     def test_admission_uses_one_snapshot_for_schedule_and_archive_settings(self):
         import uuid
 
