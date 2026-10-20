@@ -674,6 +674,67 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertFalse(stop_event.is_set())
         self.assertEqual(after_poll.revision, self.intent_ledger.read(CHANNEL).revision)
 
+    def test_inflight_return_callback_serializes_with_supervisor_completion(self):
+        coordinator, prepared, pending, _receipt = self._pending_return()
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        attempt_state = {
+            "attempt": attempt, "return_prepared": prepared,
+            "return_token": pending.intent, "return_media_at": 270.0,
+            "completed_return_media": None,
+        }
+        state_lock = threading.RLock()
+        stop_event = threading.Event()
+        ack_entered = threading.Event()
+        release_ack = threading.Event()
+        supervisor_started = threading.Event()
+        supervisor_finished = threading.Event()
+        results = {}
+        real_ack = coordinator.acknowledge_return_media
+
+        def paused_ack(*args, **kwargs):
+            ack_entered.set()
+            if not release_ack.wait(2):
+                raise AssertionError("synthetic ACK pause was not released")
+            return real_ack(*args, **kwargs)
+
+        fake_celery = types.ModuleType("celery")
+        fake_celery.shared_task = lambda *, name: lambda function: function
+        with patch.dict(sys.modules, {"celery": fake_celery}):
+            tasks = importlib.import_module("catchuparr.tasks")
+
+        def complete(label):
+            if label == "supervisor":
+                supervisor_started.set()
+            results[label] = tasks._complete_return_media(
+                state_lock, attempt_state, coordinator, stop_event,
+                attempt, prepared, pending.intent, candidate, 270.0,
+            )
+            if label == "supervisor":
+                supervisor_finished.set()
+
+        with self._return_guards(coordinator), patch.object(
+            coordinator, "acknowledge_return_media", side_effect=paused_ack,
+        ):
+            callback_thread = threading.Thread(target=complete, args=("callback",))
+            callback_thread.start()
+            self.assertTrue(ack_entered.wait(2))
+            supervisor_thread = threading.Thread(target=complete, args=("supervisor",))
+            supervisor_thread.start()
+            self.assertTrue(supervisor_started.wait(2))
+            self.assertFalse(supervisor_finished.wait(0.05))
+            release_ack.set()
+            callback_thread.join(2)
+            supervisor_thread.join(2)
+
+        self.assertFalse(callback_thread.is_alive())
+        self.assertFalse(supervisor_thread.is_alive())
+        self.assertTrue(results["callback"])
+        self.assertTrue(results["supervisor"])
+        self.assertFalse(stop_event.is_set())
+        committed = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(pending.revision + 1, committed.revision)
+
     def test_return_commit_lost_response_is_idempotent(self):
         coordinator, _opening, pending, receipt = self._pending_return()
         self.assertIsNotNone(receipt)

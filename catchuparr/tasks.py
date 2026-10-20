@@ -75,11 +75,13 @@ def _complete_return_media(
         if first_media_at is None:
             first_media_at = float(media_at)
             attempt_state["return_media_at"] = first_media_at
-    acknowledged = sharing_coordinator.acknowledge_return_media(
-        prepared, token, attempt, candidate, media_at=first_media_at,
-    )
-    if acknowledged:
-        with attempt_state_lock:
+        # Keep local completion serialized across the SQL acknowledgement. A
+        # callback that passed the pending-state check must not race a second
+        # ACK after the supervisor commits and records its completion receipt.
+        acknowledged = sharing_coordinator.acknowledge_return_media(
+            prepared, token, attempt, candidate, media_at=first_media_at,
+        )
+        if acknowledged:
             if (attempt_state.get("attempt") is attempt
                     and attempt_state.get("return_prepared") is prepared
                     and attempt_state.get("return_token") == token):
@@ -89,12 +91,12 @@ def _complete_return_media(
                 attempt_state["return_prepared"] = None
                 attempt_state["return_token"] = None
                 attempt_state["return_media_at"] = None
-        return True
-    if not sharing_coordinator.return_ack_retryable(
-        prepared, token, attempt, candidate, media_at=first_media_at,
-    ):
-        stop_event.set()
-    return False
+            return True
+        if not sharing_coordinator.return_ack_retryable(
+            prepared, token, attempt, candidate, media_at=first_media_at,
+        ):
+            stop_event.set()
+        return False
 
 
 def _issue_recorder_capability(redis, channel_uuid: str, fence: int, owner: str):
