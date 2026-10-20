@@ -735,6 +735,42 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
 
     thread = getattr(run, "thread", None)
     stop_event = getattr(run, "stop_event", None)
+    supervisor_exception_class = (
+        getattr(stop_event, "first_supervisor_exception_class", "unavailable")
+        if stop_event is not None else "unavailable"
+    )
+    allowed_supervisor_exception_classes = {
+        "AssertionError", "AttributeError", "ConnectionError", "ImportError",
+        "KeyError", "OSError", "RuntimeError", "TimeoutError", "TypeError",
+        "ValueError", "unavailable",
+    }
+    if supervisor_exception_class not in allowed_supervisor_exception_classes:
+        supervisor_exception_class = "other"
+    supervisor_exception_call_sites = []
+    raw_supervisor_call_sites = (
+        getattr(stop_event, "first_supervisor_exception_call_sites", ())
+        if stop_event is not None else ()
+    )
+    for frame in raw_supervisor_call_sites[:4]:
+        if not isinstance(frame, dict):
+            continue
+        file_name = frame.get("file")
+        function_name = frame.get("function")
+        line_number = frame.get("line")
+        if (
+            not isinstance(file_name, str)
+            or Path(file_name).is_absolute()
+            or Path(file_name).suffix != ".py"
+            or ".." in Path(file_name).parts
+        ):
+            continue
+        supervisor_exception_call_sites.append({
+            "file": file_name[:120],
+            "function": function_name[:80]
+            if isinstance(function_name, str) and function_name.isidentifier()
+            else "other",
+            "line": line_number if type(line_number) is int and line_number > 0 else None,
+        })
     return {
         "thread_alive": bool(thread is not None and thread.is_alive()),
         "stop_requested": bool(stop_event is not None and stop_event.is_set()),
@@ -750,6 +786,8 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
             getattr(stop_event, "first_supervisor_stop_reason", "unavailable")
             if stop_event is not None else "unavailable"
         ),
+        "supervisor_exception_class": supervisor_exception_class,
+        "supervisor_exception_call_sites": supervisor_exception_call_sites,
         "task_status": task_status,
         "failure_classes": failure_classes,
         "exception_call_sites": [
@@ -3189,6 +3227,9 @@ def _wait_for_supervisor_return_ack(
             lambda: {
                 "condition": condition,
                 "event_state": event_state,
+            "ack_event_count": len(events),
+            "ack_seen": "supervisor_ack" in events,
+            "poll_seen": "poll_after_supervisor_ack" in events,
                 "task": _recorder_task_early_exit_diagnostic(run),
             },
             emit=emit,

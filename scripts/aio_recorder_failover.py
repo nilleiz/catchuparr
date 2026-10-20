@@ -1116,6 +1116,46 @@ _SUPERVISOR_STOP_REASONS_BY_LINE = {
     556: "exception",
 }
 
+_SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({
+    "AssertionError", "AttributeError", "ConnectionError", "ImportError",
+    "KeyError", "OSError", "RuntimeError", "TimeoutError", "TypeError",
+    "ValueError",
+})
+
+
+def _safe_supervisor_exception_evidence(module_name, function_name, frame_locals):
+    """Expose only a mapped exception class and bounded repository locations."""
+    if module_name != "catchuparr.tasks" or function_name != "supervise":
+        return "unavailable", []
+    error = frame_locals.get("exc")
+    if not isinstance(error, BaseException):
+        return "unavailable", []
+    class_name = type(error).__name__
+    safe_class = (
+        class_name if class_name in _SAFE_SUPERVISOR_EXCEPTION_CLASSES else "other"
+    )
+    repository_root = Path(__file__).resolve().parents[1]
+    call_sites = []
+    try:
+        for frame in traceback.extract_tb(error.__traceback__)[-4:]:
+            try:
+                relative_file = Path(frame.filename).resolve().relative_to(repository_root)
+            except (OSError, ValueError):
+                continue
+            if relative_file.suffix != ".py" or any(
+                part in {"..", ".git"} for part in relative_file.parts
+            ):
+                continue
+            function = frame.name if frame.name.isidentifier() else "other"
+            call_sites.append({
+                "file": relative_file.as_posix()[:120],
+                "function": function[:80],
+                "line": frame.lineno if type(frame.lineno) is int else None,
+            })
+    except Exception:
+        return safe_class, []
+    return safe_class, call_sites
+
 
 def _safe_supervisor_stop_reason(module_name, function_name, line_number, frame_locals):
     if module_name != "catchuparr.tasks" or function_name != "supervise":
@@ -1147,6 +1187,8 @@ class _ObservedRecorderStopEvent(threading.Event):
         self.first_set_source = "not_set"
         self.first_supervisor_admission_status = "unavailable"
         self.first_supervisor_stop_reason = "unavailable"
+        self.first_supervisor_exception_class = "unavailable"
+        self.first_supervisor_exception_call_sites = []
         self._source_lock = threading.Lock()
 
     def set(self):
@@ -1163,10 +1205,19 @@ class _ObservedRecorderStopEvent(threading.Event):
                     self.first_supervisor_stop_reason = _safe_supervisor_stop_reason(
                         module_name, function_name, caller.f_lineno, caller.f_locals,
                     )
+                    if self.first_supervisor_stop_reason == "exception":
+                        (
+                            self.first_supervisor_exception_class,
+                            self.first_supervisor_exception_call_sites,
+                        ) = _safe_supervisor_exception_evidence(
+                            module_name, function_name, caller.f_locals,
+                        )
                 except Exception:
                     self.first_set_source = "other"
                     self.first_supervisor_admission_status = "unavailable"
                     self.first_supervisor_stop_reason = "unavailable"
+                    self.first_supervisor_exception_class = "unavailable"
+                    self.first_supervisor_exception_call_sites = []
             super().set()
 
 

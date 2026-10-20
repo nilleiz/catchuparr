@@ -345,6 +345,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertEqual(1, len(sleeps))
 
         for failed_events, failures, alive, expected_condition in (
+            ((), (), False, "task_exit"),
             ((expected[1],), (), True, "event_order"),
             ((expected[0],), ("task:RuntimeError",), True, "task_failure"),
         ):
@@ -358,6 +359,12 @@ class RecorderMediaProbeTests(unittest.TestCase):
                 )
             diagnostic = json.loads(output[0].split(" ", 1)[1])
             self.assertEqual(expected_condition, diagnostic["condition"])
+            self.assertEqual(len(failed_events), diagnostic["ack_event_count"])
+            self.assertEqual("supervisor_ack" in failed_events, diagnostic["ack_seen"])
+            self.assertEqual(
+                "poll_after_supervisor_ack" in failed_events,
+                diagnostic["poll_seen"],
+            )
 
         output = []
         now[0] = 0.0
@@ -724,6 +731,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         ast.increment_lineno(tree, first_stop - 2)
         exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
+        self.assertTrue(stop_event.is_set())
         diagnostic = probe._recorder_task_early_exit_diagnostic(
             SimpleNamespace(
                 result={"status": "stopped"},
@@ -734,6 +742,76 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertEqual("tasks.supervisor", diagnostic["stop_source"])
         self.assertEqual("stale_control", diagnostic["supervisor_admission_status"])
         self.assertEqual("admission_not_ready", diagnostic["supervisor_stop_reason"])
+
+    def test_supervisor_exception_receipt_is_bounded_and_redacts_message(self):
+        tasks_path = Path(__file__).parents[1] / "catchuparr" / "tasks.py"
+        source = ast.parse(tasks_path.read_text())
+        record_channel = next(
+            node for node in source.body
+            if isinstance(node, ast.FunctionDef) and node.name == "record_channel"
+        )
+        supervise = next(
+            node for node in ast.walk(record_channel)
+            if isinstance(node, ast.FunctionDef) and node.name == "supervise"
+        )
+        exception_handler = next(
+            node for node in ast.walk(supervise)
+            if isinstance(node, ast.ExceptHandler) and node.name == "exc"
+        )
+        exception_stop_line = next(
+            call.lineno
+            for statement in exception_handler.body for call in ast.walk(statement)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "set"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "stop_event"
+        )
+        synthetic = ast.parse(
+            "def supervise():\n"
+            "    try:\n"
+            "        raise SyntheticSupervisorFailure('PrivateTokenABC123')\n"
+            "    except Exception as exc:\n"
+            "        stop_event.set()\n"
+        )
+        synthetic_set_line = next(
+            node.lineno for node in ast.walk(synthetic)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "stop_event"
+        )
+        ast.increment_lineno(synthetic, exception_stop_line - synthetic_set_line)
+        stop_event = aio_recorder_failover._ObservedRecorderStopEvent()
+
+        class SyntheticSupervisorFailure(Exception):
+            pass
+
+        namespace = {
+            "__name__": "catchuparr.tasks",
+            "stop_event": stop_event,
+            "SyntheticSupervisorFailure": SyntheticSupervisorFailure,
+        }
+        exec(compile(synthetic, str(tasks_path), "exec"), namespace)
+        namespace["supervise"]()
+        diagnostic = probe._recorder_task_early_exit_diagnostic(
+            SimpleNamespace(
+                result={"status": "stopped"}, stop_event=stop_event,
+                thread=SimpleNamespace(is_alive=lambda: False),
+            )
+        )
+        self.assertEqual("exception", diagnostic["supervisor_stop_reason"])
+        self.assertEqual("other", diagnostic["supervisor_exception_class"])
+        self.assertTrue(diagnostic["supervisor_exception_call_sites"])
+        self.assertTrue(all(
+            frame["file"] == "catchuparr/tasks.py"
+            and frame["function"] == "supervise"
+            and type(frame["line"]) is int
+            for frame in diagnostic["supervisor_exception_call_sites"]
+        ))
+        encoded = json.dumps(diagnostic)
+        self.assertNotIn("PrivateTokenABC123", encoded)
 
     def test_allowed_source_wait_reports_existing_safe_task_exit_receipt(self):
         now = [0.0]
