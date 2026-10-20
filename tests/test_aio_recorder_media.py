@@ -44,6 +44,79 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_supervisor_return_ack_wait_requires_order_completion_and_live_task(self):
+        expected = (
+            "media_callback_lost_ack", "supervisor_ack", "poll_after_supervisor_ack",
+        )
+
+        def make_run(*, alive=True, failures=None):
+            return SimpleNamespace(
+                _lock=threading.Lock(),
+                thread=SimpleNamespace(is_alive=lambda: alive),
+                failures=list(failures or ()), results=[], input_headers=[], processes=[],
+                result={"status": "stopped"}, stop_event=threading.Event(),
+            )
+
+        events = [expected[0]]
+        pending = SimpleNamespace(intent=object(), phase="wait_return")
+        committed = SimpleNamespace(intent=None, phase="dedicated")
+        snapshots = [pending]
+        run = make_run()
+        now = [0.0]
+        sleeps = []
+
+        def advance_supervisor(_delay):
+            sleeps.append(_delay)
+            self.assertEqual((expected[0],), tuple(events))
+            self.assertIs(pending, snapshots[0])
+            events.extend(expected[1:])
+            snapshots[0] = committed
+            now[0] += _delay
+
+        result = probe._wait_for_supervisor_return_ack(
+            run, lambda: tuple(events), lambda: tuple(snapshots),
+            timeout=1, cooperative_sleep=advance_supervisor,
+            monotonic=lambda: now[0], emit=lambda _line: None,
+        )
+        self.assertIs(committed, result)
+        self.assertEqual(1, len(sleeps))
+
+        for failed_events, failures, alive, expected_condition in (
+            ((expected[1],), (), True, "event_order"),
+            ((expected[0],), ("task:RuntimeError",), True, "task_failure"),
+        ):
+            output = []
+            with self.subTest(condition=expected_condition), self.assertRaises(RuntimeError):
+                probe._wait_for_supervisor_return_ack(
+                    make_run(alive=alive, failures=failures),
+                    lambda: failed_events, lambda: (), timeout=1,
+                    cooperative_sleep=lambda _delay: self.fail("failed wait slept"),
+                    monotonic=lambda: 0.0, emit=output.append,
+                )
+            diagnostic = json.loads(output[0].split(" ", 1)[1])
+            self.assertEqual(expected_condition, diagnostic["condition"])
+
+        output = []
+        now[0] = 0.0
+        with self.assertRaisesRegex(RuntimeError, "bounded timeout"):
+            probe._wait_for_supervisor_return_ack(
+                make_run(), lambda: (expected[0],), lambda: (), timeout=0.25,
+                cooperative_sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+                monotonic=lambda: now[0], emit=output.append,
+            )
+        diagnostic = json.loads(output[0].split(" ", 1)[1])
+        self.assertEqual("timeout", diagnostic["condition"])
+
+        output = []
+        with self.assertRaisesRegex(RuntimeError, "task ended"):
+            probe._wait_for_supervisor_return_ack(
+                make_run(alive=False), lambda: (expected[0],), lambda: (), timeout=1,
+                cooperative_sleep=lambda _delay: self.fail("exited task slept"),
+                monotonic=lambda: 0.0, emit=output.append,
+            )
+        diagnostic = json.loads(output[0].split(" ", 1)[1])
+        self.assertEqual("task_exit", diagnostic["condition"])
+
     def test_live_overview_source_metadata_is_mode_specific(self):
         common = {
             "stream_name": "source", "provider_name": "provider",

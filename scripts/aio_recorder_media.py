@@ -3161,6 +3161,61 @@ def _wait_for_indexed_tone(
     raise RuntimeError("Synthetic recorder did not index the expected decoded source in time")
 
 
+def _wait_for_supervisor_return_ack(
+    run,
+    events_reader,
+    snapshots_reader,
+    *,
+    timeout: float,
+    cooperative_sleep=None,
+    monotonic=time.monotonic,
+    emit=print,
+):
+    """Wait for the lost callback ACK, supervisor ACK, then its following poll."""
+    expected = (
+        "media_callback_lost_ack", "supervisor_ack", "poll_after_supervisor_ack",
+    )
+    deadline = monotonic() + float(timeout)
+    sleep = cooperative_sleep or time.sleep
+
+    def fail(condition, message):
+        events = tuple(events_reader())
+        event_state = (
+            "expected_prefix" if events == expected[:len(events)]
+            else "invalid_order"
+        )
+        _require_with_failure_diagnostic(
+            False, message,
+            lambda: {
+                "condition": condition,
+                "event_state": event_state,
+                "task": _recorder_task_early_exit_diagnostic(run),
+            },
+            emit=emit,
+            diagnostic_label="CATCHUPARR_SUPERVISOR_RETURN_ACK_DIAGNOSTIC",
+        )
+
+    while True:
+        events = tuple(events_reader())
+        if events != expected[:len(events)]:
+            fail("event_order", "Supervisor RETURN ACK events were missing or out of order")
+        with run._lock:
+            failures = bool(run.failures)
+        if failures:
+            fail("task_failure", "Recorder task failed before supervisor RETURN ACK completed")
+        if events == expected:
+            snapshots = tuple(snapshots_reader())
+            if len(snapshots) == 1 and snapshots[0] is not None:
+                return snapshots[0]
+            fail("ack_snapshot", "Supervisor RETURN ACK did not capture one committed ledger snapshot")
+        if run.thread is None or not run.thread.is_alive():
+            fail("task_exit", "Recorder task ended before supervisor RETURN ACK completed")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            fail("timeout", "Supervisor RETURN ACK did not complete before its bounded timeout")
+        sleep(min(0.1, remaining))
+
+
 def _native_source_metadata(redis_client, metadata_key) -> dict[str, str]:
     raw = redis_client.hgetall(metadata_key)
     relevant = {}
@@ -6570,13 +6625,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         from catchuparr.sharing_runtime import RecorderBorrowCoordinator
 
         return_ack_events = []
+        return_ack_snapshots = []
+        return_ack_lock = threading.Lock()
         real_acknowledge_return_media = RecorderBorrowCoordinator.acknowledge_return_media
         real_coordinator_poll = RecorderBorrowCoordinator.poll
 
         def fail_first_return_ack(self, prepared, token, attempt, candidate, *, media_at):
-            if not return_ack_events:
-                return_ack_events.append("media_callback_lost_ack")
-                return False
+            with return_ack_lock:
+                if not return_ack_events:
+                    return_ack_events.append("media_callback_lost_ack")
+                    return False
             if threading.current_thread().name != f"catchuparr-{worker_id}":
                 # FFmpeg retries its callback on later segments. Keep those
                 # attempts pending so only the periodic supervisor can recover
@@ -6585,14 +6643,28 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             result = real_acknowledge_return_media(
                 self, prepared, token, attempt, candidate, media_at=media_at,
             )
-            if result and "supervisor_ack" not in return_ack_events:
-                return_ack_events.append("supervisor_ack")
+            if result:
+                committed = return_ledger.read(worker_id)
+                with return_ack_lock:
+                    if "supervisor_ack" not in return_ack_events:
+                        return_ack_snapshots.append(committed)
+                        return_ack_events.append("supervisor_ack")
             return result
 
         def observe_after_return_ack(self, **kwargs):
-            if "supervisor_ack" in return_ack_events:
-                return_ack_events.append("poll_after_supervisor_ack")
+            with return_ack_lock:
+                if ("supervisor_ack" in return_ack_events
+                        and "poll_after_supervisor_ack" not in return_ack_events):
+                    return_ack_events.append("poll_after_supervisor_ack")
             return real_coordinator_poll(self, **kwargs)
+
+        def read_return_ack_events():
+            with return_ack_lock:
+                return tuple(return_ack_events)
+
+        def read_return_ack_snapshots():
+            with return_ack_lock:
+                return tuple(return_ack_snapshots)
 
         return_ack_patch = patch.object(
             RecorderBorrowCoordinator, "acknowledge_return_media",
@@ -6601,49 +6673,61 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         return_poll_patch = patch.object(
             RecorderBorrowCoordinator, "poll", observe_after_return_ack,
         )
-        return_ack_patch.start()
-        return_poll_patch.start()
         run_restart = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
         )
-        run_restart.start()
-        harnesses.append(run_restart)
-        restarted_return_request_deadline = time.monotonic() + 150
-        while time.monotonic() < restarted_return_request_deadline:
-            if len(source_server.request_times("source-b.ts")) > restart_request_baseline:
-                break
-            if run_restart.failures:
-                raise RuntimeError("Replacement task failed before retrying the pending RETURN")
-            gevent_sleep(0.1)
-        _require(
-            len(source_server.request_times("source-b.ts")) > restart_request_baseline,
-            "Replacement task did not resume the pending allowed B source",
-        )
-        restart_returned_segments = _wait_for_indexed_tone(
-            run_restart, store, worker_id, ffmpeg, ffprobe,
-            expected_hz=880, existing_ids=restart_b_media_baseline,
-            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
-        )
-        _require(bool(restart_returned_segments),
-                 "Restarted RETURN did not archive useful B media")
-        restart_committed = return_ledger.read(worker_id)
-        _require(
-            restart_committed is not None
-            and restart_committed.intent is None
-            and restart_committed.state.phase.value == "dedicated"
-            and restart_committed.state.last_switch_at is not None
-            and restart_committed.state.last_switch_at >= pending_return.not_before,
-            "The restarted task did not commit the RETURN on its first useful B media",
-        )
-        _require(
-            return_ack_events[:3] == [
-                "media_callback_lost_ack", "supervisor_ack",
-                "poll_after_supervisor_ack",
-            ],
-            "The supervisor did not retry the lost media ACK before its next viewer poll",
-        )
-        return_poll_patch.stop()
-        return_ack_patch.stop()
+        return_ack_patch_started = False
+        return_poll_patch_started = False
+        try:
+            return_ack_patch.start()
+            return_ack_patch_started = True
+            return_poll_patch.start()
+            return_poll_patch_started = True
+            run_restart.start()
+            harnesses.append(run_restart)
+            restarted_return_request_deadline = time.monotonic() + 150
+            while time.monotonic() < restarted_return_request_deadline:
+                if len(source_server.request_times("source-b.ts")) > restart_request_baseline:
+                    break
+                if run_restart.failures:
+                    raise RuntimeError(
+                        "Replacement task failed before retrying the pending RETURN"
+                    )
+                gevent_sleep(0.1)
+            _require(
+                len(source_server.request_times("source-b.ts")) > restart_request_baseline,
+                "Replacement task did not resume the pending allowed B source",
+            )
+            restart_returned_segments = _wait_for_indexed_tone(
+                run_restart, store, worker_id, ffmpeg, ffprobe,
+                expected_hz=880, existing_ids=restart_b_media_baseline,
+                minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+            )
+            _require(bool(restart_returned_segments),
+                     "Restarted RETURN did not archive useful B media")
+            # The worker checks its supervisor every ten seconds. Allow one
+            # interval plus a small cooperative scheduling margin.
+            supervisor_ack_timeout = 10.0 + 2.0
+            restart_committed = _wait_for_supervisor_return_ack(
+                run_restart,
+                read_return_ack_events,
+                read_return_ack_snapshots,
+                timeout=supervisor_ack_timeout,
+                cooperative_sleep=gevent_sleep,
+            )
+            _require(
+                restart_committed.intent is None
+                and restart_committed.state.phase.value == "dedicated"
+                and restart_committed.state.last_switch_at is not None
+                and restart_committed.state.last_switch_at >= pending_return.not_before
+                and restart_committed.revision == pending_return.revision + 1,
+                "The restarted task did not commit the exact RETURN on its first useful B media",
+            )
+        finally:
+            if return_poll_patch_started:
+                return_poll_patch.stop()
+            if return_ack_patch_started:
+                return_ack_patch.stop()
         post_restart_first_media, _post_restart_media_index = _read_after_current_buffer_head(
             live_session, post_restart_native_buffer,
             minimum_bytes=188 * 100, timeout=20,
