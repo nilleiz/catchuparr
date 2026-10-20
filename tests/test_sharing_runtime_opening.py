@@ -756,6 +756,42 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertEqual(270.0, committed.state.last_switch_at)
         self.assertEqual(pending.revision + 1, committed.revision)
 
+    def test_probe_return_ack_binding_uses_recovered_token_revision(self):
+        coordinator, _opening, original, _receipt = self._pending_return()
+        original_token = original.intent
+        recovered = self.intent_ledger.recover(
+            CHANNEL, configuration_generation="config-synthetic",
+            control_generation=2, recorder_fence=8, now=201.0,
+            expected_revision=original.revision,
+            recovery_is_current=lambda *_args: True,
+        )
+        self.assertEqual(original.revision + 1, recovered.revision)
+        self.assertEqual(original_token.intent_epoch + 1, recovered.intent.intent_epoch)
+        coordinator.recorder_fence = 8
+        coordinator.state_record = recovered
+        prepared = coordinator._read_return_receipt()
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        with self._return_guards(coordinator):
+            self.assertTrue(coordinator.acknowledge_return_media(
+                prepared, recovered.intent, attempt, candidate, media_at=270.0,
+            ))
+        committed = self.intent_ledger.read(CHANNEL)
+
+        from scripts.aio_recorder_media import _return_ack_matches_recovered_token
+
+        evidence = {
+            "channel_uuid": CHANNEL,
+            "configuration_generation": "config-synthetic",
+            "control_generation": 2,
+        }
+        self.assertTrue(_return_ack_matches_recovered_token(
+            original_token, recovered, recovered.intent, committed, **evidence,
+        ))
+        self.assertFalse(_return_ack_matches_recovered_token(
+            original_token, recovered, original_token, committed, **evidence,
+        ))
+
     def test_return_completion_retries_after_transient_sql_failure(self):
         coordinator, _opening, pending, receipt = self._pending_return()
         attempt = self._return_attempt()

@@ -3216,6 +3216,57 @@ def _wait_for_supervisor_return_ack(
         sleep(min(0.1, remaining))
 
 
+def _return_ack_matches_recovered_token(
+    original_token,
+    recovered_record,
+    ack_token,
+    committed_record,
+    *,
+    channel_uuid: str,
+    configuration_generation: str,
+    control_generation: int,
+) -> bool:
+    """Check one exact ACK after a RETURN was rebound to the replacement fence."""
+    try:
+        recovered_state = recovered_record.state
+        committed_state = committed_record.state
+        return bool(
+            original_token.action.value == "return_to_allowed"
+            and ack_token.action.value == "return_to_allowed"
+            and recovered_record.intent == ack_token
+            and recovered_record.revision == original_token.revision + 1
+            and ack_token.revision == recovered_record.revision
+            and ack_token.channel_uuid == channel_uuid == original_token.channel_uuid
+            and ack_token.configuration_generation == configuration_generation
+            and ack_token.configuration_generation == original_token.configuration_generation
+            and ack_token.control_generation == control_generation
+            and ack_token.control_generation == original_token.control_generation
+            and ack_token.not_before == original_token.not_before
+            and ack_token.intent_epoch == original_token.intent_epoch + 1
+            and ack_token.recorder_fence > original_token.recorder_fence
+            and ack_token.target_identity is None
+            and ack_token.target_admitted is False
+            and recovered_state.phase.value == "wait_return"
+            and recovered_state.pending_action.value == "return_to_allowed"
+            and recovered_state.intent_epoch == ack_token.intent_epoch
+            and recovered_state.configuration_generation == ack_token.configuration_generation
+            and recovered_state.control_generation == ack_token.control_generation
+            and recovered_state.recorder_fence == ack_token.recorder_fence
+            and committed_record.revision == ack_token.revision + 1
+            and committed_record.intent is None
+            and committed_state.phase.value == "dedicated"
+            and committed_state.pending_action is None
+            and committed_state.intent_epoch == ack_token.intent_epoch
+            and committed_state.configuration_generation == ack_token.configuration_generation
+            and committed_state.control_generation == ack_token.control_generation
+            and committed_state.recorder_fence == ack_token.recorder_fence
+            and committed_state.last_switch_at is not None
+            and committed_state.last_switch_at >= ack_token.not_before
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _native_source_metadata(redis_client, metadata_key) -> dict[str, str]:
     raw = redis_client.hgetall(metadata_key)
     relevant = {}
@@ -6640,6 +6691,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 # attempts pending so only the periodic supervisor can recover
                 # this synthetic lost ACK.
                 return False
+            recovered_return = return_ledger.read(worker_id)
             result = real_acknowledge_return_media(
                 self, prepared, token, attempt, candidate, media_at=media_at,
             )
@@ -6647,7 +6699,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 committed = return_ledger.read(worker_id)
                 with return_ack_lock:
                     if "supervisor_ack" not in return_ack_events:
-                        return_ack_snapshots.append(committed)
+                        return_ack_snapshots.append((token, recovered_return, committed))
                         return_ack_events.append("supervisor_ack")
             return result
 
@@ -6708,20 +6760,23 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             # The worker checks its supervisor every ten seconds. Allow one
             # interval plus a small cooperative scheduling margin.
             supervisor_ack_timeout = 10.0 + 2.0
-            restart_committed = _wait_for_supervisor_return_ack(
+            restart_ack_evidence = _wait_for_supervisor_return_ack(
                 run_restart,
                 read_return_ack_events,
                 read_return_ack_snapshots,
                 timeout=supervisor_ack_timeout,
                 cooperative_sleep=gevent_sleep,
             )
+            ack_token, recovered_return_record, restart_committed = restart_ack_evidence
             _require(
-                restart_committed.intent is None
-                and restart_committed.state.phase.value == "dedicated"
-                and restart_committed.state.last_switch_at is not None
-                and restart_committed.state.last_switch_at >= pending_return.not_before
-                and restart_committed.revision == pending_return.revision + 1,
-                "The restarted task did not commit the exact RETURN on its first useful B media",
+                _return_ack_matches_recovered_token(
+                    pending_return, recovered_return_record, ack_token,
+                    restart_committed,
+                    channel_uuid=worker_id,
+                    configuration_generation=run_restart.expected_generation,
+                    control_generation=run_restart.expected_control_generation,
+                ),
+                "The restarted task did not commit the recovered RETURN with its exact token",
             )
         finally:
             if return_poll_patch_started:
