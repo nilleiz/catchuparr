@@ -1135,9 +1135,9 @@ def _safe_supervisor_exception_evidence(module_name, function_name, frame_locals
         class_name if class_name in _SAFE_SUPERVISOR_EXCEPTION_CLASSES else "other"
     )
     repository_root = Path(__file__).resolve().parents[1]
-    call_sites = []
+    repository_frames = []
     try:
-        for frame in traceback.extract_tb(error.__traceback__)[-4:]:
+        for frame in traceback.extract_tb(error.__traceback__):
             try:
                 relative_file = Path(frame.filename).resolve().relative_to(repository_root)
             except (OSError, ValueError):
@@ -1147,14 +1147,14 @@ def _safe_supervisor_exception_evidence(module_name, function_name, frame_locals
             ):
                 continue
             function = frame.name if frame.name.isidentifier() else "other"
-            call_sites.append({
+            repository_frames.append({
                 "file": relative_file.as_posix()[:120],
                 "function": function[:80],
                 "line": frame.lineno if type(frame.lineno) is int else None,
             })
     except Exception:
         return safe_class, []
-    return safe_class, call_sites
+    return safe_class, repository_frames[-4:]
 
 
 def _safe_supervisor_stop_reason(module_name, function_name, line_number, frame_locals):

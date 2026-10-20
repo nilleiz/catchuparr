@@ -770,7 +770,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         synthetic = ast.parse(
             "def supervise():\n"
             "    try:\n"
-            "        raise SyntheticSupervisorFailure('PrivateTokenABC123')\n"
+            "        external_entry()\n"
             "    except Exception as exc:\n"
             "        stop_event.set()\n"
         )
@@ -793,6 +793,18 @@ class RecorderMediaProbeTests(unittest.TestCase):
             "stop_event": stop_event,
             "SyntheticSupervisorFailure": SyntheticSupervisorFailure,
         }
+        external_frames = "\n".join(
+            f"def external_{index}():\n    return external_{index + 1}()"
+            for index in range(5)
+        ) + "\n" + (
+            "def external_5():\n"
+            "    private_local_value = 'PrivateLocalABC123'\n"
+            "    raise SyntheticSupervisorFailure('PrivateTokenABC123')\n"
+        )
+        exec(
+            compile(external_frames, "/tmp/synthetic-external-stack.py", "exec"),
+            namespace,
+        )
         exec(compile(synthetic, str(tasks_path), "exec"), namespace)
         namespace["supervise"]()
         diagnostic = probe._recorder_task_early_exit_diagnostic(
@@ -812,6 +824,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         ))
         encoded = json.dumps(diagnostic)
         self.assertNotIn("PrivateTokenABC123", encoded)
+        self.assertNotIn("PrivateLocalABC123", encoded)
 
     def test_allowed_source_wait_reports_existing_safe_task_exit_receipt(self):
         now = [0.0]
