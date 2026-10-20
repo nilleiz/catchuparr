@@ -48,8 +48,13 @@ class RecorderMediaProbeTests(unittest.TestCase):
         baseline = {
             "previous_client_is_distinct": True,
             "recorder_client_verified": True,
+            "native_registration_present": True,
             "native_manager_running": True,
             "native_owner_present": True,
+            "native_owner_matches_expected": True,
+            "source_metadata_matches_expected": True,
+            "global_native_client_count": 2,
+            "local_native_client_count": 1,
             "source_a_request_delta": 1,
             "source_a_active_count": 1,
             "source_b_active_count": 0,
@@ -66,12 +71,125 @@ class RecorderMediaProbeTests(unittest.TestCase):
         for changed in (
             {"source_a_request_delta": 2},
             {"recorder_client_verified": False},
+            {"native_registration_present": False},
             {"previous_client_is_distinct": False},
             {"native_owner_present": False},
+            {"native_owner_matches_expected": False},
+            {"source_metadata_matches_expected": False},
             {"native_manager_running": False},
+            {"global_native_client_count": 3},
+            {"local_native_client_count": 2},
         ):
             diagnostic = probe._healthy_borrow_gate_snapshot(**(baseline | changed))
             self.assertFalse(diagnostic["healthy_borrow_gate_passed"])
+
+    def test_healthy_borrow_readiness_waits_for_exact_registration_and_fails_closed(self):
+        base = {
+            "previous_client_is_distinct": True,
+            "recorder_client_verified": False,
+            "native_registration_present": False,
+            "native_manager_running": True,
+            "native_owner_present": True,
+            "native_owner_matches_expected": True,
+            "source_metadata_matches_expected": True,
+            "global_native_client_count": 1,
+            "local_native_client_count": 1,
+            "source_a_request_delta": 1,
+            "source_a_active_count": 1,
+            "source_b_active_count": 1,
+            "task_alive": True,
+            "task_has_no_unexpected_failure": True,
+            "stage": "after_normal_reattach_deadline",
+        }
+
+        def snapshot(**changes):
+            return probe._healthy_borrow_gate_snapshot(**(base | changes))
+
+        pending = snapshot()
+        registered = snapshot(
+            recorder_client_verified=True,
+            native_registration_present=True,
+            global_native_client_count=2,
+            source_b_active_count=0,
+        )
+        now = [0.0]
+        current = [pending]
+
+        def cooperative_wait(delay):
+            current[0] = registered
+            now[0] += delay
+
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: current[0], 1, monotonic=lambda: now[0], sleep=cooperative_wait,
+        )
+        self.assertTrue(ready)
+        self.assertIs(evidence, registered)
+        self.assertEqual(evidence["stage"], "after_normal_reattach_deadline")
+
+        excessive_a = snapshot(source_a_request_delta=2)
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: excessive_a, 1,
+            sleep=lambda _delay: self.fail("extra A request must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, excessive_a)
+
+        wrong_identity = snapshot(previous_client_is_distinct=False)
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: wrong_identity, 1,
+            sleep=lambda _delay: self.fail("wrong client identity must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, wrong_identity)
+
+        now[0] = 0.0
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: pending, 0.2, monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, pending)
+
+        wrong_source = snapshot(source_metadata_matches_expected=False)
+        now[0] = 0.0
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: wrong_source, 0.2, monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, wrong_source)
+
+        early_exit = snapshot(task_alive=False)
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: early_exit, 1,
+            sleep=lambda _delay: self.fail("early task exit must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, early_exit)
+
+        task_failure = snapshot(task_has_no_unexpected_failure=False)
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: task_failure, 1,
+            sleep=lambda _delay: self.fail("unexpected task failure must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, task_failure)
+
+    def test_both_borrow_gates_use_shared_readiness_proof(self):
+        source = Path(probe.__file__).read_text()
+        tree = ast.parse(source)
+        target = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "probe_actual_live_archive_isolation"
+        )
+        readiness_calls = [
+            node for node in ast.walk(target)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_wait_for_healthy_borrow_gate"
+        ]
+        self.assertEqual(len(readiness_calls), 2)
 
     def test_failure_return_ack_requires_exact_admitted_and_normal_deadline_window(self):
         token = SimpleNamespace(
