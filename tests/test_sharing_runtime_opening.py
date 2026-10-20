@@ -86,6 +86,104 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def _pending_return(self, *, episode_lease=LEASE):
+        borrowed = resolve_transition(
+            attach_state(), SharingAction.ATTACH_BORROW, succeeded=True, now=105.0,
+            current_state=attach_state(), current_observation=SharingObservation(
+                channel_uuid=CHANNEL, now=105.0,
+                configuration_generation="config-synthetic", control_generation=2,
+                recorder_fence=7, lease_is_current=True,
+                settings=SharingSettings(True, 5, 30, 60), target=target(),
+            ),
+        )
+        borrowed = replace(
+            borrowed, phase=type(borrowed.phase).WAIT_RETURN,
+            last_viewer_left_at=100.0,
+        )
+        saved_borrowed = self.intent_ledger.save(
+            borrowed, action=None, expected_revision=self.saved.revision,
+            updated_at=105.0,
+        )
+        opening = self.episode_ledger.begin_open(
+            self.saved.intent,
+            lease_digest=sha256(episode_lease.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-return-completion-synthetic",
+        )
+        self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        from catchuparr.adapters.sharing_borrow_route import sign_borrow_capability
+
+        capability = sign_borrow_capability(
+            secret=b"return-completion-synthetic-secret-000",
+            channel_uuid=CHANNEL, episode_id=opening.episode_id,
+            user_id="0", configuration_generation=opening.configuration_generation,
+            catalog_generation="catalog-synthetic", control_generation=2,
+            recorder_fence=opening.recorder_fence,
+            intent_epoch=opening.intent_epoch, connection_identity=IDENTITY,
+            episode_version=opening.version, expires_at=500.0, nonce="e" * 32,
+        )
+        prepared = PreparedBorrowOpening(
+            opening.episode_id, opening.version, opening.client_id, capability,
+        )
+        coordinator = object.__new__(RecorderBorrowCoordinator)
+        coordinator.channel_uuid = CHANNEL
+        coordinator.redis = object()
+        coordinator.intent_ledger = self.intent_ledger
+        coordinator.episode_ledger = self.episode_ledger
+        coordinator.state_record = saved_borrowed
+        coordinator.dedicated_source_available = True
+        coordinator.configuration_generation = "config-synthetic"
+        coordinator.control_generation = 2
+        coordinator.recorder_fence = 7
+        coordinator.lease_value = LEASE
+        coordinator.catalog_generation = "catalog-synthetic"
+        coordinator.active = {"connection_sharing": {CHANNEL: {
+            "enabled": True, "live_stability_seconds": 5,
+            "last_viewer_return_seconds": 30, "min_switch_interval_seconds": 60,
+        }}}
+        with patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True), patch(
+            "catchuparr.configuration._sharing_catalog_generation",
+            return_value="catalog-synthetic",
+        ), patch.object(coordinator, "_recovery_is_current", return_value=True):
+            self.assertTrue(coordinator.record_return_after_cleanup(prepared, now=200.0))
+        pending = self.intent_ledger.read(CHANNEL)
+        coordinator.state_record = pending
+        return coordinator, prepared, pending, coordinator._read_return_receipt()
+
+    @staticmethod
+    def _return_attempt():
+        return SimpleNamespace(
+            channel_uuid=CHANNEL, config_generation="config-synthetic",
+            control_generation=2, sharing_catalog_generation="catalog-synthetic",
+            stream_id="stream-synthetic", account_id="account-synthetic",
+            sharing_authority_revision=7,
+        )
+
+    def _return_guards(self, coordinator, *, cleanup=True, lease=True, operation=True):
+        from contextlib import ExitStack
+
+        from catchuparr import sharing_runtime
+
+        stack = ExitStack()
+        stack.enter_context(patch.object(
+            sharing_runtime, "borrow_return_cleanup_acknowledged", return_value=cleanup,
+        ))
+        stack.enter_context(patch("catchuparr.configuration._sharing_catalog_generation",
+                                  return_value="catalog-synthetic"))
+        stack.enter_context(patch("catchuparr.recorder_proxy.candidate_is_current",
+                                  return_value=True))
+        stack.enter_context(patch("catchuparr.recorder_proxy.sharing_operation_is_current",
+                                  return_value=operation))
+        stack.enter_context(patch("catchuparr.recorder_proxy.current_sharing_authority_context",
+                                  return_value={"authority_revision": 7,
+                                                "catalog_generation": "catalog-synthetic"}))
+        stack.enter_context(patch.object(coordinator, "_recovery_is_current",
+                                         return_value=lease))
+        return stack
+
     def test_failed_opening_ack_is_exact_and_later_cleanup_is_ignored(self):
         from scripts.aio_recorder_media import _ack_failed_opening_cleanup
 
@@ -444,6 +542,156 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertEqual(SharingAction.RETURN_TO_ALLOWED, pending.intent.action)
         self.assertEqual(165.0, pending.intent.not_before)
 
+    def test_same_lease_return_media_ack_recovers_and_allows_one_later_attach(self):
+        coordinator, _opening, pending, receipt = self._pending_return()
+        self.assertIsNotNone(receipt)
+        self.assertEqual(7, receipt.recorder_fence)
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        with self._return_guards(coordinator):
+            self.assertTrue(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+            committed = self.intent_ledger.read(CHANNEL)
+            self.assertEqual(270.0, committed.state.last_switch_at)
+            committed_revision = committed.revision
+            # A lost ACK retry is idempotent and does not advance SQL revision.
+            self.assertTrue(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+            self.assertEqual(committed_revision, self.intent_ledger.read(CHANNEL).revision)
+
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        coordinator.state_record = self.intent_ledger.read(CHANNEL)
+        coordinator.assigned_sources = ()
+        native_observation = SimpleNamespace(target=target())
+        from catchuparr import sharing_runtime
+
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=native_observation),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=336.0),
+            patch.object(sharing_runtime, "prepare_borrow_opening",
+                         return_value=(True, object())) as prepare,
+        ):
+            # First post-ACK observation seeds the live stability clock.
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=native_observation),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=342.0),
+            patch("catchuparr.sharing_runtime._django_secret",
+                  return_value=b"return-completion-synthetic-secret"),
+            patch.object(sharing_runtime, "prepare_borrow_opening",
+                         return_value=(True, object())) as prepare,
+        ):
+            attach = coordinator.poll(active=coordinator.active, control_generation=2)
+            self.assertIsNotNone(attach)
+            self.assertEqual(SharingAction.ATTACH_BORROW,
+                             self.intent_ledger.read(CHANNEL).intent.action)
+            # A second supervisor observation cannot issue the consumed claim again.
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+            prepare.assert_called_once()
+
+    def test_return_commit_lost_response_is_idempotent(self):
+        coordinator, _opening, pending, receipt = self._pending_return()
+        self.assertIsNotNone(receipt)
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        original_save = self.intent_ledger.save
+
+        def commit_then_lose_response(*args, **kwargs):
+            original_save(*args, **kwargs)
+            raise OSError("synthetic lost completion response")
+
+        with self._return_guards(coordinator), patch.object(
+            self.intent_ledger, "save", side_effect=commit_then_lose_response,
+        ):
+            self.assertTrue(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+        committed = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(270.0, committed.state.last_switch_at)
+        self.assertEqual(pending.revision + 1, committed.revision)
+
+    def test_return_completion_retries_after_transient_sql_failure(self):
+        coordinator, _opening, pending, receipt = self._pending_return()
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        with self._return_guards(coordinator), patch.object(
+            self.intent_ledger, "save", side_effect=OSError("synthetic pre-commit failure"),
+        ):
+            self.assertFalse(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+            self.assertTrue(coordinator.return_ack_retryable(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+        with self._return_guards(coordinator):
+            self.assertTrue(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+        self.assertEqual(270.0, self.intent_ledger.read(CHANNEL).state.last_switch_at)
+
+    def test_same_lease_receipt_and_media_ack_fail_closed_on_stale_proof(self):
+        coordinator, opening, pending, receipt = self._pending_return()
+        self.assertIsNotNone(receipt)
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        with self._return_guards(coordinator, cleanup=False):
+            self.assertFalse(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+        with self._return_guards(coordinator):
+            self.assertFalse(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=164.0,
+            ))
+            self.assertFalse(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt,
+                {"id": "other-stream", "account_id": attempt.account_id}, media_at=270.0,
+            ))
+        with self._return_guards(coordinator, lease=False):
+            self.assertFalse(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+        attempt_from_other_channel = SimpleNamespace(
+            **{**vars(attempt), "channel_uuid": CHANNEL + "-other"},
+        )
+        with self._return_guards(coordinator):
+            self.assertFalse(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt_from_other_channel,
+                candidate, media_at=270.0,
+            ))
+        original_config = coordinator.configuration_generation
+        coordinator.configuration_generation = "different-config-synthetic"
+        with self._return_guards(coordinator):
+            self.assertFalse(coordinator.acknowledge_return_media(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+        coordinator.configuration_generation = original_config
+        self.assertEqual(pending.intent, self.intent_ledger.read(CHANNEL).intent)
+
         # Simulate worker restart after native cleanup but before useful
         # dedicated media: recovery rebinds the return intent, never the borrow.
         recovered = self.intent_ledger.recover(
@@ -559,6 +807,31 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertEqual(SharingAction.ATTACH_BORROW, admitted.action)
         self.assertEqual(331.0, admitted.not_before)
 
+    def test_same_lease_receipt_rejects_episode_from_another_lease(self):
+        coordinator, _opening, _pending, receipt = self._pending_return(
+            episode_lease=LEASE + "-different",
+        )
+        self.assertIsNone(receipt)
+        self.assertIsNone(coordinator._read_return_receipt())
+
+    def test_return_ack_denies_when_exact_private_client_is_still_registered(self):
+        from catchuparr.sharing_runtime import borrow_return_cleanup_acknowledged
+
+        _coordinator, _opening, _pending, receipt = self._pending_return()
+        redis = object()
+        with patch(
+            "catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+            return_value=SimpleNamespace(state="known_revoked"),
+        ), patch(
+            "catchuparr.adapters.sharing_native.native_registration_is_absent",
+            return_value=False,
+        ) as registration_present:
+            self.assertFalse(borrow_return_cleanup_acknowledged(
+                redis, self.episode_ledger, receipt,
+            ))
+        registration_present.assert_called_once_with(
+            redis, channel_uuid=CHANNEL, client_id=receipt.client_id,
+        )
 
     def test_failure_cleanup_bypasses_return_and_switch_cooldowns(self):
         channel = CHANNEL + "-failure"

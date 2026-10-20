@@ -52,6 +52,49 @@ def _remember_recorder_diagnostic(attempt_state, kind, binding, phase, started_a
     }
 
 
+def _complete_return_media(
+    attempt_state_lock, attempt_state, sharing_coordinator, stop_event,
+    attempt, prepared, token, candidate, media_at,
+):
+    """Complete a media-confirmed RETURN without accepting a stale attempt."""
+    if (sharing_coordinator is None or prepared is None or token is None
+            or attempt is None):
+        return True
+    with attempt_state_lock:
+        if attempt_state.get("attempt") is not attempt:
+            return False
+        captured_state_was_cleared = (
+            attempt_state.get("return_prepared") is None
+            and attempt_state.get("return_token") is None
+        )
+        if (not captured_state_was_cleared
+                and (attempt_state.get("return_prepared") is not prepared
+                     or attempt_state.get("return_token") != token)):
+            return False
+        first_media_at = attempt_state.get("return_media_at")
+        if first_media_at is None:
+            first_media_at = float(media_at)
+            if not captured_state_was_cleared:
+                attempt_state["return_media_at"] = first_media_at
+    acknowledged = sharing_coordinator.acknowledge_return_media(
+        prepared, token, attempt, candidate, media_at=first_media_at,
+    )
+    if acknowledged:
+        with attempt_state_lock:
+            if (attempt_state.get("attempt") is attempt
+                    and attempt_state.get("return_prepared") is prepared
+                    and attempt_state.get("return_token") == token):
+                attempt_state["return_prepared"] = None
+                attempt_state["return_token"] = None
+                attempt_state["return_media_at"] = None
+        return True
+    if not sharing_coordinator.return_ack_retryable(
+        prepared, token, attempt, candidate, media_at=first_media_at,
+    ):
+        stop_event.set()
+    return False
+
+
 def _issue_recorder_capability(redis, channel_uuid: str, fence: int, owner: str):
     token = secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
@@ -270,7 +313,8 @@ def record_channel(
     attempt_state_lock = threading.RLock()
     attempt_state = {
         "attempt": None, "candidate": None, "switch": None, "borrow": None,
-        "active_borrow": None, "return_prepared": None, "diagnostic": None,
+        "active_borrow": None, "return_prepared": None, "return_token": None,
+        "return_media_at": None, "diagnostic": None,
     }
 
     def publish_dedicated_diagnostic(
@@ -422,6 +466,12 @@ def record_channel(
             if candidates is None:
                 candidates = []
 
+        def complete_return_media(attempt, prepared, token, candidate, media_at):
+            return _complete_return_media(
+                attempt_state_lock, attempt_state, sharing_coordinator, stop_event,
+                attempt, prepared, token, candidate, media_at,
+            )
+
         def supervise():
             while not stop_event.wait(10):
                 try:
@@ -433,6 +483,19 @@ def record_channel(
                     ):
                         stop_event.set()
                         return
+                    # Finish a media-confirmed RETURN before observing new
+                    # viewers. Otherwise poll() sees the pending RETURN and
+                    # suppresses the ATTACH that this ACK has just enabled.
+                    with attempt_state_lock:
+                        pending_return = (
+                            attempt_state.get("attempt"),
+                            attempt_state.get("return_prepared"),
+                            attempt_state.get("return_token"),
+                            attempt_state.get("candidate"),
+                            attempt_state.get("return_media_at"),
+                        )
+                    if pending_return[4] is not None:
+                        complete_return_media(*pending_return[:4], pending_return[4])
                     _refresh_current_recorder_diagnostic(
                         attempt_state_lock, attempt_state,
                         publish_dedicated_diagnostic, publish_borrow_diagnostic,
@@ -735,7 +798,9 @@ def record_channel(
                         attempt_state["attempt"] = attempt
                         attempt_state["candidate"] = candidate
                         attempt_state["switch"] = attempt_switch
+                        attempt_state["return_prepared"] = return_prepared
                         attempt_state["return_token"] = return_token
+                        attempt_state["return_media_at"] = None
                     dedicated_started_at = time.time()
                     publish_dedicated_diagnostic(
                         attempt, "starting", started_at=dedicated_started_at,
@@ -770,24 +835,9 @@ def record_channel(
                                 if (return_token is None or return_prepared is None
                                         or sharing_coordinator is None):
                                     return True
-                                acknowledged = sharing_coordinator.acknowledge_return_media(
-                                    return_prepared, return_token, attempt, candidate,
-                                    media_at=media_at,
+                                return complete_return_media(
+                                    attempt, return_prepared, return_token, candidate, media_at,
                                 )
-                                if acknowledged:
-                                    with attempt_state_lock:
-                                        if attempt_state.get("return_prepared") is return_prepared:
-                                            attempt_state["return_prepared"] = None
-                                elif not sharing_coordinator.return_ack_retryable(
-                                    return_prepared, return_token, attempt, candidate,
-                                ):
-                                    # A failed fresh completion proof means the
-                                    # old attempt is no longer authorized. Stop
-                                    # instead of keeping media flowing under an
-                                    # uncommitted RETURN intent. A transient SQL
-                                    # commit failure is retried on later media.
-                                    stop_event.set()
-                                return acknowledged
 
                             first_media_callback = acknowledge_return_media
                             try:
@@ -835,6 +885,7 @@ def record_channel(
                                 attempt_state["candidate"] = None
                                 attempt_state["switch"] = None
                                 attempt_state["return_token"] = None
+                                attempt_state["return_media_at"] = None
                             current_diagnostic = attempt_state.get("diagnostic")
                             if (isinstance(current_diagnostic, dict)
                                     and current_diagnostic.get("kind") == "dedicated"

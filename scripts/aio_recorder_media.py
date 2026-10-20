@@ -6535,6 +6535,74 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         source_server.set_mode("source-b.ts", "continuous")
         restart_b_media_baseline = {segment.id for segment in store.segments(worker_id)}
         restart_request_baseline = len(source_server.request_times("source-b.ts"))
+
+        # Keep an ordinary A viewer present while the allowed B attempt gets
+        # its first media. The return ACK must be recovered by the supervisor,
+        # then that same pass must observe this viewer before its next wait.
+        second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
+        live_response = _open_after_readiness(
+            lambda: wait_for_native_a_teardown(second_borrow_client_id),
+            lambda: client.get(
+                f"/proxy/ts/stream/{channel.uuid}",
+                HTTP_HOST="localhost",
+                HTTP_USER_AGENT="Synthetic post-return ordinary viewer",
+            ),
+        )
+        _require(live_response.status_code == 200,
+                 "Post-return ordinary A viewer could not open")
+        live_session, post_restart_native_buffer = _create_native_live_reader_session(
+            live_response, native_server, worker_id,
+        )
+        live_reader = live_session.reader
+        post_restart_ordinary_identity = _wait_for_native_client_count(
+            redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
+            return_identity=True,
+        )
+        _wait_for_native_active(
+            redis_client, native_server, worker_id, redis_keys=RedisKeys,
+            metadata_field=ChannelMetadataField,
+            channel_state=ChannelState, timeout=45,
+            expected_ordinary_identity=post_restart_ordinary_identity,
+        )
+
+        from unittest.mock import patch
+
+        from catchuparr.sharing_runtime import RecorderBorrowCoordinator
+
+        return_ack_events = []
+        real_acknowledge_return_media = RecorderBorrowCoordinator.acknowledge_return_media
+        real_coordinator_poll = RecorderBorrowCoordinator.poll
+
+        def fail_first_return_ack(self, prepared, token, attempt, candidate, *, media_at):
+            if not return_ack_events:
+                return_ack_events.append("media_callback_lost_ack")
+                return False
+            if threading.current_thread().name != f"catchuparr-{worker_id}":
+                # FFmpeg retries its callback on later segments. Keep those
+                # attempts pending so only the periodic supervisor can recover
+                # this synthetic lost ACK.
+                return False
+            result = real_acknowledge_return_media(
+                self, prepared, token, attempt, candidate, media_at=media_at,
+            )
+            if result and "supervisor_ack" not in return_ack_events:
+                return_ack_events.append("supervisor_ack")
+            return result
+
+        def observe_after_return_ack(self, **kwargs):
+            if "supervisor_ack" in return_ack_events:
+                return_ack_events.append("poll_after_supervisor_ack")
+            return real_coordinator_poll(self, **kwargs)
+
+        return_ack_patch = patch.object(
+            RecorderBorrowCoordinator, "acknowledge_return_media",
+            fail_first_return_ack,
+        )
+        return_poll_patch = patch.object(
+            RecorderBorrowCoordinator, "poll", observe_after_return_ack,
+        )
+        return_ack_patch.start()
+        return_poll_patch.start()
         run_restart = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
         )
@@ -6567,47 +6635,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and restart_committed.state.last_switch_at >= pending_return.not_before,
             "The restarted task did not commit the RETURN on its first useful B media",
         )
-        # The replacement task now borrows a fresh ordinary A viewer. Keep it
-        # alive through Pause to prove cleanup leaves the native viewer intact.
-        second_cycle_a_baseline = source_server.snapshot()[0]["source-a.ts"]
-        live_response = _open_after_readiness(
-            lambda: wait_for_native_a_teardown(second_borrow_client_id),
-            lambda: client.get(
-                f"/proxy/ts/stream/{channel.uuid}",
-                HTTP_HOST="localhost",
-                HTTP_USER_AGENT="Synthetic post-restart ordinary viewer",
-            ),
+        _require(
+            return_ack_events[:3] == [
+                "media_callback_lost_ack", "supervisor_ack",
+                "poll_after_supervisor_ack",
+            ],
+            "The supervisor did not retry the lost media ACK before its next viewer poll",
         )
-        _require(live_response.status_code == 200,
-                 "Post-restart ordinary A viewer could not open")
-        live_session, post_restart_native_buffer = _create_native_live_reader_session(
-            live_response, native_server, worker_id,
-        )
-        live_reader = live_session.reader
-        post_restart_ordinary_identity = _wait_for_native_client_count(
-            redis_client, native_server, RedisKeys, worker_id, 1, timeout=20,
-            return_identity=True,
-            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
-                run_restart,
-                worker_id=worker_id,
-                channel_uuid=str(channel.uuid),
-                decode_capability=decode_borrow_capability,
-                is_server_verified=catchuparr_stats._is_recorder_client,
-            ),
-        )
-        _wait_for_native_active(
-            redis_client, native_server, worker_id, redis_keys=RedisKeys,
-            metadata_field=ChannelMetadataField,
-            channel_state=ChannelState, timeout=45,
-            expected_ordinary_identity=post_restart_ordinary_identity,
-            verified_borrow_client_ids=lambda: _verified_task_borrow_client_ids(
-                run_restart,
-                worker_id=worker_id,
-                channel_uuid=str(channel.uuid),
-                decode_capability=decode_borrow_capability,
-                is_server_verified=catchuparr_stats._is_recorder_client,
-            ),
-        )
+        return_poll_patch.stop()
+        return_ack_patch.stop()
         post_restart_first_media, _post_restart_media_index = _read_after_current_buffer_head(
             live_session, post_restart_native_buffer,
             minimum_bytes=188 * 100, timeout=20,

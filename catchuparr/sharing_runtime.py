@@ -64,6 +64,7 @@ class PreparedBorrowReturn:
     control_generation: int
     recorder_fence: int
     connection_identity: tuple[str, ...]
+    lease_digest: str
 
 
 class RecorderBorrowCoordinator:
@@ -131,15 +132,31 @@ class RecorderBorrowCoordinator:
             current = self.intent_ledger.read(self.channel_uuid)
             token = current.intent if current is not None else None
             if (token is None or token.action is not SharingAction.RETURN_TO_ALLOWED
-                    or current.state.phase.value != "wait_return"):
+                    or current.state.phase.value != "wait_return"
+                    or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED
+                    or current.state.intent_epoch != token.intent_epoch
+                    or current.state.configuration_generation != self.configuration_generation
+                    or current.state.control_generation != self.control_generation
+                    or current.state.recorder_fence != self.recorder_fence
+                    or token.configuration_generation != self.configuration_generation
+                    or token.control_generation != self.control_generation
+                    or token.recorder_fence != self.recorder_fence):
                 return None
             episode = self.episode_ledger.read(self.channel_uuid)
             if (episode.phase != "closed" or not episode.client_id
                     or episode.configuration_generation != self.configuration_generation
                     or episode.control_generation != self.control_generation
-                    or episode.recorder_fence >= self.recorder_fence
+                    or episode.recorder_fence > self.recorder_fence
                     or episode.intent_epoch >= token.intent_epoch
                     or episode.identity is None):
+                return None
+            # Equal-fence recovery is allowed only when the closed episode was
+            # opened under this exact live lease. Older fences remain historical
+            # cleanup evidence; a future fence is always stale.
+            if (episode.recorder_fence == self.recorder_fence
+                    and episode.lease_digest != hashlib.sha256(
+                        str(self.lease_value).encode("utf-8"),
+                    ).hexdigest()):
                 return None
             return PreparedBorrowReturn(
                 channel_uuid=self.channel_uuid,
@@ -150,8 +167,12 @@ class RecorderBorrowCoordinator:
                 control_generation=episode.control_generation,
                 recorder_fence=episode.recorder_fence,
                 connection_identity=episode.identity,
+                lease_digest=episode.lease_digest,
             )
-        except Exception:
+        except Exception as exc:
+            from .logging_utils import error
+
+            error("sharing_return_recovery_pending", exc, callsite="return_recovery")
             return None
 
     def recovered_return_receipt(self) -> PreparedBorrowReturn | None:
@@ -370,6 +391,93 @@ class RecorderBorrowCoordinator:
         except Exception:
             return False
 
+    @staticmethod
+    def _return_transition_is_committed(current, token, media_at: float) -> bool:
+        """Recognize only the single CAS result for this exact first-media ACK."""
+        if current is None or current.intent is not None:
+            return False
+        state = current.state
+        return bool(
+            current.revision == token.revision + 1
+            and state.channel_uuid == token.channel_uuid
+            and state.configuration_generation == token.configuration_generation
+            and state.control_generation == token.control_generation
+            and state.recorder_fence == token.recorder_fence
+            and state.intent_epoch == token.intent_epoch
+            and state.phase.value == "dedicated"
+            and state.pending_action is None
+            and state.last_switch_at == float(media_at)
+            and state.last_viewer_left_at is None
+        )
+
+    def _return_media_binding_failure(
+        self, prepared, token, attempt, candidate, media_at: float,
+    ) -> str | None:
+        """Return a fixed diagnostic category when current proof is absent."""
+        from .configuration import _sharing_catalog_generation
+        from .recorder_proxy import (
+            candidate_is_current,
+            current_sharing_authority_context,
+            sharing_operation_is_current,
+        )
+
+        cleanup_ok = (
+            borrow_cleanup_acknowledged(self.redis, self.episode_ledger, prepared)
+            if isinstance(prepared, PreparedBorrowOpening)
+            else borrow_return_cleanup_acknowledged(
+                self.redis, self.episode_ledger, prepared,
+            )
+        )
+        if not cleanup_ok:
+            return "sharing_return_cleanup_pending"
+        if (token.channel_uuid != self.channel_uuid
+                or token.configuration_generation != self.configuration_generation
+                or token.control_generation != self.control_generation
+                or token.recorder_fence != self.recorder_fence
+                or token.action is not SharingAction.RETURN_TO_ALLOWED
+                or float(media_at) < token.not_before
+                or (isinstance(prepared, PreparedBorrowOpening)
+                    and (token.intent_epoch <= prepared.capability.intent_epoch
+                         or token.recorder_fence != prepared.capability.recorder_fence))
+                or (isinstance(prepared, PreparedBorrowReturn)
+                    and (token.intent_epoch <= prepared.intent_epoch
+                         or prepared.configuration_generation != self.configuration_generation
+                         or prepared.control_generation != self.control_generation
+                         or prepared.recorder_fence > self.recorder_fence))):
+            return "sharing_return_binding_stale"
+        if (getattr(attempt, "channel_uuid", None) != self.channel_uuid
+                or getattr(attempt, "config_generation", None) != self.configuration_generation
+                or getattr(attempt, "control_generation", None) != self.control_generation
+                or getattr(attempt, "sharing_catalog_generation", None) != self.catalog_generation
+                or str(candidate.get("id") or candidate.get("stream_id") or "")
+                != getattr(attempt, "stream_id", None)
+                or str(candidate.get("account_id") or "") != getattr(attempt, "account_id", None)):
+            return "sharing_return_binding_stale"
+        try:
+            if (not self._recovery_is_current(
+                    self.channel_uuid, None, self.configuration_generation,
+                    self.control_generation, self.recorder_fence,
+                )
+                    or _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation
+                    or not candidate_is_current(
+                        self.channel_uuid, attempt.stream_id, attempt.account_id, self.active,
+                    )
+                    or not sharing_operation_is_current(self.redis, attempt)):
+                return "sharing_return_binding_stale"
+            authority = current_sharing_authority_context(
+                self.redis, self.channel_uuid,
+                config_generation=self.configuration_generation,
+                control_generation=self.control_generation,
+            )
+            if (authority is None
+                    or authority.get("authority_revision")
+                    != getattr(attempt, "sharing_authority_revision", None)
+                    or authority.get("catalog_generation") != self.catalog_generation):
+                return "sharing_return_binding_stale"
+        except Exception:
+            return "sharing_return_binding_stale"
+        return None
+
     def acknowledge_return_media(
         self, prepared: PreparedBorrowOpening | PreparedBorrowReturn, token: SharingIntentToken,
         attempt: Any, candidate: dict[str, Any], *, media_at: float,
@@ -380,74 +488,38 @@ class RecorderBorrowCoordinator:
                 or token.action is not SharingAction.RETURN_TO_ALLOWED
                 or not isinstance(candidate, dict)
                 or isinstance(media_at, bool) or not isinstance(media_at, (int, float))
-                or not math.isfinite(float(media_at))
-                or float(media_at) < token.not_before):
+                or not math.isfinite(float(media_at))):
             return False
-        from .configuration import _sharing_catalog_generation
-        from .recorder_proxy import (
-            candidate_is_current,
-            current_sharing_authority_context,
-            sharing_operation_is_current,
-        )
         from .sharing_planner import resolve_transition
 
         try:
-            if isinstance(prepared, PreparedBorrowOpening):
-                origin_epoch = prepared.capability.intent_epoch
-                origin_configuration = prepared.capability.configuration_generation
-                origin_control = prepared.capability.control_generation
-                origin_fence = prepared.capability.recorder_fence
-                cleanup_ok = borrow_cleanup_acknowledged(
-                    self.redis, self.episode_ledger, prepared,
-                )
-            else:
-                origin_epoch = prepared.intent_epoch
-                origin_configuration = prepared.configuration_generation
-                origin_control = prepared.control_generation
-                origin_fence = prepared.recorder_fence
-                cleanup_ok = borrow_return_cleanup_acknowledged(
-                    self.redis, self.episode_ledger, prepared,
-                )
             current = self.intent_ledger.read(self.channel_uuid)
-            if current is None or current.intent != token:
+            if current is None:
+                from .logging_utils import error
+
+                error("sharing_return_binding_stale", callsite="return_completion")
                 return False
-            if (token.channel_uuid != self.channel_uuid
-                    or token.intent_epoch <= origin_epoch
-                    or token.configuration_generation != origin_configuration
-                    or token.control_generation != origin_control
-                    or (isinstance(prepared, PreparedBorrowOpening)
-                        and token.recorder_fence != origin_fence)
-                    or current.state.phase.value != "wait_return"
-                    or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED):
-                return False
-            if not cleanup_ok:
-                return False
-            if (getattr(attempt, "channel_uuid", None) != self.channel_uuid
-                    or getattr(attempt, "config_generation", None) != self.configuration_generation
-                    or getattr(attempt, "control_generation", None) != self.control_generation
-                    or getattr(attempt, "sharing_catalog_generation", None) != self.catalog_generation
-                    or str(candidate.get("id") or candidate.get("stream_id") or "")
-                    != getattr(attempt, "stream_id", None)
-                    or str(candidate.get("account_id") or "") != getattr(attempt, "account_id", None)):
-                return False
-            if (not self._recovery_is_current(
-                    self.channel_uuid, current.revision, self.configuration_generation,
-                    self.control_generation, self.recorder_fence,
-                )
-                    or _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation
-                    or not candidate_is_current(
-                        self.channel_uuid, attempt.stream_id, attempt.account_id, self.active,
-                    )
-                    or not sharing_operation_is_current(self.redis, attempt)):
-                return False
-            authority = current_sharing_authority_context(
-                self.redis, self.channel_uuid,
-                config_generation=self.configuration_generation,
-                control_generation=self.control_generation,
+            failure = self._return_media_binding_failure(
+                prepared, token, attempt, candidate, float(media_at),
             )
-            if (authority is None
-                    or authority.get("authority_revision") != getattr(attempt, "sharing_authority_revision", None)
-                    or authority.get("catalog_generation") != self.catalog_generation):
+            if failure is not None:
+                from .logging_utils import error
+
+                error(failure, callsite="return_completion")
+                return False
+            if self._return_transition_is_committed(current, token, float(media_at)):
+                self.state_record = current
+                return True
+            if (current.intent != token
+                    or current.state.phase.value != "wait_return"
+                    or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED
+                    or current.state.intent_epoch != token.intent_epoch
+                    or current.state.configuration_generation != self.configuration_generation
+                    or current.state.control_generation != self.control_generation
+                    or current.state.recorder_fence != self.recorder_fence):
+                from .logging_utils import error
+
+                error("sharing_return_binding_stale", callsite="return_completion")
                 return False
             settings_value = self.active.get("connection_sharing", {}).get(self.channel_uuid, {})
             settings = SharingSettings(
@@ -470,76 +542,70 @@ class RecorderBorrowCoordinator:
             )
             if (resolved.pending_action is not None
                     or resolved.last_switch_at != float(media_at)):
+                from .logging_utils import error
+
+                error("sharing_return_media_unconfirmed", callsite="return_completion")
                 return False
             # Fresh ownership is checked immediately before the SQL revision CAS.
             if not self._recovery_is_current(
                 self.channel_uuid, current.revision, self.configuration_generation,
                 self.control_generation, self.recorder_fence,
             ):
+                from .logging_utils import error
+
+                error("sharing_return_binding_stale", callsite="return_completion")
                 return False
-            self.state_record = self.intent_ledger.save(
-                resolved, action=None, expected_revision=token.revision,
-                updated_at=time.time(),
-            )
+            try:
+                saved = self.intent_ledger.save(
+                    resolved, action=None, expected_revision=token.revision,
+                    updated_at=time.time(),
+                )
+            except Exception:
+                # A caller may lose the result after SQLite committed. Only the
+                # exact one-step state transition is an idempotent success.
+                latest = self.intent_ledger.read(self.channel_uuid)
+                if (latest is not None
+                        and self._return_transition_is_committed(latest, token, float(media_at))
+                        and self._return_media_binding_failure(
+                            prepared, token, attempt, candidate, float(media_at),
+                        ) is None):
+                    self.state_record = latest
+                    return True
+                from .logging_utils import error
+
+                error("sharing_return_media_unconfirmed", callsite="return_completion")
+                return False
+            self.state_record = saved
             return True
-        except Exception:
+        except Exception as exc:
+            from .logging_utils import error
+
+            error("sharing_return_media_unconfirmed", exc, callsite="return_completion")
             return False
 
     def return_ack_retryable(
         self, prepared: PreparedBorrowOpening | PreparedBorrowReturn, token: SharingIntentToken,
-        attempt: Any, candidate: dict[str, Any],
+        attempt: Any, candidate: dict[str, Any], *, media_at: float,
     ) -> bool:
         """Retry a transient commit failure only while the same source is current."""
-        from .configuration import _sharing_catalog_generation
-        from .recorder_proxy import (
-            candidate_is_current,
-            current_sharing_authority_context,
-            sharing_operation_is_current,
-        )
-
         try:
-            origin_epoch = (
-                prepared.capability.intent_epoch
-                if isinstance(prepared, PreparedBorrowOpening)
-                else prepared.intent_epoch
-            )
-            cleanup_ok = (
-                borrow_cleanup_acknowledged(self.redis, self.episode_ledger, prepared)
-                if isinstance(prepared, PreparedBorrowOpening)
-                else borrow_return_cleanup_acknowledged(self.redis, self.episode_ledger, prepared)
-            )
-            if not cleanup_ok:
-                return False
             current = self.intent_ledger.read(self.channel_uuid)
-            if (current is None or current.intent != token
-                    or token.action is not SharingAction.RETURN_TO_ALLOWED
-                    or token.intent_epoch <= origin_epoch
-                    or not self._recovery_is_current(
-                        self.channel_uuid, current.revision, self.configuration_generation,
-                        self.control_generation, self.recorder_fence,
-                    )
-                    or _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation
-                    or getattr(attempt, "channel_uuid", None) != self.channel_uuid
-                    or getattr(attempt, "config_generation", None) != self.configuration_generation
-                    or getattr(attempt, "control_generation", None) != self.control_generation
-                    or getattr(attempt, "sharing_catalog_generation", None) != self.catalog_generation
-                    or str(candidate.get("id") or candidate.get("stream_id") or "") != getattr(attempt, "stream_id", None)
-                    or str(candidate.get("account_id") or "") != getattr(attempt, "account_id", None)
-                    or not candidate_is_current(
-                        self.channel_uuid, attempt.stream_id, attempt.account_id, self.active,
-                    )
-                    or not sharing_operation_is_current(self.redis, attempt)):
+            if current is None:
                 return False
-            authority = current_sharing_authority_context(
-                self.redis, self.channel_uuid,
-                config_generation=self.configuration_generation,
-                control_generation=self.control_generation,
-            )
-            return bool(
-                authority is not None
-                and authority.get("authority_revision") == getattr(attempt, "sharing_authority_revision", None)
-                and authority.get("catalog_generation") == self.catalog_generation
-            )
+            if self._return_media_binding_failure(
+                prepared, token, attempt, candidate, float(media_at),
+            ) is not None:
+                return False
+            if self._return_transition_is_committed(current, token, float(media_at)):
+                self.state_record = current
+                return True
+            if (current.intent != token
+                    or current.state.phase.value != "wait_return"
+                    or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED
+                    or current.state.intent_epoch != token.intent_epoch):
+                return False
+            self.state_record = current
+            return True
         except Exception:
             return False
 
@@ -786,7 +852,8 @@ def borrow_return_cleanup_acknowledged(
                 or episode.intent_epoch != receipt.intent_epoch
                 or episode.configuration_generation != receipt.configuration_generation
                 or episode.control_generation != receipt.control_generation
-                or episode.recorder_fence != receipt.recorder_fence):
+                or episode.recorder_fence != receipt.recorder_fence
+                or episode.lease_digest != receipt.lease_digest):
             return False
         from .adapters.sharing_native import (
             native_registration_is_absent,
