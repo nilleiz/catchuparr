@@ -128,6 +128,51 @@ def resolve_transition(state, action, *, succeeded, now):
 
 
 class SharingPlannerTests(unittest.TestCase):
+    def test_admitted_return_deadline_is_finite_action_bound_and_preserves_normal_cooldown(self):
+        state = replace(
+            observe(None, observation(190, candidate=target())).state,
+            phase=SharingPhase.WAIT_RETURN,
+            candidate_identity=None,
+            candidate_connection_identity=None,
+            candidate_since=None,
+            borrowed_identity=None,
+            last_viewer_left_at=200.0,
+            last_switch_at=190.0,
+            pending_action=SharingAction.RETURN_TO_ALLOWED,
+        )
+        current_observation = observation(
+            201, candidate=None, fence=state.recorder_fence,
+            generation=state.configuration_generation,
+            control=state.control_generation,
+            settings=SharingSettings(True, 5, 30, 60),
+        )
+        normal = _resolve_transition(
+            state, SharingAction.RETURN_TO_ALLOWED, succeeded=True, now=201,
+            current_state=state, current_observation=current_observation,
+        )
+        self.assertIs(state, normal)
+
+        admitted = _resolve_transition(
+            state, SharingAction.RETURN_TO_ALLOWED, succeeded=True, now=201,
+            current_state=state, current_observation=current_observation,
+            admitted_return_deadline=200.0,
+        )
+        self.assertEqual(SharingPhase.DEDICATED, admitted.phase)
+        self.assertEqual(201.0, admitted.last_switch_at)
+
+        with self.assertRaises(ValueError):
+            _resolve_transition(
+                state, SharingAction.RETURN_TO_ALLOWED, succeeded=True, now=201,
+                current_state=state, current_observation=current_observation,
+                admitted_return_deadline=float("inf"),
+            )
+        with self.assertRaises(ValueError):
+            _resolve_transition(
+                state, SharingAction.PAUSE_NO_ALLOWED_SOURCE, succeeded=True, now=201,
+                current_state=state, current_observation=current_observation,
+                admitted_return_deadline=200.0,
+            )
+
     def test_initial_attach_uses_eligible_viewer_without_waiting_for_stability(self):
         initial = observation(100, candidate=target(allowed=False))
         decision = observe(None, initial)
