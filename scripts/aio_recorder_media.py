@@ -3267,6 +3267,51 @@ def _return_ack_matches_recovered_token(
         return False
 
 
+def _failure_return_ack_matches_admitted_window(
+    failure_return_token,
+    recovered_record,
+    ack_token,
+    media_at,
+    committed_record,
+    *,
+    channel_uuid: str,
+    configuration_generation: str,
+    control_generation: int,
+    return_seconds: float,
+    minimum_switch_seconds: float,
+) -> bool:
+    """Prove failure RETURN media committed inside its persisted admission window."""
+    try:
+        state = recovered_record.state
+        committed_state = committed_record.state
+        ordinary_deadline = max(
+            state.last_viewer_left_at + return_seconds,
+            state.last_switch_at + minimum_switch_seconds,
+        )
+        return bool(
+            failure_return_token.action.value == "return_to_allowed"
+            and recovered_record.intent == failure_return_token == ack_token
+            and recovered_record.revision == ack_token.revision
+            and ack_token.channel_uuid == channel_uuid
+            and ack_token.configuration_generation == configuration_generation
+            and ack_token.control_generation == control_generation
+            and ack_token.recorder_fence == state.recorder_fence
+            and ack_token.intent_epoch == state.intent_epoch
+            and ack_token.not_before < media_at < ordinary_deadline
+            and committed_record.revision == ack_token.revision + 1
+            and committed_record.intent is None
+            and committed_state.phase.value == "dedicated"
+            and committed_state.pending_action is None
+            and committed_state.last_switch_at == media_at
+            and committed_state.intent_epoch == ack_token.intent_epoch
+            and committed_state.configuration_generation == ack_token.configuration_generation
+            and committed_state.control_generation == ack_token.control_generation
+            and committed_state.recorder_fence == ack_token.recorder_fence
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _native_source_metadata(redis_client, metadata_key) -> dict[str, str]:
     raw = redis_client.hgetall(metadata_key)
     relevant = {}
@@ -6307,6 +6352,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Paused no-source recording opened a provider stream or kept a reservation",
             no_source_pause_diagnostic,
         )
+        # Keep the ordinary failure RETURN deadline open long enough for its
+        # bounded supervisor ACK while retaining the 60-second switch guard.
+        sharing_settings = dict(sharing_settings)
+        sharing_settings["last_viewer_return_seconds"] = 30
         resumed_plugin = PluginConfig.objects.get(key="catchuparr")
         resumed_plugin.settings = dict(sharing_settings)
         resumed_plugin.save(update_fields=("settings",))
@@ -6316,7 +6365,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         active_resume = load_active_configuration(active_path)
         assert_applied_global_sharing(
             active_resume, worker_id, enabled=True, live_stability_seconds=1,
-            last_viewer_return_seconds=2, min_switch_interval_seconds=60,
+            last_viewer_return_seconds=30, min_switch_interval_seconds=60,
         )
         run_no_source.join_after_supervisor(timeout=30, cooperative_sleep=gevent_sleep)
         share_b_request_baseline = len(source_server.request_times("source-b.ts"))
@@ -6699,7 +6748,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 committed = return_ledger.read(worker_id)
                 with return_ack_lock:
                     if "supervisor_ack" not in return_ack_events:
-                        return_ack_snapshots.append((token, recovered_return, committed))
+                        return_ack_snapshots.append((
+                            token, recovered_return, media_at, committed,
+                        ))
                         return_ack_events.append("supervisor_ack")
             return result
 
@@ -6727,6 +6778,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         run_restart = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
+            defer_borrow_failure_until_armed=True,
         )
         return_ack_patch_started = False
         return_poll_patch_started = False
@@ -6767,7 +6819,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 timeout=supervisor_ack_timeout,
                 cooperative_sleep=gevent_sleep,
             )
-            ack_token, recovered_return_record, restart_committed = restart_ack_evidence
+            ack_token, recovered_return_record, _return_media_at, restart_committed = (
+                restart_ack_evidence
+            )
             _require(
                 _return_ack_matches_recovered_token(
                     pending_return, recovered_return_record, ack_token,
@@ -6783,6 +6837,17 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 return_poll_patch.stop()
             if return_ack_patch_started:
                 return_ack_patch.stop()
+
+        # Re-arm the same lost-callback/supervisor observation for the actual
+        # failure RETURN created when the replacement borrow faults after the
+        # existing healthy-borrow checks and one more committed A segment.
+        with return_ack_lock:
+            return_ack_events.clear()
+            return_ack_snapshots.clear()
+        return_ack_patch.start()
+        return_ack_patch_started = True
+        return_poll_patch.start()
+        return_poll_patch_started = True
         post_restart_first_media, _post_restart_media_index = _read_after_current_buffer_head(
             live_session, post_restart_native_buffer,
             minimum_bytes=188 * 100, timeout=20,
@@ -6829,6 +6894,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and second_active_counts["source-b.ts"] == 0,
             "Post-restart borrow opened another provider source instead of reading A",
         )
+        # Let the existing native registration and provider-isolation checks
+        # observe the healthy borrow before causing its one-shot failure.
         second_borrowed_ids = {segment.id for segment in store.segments(worker_id)}
         second_borrowed_segments = _wait_for_indexed_tone(
             run_restart, store, worker_id, ffmpeg, ffprobe,
@@ -6837,6 +6904,215 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         _require(bool(second_borrowed_segments),
                  "Post-restart borrow did not archive fresh A media")
+
+        # Keep the current native borrow healthy through the existing media
+        # proof, then fail only its next committed segment.
+        run_restart.fail_borrow_after_next_media = True
+
+        def borrow_failure_callback_snapshot():
+            with run_restart._lock:
+                media_at = run_restart.borrow_failure_media_at
+                failures = list(run_restart.failures)
+            return {
+                "conditions": {
+                    "failure_callback_after_media": media_at is not None,
+                    "no_unexpected_task_failure": not failures,
+                },
+                "failure_callback_seen": media_at is not None,
+            }
+
+        failure_callback_ready, failure_callback_readiness = _wait_for_readiness_snapshot(
+            borrow_failure_callback_snapshot, run_restart.media_idle_timeout,
+            monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.05,
+        )
+        _require_with_failure_diagnostic(
+            failure_callback_ready,
+            "The native borrow did not reach its bounded injected failure after media",
+            lambda: failure_callback_readiness,
+            diagnostic_label="CATCHUPARR_BORROW_FAILURE_CALLBACK_DIAGNOSTIC",
+        )
+        failure_media_at = run_restart.borrow_failure_media_at
+        failure_return_holder = {}
+
+        def failure_return_snapshot():
+            record = return_ledger.read(worker_id)
+            intent = record.intent if record is not None else None
+            is_failure_return = (
+                intent is not None
+                and intent.action.value == "return_to_allowed"
+                and intent.intent_epoch > second_capability.intent_epoch
+                and intent.not_before >= failure_media_at
+                and record.state.last_viewer_left_at == intent.not_before
+            )
+            if is_failure_return:
+                failure_return_holder["record"] = record
+            return {
+                "conditions": {
+                    "borrow_failure_callback_seen": failure_media_at is not None,
+                    "failure_return_persisted": is_failure_return,
+                },
+                "failure_return_action": (
+                    intent.action.value if intent is not None else "none"
+                ),
+            }
+
+        failure_return_timeout = _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+            stopping_marker_ttl=90,
+        )
+        failure_return_ready, failure_return_readiness = _wait_for_readiness_snapshot(
+            failure_return_snapshot, failure_return_timeout,
+            monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
+        )
+        _require_with_failure_diagnostic(
+            failure_return_ready,
+            "Borrowed-recorder failure did not persist its immediate RETURN admission",
+            lambda: failure_return_readiness,
+            diagnostic_label="CATCHUPARR_FAILURE_RETURN_DIAGNOSTIC",
+        )
+        failure_return_record = failure_return_holder["record"]
+        # RETURN persistence follows borrowed-process reap and its final CSV
+        # flush, so this boundary excludes every trailing A segment.
+        failure_b_media_baseline = {
+            segment.id for segment in store.segments(worker_id)
+        }
+        failure_return_token = failure_return_record.intent
+        failure_return_state = failure_return_record.state
+        return_seconds = float(sharing_settings["last_viewer_return_seconds"])
+        minimum_switch_seconds = float(sharing_settings["min_switch_interval_seconds"])
+        ordinary_return_deadline = max(
+            failure_return_state.last_viewer_left_at + return_seconds,
+            failure_return_state.last_switch_at + minimum_switch_seconds,
+        )
+        _require(
+            failure_return_token.not_before < ordinary_return_deadline
+            and failure_return_token.not_before >= failure_media_at,
+            "Failure RETURN did not bypass only the persisted admission deadline",
+        )
+
+        failure_return_media = _wait_for_indexed_tone(
+            run_restart, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=880, existing_ids=failure_b_media_baseline,
+            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(failure_return_media),
+                 "Failure RETURN did not archive fresh dedicated B media")
+        failure_ack_timeout = 10.0 + 2.0
+        failure_ack_evidence = _wait_for_supervisor_return_ack(
+            run_restart,
+            read_return_ack_events,
+            read_return_ack_snapshots,
+            timeout=failure_ack_timeout,
+            cooperative_sleep=gevent_sleep,
+        )
+        return_poll_patch.stop()
+        return_poll_patch_started = False
+        return_ack_patch.stop()
+        return_ack_patch_started = False
+        failure_ack_token, recovered_failure_return, failure_ack_media_at, failure_committed = (
+            failure_ack_evidence
+        )
+        _require(
+            _failure_return_ack_matches_admitted_window(
+                failure_return_token, recovered_failure_return,
+                failure_ack_token, failure_ack_media_at, failure_committed,
+                channel_uuid=worker_id,
+                configuration_generation=run_restart.expected_generation,
+                control_generation=run_restart.expected_control_generation,
+                return_seconds=return_seconds,
+                minimum_switch_seconds=minimum_switch_seconds,
+            ),
+            "Failure RETURN did not commit its exact first-media timestamp before normal cooldown",
+        )
+
+        live_stability = float(sharing_settings["live_stability_seconds"])
+        minimum_switch = minimum_switch_seconds
+        ordinary_connected_at = float(post_restart_ordinary_identity["connected_at"])
+        normal_reattach_deadline = max(
+            failure_ack_media_at + minimum_switch,
+            ordinary_connected_at + live_stability,
+        )
+
+        def later_borrow_snapshot():
+            with run_restart._lock:
+                borrow_times = [
+                    observed_at
+                    for headers, observed_at in zip(
+                        run_restart.input_headers, run_restart.input_header_times,
+                    )
+                    if "X-Catchuparr-Borrow" in headers
+                ]
+                task_alive = (
+                    run_restart.thread is not None and run_restart.thread.is_alive()
+                )
+                failures = list(run_restart.failures)
+            return {
+                "conditions": {
+                    "reattached_after_normal_deadline": (
+                        len(borrow_times) >= 2
+                        and borrow_times[1] >= normal_reattach_deadline
+                    ),
+                    "task_alive": task_alive,
+                    "task_has_no_unexpected_failures": not failures,
+                },
+                "borrow_count": len(borrow_times),
+                "second_borrow_at_or_after_deadline": (
+                    len(borrow_times) >= 2
+                    and borrow_times[1] >= normal_reattach_deadline
+                ),
+            }
+
+        normal_reattach_timeout = (
+            max(0.0, normal_reattach_deadline - time.time())
+            + run_restart.startup_timeout + 12.0
+        )
+        normal_reattach_ready, normal_reattach_snapshot = _wait_for_readiness_snapshot(
+            later_borrow_snapshot, normal_reattach_timeout,
+            monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
+        )
+        _require_with_failure_diagnostic(
+            normal_reattach_ready
+            and normal_reattach_snapshot["second_borrow_at_or_after_deadline"],
+            "Recorder did not reattach after normal post-return cooldown and stability",
+            lambda: normal_reattach_snapshot,
+            diagnostic_label="CATCHUPARR_POST_RETURN_REATTACH_DIAGNOSTIC",
+        )
+        _require(
+            len(source_server.request_times("source-a.ts")) == second_cycle_a_baseline + 1,
+            "Post-failure reattach opened an extra native provider connection",
+        )
+        post_failure_borrow_headers = None
+        with run_restart._lock:
+            borrowed_header_pairs = [
+                (dict(headers), observed_at)
+                for headers, observed_at in zip(
+                    run_restart.input_headers, run_restart.input_header_times,
+                )
+                if "X-Catchuparr-Borrow" in headers
+            ]
+        _require(len(borrowed_header_pairs) >= 2,
+                 "Post-failure normal reattach omitted its native borrow capability")
+        post_failure_borrow_headers = borrowed_header_pairs[1][0]
+        post_restart_borrow_headers = post_failure_borrow_headers
+        second_capability = decode_borrow_capability(
+            post_restart_borrow_headers["X-Catchuparr-Borrow"],
+        )
+        second_borrow_client_id = f"catchuparr-client-{second_capability.nonce}"
+        second_native_manager = native_server.stream_managers.get(worker_id)
+        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
+        second_source_counts, second_active_counts = source_server.snapshot()
+        _require(
+            second_borrow_client_id != borrow_client_id
+            and catchuparr_stats._is_recorder_client(worker_id, second_borrow_client_id)
+            and second_native_manager is not None and second_native_manager.running
+            and second_native_owner is not None
+            and second_source_counts["source-a.ts"] == second_cycle_a_baseline + 1
+            and second_active_counts["source-a.ts"] == 1
+            and second_active_counts["source-b.ts"] == 0,
+            "Post-failure normal reattach opened a provider source instead of reading A",
+        )
         final_a_request_total = second_cycle_a_baseline + 1
         run_share = run_restart
         share_b_request_baseline = restart_request_baseline
@@ -6978,6 +7254,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         primary_exception = error
         raise
     finally:
+        if locals().get("return_poll_patch_started"):
+            try:
+                return_poll_patch.stop()
+            except Exception:
+                pass
+        if locals().get("return_ack_patch_started"):
+            try:
+                return_ack_patch.stop()
+            except Exception:
+                pass
         # On a startup failure, freeze the observed state before cleanup
         # changes Redis keys or native worker state. The successful path has
         # already captured and restored the hooks above.
