@@ -368,7 +368,24 @@ class RecorderMediaProbeTests(unittest.TestCase):
         tree = ast.parse(
             "def supervise(current_admission=current_admission):\n    stop_event.set()\n"
         )
-        ast.increment_lineno(tree, 432)
+        source = ast.parse((Path(__file__).parents[1] / "catchuparr/tasks.py").read_text())
+        record_channel = next(
+            node for node in source.body
+            if isinstance(node, ast.FunctionDef) and node.name == "record_channel"
+        )
+        supervise = next(
+            node for node in ast.walk(record_channel)
+            if isinstance(node, ast.FunctionDef) and node.name == "supervise"
+        )
+        first_stop = min(
+            node.lineno for node in ast.walk(supervise)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "stop_event"
+        )
+        ast.increment_lineno(tree, first_stop - 2)
         exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
         diagnostic = probe._recorder_task_early_exit_diagnostic(
