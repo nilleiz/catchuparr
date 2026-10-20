@@ -4,6 +4,22 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.6.4] - Prerelease candidate
+
+### Fixed
+
+- Complete a pending return to an allowed source after its first committed
+  archive media, including recovery when the acknowledgement was committed but
+  its response was lost. The supervisor completes that acknowledgement before
+  observing viewers again, allowing a fresh attach in the same pass.
+- Preserve idempotency when a media callback races with supervisor completion;
+  retries remain bound to the same recorder attempt, lease and applied source.
+
+### Notes
+
+- Requires Dispatcharr 0.32.0 or newer. Publication and native acceptance are
+  pending.
+
 ## [0.6.3] - In-place presentation refresh
 
 - Adds read-only Current recordings and Today's recording schedule plugin actions.
