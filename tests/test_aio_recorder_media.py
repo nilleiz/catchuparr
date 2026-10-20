@@ -78,6 +78,88 @@ class RecorderMediaProbeTests(unittest.TestCase):
             SimpleNamespace(revision=6, intent=None, state=committed_state), **kwargs,
         ))
 
+    def test_failure_cleanup_barrier_requires_exact_closed_episode_and_native_absence(self):
+        capability = SimpleNamespace(
+            episode_id="episode", channel_uuid="channel", episode_version=4,
+            configuration_generation="config", control_generation=3,
+            recorder_fence=8, intent_epoch=10,
+            connection_identity=("channel", "worker", "owner", "metadata", "stream", "account", "profile", "input"),
+        )
+        episode = SimpleNamespace(
+            episode_id="episode", channel_uuid="channel", phase="closed", version=6,
+            configuration_generation="config", control_generation=3,
+            recorder_fence=8, intent_epoch=10,
+            identity=capability.connection_identity, client_id="catchuparr-client-nonce",
+        )
+
+        def snapshot(*, episode=episode, projection_state="known_revoked",
+                     projection_episode_id="episode", projection_client_id="catchuparr-client-nonce",
+                     projection_version=6, native_absent=True, held=True, alive=True,
+                     no_failure=True):
+            conditions = probe._failure_cleanup_ack_conditions(
+                episode, capability,
+                expected_client_id="catchuparr-client-nonce",
+                projection_state=projection_state,
+                projection_episode_id=projection_episode_id,
+                projection_client_id=projection_client_id,
+                projection_version=projection_version,
+                projection_binding_matches=(projection_state == "known_revoked"),
+                native_registration_absent=native_absent,
+                task_result_held=held, task_alive=alive,
+                task_has_no_unexpected_failure=no_failure,
+            )
+            return {"conditions": conditions}
+
+        self.assertTrue(all(snapshot()["conditions"].values()))
+        self.assertTrue(all(snapshot(projection_state="absent")["conditions"].values()))
+        for invalid in (
+            snapshot(episode=SimpleNamespace(**(vars(episode) | {"phase": "active"}))),
+            snapshot(episode=SimpleNamespace(**(vars(episode) | {"episode_id": "other"}))),
+            snapshot(projection_episode_id="other"),
+            snapshot(projection_client_id="other-client"),
+            snapshot(projection_version=5),
+            snapshot(native_absent=False),
+            snapshot(held=False),
+        ):
+            self.assertFalse(all(invalid["conditions"].values()))
+
+    def test_failure_cleanup_wait_handles_pending_ack_timeout_and_early_exit(self):
+        pending = {"conditions": {"task_alive": True, "task_has_no_unexpected_failure": True,
+                                   "native_ack": False}}
+        acknowledged = {"conditions": {"task_alive": True, "task_has_no_unexpected_failure": True,
+                                        "native_ack": True}}
+        now = [0.0]
+        snapshots = [pending]
+
+        def release_ack(_delay):
+            snapshots[0] = acknowledged
+            now[0] += _delay
+
+        ready, evidence = probe._wait_for_failure_cleanup_ack(
+            lambda: snapshots[0], 1, monotonic=lambda: now[0],
+            sleep=release_ack,
+        )
+        self.assertTrue(ready)
+        self.assertIs(acknowledged, evidence)
+
+        now[0] = 0.0
+        ready, evidence = probe._wait_for_failure_cleanup_ack(
+            lambda: pending, 0.2, monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+        self.assertFalse(ready)
+        self.assertIs(pending, evidence)
+
+        exited = {"conditions": {"task_alive": False,
+                                  "task_has_no_unexpected_failure": True,
+                                  "native_ack": False}}
+        ready, evidence = probe._wait_for_failure_cleanup_ack(
+            lambda: exited, 1,
+            sleep=lambda _delay: self.fail("early task exit must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(exited, evidence)
+
     def test_supervisor_return_ack_wait_requires_order_completion_and_live_task(self):
         expected = (
             "media_callback_lost_ack", "supervisor_ack", "poll_after_supervisor_ack",
