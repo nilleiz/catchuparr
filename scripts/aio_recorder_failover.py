@@ -532,6 +532,7 @@ def _recorder_task_exit_diagnostic(run) -> dict[str, object]:
             getattr(stop_event, "first_supervisor_stop_reason", "unavailable")
             if stop_event is not None else "unavailable"
         ),
+        **_supervisor_exception_receipt(stop_event),
         "expected_generation_present": isinstance(getattr(run, "expected_generation", None), str),
         "expected_control_generation_present": type(getattr(run, "expected_control_generation", None)) is int,
         "thread_alive": bool(thread is not None and thread.is_alive()),
@@ -1121,6 +1122,45 @@ _SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({
     "KeyError", "OSError", "RuntimeError", "TimeoutError", "TypeError",
     "ValueError",
 })
+
+
+def _supervisor_exception_receipt(stop_event) -> dict[str, object]:
+    """Serialize shared supervisor evidence without exception text or locals."""
+    if stop_event is None:
+        return {
+            "supervisor_exception_class": "unavailable",
+            "supervisor_exception_call_sites": [],
+        }
+    exception_class = getattr(
+        stop_event, "first_supervisor_exception_class", "unavailable",
+    )
+    if exception_class not in _SAFE_SUPERVISOR_EXCEPTION_CLASSES | {"unavailable"}:
+        exception_class = "other"
+    call_sites = []
+    for frame in getattr(stop_event, "first_supervisor_exception_call_sites", ())[:4]:
+        if not isinstance(frame, dict):
+            continue
+        file_name = frame.get("file")
+        function_name = frame.get("function")
+        line_number = frame.get("line")
+        if (
+            not isinstance(file_name, str)
+            or Path(file_name).is_absolute()
+            or Path(file_name).suffix != ".py"
+            or ".." in Path(file_name).parts
+        ):
+            continue
+        call_sites.append({
+            "file": file_name[:120],
+            "function": function_name[:80]
+            if isinstance(function_name, str) and function_name.isidentifier()
+            else "other",
+            "line": line_number if type(line_number) is int and line_number > 0 else None,
+        })
+    return {
+        "supervisor_exception_class": exception_class,
+        "supervisor_exception_call_sites": call_sites,
+    }
 
 
 def _safe_supervisor_exception_evidence(module_name, function_name, frame_locals):

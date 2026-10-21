@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -836,6 +836,37 @@ class RecorderMediaProbeTests(unittest.TestCase):
         encoded = json.dumps(diagnostic)
         self.assertNotIn("PrivateTokenABC123", encoded)
         self.assertNotIn("PrivateLocalABC123", encoded)
+
+        failed_run = SimpleNamespace(
+            result={"status": "stopped"}, stop_event=stop_event,
+            thread=SimpleNamespace(is_alive=lambda: False),
+            results=[], failures=[], processes=[],
+        )
+        failover_diagnostic = aio_recorder_failover._recorder_task_exit_diagnostic(
+            failed_run,
+        )
+        for field in ("supervisor_exception_class", "supervisor_exception_call_sites"):
+            self.assertEqual(diagnostic[field], failover_diagnostic[field])
+        failover_encoded = json.dumps(failover_diagnostic)
+        self.assertNotIn("PrivateTokenABC123", failover_encoded)
+        self.assertNotIn("PrivateLocalABC123", failover_encoded)
+
+        output = io.StringIO()
+        with redirect_stderr(output), self.assertRaisesRegex(
+            RuntimeError, "^Recorder task ended before media was indexed$",
+        ):
+            aio_recorder_failover._wait_for_source_segments(
+                failed_run, None, "channel", "ffmpeg", "ffprobe",
+                "Synthetic Source B", minimum=1, timeout=1,
+            )
+        emitted = output.getvalue()
+        prefix = aio_recorder_failover.RECORDER_EXIT_DIAGNOSTIC_PREFIX
+        self.assertTrue(emitted.startswith(prefix))
+        emitted_diagnostic = json.loads(emitted[len(prefix):])
+        for field in ("supervisor_exception_class", "supervisor_exception_call_sites"):
+            self.assertEqual(diagnostic[field], emitted_diagnostic[field])
+        self.assertNotIn("PrivateTokenABC123", emitted)
+        self.assertNotIn("PrivateLocalABC123", emitted)
 
     def test_allowed_source_wait_reports_existing_safe_task_exit_receipt(self):
         now = [0.0]
