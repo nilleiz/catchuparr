@@ -2,6 +2,7 @@ import importlib
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from contextlib import contextmanager
@@ -101,6 +102,12 @@ def _isolated_plugin_modules(fake_modules):
     """Keep package children aligned with sys.modules while stubbing Dispatcharr."""
     package = importlib.import_module("catchuparr")
     adapter_package = importlib.import_module("catchuparr.adapters")
+    previous_module_children = {
+        name: (module, set(vars(module)))
+        for name, module in tuple(sys.modules.items())
+        if (name == "catchuparr" or name.startswith("catchuparr."))
+        and isinstance(module, types.ModuleType)
+    }
     fake_modules = {
         **fake_modules,
         "catchuparr.adapters.recorder_proxy": fake_modules.get(
@@ -139,6 +146,11 @@ def _isolated_plugin_modules(fake_modules):
             package.__dict__.pop("tasks", None)
             yield
     finally:
+        for module, previous_names in previous_module_children.values():
+            for name, value in tuple(vars(module).items()):
+                if (name not in previous_names and isinstance(value, types.ModuleType)
+                        and value.__name__.startswith("catchuparr.")):
+                    module.__dict__.pop(name, None)
         if adapter_package is not None:
             if previous_adapter_proxy is missing:
                 adapter_package.__dict__.pop("recorder_proxy", None)
@@ -1086,7 +1098,7 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertEqual(1, len(cleanup_calls))
             self.assertEqual("failure", cleanup_calls[0][1])
 
-    def test_override_capacity_or_start_failure_falls_through_ranked_sources(self):
+    def test_failed_return_retries_ranked_sources_until_media_resumes(self):
         with tempfile.TemporaryDirectory() as temp:
             archive_root = Path(temp) / "archive"
             redis = FakeRedis()
@@ -1098,6 +1110,10 @@ class RecorderTaskTests(unittest.TestCase):
             stopped = []
             lifecycle = []
             attempt_switches = []
+            candidate_refreshes = []
+            acknowledged_returns = []
+            return_token = SimpleNamespace(intent_epoch=2, not_before=time.time() - 1)
+            return_receipt = SimpleNamespace(capability=SimpleNamespace(intent_epoch=1))
             source_candidates = [
                 {"id": "44", "account_id": "12"},
                 {"id": "45", "account_id": "13"},
@@ -1131,7 +1147,11 @@ class RecorderTaskTests(unittest.TestCase):
                 outcomes = [
                     RuntimeError("input startup failed"),
                     SimpleNamespace(status="no_media", useful_segments=0, return_code=1),
-                    SimpleNamespace(status="stopped", useful_segments=0, return_code=-15),
+                    SimpleNamespace(status="media_stalled", useful_segments=0, return_code=1),
+                    SimpleNamespace(status="no_media", useful_segments=0, return_code=1),
+                    RuntimeError("input temporarily unavailable"),
+                    SimpleNamespace(status="exited", useful_segments=0, return_code=1),
+                    SimpleNamespace(status="stopped", useful_segments=1, return_code=-15),
                 ]
 
                 def __init__(self, _store, _channel, input_url, _work, **kwargs):
@@ -1143,9 +1163,31 @@ class RecorderTaskTests(unittest.TestCase):
                     outcome = self.outcomes.pop(0)
                     if isinstance(outcome, Exception):
                         raise outcome
+                    if outcome.useful_segments:
+                        kwargs["on_first_media"](time.time())
                     if outcome.status == "stopped":
                         stop_event.set()
                     return outcome
+
+            class BorrowCoordinator:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def pending_return_intent(self):
+                    return return_token
+
+                def recovered_return_receipt(self):
+                    return return_receipt
+
+                def poll(self, **_kwargs):
+                    lifecycle.append("observe_native")
+                    return None
+
+                def acknowledge_return_media(
+                    self, prepared, token, attempt, candidate, *, media_at,
+                ):
+                    acknowledged_returns.append((prepared, token, attempt, candidate, media_at))
+                    return True
 
             celery = _fake_module(
                 "celery",
@@ -1171,11 +1213,18 @@ class RecorderTaskTests(unittest.TestCase):
                 "core.utils": core_utils,
                 "version": _fake_module("version", __version__="0.32.0"),
             }
+
+            def ranked_candidates(_channel, _active, *, all_sources):
+                self.assertTrue(all_sources)
+                candidate_refreshes.append(True)
+                return source_candidates
+
             with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
-                recorder_module = importlib.import_module("catchuparr.engine.recorder")
                 with (
                     patch("catchuparr.runtime.load_config", return_value=config),
+                    patch.object(tasks, "RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS", 0.0),
+                    patch.object(tasks, "RECORDER_CANDIDATE_RETRY_MAX_SECONDS", 0.0),
                     patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
                     patch(
                         "catchuparr.configuration.load_applied_state",
@@ -1183,9 +1232,7 @@ class RecorderTaskTests(unittest.TestCase):
                     ),
                     patch(
                         "catchuparr.recorder_proxy.ranked_source_candidates",
-                        side_effect=lambda _channel, _active, *, all_sources: (
-                            self.assertTrue(all_sources) or source_candidates
-                        ),
+                        side_effect=ranked_candidates,
                     ),
                     patch(
                         "catchuparr.recorder_proxy.current_sharing_authority_context",
@@ -1193,9 +1240,7 @@ class RecorderTaskTests(unittest.TestCase):
                     ),
                     patch(
                         "catchuparr.sharing_runtime.RecorderBorrowCoordinator",
-                        return_value=SimpleNamespace(
-                            poll=lambda **_kwargs: lifecycle.append("observe_native") or None,
-                        ),
+                        BorrowCoordinator,
                     ),
                     patch("catchuparr.sharing_runtime.retry_durable_open_cleanups", return_value=(0, 0)),
                     patch(
@@ -1215,21 +1260,34 @@ class RecorderTaskTests(unittest.TestCase):
                     ),
                     patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
                     patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
-                    patch.object(recorder_module, "FFmpegCopyRecorder", FakeRecorder),
+                    patch("catchuparr.engine.recorder.FFmpegCopyRecorder", FakeRecorder),
                 ):
                     result = tasks.record_channel("channel-1", expected_generation, 6)
 
             self.assertEqual("stopped", result["status"])
-            self.assertEqual(["44", "45", "46"], [attempt.stream_id for attempt in attempts])
+            self.assertEqual(
+                ["44", "45", "46", "44", "45", "46", "44"],
+                [attempt.stream_id for attempt in attempts],
+            )
             self.assertTrue(all(attempt.revoked for attempt in attempts))
-            self.assertEqual(3, len(stopped))
+            self.assertEqual(7, len(stopped))
             self.assertTrue(all(attempt.input_url.endswith("/catchuparr/recorder/channel-1") for attempt in attempts))
             self.assertTrue(all(switch is not None for switch in attempt_switches))
+            self.assertEqual(3, len(candidate_refreshes))
+            self.assertEqual(1, len(acknowledged_returns))
+            self.assertIs(return_receipt, acknowledged_returns[0][0])
+            self.assertIs(return_token, acknowledged_returns[0][1])
+            self.assertIs(attempts[-1], acknowledged_returns[0][2])
+            self.assertIs(source_candidates[0], acknowledged_returns[0][3])
             self.assertEqual(
                 ["observe_native",
                  "issue:44", "revoke:44", "stop:44", "ack:44",
                  "issue:45", "revoke:45", "stop:45", "ack:45",
-                 "issue:46", "revoke:46", "stop:46", "ack:46"],
+                 "issue:46", "revoke:46", "stop:46", "ack:46",
+                 "issue:44", "revoke:44", "stop:44", "ack:44",
+                 "issue:45", "revoke:45", "stop:45", "ack:45",
+                 "issue:46", "revoke:46", "stop:46", "ack:46",
+                 "issue:44", "revoke:44", "stop:44", "ack:44"],
                 lifecycle,
             )
 
