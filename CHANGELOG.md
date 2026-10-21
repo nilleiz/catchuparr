@@ -4,6 +4,23 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.6.7] - Prerelease candidate
+
+### Fixed
+
+- Recover from a due RETURN intent after its exact borrowed episode is closed
+  when a different, currently eligible viewer is available. Recovery rechecks
+  the current schedule, lease, configuration, control generation, source
+  catalog and cleanup proof, then creates a fresh single-use ATTACH intent.
+- Preserve the existing live-stability and minimum-switch cooldowns; the old
+  RETURN claim is never reused, and an unchanged viewer or unconfirmed cleanup
+  does not supersede the pending return.
+
+### Notes
+
+- Requires Dispatcharr 0.32.0 or newer. Required GitHub CI and native
+  acceptance remain pending.
+
 ## [0.6.6] - Prerelease candidate
 
 ### Fixed
