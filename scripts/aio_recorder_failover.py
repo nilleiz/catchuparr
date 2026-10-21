@@ -532,6 +532,7 @@ def _recorder_task_exit_diagnostic(run) -> dict[str, object]:
             getattr(stop_event, "first_supervisor_stop_reason", "unavailable")
             if stop_event is not None else "unavailable"
         ),
+        **_supervisor_exception_receipt(stop_event),
         "expected_generation_present": isinstance(getattr(run, "expected_generation", None), str),
         "expected_control_generation_present": type(getattr(run, "expected_control_generation", None)) is int,
         "thread_alive": bool(thread is not None and thread.is_alive()),
@@ -1116,6 +1117,110 @@ _SUPERVISOR_STOP_REASONS_BY_LINE = {
     556: "exception",
 }
 
+_SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({
+    "AssertionError", "AttributeError", "ConnectionError", "ImportError",
+    "KeyError", "OSError", "RuntimeError", "TimeoutError", "TypeError",
+    "ValueError", "LoopExit", "InvalidThreadUseError",
+    "BlockingSwitchOutError", "InvalidSwitchError",
+})
+_SAFE_SUPERVISOR_SCRIPT_MODULES = {
+    "aio_recorder_failover": "scripts/aio_recorder_failover.py",
+    "scripts.aio_recorder_failover": "scripts/aio_recorder_failover.py",
+    "aio_recorder_media": "scripts/aio_recorder_media.py",
+    "scripts.aio_recorder_media": "scripts/aio_recorder_media.py",
+}
+
+
+def _safe_supervisor_frame_label(frame) -> str | None:
+    """Map only known product/script module identities to fixed file labels."""
+    module_name = frame.f_globals.get("__name__")
+    if not isinstance(module_name, str):
+        return None
+    if module_name == "catchuparr":
+        return "catchuparr/__init__.py"
+    if module_name.startswith("catchuparr."):
+        parts = module_name.split(".")
+        if all(part.isidentifier() for part in parts):
+            return "/".join(parts) + ".py"
+        return None
+    script_label = _SAFE_SUPERVISOR_SCRIPT_MODULES.get(module_name)
+    if script_label is not None:
+        return script_label
+    if module_name == "__main__":
+        return {
+            "aio_recorder_failover.py": "scripts/aio_recorder_failover.py",
+            "aio_recorder_media.py": "scripts/aio_recorder_media.py",
+        }.get(Path(frame.f_code.co_filename).name)
+    return None
+
+
+def _supervisor_exception_receipt(stop_event) -> dict[str, object]:
+    """Serialize shared supervisor evidence without exception text or locals."""
+    if stop_event is None:
+        return {
+            "supervisor_exception_class": "unavailable",
+            "supervisor_exception_call_sites": [],
+        }
+    exception_class = getattr(
+        stop_event, "first_supervisor_exception_class", "unavailable",
+    )
+    if exception_class not in _SAFE_SUPERVISOR_EXCEPTION_CLASSES | {"unavailable"}:
+        exception_class = "other"
+    call_sites = []
+    for frame in getattr(stop_event, "first_supervisor_exception_call_sites", ())[:4]:
+        if not isinstance(frame, dict):
+            continue
+        file_name = frame.get("file")
+        function_name = frame.get("function")
+        line_number = frame.get("line")
+        if (
+            not isinstance(file_name, str)
+            or Path(file_name).is_absolute()
+            or Path(file_name).suffix != ".py"
+            or ".." in Path(file_name).parts
+        ):
+            continue
+        call_sites.append({
+            "file": file_name[:120],
+            "function": function_name[:80]
+            if isinstance(function_name, str) and function_name.isidentifier()
+            else "other",
+            "line": line_number if type(line_number) is int and line_number > 0 else None,
+        })
+    return {
+        "supervisor_exception_class": exception_class,
+        "supervisor_exception_call_sites": call_sites,
+    }
+
+
+def _safe_supervisor_exception_evidence(module_name, function_name, frame_locals):
+    """Expose only a mapped exception class and bounded repository locations."""
+    if module_name != "catchuparr.tasks" or function_name != "supervise":
+        return "unavailable", []
+    error = frame_locals.get("exc")
+    if not isinstance(error, BaseException):
+        return "unavailable", []
+    class_name = type(error).__name__
+    safe_class = (
+        class_name if class_name in _SAFE_SUPERVISOR_EXCEPTION_CLASSES else "other"
+    )
+    repository_frames = []
+    try:
+        for frame, line_number in traceback.walk_tb(error.__traceback__):
+            file_label = _safe_supervisor_frame_label(frame)
+            if file_label is None:
+                continue
+            function_name = frame.f_code.co_name
+            function = function_name if function_name.isidentifier() else "other"
+            repository_frames.append({
+                "file": file_label[:120],
+                "function": function[:80],
+                "line": line_number if type(line_number) is int else None,
+            })
+    except Exception:
+        return safe_class, []
+    return safe_class, repository_frames[-4:]
+
 
 def _safe_supervisor_stop_reason(module_name, function_name, line_number, frame_locals):
     if module_name != "catchuparr.tasks" or function_name != "supervise":
@@ -1147,6 +1252,8 @@ class _ObservedRecorderStopEvent(threading.Event):
         self.first_set_source = "not_set"
         self.first_supervisor_admission_status = "unavailable"
         self.first_supervisor_stop_reason = "unavailable"
+        self.first_supervisor_exception_class = "unavailable"
+        self.first_supervisor_exception_call_sites = []
         self._source_lock = threading.Lock()
 
     def set(self):
@@ -1163,17 +1270,35 @@ class _ObservedRecorderStopEvent(threading.Event):
                     self.first_supervisor_stop_reason = _safe_supervisor_stop_reason(
                         module_name, function_name, caller.f_lineno, caller.f_locals,
                     )
+                    if self.first_supervisor_stop_reason == "exception":
+                        (
+                            self.first_supervisor_exception_class,
+                            self.first_supervisor_exception_call_sites,
+                        ) = _safe_supervisor_exception_evidence(
+                            module_name, function_name, caller.f_locals,
+                        )
                 except Exception:
                     self.first_set_source = "other"
                     self.first_supervisor_admission_status = "unavailable"
                     self.first_supervisor_stop_reason = "unavailable"
+                    self.first_supervisor_exception_class = "unavailable"
+                    self.first_supervisor_exception_call_sites = []
             super().set()
 
 
 class _RecorderTaskRun:
     """Run the real recorder task with bounded engine timeouts and stop control."""
 
-    def __init__(self, channel_uuid: str, *, startup_timeout: float, media_idle_timeout: float):
+    def __init__(
+        self,
+        channel_uuid: str,
+        *,
+        startup_timeout: float,
+        media_idle_timeout: float,
+        fail_borrow_after_next_media: bool = False,
+        defer_borrow_failure_until_armed: bool = False,
+        hold_borrow_failure_result: bool = False,
+    ):
         self.channel_uuid = str(channel_uuid)
         self.startup_timeout = float(startup_timeout)
         self.media_idle_timeout = float(media_idle_timeout)
@@ -1186,9 +1311,17 @@ class _RecorderTaskRun:
         # Keep synthetic route credentials in memory solely for replay-denial
         # checks. They are never printed, serialized, or included in receipts.
         self.input_headers: list[dict[str, str]] = []
+        self.input_header_times: list[float] = []
+        self.fail_borrow_after_next_media = bool(fail_borrow_after_next_media)
+        self.defer_borrow_failure_until_armed = bool(defer_borrow_failure_until_armed)
+        self.hold_borrow_failure_result = bool(hold_borrow_failure_result)
+        self.borrow_failure_media_at: float | None = None
+        self.borrow_failure_result_held = False
+        self.borrow_failure_result_release = threading.Event()
         self._lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self._patchers = []
+        self._candidate_processes: dict[int, object] = {}
         self.expected_generation: str | None = None
         self.expected_control_generation: int | None = None
 
@@ -1232,6 +1365,7 @@ class _RecorderTaskRun:
             process = original_popen(*args, **kwargs)
             with self._lock:
                 self.processes.append(process)
+                self._candidate_processes[threading.get_ident()] = process
             return process
 
         def bounded_run_candidate(recorder, stop_event, **native_timeouts):
@@ -1239,6 +1373,39 @@ class _RecorderTaskRun:
             if isinstance(headers, dict):
                 with self._lock:
                     self.input_headers.append(dict(headers))
+                    self.input_header_times.append(time.time())
+            on_first_media = native_timeouts.get("on_first_media")
+            is_borrow = (
+                isinstance(headers, dict)
+                and "X-Catchuparr-Borrow" in headers
+                and (
+                    self.fail_borrow_after_next_media
+                    or self.defer_borrow_failure_until_armed
+                )
+            )
+            if is_borrow and on_first_media is not None:
+                def fail_after_first_media(media_at):
+                    result = on_first_media(media_at)
+                    with self._lock:
+                        inject_failure = (
+                            self.fail_borrow_after_next_media
+                            and self.borrow_failure_media_at is None
+                        )
+                        defer_ack = (
+                            self.defer_borrow_failure_until_armed
+                            and not self.fail_borrow_after_next_media
+                            and self.borrow_failure_media_at is None
+                        )
+                        if inject_failure:
+                            self.borrow_failure_media_at = float(media_at)
+                        process = self._candidate_processes.get(threading.get_ident())
+                    if inject_failure and process is not None and process.poll() is None:
+                        process.kill()
+                    if defer_ack:
+                        return False
+                    return result
+
+                native_timeouts["on_first_media"] = fail_after_first_media
             try:
                 result = original_run_candidate(
                     recorder,
@@ -1252,10 +1419,23 @@ class _RecorderTaskRun:
                         if key in native_timeouts
                     },
                 )
+                if (
+                    is_borrow
+                    and self.hold_borrow_failure_result
+                    and self.borrow_failure_media_at is not None
+                ):
+                    with self._lock:
+                        self.borrow_failure_result_held = True
+                    self.borrow_failure_result_release.wait()
+                    with self._lock:
+                        self.borrow_failure_result_held = False
             except Exception as exc:
                 with self._lock:
                     self.failures.append(type(exc).__name__)
                 raise
+            finally:
+                with self._lock:
+                    self._candidate_processes.pop(threading.get_ident(), None)
             with self._lock:
                 self.results.append(result)
             return result
