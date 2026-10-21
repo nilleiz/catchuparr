@@ -4,6 +4,19 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.6.6] - Prerelease candidate
+
+### Fixed
+
+- Resume the same admitted ATTACH intent after a transient pre-claim validation
+  miss when its durable claim remains unused. The current viewer and recorder
+  authority are revalidated, and the SQLite claim remains single-use.
+
+### Notes
+
+- Requires Dispatcharr 0.32.0 or newer. Publication and native acceptance are
+  pending.
+
 ## [0.6.5] - Prerelease candidate
 
 ### Fixed

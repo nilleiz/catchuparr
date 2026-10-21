@@ -14,6 +14,8 @@ from celery import shared_task
 logger = logging.getLogger(__name__)
 RECORDER_CAPABILITY_HEADER = "X-Catchuparr-Recorder"
 RECORDER_CAPABILITY_TTL_SECONDS = 30
+RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS = 2.0
+RECORDER_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 
 
 def _refresh_current_recorder_diagnostic(
@@ -724,9 +726,11 @@ def record_channel(
                 return True
 
             candidate_index = 0
+            candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
             while True:
                 while candidate_index < len(candidates):
                     if run_prepared_borrow():
+                        candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
                         continue
                     return_prepared = None
                     return_token = None
@@ -900,6 +904,8 @@ def record_channel(
                                 attempt_state["diagnostic"] = None
                     if admission_status is not None:
                         return {"status": admission_status}
+                    if result is not None and result.useful_segments > 0:
+                        candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
                     if result is not None and result.status == "stopped":
                         break
                     if run_prepared_borrow():
@@ -907,15 +913,49 @@ def record_channel(
                         # acknowledged before the borrowed reader starts. Return to
                         # an allowlisted source after that reader closes at grace.
                         candidate_index = 0
+                        candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
                         continue
                     candidate_index += 1
                 if sharing_coordinator is None or stop_event.is_set():
                     break
                 if run_prepared_borrow():
                     candidate_index = 0
+                    candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
                     continue
-                if stop_event.wait(0.5):
+                # A sharing task deliberately keeps its lease while it waits
+                # for viewers. Do not leave an exhausted dedicated candidate
+                # list at len(candidates) forever: a failed RETURN then blocks
+                # new ATTACH decisions indefinitely. Retry the ranked sources
+                # as a fresh cycle with bounded backoff, while rechecking task
+                # authority and refreshing the source list before any new work.
+                if stop_event.wait(candidate_retry_seconds):
                     break
+                retry_admission = _recorder_admission_state(
+                    channel_uuid, expected_generation, expected_control_generation
+                )
+                if retry_admission["status"] != "ready":
+                    return {"status": retry_admission["status"]}
+                if not lease.renew():
+                    error("recorder_retry_lease_lost", callsite="candidate_retry")
+                    return {"status": "lease_lost"}
+                try:
+                    refreshed_candidates = ranked_source_candidates(
+                        channel_uuid, retry_admission["active"], all_sources=sharing_enabled,
+                    )
+                except Exception as exc:
+                    error("recorder_retry_candidates_failed", exc, callsite="candidate_retry")
+                    return {"status": "candidate_refresh_failed"}
+                if refreshed_candidates is None:
+                    error("recorder_retry_candidates_unavailable", callsite="candidate_retry")
+                    return {"status": "candidate_refresh_unavailable"}
+                candidates = refreshed_candidates
+                sharing_coordinator.dedicated_source_available = bool(candidates)
+                candidate_index = 0
+                candidate_retry_seconds = min(
+                    RECORDER_CANDIDATE_RETRY_MAX_SECONDS,
+                    max(RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS,
+                        candidate_retry_seconds * 2),
+                )
     finally:
         try:
             if stop_event is not None:
