@@ -230,6 +230,23 @@ class BorrowEpisodeLedger:
                 db.execute("DROP TABLE sharing_borrow_registration_attempts_legacy")
                 db.commit()
 
+    def opening_claim_was_consumed(self, token: SharingIntentToken) -> bool:
+        """Return whether this ATTACH token already reserved an episode."""
+        if (not isinstance(token, SharingIntentToken)
+                or token.action is not SharingAction.ATTACH_BORROW):
+            raise ValueError("token must be an ATTACH_BORROW SharingIntentToken")
+        with self._db() as db:
+            row = db.execute(
+                """SELECT 1 FROM sharing_borrow_episode_claims
+                WHERE channel_uuid=? AND configuration_generation=?
+                  AND control_generation=? AND recorder_fence=?
+                  AND intent_epoch=? AND action=?""",
+                (token.channel_uuid, token.configuration_generation,
+                 token.control_generation, token.recorder_fence,
+                 token.intent_epoch, token.action.value),
+            ).fetchone()
+        return row is not None
+
     def _db(self):
         db = sqlite3.connect(self.database_path, timeout=5, isolation_level=None)
         db.row_factory = sqlite3.Row
