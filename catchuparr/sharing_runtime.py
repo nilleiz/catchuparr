@@ -240,6 +240,132 @@ class RecorderBorrowCoordinator:
         except Exception:
             return False
 
+    def _attach_claim_was_consumed(self, token: SharingIntentToken) -> bool:
+        """Check both durable claim ledgers before retrying an ATTACH."""
+        return (
+            self.intent_ledger.claim_was_consumed(token)
+            or self.episode_ledger.opening_claim_was_consumed(token)
+        )
+
+    def _retry_unclaimed_attach(
+        self, *, active: dict[str, Any], control_generation: int,
+    ) -> PreparedBorrowOpening | None:
+        """Resume only a current ATTACH intent whose durable claim is unused."""
+        token = self.state_record.intent
+        if token is None or token.action is not SharingAction.ATTACH_BORROW:
+            return None
+        try:
+            current_record = self.intent_ledger.read(self.channel_uuid)
+            if (current_record is None or current_record.intent != token
+                    or current_record.revision != self.state_record.revision
+                    or self._attach_claim_was_consumed(token)):
+                return None
+            self.state_record = current_record
+            from .configuration import _sharing_catalog_generation
+            from .recorder_proxy import configuration_generation
+
+            if (
+                control_generation != self.control_generation
+                or active.get("connection_sharing", {}).get(self.channel_uuid, {}).get("enabled") is not True
+                or configuration_generation(active) != token.configuration_generation
+                or token.configuration_generation != self.configuration_generation
+                or token.control_generation != self.control_generation
+                or token.recorder_fence != self.recorder_fence
+                or token.target_identity is None
+                or _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation
+                or not self._recovery_is_current(
+                    self.channel_uuid, current_record.revision,
+                    self.configuration_generation, self.control_generation,
+                    self.recorder_fence,
+                )
+            ):
+                return None
+            current_sources, current_catalog = _native_source_catalog(self.channel_uuid)
+            if current_catalog != self.catalog_generation:
+                return None
+            now = time.time()
+            native = observe_native_connection(
+                self.redis, self.channel_uuid,
+                catalog_generation=current_catalog,
+                assigned_sources=current_sources,
+                observed_at=now,
+            )
+            target = native.target if native is not None else None
+            if (target is None or target.connection_identity != token.target_identity
+                    or not target.eligible_for_new_borrow(self.channel_uuid)):
+                return None
+            setting = active["connection_sharing"][self.channel_uuid]
+            return_seconds = setting["last_viewer_return_seconds"]
+            minimum_switch = setting["min_switch_interval_seconds"]
+            if (type(return_seconds) is not int or not 0 <= return_seconds <= 3600
+                    or type(minimum_switch) is not int
+                    or not 0 <= minimum_switch <= 3600):
+                return None
+
+            def fresh_validate(exact_token: SharingIntentToken) -> bool:
+                if exact_token != token:
+                    return False
+                try:
+                    latest = self.intent_ledger.read(self.channel_uuid)
+                    if (latest is None or latest.intent != token
+                            or latest.revision != current_record.revision
+                            or token.configuration_generation != self.configuration_generation
+                            or token.control_generation != self.control_generation
+                            or token.recorder_fence != self.recorder_fence
+                            or not self._recovery_is_current(
+                                self.channel_uuid, latest.revision,
+                                self.configuration_generation, self.control_generation,
+                                self.recorder_fence,
+                            )
+                            or _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation):
+                        return False
+                    sources, catalog = _native_source_catalog(self.channel_uuid)
+                    if catalog != self.catalog_generation:
+                        return False
+                    observed = observe_native_connection(
+                        self.redis, self.channel_uuid,
+                        catalog_generation=catalog,
+                        assigned_sources=sources,
+                        observed_at=time.time(),
+                    )
+                    current_target = observed.target if observed is not None else None
+                    return bool(
+                        current_target is not None
+                        and current_target.connection_identity == token.target_identity
+                        and current_target.eligible_for_new_borrow(self.channel_uuid)
+                    )
+                except Exception:
+                    return False
+                finally:
+                    try:
+                        from django.db import close_old_connections
+
+                        close_old_connections()
+                    except Exception:
+                        pass
+
+            claimed, prepared = prepare_borrow_opening(
+                self.redis, self.intent_ledger, self.episode_ledger, token, target,
+                lease_value=self.lease_value,
+                catalog_generation=self.catalog_generation,
+                return_seconds=return_seconds,
+                minimum_switch_seconds=minimum_switch,
+                last_switch_at=current_record.state.last_switch_at,
+                capability_secret=_django_secret(),
+                fresh_validate=fresh_validate,
+            )
+            self.state_record = self.intent_ledger.read(self.channel_uuid)
+            return prepared if claimed else None
+        except Exception:
+            return None
+        finally:
+            try:
+                from django.db import close_old_connections
+
+                close_old_connections()
+            except Exception:
+                pass
+
     def record_return_after_cleanup(
         self, prepared: PreparedBorrowOpening, *, now: float,
         outcome: str = "return",
@@ -635,6 +761,16 @@ class RecorderBorrowCoordinator:
                 and control_generation == self.control_generation
                 and active.get("connection_sharing", {}).get(self.channel_uuid, {}).get("enabled") is True
             ):
+                token = self.state_record.intent
+                if token.action is SharingAction.ATTACH_BORROW:
+                    try:
+                        unclaimed = not self._attach_claim_was_consumed(token)
+                    except Exception:
+                        return None
+                    if unclaimed:
+                        return self._retry_unclaimed_attach(
+                            active=active, control_generation=control_generation,
+                        )
                 self._recover_closed_attach()
             return None
         from .configuration import _sharing_catalog_generation

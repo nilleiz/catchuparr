@@ -86,6 +86,210 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def _pending_attach_coordinator(self, *, recovery_current=True):
+        coordinator = object.__new__(RecorderBorrowCoordinator)
+        coordinator.channel_uuid = CHANNEL
+        coordinator.redis = object()
+        coordinator.intent_ledger = self.intent_ledger
+        coordinator.episode_ledger = self.episode_ledger
+        coordinator.state_record = self.saved
+        coordinator.configuration_generation = "config-synthetic"
+        coordinator.control_generation = 2
+        coordinator.recorder_fence = 7
+        coordinator.lease_value = LEASE
+        coordinator.catalog_generation = "catalog-synthetic"
+        coordinator.assigned_sources = ()
+        coordinator.active = {"connection_sharing": {CHANNEL: {
+            "enabled": True, "live_stability_seconds": 5,
+            "last_viewer_return_seconds": 30, "min_switch_interval_seconds": 60,
+        }}}
+        coordinator._recovery_is_current = lambda *_args: recovery_current
+        return coordinator
+
+    def _pending_attach_poll_patches(self, native_target=None, *, catalog="catalog-synthetic",
+                                     config="config-synthetic"):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        stack.enter_context(patch(
+            "catchuparr.adapters.sharing_native.read_native_episode_grant",
+            return_value=None,
+        ))
+        stack.enter_context(patch(
+            "catchuparr.configuration._sharing_catalog_generation", return_value=catalog,
+        ))
+        stack.enter_context(patch(
+            "catchuparr.recorder_proxy.configuration_generation", return_value=config,
+        ))
+        stack.enter_context(patch(
+            "catchuparr.sharing_runtime._native_source_catalog",
+            return_value=((), catalog),
+        ))
+        stack.enter_context(patch(
+            "catchuparr.sharing_runtime.observe_native_connection",
+            return_value=SimpleNamespace(target=native_target) if native_target is not None else None,
+        ))
+        stack.enter_context(patch("catchuparr.sharing_runtime.time.time", return_value=200.0))
+        stack.enter_context(patch("catchuparr.sharing_runtime._django_secret",
+                                  return_value=b"pending-attach-retry-synthetic-secret"))
+        return stack
+
+    def test_pending_unclaimed_attach_retries_same_token_after_preclaim_miss(self):
+        coordinator = self._pending_attach_coordinator()
+        attempts = []
+        prepared = object()
+
+        def prepare(_redis, ledger, _episodes, token, _target, **kwargs):
+            attempts.append(token)
+            if len(attempts) == 1:
+                # A transient fresh validation miss occurs before SQLite claim.
+                return ledger.run_if_current(
+                    token, fresh_validate=lambda _exact: False,
+                    side_effect=lambda _exact: prepared,
+                )
+            return ledger.run_if_current(
+                token, fresh_validate=kwargs["fresh_validate"],
+                side_effect=lambda _exact: prepared,
+            )
+
+        from catchuparr import sharing_runtime
+
+        with self._pending_attach_poll_patches(target()), patch.object(
+            sharing_runtime, "prepare_borrow_opening", side_effect=prepare,
+        ) as prepare_mock:
+            self.assertIsNone(coordinator.poll(
+                active=coordinator.active, control_generation=2,
+            ))
+            self.assertFalse(self.intent_ledger.claim_was_consumed(self.saved.intent))
+            result = coordinator.poll(active=coordinator.active, control_generation=2)
+            self.assertIs(prepared, result)
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+
+        self.assertEqual([self.saved.intent, self.saved.intent], attempts)
+        self.assertEqual(2, prepare_mock.call_count)
+        self.assertTrue(self.intent_ledger.claim_was_consumed(self.saved.intent))
+
+    def test_pending_attach_retry_fails_closed_for_consumed_or_stale_authority(self):
+        from catchuparr import sharing_runtime
+
+        # A consumed claim is never replayed, even if the exact token remains pending.
+        ran, _ = self.intent_ledger.run_if_current(
+            self.saved.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: None,
+        )
+        self.assertTrue(ran)
+        coordinator = self._pending_attach_coordinator()
+        with self._pending_attach_poll_patches(target()) as patches:
+            prepare = patches.enter_context(patch.object(
+                sharing_runtime, "prepare_borrow_opening",
+            ))
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+        prepare.assert_not_called()
+
+        # An episode claim also consumes the token if the intent claim ledger
+        # was not retained by an older/interrupted task.
+        episode_only_ledger = SharingIntentLedger(
+            Path(self.temp.name) / "episode-only-intent.sqlite", clock=lambda: 105.0,
+        )
+        episode_only = episode_only_ledger.save(
+            attach_state(), action=SharingAction.ATTACH_BORROW,
+            expected_revision=None, target_identity=IDENTITY,
+            target_admitted=True, not_before=105.0,
+        )
+        episode_only_ledger_episodes = BorrowEpisodeLedger(
+            Path(self.temp.name) / "episode-only-ledger.sqlite", clock=lambda: 105.0,
+        )
+        episode_only_ledger_episodes.begin_open(
+            episode_only.intent, lease_digest=sha256(LEASE.encode()).hexdigest(),
+            identity=IDENTITY,
+            client_id="catchuparr-client-episode-claim-synthetic",
+        )
+        coordinator = self._pending_attach_coordinator()
+        coordinator.intent_ledger = episode_only_ledger
+        coordinator.episode_ledger = episode_only_ledger_episodes
+        coordinator.state_record = episode_only
+        with self._pending_attach_poll_patches(target()) as patches:
+            prepare = patches.enter_context(patch.object(
+                sharing_runtime, "prepare_borrow_opening",
+            ))
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+        prepare.assert_not_called()
+
+        for name, current_target, recovery, poll_control, catalog, config in (
+            ("missing-viewer", None, True, 2, "catalog-synthetic", "config-synthetic"),
+            ("different-viewer", replace(target(), worker_uuid="worker-other-synthetic"), True, 2,
+             "catalog-synthetic", "config-synthetic"),
+            ("stale-lease", target(), False, 2, "catalog-synthetic", "config-synthetic"),
+            ("stale-catalog", target(), True, 2, "catalog-changed", "config-synthetic"),
+            ("stale-config", target(), True, 2, "catalog-synthetic", "config-changed"),
+            ("stale-fence", target(), True, 2, "catalog-synthetic", "config-synthetic"),
+            ("stale-control", target(), True, 3, "catalog-synthetic", "config-synthetic"),
+        ):
+            with self.subTest(name=name):
+                fresh_ledger = SharingIntentLedger(
+                    Path(self.temp.name) / f"{name}.sqlite", clock=lambda: 105.0,
+                )
+                fresh_record = fresh_ledger.save(
+                    attach_state(), action=SharingAction.ATTACH_BORROW,
+                    expected_revision=None, target_identity=IDENTITY,
+                    target_admitted=True, not_before=105.0,
+                )
+                coordinator = self._pending_attach_coordinator()
+                coordinator.intent_ledger = fresh_ledger
+                coordinator.state_record = fresh_record
+                coordinator._recovery_is_current = lambda *_args, value=recovery: value
+                if name == "stale-fence":
+                    coordinator.recorder_fence = 8
+                with self._pending_attach_poll_patches(
+                    current_target, catalog=catalog, config=config,
+                ) as patches:
+                    prepare = patches.enter_context(patch.object(
+                        sharing_runtime, "prepare_borrow_opening",
+                    ))
+                    self.assertIsNone(coordinator.poll(
+                        active=coordinator.active, control_generation=poll_control,
+                    ))
+                prepare.assert_not_called()
+
+    def test_concurrent_pending_attach_polls_claim_and_open_at_most_once(self):
+        coordinator_a = self._pending_attach_coordinator()
+        coordinator_b = self._pending_attach_coordinator()
+        barrier = threading.Barrier(2)
+        side_effects = []
+
+        def prepare(_redis, ledger, _episodes, token, _target, **kwargs):
+            barrier.wait(timeout=5)
+            return ledger.run_if_current(
+                token, fresh_validate=kwargs["fresh_validate"],
+                side_effect=lambda _exact: side_effects.append(object()) or side_effects[-1],
+            )
+
+        from catchuparr import sharing_runtime
+
+        with self._pending_attach_poll_patches(target()), patch.object(
+            sharing_runtime, "prepare_borrow_opening", side_effect=prepare,
+        ):
+            results = [None, None]
+
+            def poll(index, coordinator):
+                results[index] = coordinator.poll(
+                    active=coordinator.active, control_generation=2,
+                )
+
+            threads = [
+                threading.Thread(target=poll, args=(0, coordinator_a)),
+                threading.Thread(target=poll, args=(1, coordinator_b)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+        self.assertEqual(1, len(side_effects))
+        self.assertEqual(1, sum(result is not None for result in results))
+        self.assertTrue(self.intent_ledger.claim_was_consumed(self.saved.intent))
+
     def _pending_return(self, *, episode_lease=LEASE):
         borrowed = resolve_transition(
             attach_state(), SharingAction.ATTACH_BORROW, succeeded=True, now=105.0,
