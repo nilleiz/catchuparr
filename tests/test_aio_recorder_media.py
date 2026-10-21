@@ -654,6 +654,9 @@ class RecorderMediaProbeTests(unittest.TestCase):
                 {"aio_recorder_failover": SimpleNamespace(
                     _segment_has_useful_av=lambda *_: True,
                     _segment_tone_frequency=lambda *_: 880,
+                    _supervisor_exception_receipt=(
+                        aio_recorder_failover._supervisor_exception_receipt
+                    ),
                 )},
             ):
                 probe._wait_for_indexed_tone(
@@ -787,13 +790,13 @@ class RecorderMediaProbeTests(unittest.TestCase):
         ast.increment_lineno(synthetic, exception_stop_line - synthetic_set_line)
         stop_event = aio_recorder_failover._ObservedRecorderStopEvent()
 
-        class SyntheticSupervisorFailure(Exception):
+        class LoopExit(Exception):
             pass
 
         namespace = {
             "__name__": "catchuparr.tasks",
             "stop_event": stop_event,
-            "SyntheticSupervisorFailure": SyntheticSupervisorFailure,
+            "LoopExit": LoopExit,
         }
         traceback_functions = []
 
@@ -809,12 +812,15 @@ class RecorderMediaProbeTests(unittest.TestCase):
         ) + "\n" + (
             "def external_5():\n"
             "    private_local_value = 'PrivateLocalABC123'\n"
-            "    raise SyntheticSupervisorFailure('PrivateTokenABC123')\n"
+            "    raise LoopExit('PrivateTokenABC123')\n"
         )
+        external_namespace = {"__name__": "gevent._waiter", "LoopExit": LoopExit}
+        staged_gevent_file = Path(__file__).parents[1] / "app" / "src" / "gevent" / "_waiter.py"
         exec(
-            compile(external_frames, "/tmp/synthetic-external-stack.py", "exec"),
-            namespace,
+            compile(external_frames, str(staged_gevent_file), "exec"),
+            external_namespace,
         )
+        namespace["external_0"] = external_namespace["external_0"]
         exec(compile(synthetic, str(tasks_path), "exec"), namespace)
         namespace["supervise"]()
         diagnostic = probe._recorder_task_early_exit_diagnostic(
@@ -824,7 +830,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
             )
         )
         self.assertEqual("exception", diagnostic["supervisor_stop_reason"])
-        self.assertEqual("other", diagnostic["supervisor_exception_class"])
+        self.assertEqual("LoopExit", diagnostic["supervisor_exception_class"])
         self.assertTrue(diagnostic["supervisor_exception_call_sites"])
         self.assertTrue(all(
             frame["file"] == "catchuparr/tasks.py"
