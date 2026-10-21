@@ -1120,8 +1120,38 @@ _SUPERVISOR_STOP_REASONS_BY_LINE = {
 _SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({
     "AssertionError", "AttributeError", "ConnectionError", "ImportError",
     "KeyError", "OSError", "RuntimeError", "TimeoutError", "TypeError",
-    "ValueError",
+    "ValueError", "LoopExit", "InvalidThreadUseError",
+    "BlockingSwitchOutError", "InvalidSwitchError",
 })
+_SAFE_SUPERVISOR_SCRIPT_MODULES = {
+    "aio_recorder_failover": "scripts/aio_recorder_failover.py",
+    "scripts.aio_recorder_failover": "scripts/aio_recorder_failover.py",
+    "aio_recorder_media": "scripts/aio_recorder_media.py",
+    "scripts.aio_recorder_media": "scripts/aio_recorder_media.py",
+}
+
+
+def _safe_supervisor_frame_label(frame) -> str | None:
+    """Map only known product/script module identities to fixed file labels."""
+    module_name = frame.f_globals.get("__name__")
+    if not isinstance(module_name, str):
+        return None
+    if module_name == "catchuparr":
+        return "catchuparr/__init__.py"
+    if module_name.startswith("catchuparr."):
+        parts = module_name.split(".")
+        if all(part.isidentifier() for part in parts):
+            return "/".join(parts) + ".py"
+        return None
+    script_label = _SAFE_SUPERVISOR_SCRIPT_MODULES.get(module_name)
+    if script_label is not None:
+        return script_label
+    if module_name == "__main__":
+        return {
+            "aio_recorder_failover.py": "scripts/aio_recorder_failover.py",
+            "aio_recorder_media.py": "scripts/aio_recorder_media.py",
+        }.get(Path(frame.f_code.co_filename).name)
+    return None
 
 
 def _supervisor_exception_receipt(stop_event) -> dict[str, object]:
@@ -1174,23 +1204,18 @@ def _safe_supervisor_exception_evidence(module_name, function_name, frame_locals
     safe_class = (
         class_name if class_name in _SAFE_SUPERVISOR_EXCEPTION_CLASSES else "other"
     )
-    repository_root = Path(__file__).resolve().parents[1]
     repository_frames = []
     try:
-        for frame in traceback.extract_tb(error.__traceback__):
-            try:
-                relative_file = Path(frame.filename).resolve().relative_to(repository_root)
-            except (OSError, ValueError):
+        for frame, line_number in traceback.walk_tb(error.__traceback__):
+            file_label = _safe_supervisor_frame_label(frame)
+            if file_label is None:
                 continue
-            if relative_file.suffix != ".py" or any(
-                part in {"..", ".git"} for part in relative_file.parts
-            ):
-                continue
-            function = frame.name if frame.name.isidentifier() else "other"
+            function_name = frame.f_code.co_name
+            function = function_name if function_name.isidentifier() else "other"
             repository_frames.append({
-                "file": relative_file.as_posix()[:120],
+                "file": file_label[:120],
                 "function": function[:80],
-                "line": frame.lineno if type(frame.lineno) is int else None,
+                "line": line_number if type(line_number) is int else None,
             })
     except Exception:
         return safe_class, []
