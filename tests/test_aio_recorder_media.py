@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -770,8 +771,9 @@ class RecorderMediaProbeTests(unittest.TestCase):
         synthetic = ast.parse(
             "def supervise():\n"
             "    try:\n"
-            "        external_entry()\n"
+            "        external_0()\n"
             "    except Exception as exc:\n"
+            "        capture_exception(exc)\n"
             "        stop_event.set()\n"
         )
         synthetic_set_line = next(
@@ -793,6 +795,14 @@ class RecorderMediaProbeTests(unittest.TestCase):
             "stop_event": stop_event,
             "SyntheticSupervisorFailure": SyntheticSupervisorFailure,
         }
+        traceback_functions = []
+
+        def capture_exception(error):
+            traceback_functions.extend(
+                frame.name for frame in traceback.extract_tb(error.__traceback__)
+            )
+
+        namespace["capture_exception"] = capture_exception
         external_frames = "\n".join(
             f"def external_{index}():\n    return external_{index + 1}()"
             for index in range(5)
@@ -822,6 +832,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
             and type(frame["line"]) is int
             for frame in diagnostic["supervisor_exception_call_sites"]
         ))
+        self.assertIn("external_5", traceback_functions)
         encoded = json.dumps(diagnostic)
         self.assertNotIn("PrivateTokenABC123", encoded)
         self.assertNotIn("PrivateLocalABC123", encoded)
