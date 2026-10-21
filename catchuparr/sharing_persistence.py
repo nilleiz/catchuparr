@@ -491,6 +491,37 @@ class SharingIntentLedger:
             ).fetchone()
         return self._decode(row) if row is not None else None
 
+    def claim_was_consumed(self, token: SharingIntentToken) -> bool:
+        """Return whether this exact logical intent has ever been claimed.
+
+        This is an advisory read used to decide whether a pre-claim ATTACH
+        preparation can be retried. ``run_if_current`` remains the atomic,
+        cross-process single-use authority and rechecks the claim itself.
+        """
+        if not isinstance(token, SharingIntentToken):
+            raise ValueError("token must be SharingIntentToken")
+        with self._database() as db:
+            legacy = db.execute(
+                """SELECT 1 FROM sharing_legacy_intent_claims
+                WHERE channel_uuid=? AND intent_epoch=? AND action=?""",
+                (token.channel_uuid, token.intent_epoch, token.action.value),
+            ).fetchone()
+            revision = db.execute(
+                """SELECT 1 FROM sharing_intent_claims
+                WHERE channel_uuid=? AND revision=?""",
+                (token.channel_uuid, token.revision),
+            ).fetchone()
+            logical = db.execute(
+                """SELECT 1 FROM sharing_logical_intent_claims
+                WHERE channel_uuid=? AND configuration_generation=?
+                  AND control_generation=? AND recorder_fence=?
+                  AND intent_epoch=? AND action=?""",
+                (token.channel_uuid, token.configuration_generation,
+                 token.control_generation, token.recorder_fence,
+                 token.intent_epoch, token.action.value),
+            ).fetchone()
+        return legacy is not None or revision is not None or logical is not None
+
     @staticmethod
     def _strict_json_loads(value: str):
         def reject_constant(_constant: str):
