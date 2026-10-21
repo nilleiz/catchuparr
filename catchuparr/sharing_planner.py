@@ -653,6 +653,7 @@ def resolve_transition(
     now: float,
     current_state: SharingState,
     current_observation: SharingObservation,
+    admitted_return_deadline: float | None = None,
 ) -> SharingState:
     """Commit only successful route changes; failures never advance switch time."""
     if not isinstance(state, SharingState) or not isinstance(current_state, SharingState):
@@ -665,6 +666,13 @@ def resolve_transition(
         raise ValueError("now must be a finite timestamp")
     if not isinstance(current_observation, SharingObservation):
         raise ValueError("current_observation must be a fresh SharingObservation")
+    if admitted_return_deadline is not None and (
+        action is not SharingAction.RETURN_TO_ALLOWED
+        or isinstance(admitted_return_deadline, bool)
+        or not isinstance(admitted_return_deadline, (int, float))
+        or not math.isfinite(float(admitted_return_deadline))
+    ):
+        raise ValueError("admitted return deadline must be finite and bound to RETURN_TO_ALLOWED")
     if (
         not current_observation.lease_is_current
         or current_observation.channel_uuid != state.channel_uuid
@@ -729,7 +737,10 @@ def resolve_transition(
         SharingAction.RETURN_TO_ALLOWED,
         SharingAction.PAUSE_NO_ALLOWED_SOURCE,
     }:
-        deadline = _completion_deadline(current_state, current_observation, action)
+        deadline = _completion_deadline(
+            current_state, current_observation, action,
+            admitted_return_deadline=admitted_return_deadline,
+        )
         if deadline is not None and (
             float(now) < deadline or float(current_observation.now) < deadline
         ):
@@ -796,6 +807,8 @@ def _completion_deadline(
     state: SharingState,
     observation: SharingObservation,
     action: SharingAction,
+    *,
+    admitted_return_deadline: float | None = None,
 ) -> float | None:
     """Recheck normal switching deadlines at transition completion.
 
@@ -816,6 +829,10 @@ def _completion_deadline(
         SharingAction.RETURN_TO_ALLOWED,
         SharingAction.PAUSE_NO_ALLOWED_SOURCE,
     }:
+        if admitted_return_deadline is not None:
+            if action is not SharingAction.RETURN_TO_ALLOWED:
+                raise ValueError("admitted return deadline is only valid for RETURN_TO_ALLOWED")
+            return float(admitted_return_deadline)
         if state.phase != SharingPhase.WAIT_RETURN or state.last_viewer_left_at is None:
             return None
         return _later_deadline(

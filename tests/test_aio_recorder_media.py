@@ -6,8 +6,9 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -44,6 +45,269 @@ class _FakeRedis:
 
 
 class RecorderMediaProbeTests(unittest.TestCase):
+    def test_healthy_borrow_gate_diagnostic_preserves_exact_provider_predicate(self):
+        baseline = {
+            "previous_client_is_distinct": True,
+            "recorder_client_verified": True,
+            "native_registration_present": True,
+            "native_manager_running": True,
+            "native_owner_present": True,
+            "native_owner_matches_expected": True,
+            "source_metadata_matches_expected": True,
+            "global_native_client_count": 2,
+            "local_native_client_count": 1,
+            "source_a_request_delta": 1,
+            "source_a_active_count": 1,
+            "source_b_active_count": 0,
+            "task_alive": True,
+            "task_has_no_unexpected_failure": True,
+        }
+        passing = probe._healthy_borrow_gate_snapshot(**baseline)
+        self.assertTrue(passing["healthy_borrow_gate_passed"])
+        self.assertEqual(passing["exact_A_request_delta"], 1)
+        self.assertEqual(passing["A_active_count"], 1)
+        self.assertEqual(passing["B_active_count"], 0)
+        self.assertEqual(passing["stage"], "before_fault_arming")
+
+        for changed in (
+            {"source_a_request_delta": 2},
+            {"recorder_client_verified": False},
+            {"native_registration_present": False},
+            {"previous_client_is_distinct": False},
+            {"native_owner_present": False},
+            {"native_owner_matches_expected": False},
+            {"source_metadata_matches_expected": False},
+            {"native_manager_running": False},
+            {"global_native_client_count": 3},
+            {"local_native_client_count": 2},
+        ):
+            diagnostic = probe._healthy_borrow_gate_snapshot(**(baseline | changed))
+            self.assertFalse(diagnostic["healthy_borrow_gate_passed"])
+
+    def test_healthy_borrow_readiness_waits_for_exact_registration_and_fails_closed(self):
+        base = {
+            "previous_client_is_distinct": True,
+            "recorder_client_verified": False,
+            "native_registration_present": False,
+            "native_manager_running": True,
+            "native_owner_present": True,
+            "native_owner_matches_expected": True,
+            "source_metadata_matches_expected": True,
+            "global_native_client_count": 1,
+            "local_native_client_count": 1,
+            "source_a_request_delta": 1,
+            "source_a_active_count": 1,
+            "source_b_active_count": 1,
+            "task_alive": True,
+            "task_has_no_unexpected_failure": True,
+            "stage": "after_normal_reattach_deadline",
+        }
+
+        def snapshot(**changes):
+            return probe._healthy_borrow_gate_snapshot(**(base | changes))
+
+        pending = snapshot()
+        registered = snapshot(
+            recorder_client_verified=True,
+            native_registration_present=True,
+            global_native_client_count=2,
+            source_b_active_count=0,
+        )
+        now = [0.0]
+        current = [pending]
+
+        def cooperative_wait(delay):
+            current[0] = registered
+            now[0] += delay
+
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: current[0], 1, monotonic=lambda: now[0], sleep=cooperative_wait,
+        )
+        self.assertTrue(ready)
+        self.assertIs(evidence, registered)
+        self.assertEqual(evidence["stage"], "after_normal_reattach_deadline")
+
+        excessive_a = snapshot(source_a_request_delta=2)
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: excessive_a, 1,
+            sleep=lambda _delay: self.fail("extra A request must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, excessive_a)
+
+        wrong_identity = snapshot(previous_client_is_distinct=False)
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: wrong_identity, 1,
+            sleep=lambda _delay: self.fail("wrong client identity must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, wrong_identity)
+
+        now[0] = 0.0
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: pending, 0.2, monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, pending)
+
+        wrong_source = snapshot(source_metadata_matches_expected=False)
+        now[0] = 0.0
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: wrong_source, 0.2, monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, wrong_source)
+
+        early_exit = snapshot(task_alive=False)
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: early_exit, 1,
+            sleep=lambda _delay: self.fail("early task exit must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, early_exit)
+
+        task_failure = snapshot(task_has_no_unexpected_failure=False)
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: task_failure, 1,
+            sleep=lambda _delay: self.fail("unexpected task failure must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(evidence, task_failure)
+
+    def test_both_borrow_gates_use_shared_readiness_proof(self):
+        source = Path(probe.__file__).read_text()
+        tree = ast.parse(source)
+        target = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "probe_actual_live_archive_isolation"
+        )
+        readiness_calls = [
+            node for node in ast.walk(target)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_wait_for_healthy_borrow_gate"
+        ]
+        self.assertEqual(len(readiness_calls), 2)
+
+    def test_failure_return_ack_requires_exact_admitted_and_normal_deadline_window(self):
+        token = SimpleNamespace(
+            action=SimpleNamespace(value="return_to_allowed"),
+            revision=4, channel_uuid="channel",
+            configuration_generation="config", control_generation=7,
+            recorder_fence=9, intent_epoch=12, not_before=200.0,
+        )
+        state = SimpleNamespace(
+            last_viewer_left_at=200.0, last_switch_at=190.0,
+            recorder_fence=9, intent_epoch=12,
+        )
+        recovered = SimpleNamespace(intent=token, revision=4, state=state)
+        committed_state = SimpleNamespace(
+            phase=SimpleNamespace(value="dedicated"), pending_action=None,
+            last_switch_at=201.0, intent_epoch=12,
+            configuration_generation="config", control_generation=7,
+            recorder_fence=9,
+        )
+        committed = SimpleNamespace(revision=5, intent=None, state=committed_state)
+        check = probe._failure_return_ack_matches_admitted_window
+        args = (token, recovered, token, 201.0, committed)
+        kwargs = {
+            "channel_uuid": "channel", "configuration_generation": "config",
+            "control_generation": 7,
+            "return_seconds": 1800.0, "minimum_switch_seconds": 60.0,
+        }
+        self.assertTrue(check(*args, **kwargs))
+        self.assertFalse(check(*args[:3], 199.0, committed, **kwargs))
+        self.assertFalse(check(*args[:3], 200.0 + 1800.0, committed, **kwargs))
+        self.assertFalse(check(
+            token, recovered, token, 201.0,
+            SimpleNamespace(revision=6, intent=None, state=committed_state), **kwargs,
+        ))
+
+    def test_failure_cleanup_barrier_requires_exact_closed_episode_and_native_absence(self):
+        capability = SimpleNamespace(
+            episode_id="episode", channel_uuid="channel", episode_version=4,
+            configuration_generation="config", control_generation=3,
+            recorder_fence=8, intent_epoch=10,
+            connection_identity=("channel", "worker", "owner", "metadata", "stream", "account", "profile", "input"),
+        )
+        episode = SimpleNamespace(
+            episode_id="episode", channel_uuid="channel", phase="closed", version=6,
+            configuration_generation="config", control_generation=3,
+            recorder_fence=8, intent_epoch=10,
+            identity=capability.connection_identity, client_id="catchuparr-client-nonce",
+        )
+
+        def snapshot(*, episode=episode, projection_state="known_revoked",
+                     projection_episode_id="episode", projection_client_id="catchuparr-client-nonce",
+                     projection_version=6, native_absent=True, held=True, alive=True,
+                     no_failure=True):
+            conditions = probe._failure_cleanup_ack_conditions(
+                episode, capability,
+                expected_client_id="catchuparr-client-nonce",
+                projection_state=projection_state,
+                projection_episode_id=projection_episode_id,
+                projection_client_id=projection_client_id,
+                projection_version=projection_version,
+                projection_binding_matches=(projection_state == "known_revoked"),
+                native_registration_absent=native_absent,
+                task_result_held=held, task_alive=alive,
+                task_has_no_unexpected_failure=no_failure,
+            )
+            return {"conditions": conditions}
+
+        self.assertTrue(all(snapshot()["conditions"].values()))
+        self.assertTrue(all(snapshot(projection_state="absent")["conditions"].values()))
+        for invalid in (
+            snapshot(episode=SimpleNamespace(**(vars(episode) | {"phase": "active"}))),
+            snapshot(episode=SimpleNamespace(**(vars(episode) | {"episode_id": "other"}))),
+            snapshot(projection_episode_id="other"),
+            snapshot(projection_client_id="other-client"),
+            snapshot(projection_version=5),
+            snapshot(native_absent=False),
+            snapshot(held=False),
+        ):
+            self.assertFalse(all(invalid["conditions"].values()))
+
+    def test_failure_cleanup_wait_handles_pending_ack_timeout_and_early_exit(self):
+        pending = {"conditions": {"task_alive": True, "task_has_no_unexpected_failure": True,
+                                   "native_ack": False}}
+        acknowledged = {"conditions": {"task_alive": True, "task_has_no_unexpected_failure": True,
+                                        "native_ack": True}}
+        now = [0.0]
+        snapshots = [pending]
+
+        def release_ack(_delay):
+            snapshots[0] = acknowledged
+            now[0] += _delay
+
+        ready, evidence = probe._wait_for_failure_cleanup_ack(
+            lambda: snapshots[0], 1, monotonic=lambda: now[0],
+            sleep=release_ack,
+        )
+        self.assertTrue(ready)
+        self.assertIs(acknowledged, evidence)
+
+        now[0] = 0.0
+        ready, evidence = probe._wait_for_failure_cleanup_ack(
+            lambda: pending, 0.2, monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+        self.assertFalse(ready)
+        self.assertIs(pending, evidence)
+
+        exited = {"conditions": {"task_alive": False,
+                                  "task_has_no_unexpected_failure": True,
+                                  "native_ack": False}}
+        ready, evidence = probe._wait_for_failure_cleanup_ack(
+            lambda: exited, 1,
+            sleep=lambda _delay: self.fail("early task exit must fail immediately"),
+        )
+        self.assertFalse(ready)
+        self.assertIs(exited, evidence)
+
     def test_supervisor_return_ack_wait_requires_order_completion_and_live_task(self):
         expected = (
             "media_callback_lost_ack", "supervisor_ack", "poll_after_supervisor_ack",
@@ -82,6 +346,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertEqual(1, len(sleeps))
 
         for failed_events, failures, alive, expected_condition in (
+            ((), (), False, "task_exit"),
             ((expected[1],), (), True, "event_order"),
             ((expected[0],), ("task:RuntimeError",), True, "task_failure"),
         ):
@@ -95,6 +360,12 @@ class RecorderMediaProbeTests(unittest.TestCase):
                 )
             diagnostic = json.loads(output[0].split(" ", 1)[1])
             self.assertEqual(expected_condition, diagnostic["condition"])
+            self.assertEqual(len(failed_events), diagnostic["ack_event_count"])
+            self.assertEqual("supervisor_ack" in failed_events, diagnostic["ack_seen"])
+            self.assertEqual(
+                "poll_after_supervisor_ack" in failed_events,
+                diagnostic["poll_seen"],
+            )
 
         output = []
         now[0] = 0.0
@@ -383,6 +654,9 @@ class RecorderMediaProbeTests(unittest.TestCase):
                 {"aio_recorder_failover": SimpleNamespace(
                     _segment_has_useful_av=lambda *_: True,
                     _segment_tone_frequency=lambda *_: 880,
+                    _supervisor_exception_receipt=(
+                        aio_recorder_failover._supervisor_exception_receipt
+                    ),
                 )},
             ):
                 probe._wait_for_indexed_tone(
@@ -461,6 +735,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         ast.increment_lineno(tree, first_stop - 2)
         exec(compile(tree, "synthetic_tasks.py", "exec"), namespace)
         namespace["supervise"]()
+        self.assertTrue(stop_event.is_set())
         diagnostic = probe._recorder_task_early_exit_diagnostic(
             SimpleNamespace(
                 result={"status": "stopped"},
@@ -471,6 +746,133 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertEqual("tasks.supervisor", diagnostic["stop_source"])
         self.assertEqual("stale_control", diagnostic["supervisor_admission_status"])
         self.assertEqual("admission_not_ready", diagnostic["supervisor_stop_reason"])
+
+    def test_supervisor_exception_receipt_is_bounded_and_redacts_message(self):
+        tasks_path = Path(__file__).parents[1] / "catchuparr" / "tasks.py"
+        source = ast.parse(tasks_path.read_text())
+        record_channel = next(
+            node for node in source.body
+            if isinstance(node, ast.FunctionDef) and node.name == "record_channel"
+        )
+        supervise = next(
+            node for node in ast.walk(record_channel)
+            if isinstance(node, ast.FunctionDef) and node.name == "supervise"
+        )
+        exception_handler = next(
+            node for node in ast.walk(supervise)
+            if isinstance(node, ast.ExceptHandler) and node.name == "exc"
+        )
+        exception_stop_line = next(
+            call.lineno
+            for statement in exception_handler.body for call in ast.walk(statement)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "set"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "stop_event"
+        )
+        synthetic = ast.parse(
+            "def supervise():\n"
+            "    try:\n"
+            "        external_0()\n"
+            "    except Exception as exc:\n"
+            "        capture_exception(exc)\n"
+            "        stop_event.set()\n"
+        )
+        synthetic_set_line = next(
+            node.lineno for node in ast.walk(synthetic)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "stop_event"
+        )
+        ast.increment_lineno(synthetic, exception_stop_line - synthetic_set_line)
+        stop_event = aio_recorder_failover._ObservedRecorderStopEvent()
+
+        class LoopExit(Exception):
+            pass
+
+        namespace = {
+            "__name__": "catchuparr.tasks",
+            "stop_event": stop_event,
+            "LoopExit": LoopExit,
+        }
+        traceback_functions = []
+
+        def capture_exception(error):
+            traceback_functions.extend(
+                frame.name for frame in traceback.extract_tb(error.__traceback__)
+            )
+
+        namespace["capture_exception"] = capture_exception
+        external_frames = "\n".join(
+            f"def external_{index}():\n    return external_{index + 1}()"
+            for index in range(5)
+        ) + "\n" + (
+            "def external_5():\n"
+            "    private_local_value = 'PrivateLocalABC123'\n"
+            "    raise LoopExit('PrivateTokenABC123')\n"
+        )
+        external_namespace = {"__name__": "gevent._waiter", "LoopExit": LoopExit}
+        staged_gevent_file = Path(__file__).parents[1] / "app" / "src" / "gevent" / "_waiter.py"
+        exec(
+            compile(external_frames, str(staged_gevent_file), "exec"),
+            external_namespace,
+        )
+        namespace["external_0"] = external_namespace["external_0"]
+        exec(compile(synthetic, str(tasks_path), "exec"), namespace)
+        namespace["supervise"]()
+        diagnostic = probe._recorder_task_early_exit_diagnostic(
+            SimpleNamespace(
+                result={"status": "stopped"}, stop_event=stop_event,
+                thread=SimpleNamespace(is_alive=lambda: False),
+            )
+        )
+        self.assertEqual("exception", diagnostic["supervisor_stop_reason"])
+        self.assertEqual("LoopExit", diagnostic["supervisor_exception_class"])
+        self.assertTrue(diagnostic["supervisor_exception_call_sites"])
+        self.assertTrue(all(
+            frame["file"] == "catchuparr/tasks.py"
+            and frame["function"] == "supervise"
+            and type(frame["line"]) is int
+            for frame in diagnostic["supervisor_exception_call_sites"]
+        ))
+        self.assertIn("external_5", traceback_functions)
+        encoded = json.dumps(diagnostic)
+        self.assertNotIn("PrivateTokenABC123", encoded)
+        self.assertNotIn("PrivateLocalABC123", encoded)
+
+        failed_run = SimpleNamespace(
+            result={"status": "stopped"}, stop_event=stop_event,
+            thread=SimpleNamespace(is_alive=lambda: False),
+            results=[], failures=[], processes=[],
+        )
+        failover_diagnostic = aio_recorder_failover._recorder_task_exit_diagnostic(
+            failed_run,
+        )
+        for field in ("supervisor_exception_class", "supervisor_exception_call_sites"):
+            self.assertEqual(diagnostic[field], failover_diagnostic[field])
+        failover_encoded = json.dumps(failover_diagnostic)
+        self.assertNotIn("PrivateTokenABC123", failover_encoded)
+        self.assertNotIn("PrivateLocalABC123", failover_encoded)
+
+        output = io.StringIO()
+        with redirect_stderr(output), self.assertRaisesRegex(
+            RuntimeError, "^Recorder task ended before media was indexed$",
+        ):
+            aio_recorder_failover._wait_for_source_segments(
+                failed_run, None, "channel", "ffmpeg", "ffprobe",
+                "Synthetic Source B", minimum=1, timeout=1,
+            )
+        emitted = output.getvalue()
+        prefix = aio_recorder_failover.RECORDER_EXIT_DIAGNOSTIC_PREFIX
+        self.assertTrue(emitted.startswith(prefix))
+        emitted_diagnostic = json.loads(emitted[len(prefix):])
+        for field in ("supervisor_exception_class", "supervisor_exception_call_sites"):
+            self.assertEqual(diagnostic[field], emitted_diagnostic[field])
+        self.assertNotIn("PrivateTokenABC123", emitted)
+        self.assertNotIn("PrivateLocalABC123", emitted)
 
     def test_allowed_source_wait_reports_existing_safe_task_exit_receipt(self):
         now = [0.0]

@@ -539,6 +539,7 @@ class RecorderBorrowCoordinator:
                 current.state, SharingAction.RETURN_TO_ALLOWED, succeeded=True,
                 now=float(media_at), current_state=current.state,
                 current_observation=observation,
+                admitted_return_deadline=token.not_before,
             )
             if (resolved.pending_action is not None
                     or resolved.last_switch_at != float(media_at)):
@@ -560,7 +561,7 @@ class RecorderBorrowCoordinator:
                     resolved, action=None, expected_revision=token.revision,
                     updated_at=time.time(),
                 )
-            except Exception:
+            except Exception as exc:
                 # A caller may lose the result after SQLite committed. Only the
                 # exact one-step state transition is an idempotent success.
                 latest = self.intent_ledger.read(self.channel_uuid)
@@ -573,7 +574,7 @@ class RecorderBorrowCoordinator:
                     return True
                 from .logging_utils import error
 
-                error("sharing_return_media_unconfirmed", callsite="return_completion")
+                error("sharing_return_media_unconfirmed", exc, callsite="return_completion")
                 return False
             self.state_record = saved
             return True
