@@ -1110,11 +1110,11 @@ def _safe_supervisor_admission_status(module_name, function_name, frame_locals) 
 
 
 _SUPERVISOR_STOP_REASONS_BY_LINE = {
-    501: "admission_or_lease_renewal",
-    524: "stats_capability_refresh",
-    556: "attempt_renewal",
-    564: "candidate_currentness",
-    568: "exception",
+    544: "admission_or_lease_renewal",
+    567: "stats_capability_refresh",
+    611: "attempt_renewal",
+    619: "candidate_currentness",
+    623: "exception",
 }
 
 _SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({
@@ -1298,6 +1298,7 @@ class _RecorderTaskRun:
         fail_borrow_after_next_media: bool = False,
         defer_borrow_failure_until_armed: bool = False,
         hold_borrow_failure_result: bool = False,
+        hold_first_cleanup_ack: bool = False,
     ):
         self.channel_uuid = str(channel_uuid)
         self.startup_timeout = float(startup_timeout)
@@ -1318,6 +1319,11 @@ class _RecorderTaskRun:
         self.borrow_failure_media_at: float | None = None
         self.borrow_failure_result_held = False
         self.borrow_failure_result_release = threading.Event()
+        self.hold_first_cleanup_ack = bool(hold_first_cleanup_ack)
+        self.cleanup_ack_release = threading.Event()
+        self.cleanup_ack_attempts = 0
+        self._cleanup_ack_worker: str | None = None
+        self._cleanup_ack_lease: str | None = None
         self._lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self._patchers = []
@@ -1325,10 +1331,26 @@ class _RecorderTaskRun:
         self.expected_generation: str | None = None
         self.expected_control_generation: int | None = None
 
+    def _confirm_native_stop(self, native_stop, redis, attempt, lease) -> bool:
+        # Withhold an ACK only after the real stop/reap checks succeed. The
+        # fixture cannot turn a failed cleanup into proof of resource absence.
+        if not native_stop(redis, attempt, lease):
+            return False
+        with self._lock:
+            if self.hold_first_cleanup_ack:
+                if self._cleanup_ack_worker is None:
+                    self._cleanup_ack_worker = attempt.worker_id
+                    self._cleanup_ack_lease = getattr(lease, "_value", None)
+                if (self._cleanup_ack_worker == attempt.worker_id
+                        and not self.cleanup_ack_release.is_set()):
+                    self.cleanup_ack_attempts += 1
+                    return False
+        return True
+
     def start(self, task_args: tuple | list | None = None) -> None:
         from unittest.mock import patch
 
-        from catchuparr import tasks
+        from catchuparr import recorder_proxy, tasks
         from catchuparr.configuration import load_active_configuration
         from catchuparr.engine import recorder as recorder_engine
         from catchuparr.engine.recorder import FFmpegCopyRecorder
@@ -1360,6 +1382,10 @@ class _RecorderTaskRun:
 
         original_run_candidate = FFmpegCopyRecorder.run_candidate
         original_popen = subprocess.Popen
+        original_native_stop = recorder_proxy.stop_recorder_attempt
+
+        def deferred_native_stop(redis, attempt, lease):
+            return self._confirm_native_stop(original_native_stop, redis, attempt, lease)
 
         def tracked_popen(*args, **kwargs):
             process = original_popen(*args, **kwargs)
@@ -1450,6 +1476,7 @@ class _RecorderTaskRun:
             patch.object(tasks, "threading", task_threading),
             patch.object(FFmpegCopyRecorder, "run_candidate", bounded_run_candidate),
             patch.object(recorder_engine, "subprocess", process_api),
+            patch.object(recorder_proxy, "stop_recorder_attempt", deferred_native_stop),
         ]
         for patcher in self._patchers:
             patcher.start()
@@ -2029,10 +2056,45 @@ def probe_recorder_failover(root: Path) -> None:
             str(startup_channel.uuid),
             startup_timeout=STARTUP_TIMEOUT,
             media_idle_timeout=MEDIA_IDLE_TIMEOUT,
+            hold_first_cleanup_ack=True,
         )
         startup_run.start()
         harnesses.append(startup_run)
         try:
+            startup_deadline = time.monotonic() + 100
+            pending_lease = None
+            while startup_run.cleanup_ack_attempts < 2:
+                if (startup_run.thread is None or not startup_run.thread.is_alive()
+                        or time.monotonic() >= startup_deadline):
+                    _emit_recorder_exit_diagnostic(startup_run)
+                _require(
+                    startup_run.thread is not None and startup_run.thread.is_alive(),
+                    "Recorder exited instead of retrying delayed native cleanup",
+                )
+                _require(time.monotonic() < startup_deadline, "Delayed cleanup retry was not reached")
+                counts, active_counts = source_server.snapshot()
+                _require(
+                    all(counts[f"source-{label}.ts"] == startup_baseline[f"source-{label}.ts"]
+                        for label in ("b", "c", "d")),
+                    "A replacement source opened before exact cleanup acknowledgment",
+                )
+                if startup_run.cleanup_ack_attempts:
+                    lease = redis_client.get(f"catchuparr:recorder:{startup_channel.uuid}")
+                    _require(lease is not None, "Recorder lost its lease during delayed cleanup")
+                    if pending_lease is None:
+                        pending_lease = lease
+                    _require(lease == pending_lease, "Recorder restarted during delayed cleanup")
+                    _require(active_counts["source-a.ts"] == 0, "Real source A cleanup was not completed")
+                time.sleep(POLL_INTERVAL)
+            _assert_worker_cleanup(redis_client, startup_channel.uuid)
+            lease = redis_client.get(f"catchuparr:recorder:{startup_channel.uuid}")
+            if isinstance(lease, bytes):
+                lease = lease.decode("utf-8")
+            _require(
+                lease is not None and lease == startup_run._cleanup_ack_lease,
+                "Delayed cleanup did not retain the exact recorder lease",
+            )
+            startup_run.cleanup_ack_release.set()
             startup_b = _wait_for_source_segments(
                 startup_run,
                 startup_store,
@@ -2041,7 +2103,7 @@ def probe_recorder_failover(root: Path) -> None:
                 ffprobe,
                 "Synthetic Source B",
                 minimum=1,
-                timeout=100,
+                timeout=max(0.1, startup_deadline - time.monotonic()),
             )
             hold_until = time.monotonic() + MEDIA_IDLE_TIMEOUT + 3
             while time.monotonic() < hold_until:
@@ -2311,7 +2373,7 @@ def probe_recorder_failover(root: Path) -> None:
             ),
             "Failover cleanup changed a native profile credential marker",
         )
-        print("AIO recorder startup, capacity, runtime failover, media gaps, and cleanup passed")
+        print("AIO recorder startup, delayed cleanup recovery, capacity, runtime failover, media gaps, and cleanup passed")
     finally:
         for run in harnesses:
             if run.thread is not None and run.thread.is_alive():
