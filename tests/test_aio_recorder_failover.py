@@ -876,9 +876,13 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
         self.assertLessEqual(cooperative_sleeps[0], 0.05)
         self.assertFalse(run.stop_event.is_set())
 
-    def test_supervisor_join_requires_explicit_expected_fence_result(self):
+    def test_supervisor_join_accepts_only_explicit_fence_results(self):
         run = probe._RecorderTaskRun(
             "synthetic-channel", startup_timeout=1, media_idle_timeout=1,
+        )
+        accepted_results = (
+            {"status": "stopped"},
+            {"status": "stale_control"},
         )
         run.result = {"status": "stale_control"}
 
@@ -886,8 +890,13 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not finish as expected"):
                 run.join_after_supervisor(timeout=1)
             run.join_after_supervisor(
-                timeout=1, expected_result={"status": "stale_control"},
+                timeout=1, expected_results=accepted_results,
             )
+            run.result = {"status": "media_stalled"}
+            with self.assertRaisesRegex(RuntimeError, "did not finish as expected"):
+                run.join_after_supervisor(
+                    timeout=1, expected_results=accepted_results,
+                )
 
         self.assertFalse(run.stop_event.is_set())
 
