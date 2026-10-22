@@ -44,7 +44,7 @@ def _ack_failed_opening_cleanup(ledger, channel_uuid, episode_id, result, *, ack
     return True
 
 
-def _run_current_recordings_readonly(action, archive_db, outbox_db):
+def _run_current_recordings_readonly(action, archive_db, outbox_db=None):
     """Run the action while an SQLite authorizer watches its persistent reads."""
     import sqlite3
     from urllib.parse import unquote, urlsplit
@@ -57,7 +57,7 @@ def _run_current_recordings_readonly(action, archive_db, outbox_db):
         getcurrent = None
 
     archive_path = Path(archive_db).resolve()
-    outbox_path = Path(outbox_db).resolve()
+    outbox_path = Path(outbox_db).resolve() if outbox_db is not None else None
     original_connect = recording_overview.sqlite3.connect
     action_thread_id = threading.get_ident()
     action_greenlet = getcurrent() if getcurrent is not None else None
@@ -113,7 +113,7 @@ def _run_current_recordings_readonly(action, archive_db, outbox_db):
         try:
             resolved_path = Path(parsed_path).resolve()
             is_archive = resolved_path == archive_path
-            is_outbox = resolved_path == outbox_path
+            is_outbox = outbox_path is not None and resolved_path == outbox_path
         except (OSError, ValueError):
             is_archive = False
             is_outbox = False
@@ -7669,8 +7669,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 try:
                     run.stop()
                     run.join(20, cooperative_sleep=gevent_sleep)
-                except Exception:
+                except Exception as error:
                     cleanup_errors.append("recorder-task")
+                    cleanup_exception_types.append(type(error).__name__)
         if live_session is not None:
             try:
                 force_release = None
