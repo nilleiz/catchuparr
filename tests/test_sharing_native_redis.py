@@ -13,8 +13,11 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -37,7 +40,10 @@ from catchuparr.adapters.sharing_native import (
     register_borrowed_client,
     tombstone_expired_unprojected_opening,
 )
-from catchuparr.sharing_episode import BorrowEpisodeSnapshot
+from catchuparr.sharing_episode import BorrowEpisodeLedger, BorrowEpisodeSnapshot
+from catchuparr.sharing_persistence import SharingIntentToken
+from catchuparr.sharing_planner import SharingAction
+from catchuparr.sharing_recovery import recover_superseded_borrow
 
 CHANNEL = "channel-synthetic-lua-060"
 WORKER = "worker-synthetic-lua-060"
@@ -1329,6 +1335,58 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertEqual(self.redis.type(keys["client"]), "none")
         self.assertFalse(self.redis.sismember(keys["clients"], CLIENT))
         self.assertIsNone(self.redis.hget(keys["private"], CLIENT))
+
+    def test_superseded_active_sql_episode_recovers_and_registers_without_losing_viewer(self):
+        self._base_authority()
+        self._native_source_and_viewer()
+        identity = (CHANNEL, WORKER, WORKER, WORKER, STREAM, ACCOUNT,
+                    M3U_PROFILE, INPUT_PROFILE)
+        old_token = SharingIntentToken(
+            channel_uuid=CHANNEL, revision=1, intent_epoch=1,
+            action=SharingAction.ATTACH_BORROW, configuration_generation=CONFIG,
+            control_generation=6, recorder_fence=11, target_identity=identity,
+            target_admitted=True, not_before=100,
+        )
+        new_lease = "12:synthetic-replacement-owner"
+        self.redis.command("SET", _keys()["lease"], new_lease, "EX", 600)
+        with tempfile.TemporaryDirectory() as temp:
+            ledger = BorrowEpisodeLedger(Path(temp) / "episodes.sqlite3")
+            old = ledger.begin_open(
+                old_token, lease_digest=hashlib.sha256(LEASE.encode()).hexdigest(),
+                identity=identity, client_id=CLIENT, expected_version=None,
+            )
+            old = ledger.activate(
+                old.episode_id, expected_version=old.version, client_id=CLIENT,
+                connected_at="100", ordinary_viewer_ids=(VIEWER,),
+            )
+            self.assertTrue(recover_superseded_borrow(
+                ledger, self.redis, CHANNEL, configuration_generation=CONFIG,
+                control_generation=7, recorder_fence=12, lease_value=new_lease,
+                current_authority=lambda: {
+                    "catalog_generation": CATALOG, "authority_revision": 1,
+                },
+            ))
+            closed = ledger.read(CHANNEL)
+            self.assertEqual("closed", closed.phase)
+            new_client = "catchuparr-client-synthetic-replacement"
+            fresh = ledger.begin_open(
+                replace(old_token, recorder_fence=12, control_generation=7, intent_epoch=2),
+                lease_digest=hashlib.sha256(new_lease.encode()).hexdigest(),
+                identity=identity, client_id=new_client, expected_version=closed.version,
+            )
+            self.assertTrue(project_opening_episode(
+                self.redis, fresh, lease_value=new_lease, catalog_generation=CATALOG,
+                return_seconds=30, minimum_switch_seconds=60, last_switch_at=None,
+            ))
+            ack = register_borrowed_client(
+                self.redis, fresh, lease_value=new_lease, catalog_generation=CATALOG,
+                client_id=new_client, local_worker_id=TASK_WORKER,
+                user_agent="Synthetic Player", client_ip="192.0.2.60",
+            )
+            self.assertIsNotNone(ack)
+            self.assertEqual({VIEWER, new_client}, self.redis.smembers(_keys()["clients"]))
+            self.assertEqual(WORKER, self.redis.get(_keys()["owner"]))
+            self.assertEqual(STREAM, self.redis.hget(_keys()["metadata"], "stream_id"))
 
     def test_expired_opening_tombstone_is_idempotent_and_denies_changed_authority(self):
         episode = self._opening_projection()
