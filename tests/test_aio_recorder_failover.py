@@ -128,44 +128,44 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         self.assertEqual(stop_lines, set(probe._SUPERVISOR_STOP_REASONS_BY_LINE))
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 491,
+                "catchuparr.tasks", "supervise", 501,
                 {"current_admission": {"status": "ready"}},
             ),
             "lease_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 491,
+                "catchuparr.tasks", "supervise", 501,
                 {"current_admission": {"status": "stale_control"}},
             ),
             "admission_not_ready",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 514, {},
+                "catchuparr.tasks", "supervise", 524, {},
             ),
             "stats_capability_refresh",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 546, {},
+                "catchuparr.tasks", "supervise", 556, {},
             ),
             "attempt_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 554, {},
+                "catchuparr.tasks", "supervise", 564, {},
             ),
             "candidate_currentness",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 558, {},
+                "catchuparr.tasks", "supervise", 568, {},
             ),
             "exception",
         )
         self.assertEqual(
-            probe._safe_supervisor_stop_reason("untrusted", "supervise", 491, {}),
+            probe._safe_supervisor_stop_reason("untrusted", "supervise", 501, {}),
             "unavailable",
         )
 
@@ -874,6 +874,30 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
         self.assertEqual(len(cooperative_sleeps), 1)
         self.assertGreater(cooperative_sleeps[0], 0)
         self.assertLessEqual(cooperative_sleeps[0], 0.05)
+        self.assertFalse(run.stop_event.is_set())
+
+    def test_supervisor_join_accepts_only_explicit_fence_results(self):
+        run = probe._RecorderTaskRun(
+            "synthetic-channel", startup_timeout=1, media_idle_timeout=1,
+        )
+        accepted_results = (
+            {"status": "stopped"},
+            {"status": "stale_control"},
+        )
+        run.result = {"status": "stale_control"}
+
+        with patch.object(probe, "_emit_recorder_exit_diagnostic"):
+            with self.assertRaisesRegex(RuntimeError, "did not finish as expected"):
+                run.join_after_supervisor(timeout=1)
+            run.join_after_supervisor(
+                timeout=1, expected_results=accepted_results,
+            )
+            run.result = {"status": "media_stalled"}
+            with self.assertRaisesRegex(RuntimeError, "did not finish as expected"):
+                run.join_after_supervisor(
+                    timeout=1, expected_results=accepted_results,
+                )
+
         self.assertFalse(run.stop_event.is_set())
 
     def test_supervisor_join_keeps_timeout_bounded_without_signalling(self):

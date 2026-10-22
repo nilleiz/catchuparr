@@ -44,16 +44,23 @@ def _ack_failed_opening_cleanup(ledger, channel_uuid, episode_id, result, *, ack
     return True
 
 
-def _run_current_recordings_readonly(action, archive_db):
-    """Run the action while an SQLite authorizer watches its archive reads."""
+def _run_current_recordings_readonly(action, archive_db, outbox_db=None):
+    """Run the action while an SQLite authorizer watches its persistent reads."""
     import sqlite3
     from urllib.parse import unquote, urlsplit
 
     from catchuparr import recording_overview
 
+    try:
+        from greenlet import getcurrent
+    except ImportError:
+        getcurrent = None
+
     archive_path = Path(archive_db).resolve()
+    outbox_path = Path(outbox_db).resolve() if outbox_db is not None else None
     original_connect = recording_overview.sqlite3.connect
     action_thread_id = threading.get_ident()
+    action_greenlet = getcurrent() if getcurrent is not None else None
     inspected = []
     attempted_writes = []
     write_actions = {
@@ -93,24 +100,33 @@ def _run_current_recordings_readonly(action, archive_db):
         def __getattr__(self, name):
             return getattr(self._connection, name)
 
-    def guarded_connect(database, *args, **kwargs):
+    def in_action_context():
         if threading.get_ident() != action_thread_id:
+            return False
+        return getcurrent is None or getcurrent() is action_greenlet
+
+    def guarded_connect(database, *args, **kwargs):
+        if not in_action_context():
             return original_connect(database, *args, **kwargs)
         value = str(database)
         parsed_path = unquote(urlsplit(value).path) if value.startswith("file:") else value
         try:
-            is_archive = Path(parsed_path).resolve() == archive_path
+            resolved_path = Path(parsed_path).resolve()
+            is_archive = resolved_path == archive_path
+            is_outbox = outbox_path is not None and resolved_path == outbox_path
         except (OSError, ValueError):
             is_archive = False
+            is_outbox = False
         connection = original_connect(database, *args, **kwargs)
-        if not is_archive:
+        if not is_archive and not is_outbox:
             return connection
+        category = "archive_index" if is_archive else "sharing_authority_outbox"
         uri_readonly = value.startswith("file:") and "mode=ro" in value.split("?", 1)[-1].split("&")
         observation = {"uri_readonly": uri_readonly, "query_only": False}
 
         def authorize(action_code, arg1, arg2, _database, _trigger):
             if action_code in write_actions:
-                attempted_writes.append(str(arg1 or "unknown"))
+                attempted_writes.append(category)
                 return sqlite3.SQLITE_DENY
             if action_code == getattr(sqlite3, "SQLITE_PRAGMA", None) and arg2 is not None:
                 allowed_query_only = (
@@ -118,11 +134,13 @@ def _run_current_recordings_readonly(action, archive_db):
                     and str(arg2).upper() == "ON"
                 )
                 if not allowed_query_only:
-                    attempted_writes.append("pragma")
+                    attempted_writes.append(category)
                     return sqlite3.SQLITE_DENY
             return sqlite3.SQLITE_OK
 
         connection.set_authorizer(authorize)
+        if not is_archive:
+            return connection
         inspected.append(observation)
         return GuardedConnection(connection, observation)
 
@@ -135,9 +153,9 @@ def _run_current_recordings_readonly(action, archive_db):
     _require(all(item["uri_readonly"] and item["query_only"] for item in inspected),
              "Current recordings archive connection was not read-only/query-only")
     _require(not attempted_writes,
-             "Current recordings attempted to change the archive index")
+             "Current recordings attempted a SQLite write: "
+             + ", ".join(sorted(set(attempted_writes))))
     return result
-
 
 def _overview_source_metadata_matches(source, expected_mode):
     if not isinstance(source, dict) or source.get("mode") != expected_mode:
@@ -159,7 +177,6 @@ def _overview_source_metadata_matches(source, expected_mode):
 
 def _assert_live_overview(archive_root, active_path, control_path, channel_uuid, expected_mode):
     """Validate read-only current-recording output while a real attempt is live."""
-    import hashlib
     from datetime import datetime, timezone
 
     from catchuparr.plugin import Plugin
@@ -168,26 +185,24 @@ def _assert_live_overview(archive_root, active_path, control_path, channel_uuid,
     archive_db = archive_root / "archive.sqlite3"
     outbox_db = active_path.with_name(".catchuparr-sharing-authority.sqlite3")
 
-    def file_digest(path):
-        try:
-            return hashlib.sha256(path.read_bytes()).digest()
-        except FileNotFoundError:
-            return None
-
     def state_snapshot():
-        return (
-            active_path.read_bytes(), control_path.read_bytes(),
-            file_digest(outbox_db),
-        )
+        return active_path.read_bytes(), control_path.read_bytes()
 
-    before = state_snapshot()
-    result = _run_current_recordings_readonly(
-        lambda: Plugin.__new__(Plugin).run("current_recordings", {}, {}),
-        archive_db,
-    )
-    after = state_snapshot()
+    from catchuparr.configuration import _config_lock
+
+    # Exclude configuration writers that use the active-state lock. The
+    # supervisor may commit outbox recovery concurrently, so the action-thread
+    # SQLite authorizer checks outbox writes without attributing those commits
+    # to the overview call.
+    with _config_lock(active_path, exclusive=False):
+        before = state_snapshot()
+        result = _run_current_recordings_readonly(
+            lambda: Plugin.__new__(Plugin).run("current_recordings", {}, {}),
+            archive_db, outbox_db,
+        )
+        after = state_snapshot()
     _require(before == after,
-             "Current recordings overview changed applied configuration or outbox state")
+             "Current recordings overview changed applied configuration/control state")
     _require(result.get("status") == "ok" and isinstance(result.get("channels"), list),
              "Current recordings overview did not return applied channel rows")
     rows = {row.get("channel_uuid"): row for row in result["channels"]}
@@ -4305,7 +4320,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         load_applied_state,
     )
     from catchuparr.engine.store import ArchiveStore
-    from catchuparr.recorder_control import control_deny_path, control_state_path
+    from catchuparr.recorder_control import (
+        control_deny_path,
+        control_state_path,
+        load_recorder_control,
+    )
     from catchuparr.recorder_proxy import (
         CAPABILITY_PREFIX,
         configuration_generation,
@@ -6557,7 +6576,19 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             active_resume, worker_id, enabled=True, live_stability_seconds=1,
             last_viewer_return_seconds=30, min_switch_interval_seconds=60,
         )
-        run_no_source.join_after_supervisor(timeout=30, cooperative_sleep=gevent_sleep)
+        resumed_control = load_recorder_control()
+        _require(
+            resumed_control.generation != run_no_source.expected_control_generation,
+            "Restoring the source policy did not fence the prior no-source task",
+        )
+        run_no_source.join_after_supervisor(
+            timeout=30,
+            cooperative_sleep=gevent_sleep,
+            expected_results=(
+                {"status": "stopped"},
+                {"status": "stale_control"},
+            ),
+        )
         share_b_request_baseline = len(source_server.request_times("source-b.ts"))
         run_share = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
@@ -7638,8 +7669,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 try:
                     run.stop()
                     run.join(20, cooperative_sleep=gevent_sleep)
-                except Exception:
+                except Exception as error:
                     cleanup_errors.append("recorder-task")
+                    cleanup_exception_types.append(type(error).__name__)
         if live_session is not None:
             try:
                 force_release = None
