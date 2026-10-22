@@ -185,7 +185,7 @@ def _assert_live_overview(archive_root, active_path, control_path, channel_uuid,
     # Exclude an unrelated supervisor/configuration recovery from this
     # before/after window. The overview takes the same lock in shared mode;
     # direct writes by the action still change the snapshots and fail below.
-    with _config_lock(archive_root.parent / active_path.name, exclusive=False):
+    with _config_lock(active_path, exclusive=False):
         before = state_snapshot()
         result = _run_current_recordings_readonly(
             lambda: Plugin.__new__(Plugin).run("current_recordings", {}, {}),
