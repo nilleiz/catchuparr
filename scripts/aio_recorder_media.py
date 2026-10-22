@@ -192,8 +192,16 @@ def _assert_live_overview(archive_root, active_path, control_path, channel_uuid,
             archive_db,
         )
         after = state_snapshot()
-    _require(before == after,
-             "Current recordings overview changed applied configuration or outbox state")
+    changed_state = [
+        name for name, before_value, after_value in zip(
+            ("applied_configuration", "control_state", "sharing_authority_outbox"),
+            before, after,
+        )
+        if before_value != after_value
+    ]
+    _require(not changed_state,
+             "Current recordings overview changed persistent state: "
+             + ", ".join(changed_state))
     _require(result.get("status") == "ok" and isinstance(result.get("channels"), list),
              "Current recordings overview did not return applied channel rows")
     rows = {row.get("channel_uuid"): row for row in result["channels"]}
