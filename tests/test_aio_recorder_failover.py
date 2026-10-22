@@ -128,44 +128,44 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         self.assertEqual(stop_lines, set(probe._SUPERVISOR_STOP_REASONS_BY_LINE))
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 491,
+                "catchuparr.tasks", "supervise", 501,
                 {"current_admission": {"status": "ready"}},
             ),
             "lease_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 491,
+                "catchuparr.tasks", "supervise", 501,
                 {"current_admission": {"status": "stale_control"}},
             ),
             "admission_not_ready",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 514, {},
+                "catchuparr.tasks", "supervise", 524, {},
             ),
             "stats_capability_refresh",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 546, {},
+                "catchuparr.tasks", "supervise", 556, {},
             ),
             "attempt_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 554, {},
+                "catchuparr.tasks", "supervise", 564, {},
             ),
             "candidate_currentness",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 558, {},
+                "catchuparr.tasks", "supervise", 568, {},
             ),
             "exception",
         )
         self.assertEqual(
-            probe._safe_supervisor_stop_reason("untrusted", "supervise", 491, {}),
+            probe._safe_supervisor_stop_reason("untrusted", "supervise", 501, {}),
             "unavailable",
         )
 

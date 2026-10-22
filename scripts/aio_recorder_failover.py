@@ -1110,11 +1110,11 @@ def _safe_supervisor_admission_status(module_name, function_name, frame_locals) 
 
 
 _SUPERVISOR_STOP_REASONS_BY_LINE = {
-    491: "admission_or_lease_renewal",
-    514: "stats_capability_refresh",
-    546: "attempt_renewal",
-    554: "candidate_currentness",
-    558: "exception",
+    501: "admission_or_lease_renewal",
+    524: "stats_capability_refresh",
+    556: "attempt_renewal",
+    564: "candidate_currentness",
+    568: "exception",
 }
 
 _SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({
@@ -1514,11 +1514,14 @@ class _RecorderTaskRun:
         self._patchers = []
         with self._lock:
             _require(not self.failures, "Synthetic recorder task raised an internal error")
-            _require(self.result == {"status": "stopped"}, "Synthetic recorder task did not finish cleanly")
-            _require(
-                all(process.poll() is not None for process in self.processes),
-                "Synthetic FFmpeg process remained after recorder stop",
-            )
+            task_stopped = self.result == {"status": "stopped"}
+        if not task_stopped and os.environ.get("CATCHUPARR_INTEGRATION_TEST") == "1":
+            _emit_recorder_exit_diagnostic(self)
+        _require(task_stopped, "Synthetic recorder task did not finish cleanly")
+        _require(
+            all(process.poll() is not None for process in self.processes),
+            "Synthetic FFmpeg process remained after recorder stop",
+        )
 
 
 def _probe_schedule_and_control_gates(
