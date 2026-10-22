@@ -12,7 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import aio_recorder_failover as probe
 
@@ -39,6 +39,117 @@ class _SyntheticArchiveStore:
 
 
 class RecorderFailoverMediaTests(unittest.TestCase):
+    def _deferred_cleanup_case(self, snapshots, *, leases=None, deadline=1.0):
+        baseline = {f"source-{label}.ts": 0 for label in "abcd"}
+        run = probe._RecorderTaskRun(
+            "channel-synthetic", startup_timeout=1, media_idle_timeout=1,
+            hold_first_cleanup_ack=True,
+        )
+        run.thread = SimpleNamespace(is_alive=lambda: True)
+        redis = SimpleNamespace(get=Mock(side_effect=leases) if leases else Mock(return_value=b"lease"))
+        clock = [0.0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        rows = iter(snapshots)
+        last = [None]
+
+        def snapshot(*_args):
+            last[0] = next(rows, last[0])
+            acks, active_a, requests_b = last[0]
+            return acks, dict(baseline, **{"source-b.ts": requests_b}), {"source-a.ts": active_a}
+
+        with (
+            patch.object(probe, "_cleanup_ack_source_snapshot", side_effect=snapshot),
+            patch.object(probe, "_emit_recorder_exit_diagnostic"),
+        ):
+            probe._wait_for_deferred_cleanup(
+                run, object(), redis, "channel-synthetic", baseline, deadline,
+                monotonic=lambda: clock[0], sleep=sleep,
+            )
+        self.assertFalse(run.cleanup_ack_release.is_set())
+        return sleeps
+
+    def test_cleanup_barrier_requires_two_acks_and_actual_provider_drain(self):
+        sleeps = self._deferred_cleanup_case([(1, 0, 0), (2, 1, 0), (2, 0, 0)])
+        self.assertEqual([probe.POLL_INTERVAL] * 2, sleeps)
+
+    def test_cleanup_barrier_fails_if_provider_never_drains(self):
+        with self.assertRaisesRegex(RuntimeError, "Delayed cleanup retry was not reached"):
+            self._deferred_cleanup_case([(2, 1, 0)], deadline=probe.POLL_INTERVAL * 2)
+
+    def test_cleanup_barrier_rejects_any_replacement_request_before_release(self):
+        with self.assertRaisesRegex(RuntimeError, "replacement source opened"):
+            self._deferred_cleanup_case([(2, 0, 1)])
+
+    def test_cleanup_barrier_rejects_lease_replacement_while_provider_drains(self):
+        with self.assertRaisesRegex(RuntimeError, "Recorder restarted"):
+            self._deferred_cleanup_case([(1, 1, 0), (2, 0, 0)], leases=[b"first", b"second"])
+
+    def test_cleanup_snapshot_never_pairs_an_earlier_connection_with_a_later_ack(self):
+        run = probe._RecorderTaskRun(
+            "channel-synthetic", startup_timeout=1, media_idle_timeout=1,
+            hold_first_cleanup_ack=True,
+        )
+        native_stop = Mock(return_value=True)
+        attempt = SimpleNamespace(worker_id="worker-synthetic")
+        lease = SimpleNamespace(_value="synthetic-lease")
+        provider_active = {"source-a.ts": 1, "source-b.ts": 0}
+        requests = {"source-a.ts": 1, "source-b.ts": 0}
+
+        def read_provider_then_cleanup():
+            # Reproduce the CI ordering: the provider snapshot was acquired
+            # before a real cleanup ACK, but returned to the probe afterward.
+            observed_active = dict(provider_active)
+            self.assertFalse(run._confirm_native_stop(native_stop, object(), attempt, lease))
+            provider_active["source-a.ts"] = 0
+            return dict(requests), observed_active
+
+        source_server = SimpleNamespace(snapshot=read_provider_then_cleanup)
+        acknowledgments, _, active = probe._cleanup_ack_source_snapshot(run, source_server)
+        self.assertEqual(0, acknowledgments)
+        self.assertEqual(1, active["source-a.ts"])
+        self.assertEqual(1, run.cleanup_ack_attempts)
+
+        source_server.snapshot = lambda: (dict(requests), dict(provider_active))
+        acknowledgments, observed_requests, active = probe._cleanup_ack_source_snapshot(
+            run, source_server,
+        )
+        self.assertEqual(1, acknowledgments)
+        self.assertEqual(0, active["source-a.ts"])
+        self.assertEqual(0, observed_requests["source-b.ts"])
+        self.assertFalse(run.cleanup_ack_release.is_set())
+
+    def test_deferred_cleanup_never_turns_failed_native_cleanup_into_an_ack(self):
+        run = probe._RecorderTaskRun(
+            "channel-synthetic", startup_timeout=1, media_idle_timeout=1,
+            hold_first_cleanup_ack=True,
+        )
+        stop = Mock(return_value=False)
+        attempt = SimpleNamespace(worker_id="worker-synthetic")
+        self.assertFalse(run._confirm_native_stop(stop, object(), attempt, object()))
+        self.assertEqual(0, run.cleanup_ack_attempts)
+        self.assertIsNone(run._cleanup_ack_worker)
+
+    def test_deferred_cleanup_requires_release_after_repeated_real_stop_acks(self):
+        run = probe._RecorderTaskRun(
+            "channel-synthetic", startup_timeout=1, media_idle_timeout=1,
+            hold_first_cleanup_ack=True,
+        )
+        stop = Mock(return_value=True)
+        attempt = SimpleNamespace(worker_id="worker-synthetic")
+        lease = SimpleNamespace(_value="synthetic-lease-binding")
+        self.assertFalse(run._confirm_native_stop(stop, object(), attempt, lease))
+        self.assertFalse(run._confirm_native_stop(stop, object(), attempt, lease))
+        self.assertEqual(2, run.cleanup_ack_attempts)
+        self.assertEqual(lease._value, run._cleanup_ack_lease)
+        run.cleanup_ack_release.set()
+        self.assertTrue(run._confirm_native_stop(stop, object(), attempt, lease))
+        self.assertEqual(3, stop.call_count)
+
     def test_recorder_task_threading_preserves_observed_event_and_reentrant_lock(self):
         stop_event = threading.Event()
         task_threading = probe._recorder_task_threading(stop_event)
@@ -128,44 +239,44 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         self.assertEqual(stop_lines, set(probe._SUPERVISOR_STOP_REASONS_BY_LINE))
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 501,
+                "catchuparr.tasks", "supervise", 544,
                 {"current_admission": {"status": "ready"}},
             ),
             "lease_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 501,
+                "catchuparr.tasks", "supervise", 544,
                 {"current_admission": {"status": "stale_control"}},
             ),
             "admission_not_ready",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 524, {},
+                "catchuparr.tasks", "supervise", 567, {},
             ),
             "stats_capability_refresh",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 556, {},
+                "catchuparr.tasks", "supervise", 611, {},
             ),
             "attempt_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 564, {},
+                "catchuparr.tasks", "supervise", 619, {},
             ),
             "candidate_currentness",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 568, {},
+                "catchuparr.tasks", "supervise", 623, {},
             ),
             "exception",
         )
         self.assertEqual(
-            probe._safe_supervisor_stop_reason("untrusted", "supervise", 501, {}),
+            probe._safe_supervisor_stop_reason("untrusted", "supervise", 544, {}),
             "unavailable",
         )
 
@@ -926,6 +1037,35 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
         self.assertTrue(thread.joined_with)
         self.assertTrue(all(timeout == 0 for timeout in thread.joined_with))
         self.assertFalse(run.stop_event.is_set())
+
+    def test_final_cleanup_preserves_only_the_exact_validated_fence_result(self):
+        run = probe._RecorderTaskRun(
+            "synthetic-channel", startup_timeout=1, media_idle_timeout=1,
+        )
+        run.thread = SimpleNamespace(is_alive=lambda: False)
+        run.processes = [SimpleNamespace(poll=lambda: 0)]
+        run.result = {"status": "stale_control"}
+        with patch.object(probe, "_emit_recorder_exit_diagnostic"):
+            # A generic cleanup cannot admit a previously unvalidated exit.
+            with self.assertRaisesRegex(RuntimeError, "did not finish as expected"):
+                run.join(timeout=1)
+            run.join_after_supervisor(
+                timeout=1, expected_results=({"status": "stale_control"},),
+            )
+            # The outer finally repeats cleanup after the scenario has already
+            # validated this exact control-fenced exit.
+            run.join(timeout=1)
+            run.result["status"] = "media_stalled"
+            with self.assertRaisesRegex(RuntimeError, "did not finish as expected"):
+                run.join(timeout=1)
+            run.result = {"status": "stale_control"}
+            run.processes = [SimpleNamespace(poll=lambda: None)]
+            with self.assertRaisesRegex(RuntimeError, "FFmpeg process remained"):
+                run.join(timeout=1)
+            run.processes = []
+            run.failures = ["synthetic failure"]
+            with self.assertRaisesRegex(RuntimeError, "raised an internal error"):
+                run.join(timeout=1)
 
     def test_bridge_idle_wait_observes_handler_close(self):
         drained = threading.Event()

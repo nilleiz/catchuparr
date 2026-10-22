@@ -4,6 +4,27 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.6.8] - Prerelease
+
+### Fixed
+
+- Retain the recorder task, lease and allowed-source position while retrying
+  delayed revocation, native stop and HTTP cleanup acknowledgments. A failed
+  first source no longer forces reconciliation to restart at that source
+  instead of advancing to the next permitted source after confirmed cleanup.
+- Continue checking pause, configuration and lease authority during cleanup
+  without renewing an intentionally revoked recorder capability. Unconfirmed
+  cleanup never authorizes another source.
+
+### Verification
+
+- Synthetic regressions cover delayed native stop and HTTP acknowledgment,
+  transient cleanup errors, cancellation and lease loss. The native
+  Dispatcharr 0.32.0 scenario withholds real cleanup acknowledgments, checks
+  the unchanged lease and absence of replacement connections, then requires
+  useful indexed media from the next permitted source.
+- Requires Dispatcharr 0.32.0 or newer.
+
 ## [0.6.7] - Prerelease candidate
 
 ### Fixed
