@@ -471,10 +471,9 @@ def record_channel(
         if sharing_enabled:
             from .sharing_runtime import RecorderBorrowCoordinator
 
-            # Reconcile only this channel's durable failed opening before
-            # reading the native viewer observation. A valid opening or active
-            # episode is never stale-cleaned, and unresolved cleanup blocks
-            # both ATTACH and dedicated-provider fallback.
+            # Reconcile exact private resources before observing viewers or
+            # consuming another ATTACH claim. Current live episodes are never
+            # discarded, and unresolved cleanup blocks provider fallback too.
             try:
                 from .sharing_episode import BorrowEpisodeLedger
                 from .sharing_runtime import retry_durable_open_cleanups
@@ -489,6 +488,29 @@ def record_channel(
                 cleanup_pending = 1
                 error("sharing_recovery_failed", exc, callsite="startup_recovery")
             if cleanup_pending:
+                error("sharing_cleanup_pending", callsite="startup_recovery")
+                return {"status": "sharing_cleanup_pending"}
+
+            from .sharing_recovery import recover_superseded_borrow
+
+            def recovery_authority():
+                admission = _recorder_admission_state(
+                    channel_uuid, expected_generation, expected_control_generation,
+                )
+                if admission["status"] != "ready":
+                    return None
+                return current_sharing_authority_context(
+                    redis, str(channel_uuid), config_generation=expected_generation,
+                    control_generation=expected_control_generation,
+                )
+
+            if not recover_superseded_borrow(
+                episode_ledger, redis, str(channel_uuid),
+                configuration_generation=expected_generation,
+                control_generation=expected_control_generation,
+                recorder_fence=fence, lease_value=str(lease._value),
+                current_authority=recovery_authority,
+            ):
                 error("sharing_cleanup_pending", callsite="startup_recovery")
                 return {"status": "sharing_cleanup_pending"}
 
