@@ -349,6 +349,65 @@ class RecorderTaskTests(unittest.TestCase):
         self.assertEqual(Path("/tmp/synthetic-snapshot-a"), state["config"].archive_root)
         self.assertEqual([active_a], read_snapshots)
 
+    def test_supervisor_admission_runs_in_native_pool_and_closes_thread_db_state(self):
+        caller_thread = threading.get_ident()
+        admission_threads = []
+        connection_cleanup_threads = []
+
+        def apply_in_native_thread(callback):
+            result = []
+            failure = []
+
+            def run():
+                try:
+                    result.append(callback())
+                except BaseException as exc:
+                    failure.append(exc)
+
+            worker = threading.Thread(target=run)
+            worker.start()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+            if failure:
+                raise failure[0]
+            return result[0]
+
+        pool = SimpleNamespace(apply=apply_in_native_thread)
+        gevent = _fake_module(
+            "gevent", get_hub=lambda: SimpleNamespace(threadpool=pool),
+        )
+        django_db = _fake_module(
+            "django.db",
+            close_old_connections=lambda: connection_cleanup_threads.append(
+                threading.get_ident()
+            ),
+        )
+        django = _fake_module("django")
+        django.db = django_db
+        result = {"status": "ready"}
+        fake_modules = {
+            "celery": _fake_module(
+                "celery", shared_task=lambda *, name: lambda function: function,
+            ),
+            "django": django,
+            "django.db": django_db,
+            "gevent": gevent,
+        }
+        with _isolated_plugin_modules(fake_modules):
+            tasks = importlib.import_module("catchuparr.tasks")
+
+            def admission(*_args):
+                admission_threads.append(threading.get_ident())
+                return result
+
+            with patch("catchuparr.tasks._recorder_admission_state", side_effect=admission):
+                actual = tasks._supervisor_recorder_admission_state("channel-1", "gen", 7)
+
+        self.assertIs(result, actual)
+        self.assertEqual(1, len(admission_threads))
+        self.assertNotEqual(caller_thread, admission_threads[0])
+        self.assertEqual([admission_threads[0], admission_threads[0]], connection_cleanup_threads)
+
     def test_running_supervisor_stops_on_pause_fence_and_schedule_close(self):
         import uuid
 
