@@ -1110,11 +1110,11 @@ def _safe_supervisor_admission_status(module_name, function_name, frame_locals) 
 
 
 _SUPERVISOR_STOP_REASONS_BY_LINE = {
-    491: "admission_or_lease_renewal",
-    514: "stats_capability_refresh",
-    546: "attempt_renewal",
-    554: "candidate_currentness",
-    558: "exception",
+    501: "admission_or_lease_renewal",
+    524: "stats_capability_refresh",
+    556: "attempt_renewal",
+    564: "candidate_currentness",
+    568: "exception",
 }
 
 _SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({
@@ -1493,11 +1493,21 @@ class _RecorderTaskRun:
 
     def join_after_supervisor(
         self, timeout: float = 20.0, *, cooperative_sleep=None,
+        expected_results: tuple[dict, ...] | None = None,
     ) -> None:
         """Wait for a pause/config/schedule fence to stop the task naturally."""
-        self._join_and_validate(timeout, cooperative_sleep=cooperative_sleep)
+        self._join_and_validate(
+            timeout,
+            cooperative_sleep=cooperative_sleep,
+            expected_results=(
+                expected_results if expected_results is not None
+                else ({"status": "stopped"},)
+            ),
+        )
 
-    def _join_and_validate(self, timeout: float, *, cooperative_sleep=None) -> None:
+    def _join_and_validate(
+        self, timeout: float, *, cooperative_sleep=None, expected_results=None,
+    ) -> None:
         if self.thread is not None:
             sleep = cooperative_sleep or time.sleep
             deadline = time.monotonic() + timeout
@@ -1514,11 +1524,18 @@ class _RecorderTaskRun:
         self._patchers = []
         with self._lock:
             _require(not self.failures, "Synthetic recorder task raised an internal error")
-            _require(self.result == {"status": "stopped"}, "Synthetic recorder task did not finish cleanly")
-            _require(
-                all(process.poll() is not None for process in self.processes),
-                "Synthetic FFmpeg process remained after recorder stop",
+            accepted_results = (
+                expected_results if expected_results is not None
+                else ({"status": "stopped"},)
             )
+            task_finished_as_expected = self.result in accepted_results
+        if not task_finished_as_expected and os.environ.get("CATCHUPARR_INTEGRATION_TEST") == "1":
+            _emit_recorder_exit_diagnostic(self)
+        _require(task_finished_as_expected, "Synthetic recorder task did not finish as expected")
+        _require(
+            all(process.poll() is not None for process in self.processes),
+            "Synthetic FFmpeg process remained after recorder stop",
+        )
 
 
 def _probe_schedule_and_control_gates(

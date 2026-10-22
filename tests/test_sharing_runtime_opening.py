@@ -102,7 +102,10 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         coordinator.active = {"connection_sharing": {CHANNEL: {
             "enabled": True, "live_stability_seconds": 5,
             "last_viewer_return_seconds": 30, "min_switch_interval_seconds": 60,
-        }}}
+        }}, "recording_enabled": True,
+            "recording_schedule": {"timezone": "UTC", "channels": {
+                CHANNEL: {"mode": "continuous"},
+            }}}
         coordinator._recovery_is_current = lambda *_args: recovery_current
         return coordinator
 
@@ -347,7 +350,10 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         coordinator.active = {"connection_sharing": {CHANNEL: {
             "enabled": True, "live_stability_seconds": 5,
             "last_viewer_return_seconds": 30, "min_switch_interval_seconds": 60,
-        }}}
+        }}, "recording_enabled": True,
+            "recording_schedule": {"timezone": "UTC", "channels": {
+                CHANNEL: {"mode": "continuous"},
+            }}}
         with patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True), patch(
             "catchuparr.configuration._sharing_catalog_generation",
             return_value="catalog-synthetic",
@@ -1120,10 +1126,7 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         reloaded = self.intent_ledger.read(CHANNEL)
         self.assertEqual(270.0, reloaded.state.last_switch_at)
         self.assertEqual("dedicated", reloaded.state.phase.value)
-        # A viewer can return while the allowed-source operation is active.
-        # The pending RETURN cannot be replaced by ATTACH before useful media
-        # proves the return, but after that exact ACK the same viewer is
-        # observed again and admitted only after the normal switch interval.
+        # After exact media ACK, the same viewer follows the normal switch cooldown.
         class FakeRedis:
             def get(self, key):
                 return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
@@ -1179,6 +1182,282 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         admitted = self.intent_ledger.read(CHANNEL).intent
         self.assertEqual(SharingAction.ATTACH_BORROW, admitted.action)
         self.assertEqual(331.0, admitted.not_before)
+
+    def test_pending_return_does_not_reuse_same_closed_viewer_before_media_ack(self):
+        coordinator, _opening, pending, _receipt = self._pending_return()
+
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog",
+                  return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=SimpleNamespace(target=target())),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged",
+                  return_value=True),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=200.0),
+        ):
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+
+        unchanged = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(pending.intent, unchanged.intent)
+        self.assertEqual(pending.revision, unchanged.revision)
+
+    def test_pending_return_does_not_supersede_before_admitted_deadline(self):
+        coordinator, _opening, pending, _receipt = self._pending_return()
+        new_target = replace(target(), stream_id="stream-new-viewer-synthetic")
+
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog",
+                  return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=SimpleNamespace(target=new_target)),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=164.0),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged") as cleanup,
+        ):
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+
+        cleanup.assert_not_called()
+        unchanged = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(pending.intent, unchanged.intent)
+        self.assertEqual(pending.revision, unchanged.revision)
+
+    def test_consumed_return_claim_is_never_replaced_by_new_viewer(self):
+        coordinator, _opening, pending, _receipt = self._pending_return()
+        # The old token is only claimable once its admitted return deadline is due.
+        coordinator.intent_ledger.clock = lambda: 200.0
+        claimed, _ = self.intent_ledger.run_if_current(
+            pending.intent, fresh_validate=lambda _token: True,
+            side_effect=lambda _token: "synthetic-claim",
+        )
+        self.assertTrue(claimed)
+        new_target = replace(target(), stream_id="stream-new-viewer-synthetic")
+
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog",
+                  return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=SimpleNamespace(target=new_target)),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=200.0),
+        ):
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+
+        unchanged = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(pending.intent, unchanged.intent)
+        self.assertEqual(pending.revision, unchanged.revision)
+
+    def test_expired_return_with_new_viewer_restarts_attach_after_cleanup_and_cooldown(self):
+        coordinator, _opening, pending, receipt = self._pending_return()
+        self.assertIsNotNone(receipt)
+        new_target = replace(target(), stream_id="stream-new-viewer-synthetic")
+
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        coordinator.assigned_sources = ()
+        from catchuparr import sharing_runtime
+
+        prepared = object()
+        ledger_clock = [200.0]
+        coordinator.intent_ledger.clock = lambda: ledger_clock[0]
+
+        def claim_fresh_attach(_redis, ledger, _episodes, token, _target, **kwargs):
+            return ledger.run_if_current(
+                token,
+                fresh_validate=kwargs["fresh_validate"],
+                side_effect=lambda _exact: prepared,
+            )
+
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog",
+                  return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=SimpleNamespace(target=new_target)),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged",
+                  return_value=True),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=200.0),
+            patch("catchuparr.sharing_runtime._django_secret",
+                  return_value=b"return-retry-synthetic-secret-000000"),
+            patch.object(sharing_runtime, "prepare_borrow_opening",
+                         side_effect=claim_fresh_attach) as prepare,
+        ):
+            # The expired RETURN may be superseded for a different viewer, but
+            # the prior successful switch clock still enforces live stability.
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+            waiting = self.intent_ledger.read(CHANNEL)
+            self.assertIsNone(waiting.intent)
+            self.assertEqual("wait_live", waiting.state.phase.value)
+            self.assertEqual(105.0, waiting.state.last_switch_at)
+            self.assertEqual(pending.intent.intent_epoch, waiting.state.intent_epoch)
+
+            ledger_clock[0] = 206.0
+            with patch("catchuparr.sharing_runtime.time.time", return_value=206.0):
+                result = coordinator.poll(active=coordinator.active, control_generation=2)
+
+        self.assertIs(result, prepared)
+        retried = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(SharingAction.ATTACH_BORROW, retried.intent.action)
+        self.assertEqual(new_target.connection_identity, retried.intent.target_identity)
+        self.assertGreater(retried.intent.intent_epoch, pending.intent.intent_epoch)
+        self.assertTrue(self.intent_ledger.claim_was_consumed(retried.intent))
+        self.assertFalse(self.intent_ledger.claim_was_consumed(pending.intent))
+        self.assertEqual(1, prepare.call_count)
+
+    def test_expired_return_is_not_replaced_without_current_lease(self):
+        coordinator, _opening, pending, _receipt = self._pending_return()
+        new_target = replace(target(), stream_id="stream-new-viewer-synthetic")
+
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog",
+                  return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=SimpleNamespace(target=new_target)),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged") as cleanup,
+            patch.object(coordinator, "_recovery_is_current", return_value=False),
+            patch("catchuparr.sharing_runtime.time.time", return_value=200.0),
+        ):
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+
+        cleanup.assert_not_called()
+        unchanged = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(pending.intent, unchanged.intent)
+        self.assertEqual(pending.revision, unchanged.revision)
+
+    def test_expired_return_is_not_replaced_without_a_current_viewer(self):
+        coordinator, _opening, pending, _receipt = self._pending_return()
+
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog",
+                  return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.observe_native_connection", return_value=None),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged") as cleanup,
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=200.0),
+        ):
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+
+        cleanup.assert_not_called()
+        unchanged = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(pending.intent, unchanged.intent)
+        self.assertEqual(pending.revision, unchanged.revision)
+
+    def test_expired_return_does_not_supersede_without_exact_closed_cleanup(self):
+        coordinator, _opening, pending, _receipt = self._pending_return()
+        new_target = replace(target(), stream_id="stream-new-viewer-synthetic")
+
+        class FakeRedis:
+            def get(self, key):
+                return LEASE if key == f"catchuparr:recorder:{CHANNEL}" else None
+
+            def ttl(self, key):
+                return 60 if key == f"catchuparr:recorder:{CHANNEL}" else -2
+
+        coordinator.redis = FakeRedis()
+        coordinator.assigned_sources = ()
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant",
+                  return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation",
+                  return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation",
+                  return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog",
+                  return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.observe_native_connection",
+                  return_value=SimpleNamespace(target=new_target)),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged",
+                  return_value=False),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=200.0),
+        ):
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+
+        unchanged = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(pending.intent, unchanged.intent)
+        self.assertEqual(pending.revision, unchanged.revision)
 
     def test_same_lease_receipt_rejects_episode_from_another_lease(self):
         coordinator, _opening, _pending, receipt = self._pending_return(

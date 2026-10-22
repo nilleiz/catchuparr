@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,6 +38,7 @@ from .sharing_planner import (
     BorrowTarget,
     SharingAction,
     SharingObservation,
+    SharingPhase,
     SharingSettings,
     observe,
 )
@@ -736,6 +738,163 @@ class RecorderBorrowCoordinator:
         except Exception:
             return False
 
+    def _retry_closed_return_for_new_viewer(
+        self, *, active: dict[str, Any], control_generation: int,
+    ) -> PreparedBorrowOpening | None:
+        """Supersede an expired RETURN only for a different, fully eligible viewer.
+
+        The prior native borrower must already be durably closed and absent.
+        A fresh ATTACH token is then written by SQLite revision CAS; the old
+        RETURN token is never reused. Same-identity viewers still wait for the
+        ordinary dedicated-media return acknowledgement.
+        """
+        token = self.state_record.intent
+        if (token is None or token.action is not SharingAction.RETURN_TO_ALLOWED
+                or control_generation != self.control_generation
+                or active.get("connection_sharing", {}).get(self.channel_uuid, {}).get("enabled") is not True
+                or active.get("recording_enabled") is not True):
+            return None
+        try:
+            from dataclasses import replace
+
+            from .configuration import _sharing_catalog_generation
+            from .recorder_proxy import configuration_generation
+            from .schedule import schedule_from_snapshot, schedule_is_active
+
+            current = self.intent_ledger.read(self.channel_uuid)
+            if (current is None or current.intent != token
+                    or current.revision != self.state_record.revision
+                    or current.state.phase not in {
+                        SharingPhase.WAIT_RETURN, SharingPhase.FAILED, SharingPhase.PAUSED,
+                    }
+                    or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED
+                    or current.state.intent_epoch != token.intent_epoch
+                    or token.configuration_generation != self.configuration_generation
+                    or token.control_generation != self.control_generation
+                    or token.recorder_fence != self.recorder_fence
+                    or configuration_generation(active) != self.configuration_generation
+                    or self.intent_ledger.claim_was_consumed(token)):
+                return None
+            self.state_record = current
+            now = time.time()
+            if now < token.not_before:
+                return None
+            schedules = active.get("recording_schedule")
+            if not isinstance(schedules, dict):
+                return None
+            schedule_config = schedules.get("channels")
+            timezone_name = schedules.get("timezone")
+            if (not isinstance(schedule_config, dict)
+                    or self.channel_uuid not in schedule_config
+                    or not isinstance(timezone_name, str)):
+                return None
+            schedule = schedule_from_snapshot(schedule_config[self.channel_uuid])
+            if not schedule_is_active(
+                    schedule, timezone_name, datetime.fromtimestamp(now, timezone.utc)):
+                return None
+            if (not self._recovery_is_current(
+                    self.channel_uuid, current.revision, self.configuration_generation,
+                    self.control_generation, self.recorder_fence,
+                )
+                    or _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation):
+                return None
+            current_sources, current_catalog = _native_source_catalog(self.channel_uuid)
+            if current_catalog != self.catalog_generation:
+                return None
+            native = observe_native_connection(
+                self.redis, self.channel_uuid, catalog_generation=current_catalog,
+                assigned_sources=current_sources, observed_at=now,
+            )
+            target = native.target if native is not None else None
+            if target is None or not target.eligible_for_new_borrow(self.channel_uuid):
+                return None
+
+            receipt = self._read_return_receipt()
+            if (receipt is None or receipt.intent_epoch >= token.intent_epoch
+                    or receipt.recorder_fence > self.recorder_fence
+                    or target.connection_identity == receipt.connection_identity
+                    or not borrow_return_cleanup_acknowledged(
+                        self.redis, self.episode_ledger, receipt,
+                    )):
+                return None
+            latest = self.intent_ledger.read(self.channel_uuid)
+            if (latest is None or latest.intent != token or latest.revision != current.revision
+                    or not self._recovery_is_current(
+                        self.channel_uuid, latest.revision, self.configuration_generation,
+                        self.control_generation, self.recorder_fence,
+                    )
+                    or _sharing_catalog_generation(self.channel_uuid) != self.catalog_generation):
+                return None
+
+            setting = active["connection_sharing"][self.channel_uuid]
+            settings = SharingSettings(
+                enabled=True,
+                live_stability_seconds=setting["live_stability_seconds"],
+                last_viewer_return_seconds=setting["last_viewer_return_seconds"],
+                min_switch_interval_seconds=setting["min_switch_interval_seconds"],
+            )
+            # Clear only the completed prior route intent. Preserve the last
+            # successful switch timestamp so the normal stability/cooldown
+            # calculation still applies to this new viewer.
+            base = replace(
+                latest.state,
+                phase=SharingPhase.DEDICATED,
+                candidate_identity=None,
+                candidate_connection_identity=None,
+                candidate_since=None,
+                borrowed_identity=None,
+                last_viewer_left_at=None,
+                pending_action=None,
+            )
+            observation = SharingObservation(
+                channel_uuid=self.channel_uuid, now=now,
+                configuration_generation=self.configuration_generation,
+                control_generation=self.control_generation,
+                recorder_fence=self.recorder_fence, lease_is_current=True,
+                settings=settings, target=target,
+                recording_enabled=True, schedule_open=True,
+                dedicated_source_available=self.dedicated_source_available,
+            )
+            decision = observe(base, observation)
+            action = decision.action if decision.action not in {
+                SharingAction.WAIT, SharingAction.NOOP,
+            } else None
+            target_identity = (
+                decision.state.candidate_connection_identity
+                if action is SharingAction.ATTACH_BORROW else None
+            )
+            if not self._recovery_is_current(
+                    self.channel_uuid, latest.revision, self.configuration_generation,
+                    self.control_generation, self.recorder_fence,
+                ):
+                return None
+            self.state_record = self.intent_ledger.save(
+                decision.state, action=action,
+                expected_revision=latest.revision,
+                target_identity=target_identity,
+                target_admitted=action is SharingAction.ATTACH_BORROW,
+                not_before=(
+                    (decision.deadline if decision.deadline is not None else now)
+                    if action is not None else None
+                ),
+                updated_at=now,
+            )
+            if (self.state_record.intent is None
+                    or self.state_record.intent.action is not SharingAction.ATTACH_BORROW):
+                return None
+            return self._retry_unclaimed_attach(
+                active=active, control_generation=control_generation,
+            )
+        except Exception:
+            return None
+        finally:
+            try:
+                from django.db import close_old_connections
+
+                close_old_connections()
+            except Exception:
+                pass
+
     def poll(self, *, active: dict[str, Any], control_generation: int) -> PreparedBorrowOpening | None:
         """Persist cooldown observations and claim an ATTACH only at its deadline."""
         latest = self.intent_ledger.read(self.channel_uuid)
@@ -771,6 +930,10 @@ class RecorderBorrowCoordinator:
                         return self._retry_unclaimed_attach(
                             active=active, control_generation=control_generation,
                         )
+                elif token.action is SharingAction.RETURN_TO_ALLOWED:
+                    return self._retry_closed_return_for_new_viewer(
+                        active=active, control_generation=control_generation,
+                    )
                 self._recover_closed_attach()
             return None
         from .configuration import _sharing_catalog_generation

@@ -448,6 +448,177 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         publish.assert_not_called()
         self.assertEqual("newer-config-synthetic", self.redis.hashes[newer_key]["configuration_generation"])
 
+    def test_startup_rehydrates_missing_projection_from_exact_committed_head(self):
+        from catchuparr.configuration import (
+            SHARING_AUTHORITY_OUTBOX_NAME,
+            rehydrate_current_sharing_authority,
+        )
+
+        active_path = Path(self.temp.name) / "active-startup-synthetic.json"
+        outbox = SharingAuthorityOutbox(
+            active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME),
+            clock=lambda: self.now[0],
+        )
+        event = outbox.stage("activation-startup-synthetic", (self.target,))[0]
+        self.assertTrue(outbox.commit_activation(event.activation_id))
+        outbox.drain(
+            self.redis,
+            read_prior=lambda *_args: SharingAuthorityPriorObservation("absent"),
+            publish=self.publish,
+            invalidate=lambda *_args: True,
+        )
+        cancelled = outbox.stage("activation-startup-cancelled-synthetic", (self.target,))[0]
+        self.assertTrue(outbox.cancel_activation(cancelled.activation_id))
+        key = f"catchuparr:sharing:current:{self.target.channel_uuid}"
+        self.assertEqual("1", self.redis.hgetall(key)["authority_revision"])
+        self.redis.hashes.pop(key)
+        episode_key = f"catchuparr:sharing:episode:{self.target.channel_uuid}"
+        self.redis.hashes[episode_key] = {"phase": "active", "lease": "preserve"}
+
+        published = []
+
+        def publish_current(redis, channel_uuid, **kwargs):
+            record = types.SimpleNamespace(channel_uuid=channel_uuid, **kwargs)
+            published.append((channel_uuid, kwargs["expected_revision"], kwargs["authority_revision"]))
+            return self.publish(redis, record)
+
+        core = types.ModuleType("core")
+        core.__path__ = []
+        core_utils = types.ModuleType("core.utils")
+        core_utils.RedisClient = types.SimpleNamespace(get_client=lambda: self.redis)
+        active = {"connection_sharing": {self.target.channel_uuid: {"enabled": True}}}
+        control = types.SimpleNamespace(paused=False, generation=self.target.control_generation)
+        with (
+            patch.dict(sys.modules, {"core": core, "core.utils": core_utils}),
+            patch("catchuparr.configuration.active_configuration_generation", return_value=self.target.configuration_generation),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value=self.target.catalog_generation),
+            patch("catchuparr.adapters.sharing_native.publish_current_authority", side_effect=publish_current),
+        ):
+            self.assertTrue(rehydrate_current_sharing_authority(active, control, active_path))
+
+        self.assertEqual([(self.target.channel_uuid, 0, event.authority_revision)], published)
+        self.assertEqual(str(event.authority_revision), self.redis.hgetall(key)["authority_revision"])
+        self.assertEqual({"phase": "active", "lease": "preserve"}, self.redis.hgetall(episode_key))
+        self.assertEqual(event, outbox.committed_authority_head(self.target.channel_uuid))
+        self.assertEqual("cancelled", outbox.latest_for_channel(self.target.channel_uuid).status)
+
+    def test_startup_rehydration_fails_closed_when_committed_head_is_stale(self):
+        from catchuparr.configuration import (
+            SHARING_AUTHORITY_OUTBOX_NAME,
+            rehydrate_current_sharing_authority,
+        )
+
+        active_path = Path(self.temp.name) / "active-startup-stale-synthetic.json"
+        outbox = SharingAuthorityOutbox(
+            active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME),
+            clock=lambda: self.now[0],
+        )
+        event = outbox.stage("activation-startup-stale-synthetic", (self.target,))[0]
+        self.assertTrue(outbox.commit_activation(event.activation_id))
+        outbox.drain(
+            self.redis,
+            read_prior=lambda *_args: SharingAuthorityPriorObservation("absent"),
+            publish=self.publish,
+            invalidate=lambda *_args: True,
+        )
+        key = f"catchuparr:sharing:current:{self.target.channel_uuid}"
+        self.redis.hashes.pop(key)
+        published = Mock(return_value=True)
+
+        core = types.ModuleType("core")
+        core.__path__ = []
+        core_utils = types.ModuleType("core.utils")
+        core_utils.RedisClient = types.SimpleNamespace(get_client=lambda: self.redis)
+        active = {"connection_sharing": {self.target.channel_uuid: {"enabled": True}}}
+        control = types.SimpleNamespace(paused=False, generation=self.target.control_generation)
+        with (
+            patch.dict(sys.modules, {"core": core, "core.utils": core_utils}),
+            patch("catchuparr.configuration.active_configuration_generation", return_value="new-config-synthetic"),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value=self.target.catalog_generation),
+            patch("catchuparr.adapters.sharing_native.publish_current_authority", side_effect=published),
+        ):
+            self.assertFalse(rehydrate_current_sharing_authority(active, control, active_path))
+
+        published.assert_not_called()
+        self.assertFalse(self.redis.hgetall(key))
+
+    def test_startup_rehydration_does_not_run_while_outbox_transition_is_pending(self):
+        from catchuparr.configuration import (
+            SHARING_AUTHORITY_OUTBOX_NAME,
+            rehydrate_current_sharing_authority,
+        )
+
+        active_path = Path(self.temp.name) / "active-startup-pending-synthetic.json"
+        outbox = SharingAuthorityOutbox(
+            active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME),
+            clock=lambda: self.now[0],
+        )
+        event = outbox.stage("activation-startup-pending-synthetic", (self.target,))[0]
+        published = Mock(return_value=True)
+
+        core = types.ModuleType("core")
+        core.__path__ = []
+        core_utils = types.ModuleType("core.utils")
+        core_utils.RedisClient = types.SimpleNamespace(get_client=lambda: self.redis)
+        active = {"connection_sharing": {self.target.channel_uuid: {"enabled": True}}}
+        control = types.SimpleNamespace(paused=False, generation=self.target.control_generation)
+        with (
+            patch.dict(sys.modules, {"core": core, "core.utils": core_utils}),
+            patch("catchuparr.configuration.active_configuration_generation", return_value=self.target.configuration_generation),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value=self.target.catalog_generation),
+            patch("catchuparr.adapters.sharing_native.publish_current_authority", side_effect=published),
+        ):
+            self.assertFalse(rehydrate_current_sharing_authority(active, control, active_path))
+
+        self.assertEqual((event,), outbox.pending())
+        published.assert_not_called()
+        self.assertFalse(self.redis.hgetall(f"catchuparr:sharing:current:{event.channel_uuid}"))
+
+    def test_startup_rehydration_never_overwrites_a_newer_redis_projection(self):
+        from catchuparr.configuration import (
+            SHARING_AUTHORITY_OUTBOX_NAME,
+            rehydrate_current_sharing_authority,
+        )
+
+        active_path = Path(self.temp.name) / "active-startup-newer-synthetic.json"
+        outbox = SharingAuthorityOutbox(
+            active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME),
+            clock=lambda: self.now[0],
+        )
+        event = outbox.stage("activation-startup-newer-synthetic", (self.target,))[0]
+        self.assertTrue(outbox.commit_activation(event.activation_id))
+        outbox.drain(
+            self.redis,
+            read_prior=lambda *_args: SharingAuthorityPriorObservation("absent"),
+            publish=self.publish,
+            invalidate=lambda *_args: True,
+        )
+        key = f"catchuparr:sharing:current:{self.target.channel_uuid}"
+        self.redis.hashes[key] = {
+            "authority_revision": "2",
+            "configuration_generation": "newer-config-synthetic",
+            "control_generation": str(self.target.control_generation),
+            "catalog_generation": "newer-catalog-synthetic",
+        }
+        published = Mock(return_value=True)
+
+        core = types.ModuleType("core")
+        core.__path__ = []
+        core_utils = types.ModuleType("core.utils")
+        core_utils.RedisClient = types.SimpleNamespace(get_client=lambda: self.redis)
+        active = {"connection_sharing": {self.target.channel_uuid: {"enabled": True}}}
+        control = types.SimpleNamespace(paused=False, generation=self.target.control_generation)
+        with (
+            patch.dict(sys.modules, {"core": core, "core.utils": core_utils}),
+            patch("catchuparr.configuration.active_configuration_generation", return_value=self.target.configuration_generation),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value=self.target.catalog_generation),
+            patch("catchuparr.adapters.sharing_native.publish_current_authority", side_effect=published),
+        ):
+            self.assertFalse(rehydrate_current_sharing_authority(active, control, active_path))
+
+        published.assert_not_called()
+        self.assertEqual("newer-config-synthetic", self.redis.hgetall(key)["configuration_generation"])
+
     def test_rehydration_rejects_incomplete_hashes_even_when_their_revision_is_newer(self):
         from catchuparr.configuration import _rehydrate_sharing_authority_head
 
