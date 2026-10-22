@@ -1306,6 +1306,7 @@ class _RecorderTaskRun:
         self.stop_event = _ObservedRecorderStopEvent()
         self.results: list[object] = []
         self.result: dict | None = None
+        self._validated_result: dict | None = None
         self.failures: list[str] = []
         self.exception_call_sites: list[list[dict[str, object]]] = []
         self.processes: list[object] = []
@@ -1516,7 +1517,15 @@ class _RecorderTaskRun:
 
     def join(self, timeout: float = 15.0, *, cooperative_sleep=None) -> None:
         self.stop_event.set()
-        self._join_and_validate(timeout, cooperative_sleep=cooperative_sleep)
+        # A scenario can explicitly validate a control-fenced exit before its
+        # outer finally repeats cleanup. Retain that exact proven result rather
+        # than reinterpreting it as an unexpected ordinary stop.
+        self._join_and_validate(
+            timeout, cooperative_sleep=cooperative_sleep,
+            expected_results=(
+                (self._validated_result,) if self._validated_result is not None else None
+            ),
+        )
 
     def join_after_supervisor(
         self, timeout: float = 20.0, *, cooperative_sleep=None,
@@ -1563,6 +1572,7 @@ class _RecorderTaskRun:
             all(process.poll() is not None for process in self.processes),
             "Synthetic FFmpeg process remained after recorder stop",
         )
+        self._validated_result = dict(self.result)
 
 
 def _probe_schedule_and_control_gates(

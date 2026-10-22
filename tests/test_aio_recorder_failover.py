@@ -954,6 +954,35 @@ class RecorderFailoverBridgeTests(unittest.TestCase):
         self.assertTrue(all(timeout == 0 for timeout in thread.joined_with))
         self.assertFalse(run.stop_event.is_set())
 
+    def test_final_cleanup_preserves_only_the_exact_validated_fence_result(self):
+        run = probe._RecorderTaskRun(
+            "synthetic-channel", startup_timeout=1, media_idle_timeout=1,
+        )
+        run.thread = SimpleNamespace(is_alive=lambda: False)
+        run.processes = [SimpleNamespace(poll=lambda: 0)]
+        run.result = {"status": "stale_control"}
+        with patch.object(probe, "_emit_recorder_exit_diagnostic"):
+            # A generic cleanup cannot admit a previously unvalidated exit.
+            with self.assertRaisesRegex(RuntimeError, "did not finish as expected"):
+                run.join(timeout=1)
+            run.join_after_supervisor(
+                timeout=1, expected_results=({"status": "stale_control"},),
+            )
+            # The outer finally repeats cleanup after the scenario has already
+            # validated this exact control-fenced exit.
+            run.join(timeout=1)
+            run.result["status"] = "media_stalled"
+            with self.assertRaisesRegex(RuntimeError, "did not finish as expected"):
+                run.join(timeout=1)
+            run.result = {"status": "stale_control"}
+            run.processes = [SimpleNamespace(poll=lambda: None)]
+            with self.assertRaisesRegex(RuntimeError, "FFmpeg process remained"):
+                run.join(timeout=1)
+            run.processes = []
+            run.failures = ["synthetic failure"]
+            with self.assertRaisesRegex(RuntimeError, "raised an internal error"):
+                run.join(timeout=1)
+
     def test_bridge_idle_wait_observes_handler_close(self):
         drained = threading.Event()
         server = SimpleNamespace(active_requests=lambda: int(not drained.is_set()))
