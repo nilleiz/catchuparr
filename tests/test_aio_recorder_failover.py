@@ -12,7 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import aio_recorder_failover as probe
 
@@ -39,6 +39,33 @@ class _SyntheticArchiveStore:
 
 
 class RecorderFailoverMediaTests(unittest.TestCase):
+    def test_deferred_cleanup_never_turns_failed_native_cleanup_into_an_ack(self):
+        run = probe._RecorderTaskRun(
+            "channel-synthetic", startup_timeout=1, media_idle_timeout=1,
+            hold_first_cleanup_ack=True,
+        )
+        stop = Mock(return_value=False)
+        attempt = SimpleNamespace(worker_id="worker-synthetic")
+        self.assertFalse(run._confirm_native_stop(stop, object(), attempt, object()))
+        self.assertEqual(0, run.cleanup_ack_attempts)
+        self.assertIsNone(run._cleanup_ack_worker)
+
+    def test_deferred_cleanup_requires_release_after_repeated_real_stop_acks(self):
+        run = probe._RecorderTaskRun(
+            "channel-synthetic", startup_timeout=1, media_idle_timeout=1,
+            hold_first_cleanup_ack=True,
+        )
+        stop = Mock(return_value=True)
+        attempt = SimpleNamespace(worker_id="worker-synthetic")
+        lease = SimpleNamespace(_value="synthetic-lease-binding")
+        self.assertFalse(run._confirm_native_stop(stop, object(), attempt, lease))
+        self.assertFalse(run._confirm_native_stop(stop, object(), attempt, lease))
+        self.assertEqual(2, run.cleanup_ack_attempts)
+        self.assertEqual(lease._value, run._cleanup_ack_lease)
+        run.cleanup_ack_release.set()
+        self.assertTrue(run._confirm_native_stop(stop, object(), attempt, lease))
+        self.assertEqual(3, stop.call_count)
+
     def test_recorder_task_threading_preserves_observed_event_and_reentrant_lock(self):
         stop_event = threading.Event()
         task_threading = probe._recorder_task_threading(stop_event)
@@ -128,44 +155,44 @@ class RecorderFailoverMediaTests(unittest.TestCase):
         self.assertEqual(stop_lines, set(probe._SUPERVISOR_STOP_REASONS_BY_LINE))
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 501,
+                "catchuparr.tasks", "supervise", 544,
                 {"current_admission": {"status": "ready"}},
             ),
             "lease_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 501,
+                "catchuparr.tasks", "supervise", 544,
                 {"current_admission": {"status": "stale_control"}},
             ),
             "admission_not_ready",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 524, {},
+                "catchuparr.tasks", "supervise", 567, {},
             ),
             "stats_capability_refresh",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 556, {},
+                "catchuparr.tasks", "supervise", 611, {},
             ),
             "attempt_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 564, {},
+                "catchuparr.tasks", "supervise", 619, {},
             ),
             "candidate_currentness",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 568, {},
+                "catchuparr.tasks", "supervise", 623, {},
             ),
             "exception",
         )
         self.assertEqual(
-            probe._safe_supervisor_stop_reason("untrusted", "supervise", 501, {}),
+            probe._safe_supervisor_stop_reason("untrusted", "supervise", 544, {}),
             "unavailable",
         )
 
