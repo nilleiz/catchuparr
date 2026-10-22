@@ -116,7 +116,11 @@ def reconcile_recorders():
     from apps.channels.models import Channel
     from core.utils import RedisClient
 
-    from .configuration import load_applied_state, reset_legacy_configuration
+    from .configuration import (
+        load_applied_state,
+        rehydrate_current_sharing_authority,
+        reset_legacy_configuration,
+    )
     from .engine.store import ArchiveStore
     from .logging_utils import apply_log_level
     from .recorder_control import RecorderControlError
@@ -136,6 +140,12 @@ def reconcile_recorders():
         active, control = load_active_configuration(), None
     apply_log_level(active.get("log_level", "INFO") if active else "INFO")
     config = load_config(active_snapshot=active) if active is not None else None
+    if config is not None and active is not None and control is not None:
+        if not rehydrate_current_sharing_authority(active, control):
+            from .logging_utils import error
+
+            error("sharing_recovery_failed", callsite="startup_recovery")
+            return {"queued": 0, "cleanup_pending": 0}
     cleanup_pending = set()
     if config is not None and active is not None:
         generation = configuration_generation(active)

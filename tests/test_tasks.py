@@ -553,6 +553,8 @@ class RecorderTaskTests(unittest.TestCase):
     def test_reconcile_queues_the_applied_generation_with_each_channel(self):
         redis = FakeRedis()
         queued = []
+        events = []
+        recovery_allowed = [True]
 
         class ChannelQuery:
             def filter(self, **kwargs):
@@ -575,10 +577,18 @@ class RecorderTaskTests(unittest.TestCase):
         def task_decorator(*, name):
             def decorate(function):
                 if name == "catchuparr.record_channel":
-                    function.apply_async = lambda **kwargs: queued.append(kwargs)
+                    def apply_async(**kwargs):
+                        events.append("queue")
+                        queued.append(kwargs)
+
+                    function.apply_async = apply_async
                 return function
 
             return decorate
+
+        def recover_authority(_active, _control):
+            events.append("authority_recovery")
+            return recovery_allowed[0]
 
         celery = _fake_module("celery", shared_task=task_decorator)
         apps = _fake_module("apps")
@@ -619,13 +629,27 @@ class RecorderTaskTests(unittest.TestCase):
                     "catchuparr.configuration.load_applied_state",
                     return_value=(active, control),
                 ),
+                patch(
+                    "catchuparr.configuration.rehydrate_current_sharing_authority",
+                    side_effect=recover_authority,
+                ),
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
             ):
                 result = tasks.reconcile_recorders()
+                self.assertEqual(["authority_recovery", "queue"], events)
+                self.assertEqual(
+                    [{"args": ["channel-1", expected_generation, 7], "queue": "dvr"}],
+                    queued,
+                )
+                recovery_allowed[0] = False
+                events.clear()
+                queued.clear()
+                redis.values.clear()
+                blocked_result = tasks.reconcile_recorders()
         self.assertEqual({"queued": 1, "cleanup_pending": 0}, result)
-        self.assertEqual(
-            [{"args": ["channel-1", expected_generation, 7], "queue": "dvr"}], queued
-        )
+        self.assertEqual([], queued)
+        self.assertEqual(["authority_recovery"], events)
+        self.assertEqual({"queued": 0, "cleanup_pending": 0}, blocked_result)
 
     def test_reconcile_retries_channel_cleanup_before_dispatch_and_respects_live_lease(self):
         redis = FakeRedis()
@@ -690,6 +714,10 @@ class RecorderTaskTests(unittest.TestCase):
                 patch(
                     "catchuparr.configuration.load_applied_state",
                     return_value=(active, SimpleNamespace(paused=False, generation=7)),
+                ),
+                patch(
+                    "catchuparr.configuration.rehydrate_current_sharing_authority",
+                    return_value=True,
                 ),
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
                 patch("catchuparr.sharing_runtime.retry_durable_open_cleanups", side_effect=cleanup),

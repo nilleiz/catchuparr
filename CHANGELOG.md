@@ -8,6 +8,10 @@ included here to explain the feature history leading to 0.4.0.
 
 ### Fixed
 
+- Restore missing Redis sharing-authority projections during recorder
+  reconciliation from exact, committed outbox heads after a Redis/container
+  restart. Recovery fails closed on pending transitions, mismatched generations
+  or newer conflicting projections, and never replays prior episode snapshots.
 - Recover from a due RETURN intent after its exact borrowed episode is closed
   when a different, currently eligible viewer is available. Recovery rechecks
   the current schedule, lease, configuration, control generation, source
