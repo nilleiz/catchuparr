@@ -1286,6 +1286,49 @@ class _ObservedRecorderStopEvent(threading.Event):
             super().set()
 
 
+def _cleanup_ack_source_snapshot(run, source_server):
+    """Observe provider state after the cleanup ACK count, never before it."""
+    with run._lock:
+        acknowledged_attempts = run.cleanup_ack_attempts
+    # Native cleanup can finish while the probe reads the counters. A positive
+    # ACK count must precede this snapshot so a pre-cleanup connection count
+    # cannot be attributed to an acknowledgment that arrived afterward.
+    counts, active_counts = source_server.snapshot()
+    return acknowledged_attempts, counts, active_counts
+
+
+def _wait_for_deferred_cleanup(
+    run, source_server, redis_client, channel_uuid, baseline, deadline, *,
+    monotonic=time.monotonic, sleep=time.sleep,
+):
+    """Hold the ACK until repeated native cleanup and provider drain are proven."""
+    pending_lease = None
+    while True:
+        task_alive = run.thread is not None and run.thread.is_alive()
+        if not task_alive or monotonic() >= deadline:
+            _emit_recorder_exit_diagnostic(run)
+        _require(task_alive, "Recorder exited instead of retrying delayed native cleanup")
+        _require(monotonic() < deadline, "Delayed cleanup retry was not reached")
+        acknowledgments, counts, active_counts = _cleanup_ack_source_snapshot(run, source_server)
+        _require(
+            all(counts[f"source-{label}.ts"] == baseline[f"source-{label}.ts"]
+                for label in ("b", "c", "d")),
+            "A replacement source opened before exact cleanup acknowledgment",
+        )
+        if acknowledgments:
+            lease = redis_client.get(f"catchuparr:recorder:{channel_uuid}")
+            _require(lease is not None, "Recorder lost its lease during delayed cleanup")
+            if pending_lease is None:
+                pending_lease = lease
+            _require(lease == pending_lease, "Recorder restarted during delayed cleanup")
+        # Closing the native upstream and the synthetic provider handler's
+        # socket-error/finally callback are asynchronous. Keep the ACK withheld
+        # until both real observations agree, inside the original case budget.
+        if acknowledgments >= 2 and active_counts["source-a.ts"] == 0:
+            return
+        sleep(POLL_INTERVAL)
+
+
 class _RecorderTaskRun:
     """Run the real recorder task with bounded engine timeouts and stop control."""
 
@@ -2072,30 +2115,17 @@ def probe_recorder_failover(root: Path) -> None:
         harnesses.append(startup_run)
         try:
             startup_deadline = time.monotonic() + 100
-            pending_lease = None
-            while startup_run.cleanup_ack_attempts < 2:
-                if (startup_run.thread is None or not startup_run.thread.is_alive()
-                        or time.monotonic() >= startup_deadline):
-                    _emit_recorder_exit_diagnostic(startup_run)
-                _require(
-                    startup_run.thread is not None and startup_run.thread.is_alive(),
-                    "Recorder exited instead of retrying delayed native cleanup",
-                )
-                _require(time.monotonic() < startup_deadline, "Delayed cleanup retry was not reached")
-                counts, active_counts = source_server.snapshot()
-                _require(
-                    all(counts[f"source-{label}.ts"] == startup_baseline[f"source-{label}.ts"]
-                        for label in ("b", "c", "d")),
-                    "A replacement source opened before exact cleanup acknowledgment",
-                )
-                if startup_run.cleanup_ack_attempts:
-                    lease = redis_client.get(f"catchuparr:recorder:{startup_channel.uuid}")
-                    _require(lease is not None, "Recorder lost its lease during delayed cleanup")
-                    if pending_lease is None:
-                        pending_lease = lease
-                    _require(lease == pending_lease, "Recorder restarted during delayed cleanup")
-                    _require(active_counts["source-a.ts"] == 0, "Real source A cleanup was not completed")
-                time.sleep(POLL_INTERVAL)
+            _wait_for_deferred_cleanup(
+                startup_run, source_server, redis_client, startup_channel.uuid,
+                startup_baseline, startup_deadline,
+            )
+            _, counts, active_counts = _cleanup_ack_source_snapshot(startup_run, source_server)
+            _require(active_counts["source-a.ts"] == 0, "Real source A cleanup was not completed")
+            _require(
+                all(counts[f"source-{label}.ts"] == startup_baseline[f"source-{label}.ts"]
+                    for label in ("b", "c", "d")),
+                "A replacement source opened before exact cleanup acknowledgment",
+            )
             _assert_worker_cleanup(redis_client, startup_channel.uuid)
             lease = redis_client.get(f"catchuparr:recorder:{startup_channel.uuid}")
             if isinstance(lease, bytes):
