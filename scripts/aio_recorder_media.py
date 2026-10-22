@@ -180,12 +180,18 @@ def _assert_live_overview(archive_root, active_path, control_path, channel_uuid,
             file_digest(outbox_db),
         )
 
-    before = state_snapshot()
-    result = _run_current_recordings_readonly(
-        lambda: Plugin.__new__(Plugin).run("current_recordings", {}, {}),
-        archive_db,
-    )
-    after = state_snapshot()
+    from catchuparr.configuration import _config_lock
+
+    # Exclude an unrelated supervisor/configuration recovery from this
+    # before/after window. The overview takes the same lock in shared mode;
+    # direct writes by the action still change the snapshots and fail below.
+    with _config_lock(archive_root.parent / active_path.name, exclusive=False):
+        before = state_snapshot()
+        result = _run_current_recordings_readonly(
+            lambda: Plugin.__new__(Plugin).run("current_recordings", {}, {}),
+            archive_db,
+        )
+        after = state_snapshot()
     _require(before == after,
              "Current recordings overview changed applied configuration or outbox state")
     _require(result.get("status") == "ok" and isinstance(result.get("channels"), list),
