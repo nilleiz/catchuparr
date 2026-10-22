@@ -4,6 +4,26 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.6.9] - Prerelease candidate
+
+### Fixed
+
+- Recover a superseded active borrow episode before admitting another recorder
+  opening after restart. Exact current lease and applied authority, an older
+  episode fence, absent native projection and confirmed private-client absence
+  are required. A permanent native tombstone prevents delayed registration from
+  restoring the obsolete episode before SQLite acknowledges its cleanup.
+- Preserve ordinary viewers and native source ownership. Missing cleanup proof,
+  stale admission, SQL contention or Redis failure keeps new openings blocked;
+  existing intent claims are never deleted or reused.
+
+### Verification
+
+- Focused real-SQLite and Redis/Lua regressions cover obsolete active state,
+  fresh registration, preserved viewers, lease and authority changes, corrupt
+  state, cleanup retries and opening rejection before recovery.
+- Requires Dispatcharr 0.32.0 or newer. Authoritative native CI is pending.
+
 ## [0.6.8] - Prerelease
 
 ### Fixed
