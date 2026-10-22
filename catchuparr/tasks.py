@@ -492,7 +492,7 @@ def record_channel(
         def supervise():
             while not stop_event.wait(10):
                 try:
-                    current_admission = _recorder_admission_state(
+                    current_admission = _supervisor_recorder_admission_state(
                         channel_uuid, expected_generation, expected_control_generation
                     )
                     if (
@@ -993,6 +993,37 @@ def _active_schedule(active, channel_uuid):
     if not isinstance(schedules, dict) or channel_uuid not in schedules:
         raise ScheduleError("channel schedule is missing")
     return schedule_from_snapshot(schedules[channel_uuid]), timezone_name
+
+
+def _supervisor_recorder_admission_state(
+    channel_uuid, expected_generation, expected_control_generation,
+):
+    """Run periodic ORM-backed admission away from Dispatcharr's gevent loop."""
+    try:
+        from gevent import get_hub
+    except ImportError:
+        # Unit-only environments without Dispatcharr's gevent runtime retain
+        # the normal synchronous behavior.
+        return _recorder_admission_state(
+            channel_uuid, expected_generation, expected_control_generation,
+        )
+
+    def check_admission():
+        try:
+            from django.db import close_old_connections
+        except ImportError:
+            close_old_connections = None
+        if close_old_connections is not None:
+            close_old_connections()
+        try:
+            return _recorder_admission_state(
+                channel_uuid, expected_generation, expected_control_generation,
+            )
+        finally:
+            if close_old_connections is not None:
+                close_old_connections()
+
+    return get_hub().threadpool.apply(check_admission)
 
 
 def _recorder_admission_state(channel_uuid, expected_generation, expected_control_generation):
