@@ -4305,7 +4305,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         load_applied_state,
     )
     from catchuparr.engine.store import ArchiveStore
-    from catchuparr.recorder_control import control_deny_path, control_state_path
+    from catchuparr.recorder_control import (
+        control_deny_path,
+        control_state_path,
+        load_recorder_control,
+    )
     from catchuparr.recorder_proxy import (
         CAPABILITY_PREFIX,
         configuration_generation,
@@ -6557,7 +6561,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             active_resume, worker_id, enabled=True, live_stability_seconds=1,
             last_viewer_return_seconds=30, min_switch_interval_seconds=60,
         )
-        run_no_source.join_after_supervisor(timeout=30, cooperative_sleep=gevent_sleep)
+        resumed_control = load_recorder_control()
+        _require(
+            resumed_control.generation != run_no_source.expected_control_generation,
+            "Restoring the source policy did not fence the prior no-source task",
+        )
+        run_no_source.join_after_supervisor(
+            timeout=30,
+            cooperative_sleep=gevent_sleep,
+            expected_result={"status": "stale_control"},
+        )
         share_b_request_baseline = len(source_server.request_times("source-b.ts"))
         run_share = _RecorderTaskRun(
             worker_id, startup_timeout=45, media_idle_timeout=25,
