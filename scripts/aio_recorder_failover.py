@@ -1493,20 +1493,20 @@ class _RecorderTaskRun:
 
     def join_after_supervisor(
         self, timeout: float = 20.0, *, cooperative_sleep=None,
-        expected_result: dict | None = None,
+        expected_results: tuple[dict, ...] | None = None,
     ) -> None:
         """Wait for a pause/config/schedule fence to stop the task naturally."""
         self._join_and_validate(
             timeout,
             cooperative_sleep=cooperative_sleep,
-            expected_result=(
-                expected_result if expected_result is not None
-                else {"status": "stopped"}
+            expected_results=(
+                expected_results if expected_results is not None
+                else ({"status": "stopped"},)
             ),
         )
 
     def _join_and_validate(
-        self, timeout: float, *, cooperative_sleep=None, expected_result=None,
+        self, timeout: float, *, cooperative_sleep=None, expected_results=None,
     ) -> None:
         if self.thread is not None:
             sleep = cooperative_sleep or time.sleep
@@ -1524,9 +1524,11 @@ class _RecorderTaskRun:
         self._patchers = []
         with self._lock:
             _require(not self.failures, "Synthetic recorder task raised an internal error")
-            task_finished_as_expected = self.result == (
-                expected_result if expected_result is not None else {"status": "stopped"}
+            accepted_results = (
+                expected_results if expected_results is not None
+                else ({"status": "stopped"},)
             )
+            task_finished_as_expected = self.result in accepted_results
         if not task_finished_as_expected and os.environ.get("CATCHUPARR_INTEGRATION_TEST") == "1":
             _emit_recorder_exit_diagnostic(self)
         _require(task_finished_as_expected, "Synthetic recorder task did not finish as expected")

@@ -6569,7 +6569,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         run_no_source.join_after_supervisor(
             timeout=30,
             cooperative_sleep=gevent_sleep,
-            expected_result={"status": "stale_control"},
+            expected_results=(
+                {"status": "stopped"},
+                {"status": "stale_control"},
+            ),
         )
         share_b_request_baseline = len(source_server.request_times("source-b.ts"))
         run_share = _RecorderTaskRun(
