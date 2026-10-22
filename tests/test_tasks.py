@@ -8,7 +8,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from catchuparr.engine import ArchiveStore
 from catchuparr.recorder_proxy import configuration_generation
@@ -601,13 +601,8 @@ class RecorderTaskTests(unittest.TestCase):
                 self.assertEqual(1, len(lease_instances))
                 self.assertTrue(lease_instances[0].released)
                 self.assertEqual([], recorder_constructions)
-                if path == "private":
-                    self.assertEqual(1, len(attempts))
-                    self.assertTrue(attempts[0].revoked)
-                    self.assertEqual([True], stopped_attempts)
-                else:
-                    self.assertEqual([], attempts)
-                    self.assertEqual([], stopped_attempts)
+                self.assertEqual([], attempts)
+                self.assertEqual([], stopped_attempts)
 
     def test_reconcile_queues_the_applied_generation_with_each_channel(self):
         redis = FakeRedis()
@@ -1186,6 +1181,109 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertEqual("failure", cleanup_calls[0][1])
 
     def test_failed_return_retries_ranked_sources_until_media_resumes(self):
+        self._exercise_failed_source_recovery()
+
+    def test_delayed_native_stop_preserves_source_failover_position(self):
+        self._exercise_failed_source_recovery(stop_failures=2)
+
+    def test_delayed_operation_ack_preserves_source_failover_position(self):
+        self._exercise_failed_source_recovery(ack_failures=2)
+
+    def test_supervisor_keeps_nonsharing_cleanup_alive_after_capability_revocation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            redis = FakeRedis()
+            active = _active_configuration()
+            config = SimpleNamespace(archive_root=Path(temp) / "archive")
+            ready = {"status": "ready", "active": active, "config": config}
+            attempts = []
+            monitors = []
+            stop_calls = []
+            actual_event = threading.Event()
+
+            class StopEvent:
+                supervisor_ticks = 0
+
+                def is_set(self):
+                    return actual_event.is_set()
+
+                def set(self):
+                    actual_event.set()
+
+                def wait(self, seconds):
+                    if seconds == 10:
+                        self.supervisor_ticks += 1
+                        return self.supervisor_ticks > 1
+                    return actual_event.is_set()
+
+            stop_event = StopEvent()
+
+            class ManualThread:
+                ident = None
+
+                def __init__(self, *, target, **_kwargs):
+                    monitors.append(target)
+
+                def start(self):
+                    pass
+
+            class FakeRecorder:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def run_candidate(self, event, **_kwargs):
+                    if len(attempts) == 2:
+                        event.set()
+                        return SimpleNamespace(status="stopped", useful_segments=1)
+                    return SimpleNamespace(status="no_media", useful_segments=0)
+
+            def issue(_redis, _lease, **kwargs):
+                attempt = SimpleNamespace(
+                    worker_id="catchuparr-r" + kwargs["candidate"]["id"].zfill(40),
+                    stream_id=kwargs["candidate"]["id"],
+                    input_url="http://dispatcharr.invalid/synthetic-input",
+                    input_headers={}, revoke=Mock(return_value=True),
+                    renew=Mock(side_effect=AssertionError("revoked bearer renewed during cleanup")),
+                )
+                attempts.append(attempt)
+                return attempt
+
+            def stop(_redis, attempt, _lease):
+                stop_calls.append(attempt.stream_id)
+                if len(stop_calls) == 1:
+                    monitors[0]()
+                    self.assertFalse(stop_event.is_set())
+                    return False
+                return True
+
+            with _isolated_plugin_modules(_recording_task_fake_modules(redis)):
+                tasks = importlib.import_module("catchuparr.tasks")
+                with (
+                    patch.object(tasks, "_recorder_admission_state", return_value=ready),
+                    patch.object(tasks, "_supervisor_recorder_admission_state", return_value=ready),
+                    patch.object(tasks, "_issue_recorder_capability", return_value=(None, None, None)),
+                    patch.object(tasks, "threading", SimpleNamespace(
+                        Event=lambda: stop_event, RLock=threading.RLock, Thread=ManualThread,
+                    )),
+                    patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
+                    patch("catchuparr.recorder_proxy.ranked_source_candidates", return_value=[
+                        {"id": "44", "account_id": "12"},
+                        {"id": "45", "account_id": "13"},
+                    ]),
+                    patch("catchuparr.recorder_proxy.issue_recorder_attempt", side_effect=issue),
+                    patch("catchuparr.recorder_proxy.stop_recorder_attempt", side_effect=stop),
+                    patch("catchuparr.engine.recorder.FFmpegCopyRecorder", FakeRecorder),
+                ):
+                    result = tasks.record_channel("channel-1", "synthetic-generation", 6)
+            self.assertEqual({"status": "stopped"}, result)
+            self.assertEqual(["44", "45"], [attempt.stream_id for attempt in attempts])
+            self.assertEqual(["44", "44", "45"], stop_calls)
+            for attempt in attempts:
+                attempt.renew.assert_not_called()
+
+    def _exercise_failed_source_recovery(self, *, stop_failures=0, ack_failures=0):
+        extra_stop_calls = stop_failures + ack_failures
+        pending_stops = stop_failures
+        pending_acks = ack_failures
         with tempfile.TemporaryDirectory() as temp:
             archive_root = Path(temp) / "archive"
             redis = FakeRedis()
@@ -1227,7 +1325,11 @@ class RecorderTaskTests(unittest.TestCase):
                     return False
 
                 def acknowledge_reaped(self, _redis_client):
+                    nonlocal pending_acks
                     lifecycle.append(f"ack:{self.stream_id}")
+                    if pending_acks:
+                        pending_acks -= 1
+                        return False
                     return True
 
             class FakeRecorder:
@@ -1306,12 +1408,22 @@ class RecorderTaskTests(unittest.TestCase):
                 candidate_refreshes.append(True)
                 return source_candidates
 
+            def stop_attempt(_redis, attempt, _lease):
+                nonlocal pending_stops
+                lifecycle.append(f"stop:{attempt.stream_id}")
+                stopped.append(True)
+                if pending_stops:
+                    pending_stops -= 1
+                    return False
+                return True
+
             with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
                 with (
                     patch("catchuparr.runtime.load_config", return_value=config),
                     patch.object(tasks, "RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS", 0.0),
                     patch.object(tasks, "RECORDER_CANDIDATE_RETRY_MAX_SECONDS", 0.0),
+                    patch.object(tasks, "RECORDER_CLEANUP_RETRY_SECONDS", 0.0),
                     patch("catchuparr.configuration.reset_legacy_configuration", return_value=False),
                     patch(
                         "catchuparr.configuration.load_applied_state",
@@ -1340,10 +1452,7 @@ class RecorderTaskTests(unittest.TestCase):
                     ),
                     patch(
                         "catchuparr.recorder_proxy.stop_recorder_attempt",
-                        side_effect=lambda _redis, attempt, _lease: (
-                            lifecycle.append(f"stop:{attempt.stream_id}")
-                            or stopped.append(True) or True
-                        ),
+                        side_effect=stop_attempt,
                     ),
                     patch("catchuparr.adapters.recorder_proxy.core_api_supported", return_value=True),
                     patch("catchuparr.adapters.recorder_proxy.install_proxyserver_cleanup_hook", return_value=True),
@@ -1357,7 +1466,7 @@ class RecorderTaskTests(unittest.TestCase):
                 [attempt.stream_id for attempt in attempts],
             )
             self.assertTrue(all(attempt.revoked for attempt in attempts))
-            self.assertEqual(7, len(stopped))
+            self.assertEqual(7 + extra_stop_calls, len(stopped))
             self.assertTrue(all(attempt.input_url.endswith("/catchuparr/recorder/channel-1") for attempt in attempts))
             self.assertTrue(all(switch is not None for switch in attempt_switches))
             self.assertEqual(3, len(candidate_refreshes))
@@ -1368,7 +1477,10 @@ class RecorderTaskTests(unittest.TestCase):
             self.assertIs(source_candidates[0], acknowledged_returns[0][3])
             self.assertEqual(
                 ["observe_native",
-                 "issue:44", "revoke:44", "stop:44", "ack:44",
+                 "issue:44", "revoke:44",
+                 *(["stop:44"] * stop_failures),
+                 *(["stop:44", "ack:44"] * ack_failures),
+                 "stop:44", "ack:44",
                  "issue:45", "revoke:45", "stop:45", "ack:45",
                  "issue:46", "revoke:46", "stop:46", "ack:46",
                  "issue:44", "revoke:44", "stop:44", "ack:44",
@@ -1377,6 +1489,113 @@ class RecorderTaskTests(unittest.TestCase):
                  "issue:44", "revoke:44", "stop:44", "ack:44"],
                 lifecycle,
             )
+
+
+class RecorderAttemptCleanupTests(unittest.TestCase):
+    def _run_cleanup(
+        self, *, revokes=(True,), stops=(True,), acks=(True,), sharing=True,
+        current=True, renew=True, cancelled=False, cancel_on_wait=False,
+        diagnostic_failure=False,
+    ):
+        class StopEvent:
+            def __init__(self):
+                self.cancelled = cancelled
+                self.waits = []
+
+            def is_set(self):
+                return self.cancelled
+
+            def set(self):
+                self.cancelled = True
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+                if cancel_on_wait:
+                    self.cancelled = True
+                return self.cancelled
+
+        event = StopEvent()
+        attempt = SimpleNamespace(
+            revoke=Mock(side_effect=list(revokes)),
+            acknowledge_reaped=Mock(side_effect=list(acks)),
+        )
+        lease = SimpleNamespace(renew=Mock(return_value=renew))
+        admission = Mock(return_value=current)
+        pending = Mock(side_effect=RuntimeError("diagnostic write unavailable")) if diagnostic_failure else Mock()
+        redis = FakeRedis()
+        with _isolated_plugin_modules(_recording_task_fake_modules(redis)):
+            tasks = importlib.import_module("catchuparr.tasks")
+            with (
+                patch("catchuparr.recorder_proxy.stop_recorder_attempt", side_effect=list(stops)) as stop,
+                patch("catchuparr.logging_utils.error") as errors,
+            ):
+                result = tasks._finish_recorder_attempt(
+                    redis, attempt, lease, event, sharing=sharing,
+                    still_current=admission, on_pending=pending,
+                )
+        return SimpleNamespace(
+            result=result, attempt=attempt, lease=lease, event=event,
+            admission=admission, pending=pending, stop=stop, errors=errors,
+        )
+
+    def test_revocation_is_confirmed_before_stopping_native_worker(self):
+        run = self._run_cleanup(revokes=(False, True))
+        self.assertTrue(run.result)
+        self.assertEqual(2, run.attempt.revoke.call_count)
+        self.assertEqual(1, run.stop.call_count)
+        self.assertEqual([1.0], run.event.waits)
+
+    def test_native_stop_and_http_ack_can_complete_on_different_retries(self):
+        run = self._run_cleanup(stops=(False, True, True), acks=(False, True))
+        self.assertTrue(run.result)
+        self.assertEqual(1, run.attempt.revoke.call_count)
+        self.assertEqual(3, run.stop.call_count)
+        self.assertEqual(2, run.attempt.acknowledge_reaped.call_count)
+        self.assertEqual(2, run.lease.renew.call_count)
+        self.assertEqual([1.0, 1.0], run.event.waits)
+        self.assertFalse(run.event.is_set())
+
+    def test_transient_cleanup_error_retries_only_while_lease_is_current(self):
+        run = self._run_cleanup(stops=(ConnectionError("synthetic outage"), True))
+        self.assertTrue(run.result)
+        self.assertEqual(2, run.stop.call_count)
+        self.assertEqual(1, run.errors.call_count)
+
+    def test_lost_lease_does_not_authorize_a_new_source(self):
+        run = self._run_cleanup(stops=(False,), renew=False)
+        self.assertFalse(run.result)
+        self.assertTrue(run.event.is_set())
+        self.assertEqual(1, run.stop.call_count)
+        run.attempt.acknowledge_reaped.assert_not_called()
+        self.assertEqual([], run.event.waits)
+
+    def test_changed_admission_stops_cleanup_wait_without_advancing(self):
+        run = self._run_cleanup(stops=(False,), current=False)
+        self.assertFalse(run.result)
+        self.assertTrue(run.event.is_set())
+        run.lease.renew.assert_not_called()
+
+    def test_cancelled_task_still_attempts_exact_cleanup_once(self):
+        run = self._run_cleanup(stops=(False,), cancelled=True)
+        self.assertFalse(run.result)
+        self.assertEqual(1, run.stop.call_count)
+        run.admission.assert_not_called()
+
+    def test_pause_interrupts_retry_wait(self):
+        run = self._run_cleanup(stops=(False,), cancel_on_wait=True)
+        self.assertFalse(run.result)
+        self.assertEqual(1, run.stop.call_count)
+        self.assertTrue(run.event.is_set())
+
+    def test_diagnostic_failure_does_not_abort_exact_cleanup(self):
+        run = self._run_cleanup(stops=(False, True), diagnostic_failure=True)
+        self.assertTrue(run.result)
+        self.assertEqual(2, run.stop.call_count)
+
+    def test_nonsharing_recorder_waits_for_native_cleanup_without_sharing_ack(self):
+        run = self._run_cleanup(stops=(False, True), sharing=False)
+        self.assertTrue(run.result)
+        run.attempt.acknowledge_reaped.assert_not_called()
 
 
 if __name__ == "__main__":

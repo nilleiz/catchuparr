@@ -16,6 +16,49 @@ RECORDER_CAPABILITY_HEADER = "X-Catchuparr-Recorder"
 RECORDER_CAPABILITY_TTL_SECONDS = 30
 RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS = 2.0
 RECORDER_CANDIDATE_RETRY_MAX_SECONDS = 30.0
+RECORDER_CLEANUP_RETRY_SECONDS = 1.0
+
+
+def _finish_recorder_attempt(
+    redis, attempt, lease, stop_event, *, sharing, still_current, on_pending,
+):
+    """Retain this source's position until its exact teardown is acknowledged.
+
+    A native stop request and its HTTP close callback can finish separately.
+    Ending the task on the first missing ACK loses the failed source position,
+    so the next reconciliation can retry the same broken source forever.
+    Keep admission revoked and retry only this attempt while ownership holds.
+    """
+    from .logging_utils import error
+    from .recorder_proxy import stop_recorder_attempt
+
+    revoked = False
+    while True:
+        try:
+            if not revoked:
+                revoked = attempt.revoke(redis)
+            if revoked and stop_recorder_attempt(redis, attempt, lease):
+                if not sharing or attempt.acknowledge_reaped(redis):
+                    return True
+        except Exception as exc:
+            error("supervision_failed", exc, callsite="dedicated_worker")
+        try:
+            on_pending()
+        except Exception:
+            # Diagnostic publication cannot decide native resource ownership.
+            pass
+        if stop_event.is_set():
+            return False
+        try:
+            current = still_current() and lease.renew()
+        except Exception as exc:
+            error("supervision_failed", exc, callsite="dedicated_worker")
+            current = False
+        if not current:
+            stop_event.set()
+            return False
+        if stop_event.wait(RECORDER_CLEANUP_RETRY_SECONDS):
+            return False
 
 
 def _refresh_current_recorder_diagnostic(
@@ -293,7 +336,6 @@ def record_channel(
         issue_recorder_attempt,
         ranked_source_candidates,
         reconcile_unlaunched_sharing_operation,
-        stop_recorder_attempt,
     )
     from .runtime import require_supported_version
 
@@ -332,6 +374,7 @@ def record_channel(
         "active_borrow": None, "return_prepared": None, "return_token": None,
         "return_media_at": None, "completed_return_media": None,
         "diagnostic": None,
+        "cleaning_up": False,
     }
 
     def publish_dedicated_diagnostic(
@@ -527,6 +570,13 @@ def record_channel(
 
                         refresh_recorder_markers(redis, stats_capability_digest)
                     current_active = current_admission["active"]
+                    with attempt_state_lock:
+                        cleaning_up = attempt_state["cleaning_up"]
+                    # Revocation is intentional during teardown. Keep the
+                    # lease/control supervision alive without renewing the
+                    # revoked capability or preparing another native input.
+                    if cleaning_up:
+                        continue
                     if sharing_coordinator is not None:
                         prepared = sharing_coordinator.poll(
                             active=current_active,
@@ -544,17 +594,22 @@ def record_channel(
                                 if current_switch is not None:
                                     current_switch.request()
                     with attempt_state_lock:
+                        if attempt_state["cleaning_up"]:
+                            continue
                         current_attempt = attempt_state["attempt"]
                         current_candidate = attempt_state["candidate"]
                         current_switch = attempt_state["switch"]
-                    if current_attempt is not None and current_switch is not None:
-                        if current_attempt.operation_needs_switch(redis):
-                            current_switch.request()
-                        elif not current_attempt.renew(redis):
-                            current_switch.request()
-                    elif current_attempt is not None and not current_attempt.renew(redis):
-                        stop_event.set()
-                        return
+                        # Serialize this renewal with the cleanup flag. A
+                        # supervisor that took an earlier snapshot must not
+                        # stop the task because teardown revoked its bearer.
+                        if current_attempt is not None and current_switch is not None:
+                            if current_attempt.operation_needs_switch(redis):
+                                current_switch.request()
+                            elif not current_attempt.renew(redis):
+                                current_switch.request()
+                        elif current_attempt is not None and not current_attempt.renew(redis):
+                            stop_event.set()
+                            return
                     if current_candidate is not None and not candidate_is_current(
                         channel_uuid,
                         str(current_candidate.get("id") or current_candidate.get("stream_id") or ""),
@@ -769,6 +824,13 @@ def record_channel(
                     candidate = candidates[index]
                     if stop_event.is_set():
                         break
+                    current_state = _recorder_admission_state(
+                        channel_uuid, expected_generation, expected_control_generation,
+                    )
+                    if current_state["status"] != "ready":
+                        return {"status": current_state["status"]}
+                    if not lease.renew():
+                        return {"status": "lease_lost"}
                     sharing_authority = None
                     attempt_switch = None
                     if sharing_enabled:
@@ -889,29 +951,43 @@ def record_channel(
                                         started_at=dedicated_started_at,
                                     )
                     finally:
-                        revoked = attempt.revoke(redis)
-                        cleanup_ok = False
-                        try:
-                            cleanup_ok = stop_recorder_attempt(redis, attempt, lease)
-                            if cleanup_ok and sharing_authority is not None:
-                                cleanup_ok = attempt.acknowledge_reaped(redis)
-                        except Exception as exc:
-                            error("supervision_failed", exc, callsite="dedicated_worker")
-                        if not revoked or not cleanup_ok:
-                            stop_event.set()
                         with attempt_state_lock:
-                            if attempt_state["attempt"] is attempt:
-                                attempt_state["attempt"] = None
-                                attempt_state["candidate"] = None
-                                attempt_state["switch"] = None
-                                attempt_state["completed_return_media"] = None
-                                attempt_state["return_token"] = None
-                                attempt_state["return_media_at"] = None
-                            current_diagnostic = attempt_state.get("diagnostic")
-                            if (isinstance(current_diagnostic, dict)
-                                    and current_diagnostic.get("kind") == "dedicated"
-                                    and current_diagnostic.get("attempt") is attempt):
-                                attempt_state["diagnostic"] = None
+                            attempt_state["cleaning_up"] = True
+
+                        def cleanup_still_current():
+                            return _recorder_admission_state(
+                                channel_uuid, expected_generation, expected_control_generation,
+                            )["status"] == "ready"
+
+                        def cleanup_pending():
+                            error("recorder_cleanup_pending", callsite="attempt_reconciliation")
+                            publish_dedicated_diagnostic(
+                                attempt, "cleanup_pending", started_at=dedicated_started_at,
+                            )
+
+                        try:
+                            cleanup_ok = _finish_recorder_attempt(
+                                redis, attempt, lease, stop_event,
+                                sharing=sharing_authority is not None,
+                                still_current=cleanup_still_current, on_pending=cleanup_pending,
+                            )
+                            if not cleanup_ok:
+                                stop_event.set()
+                        finally:
+                            with attempt_state_lock:
+                                if attempt_state["attempt"] is attempt:
+                                    attempt_state["attempt"] = None
+                                    attempt_state["candidate"] = None
+                                    attempt_state["switch"] = None
+                                    attempt_state["completed_return_media"] = None
+                                    attempt_state["return_token"] = None
+                                    attempt_state["return_media_at"] = None
+                                    attempt_state["cleaning_up"] = False
+                                current_diagnostic = attempt_state.get("diagnostic")
+                                if (isinstance(current_diagnostic, dict)
+                                        and current_diagnostic.get("kind") == "dedicated"
+                                        and current_diagnostic.get("attempt") is attempt):
+                                    attempt_state["diagnostic"] = None
                     if admission_status is not None:
                         return {"status": admission_status}
                     if result is not None and result.useful_segments > 0:
