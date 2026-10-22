@@ -5,7 +5,7 @@ import threading
 import time
 import types
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -1103,6 +1103,17 @@ class RecorderTaskTests(unittest.TestCase):
             }
             with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
+                startup_patches = ExitStack()
+                startup_patches.enter_context(patch(
+                    "catchuparr.sharing_episode.BorrowEpisodeLedger", return_value=object(),
+                ))
+                startup_patches.enter_context(patch(
+                    "catchuparr.sharing_recovery.recover_superseded_borrow",
+                    side_effect=lambda *_args, **_kwargs: (
+                        recovery_events.append("superseded_recovery") or True
+                    ),
+                ))
+                self.addCleanup(startup_patches.close)
                 with (
                     patch("catchuparr.runtime.load_config", return_value=config),
                     patch("catchuparr.engine.leases.RedisRecorderLease", FakeLease),
@@ -1131,7 +1142,6 @@ class RecorderTaskTests(unittest.TestCase):
                         "catchuparr.sharing_runtime.RecorderBorrowCoordinator",
                         BorrowCoordinator,
                     ),
-                    patch("catchuparr.sharing_episode.BorrowEpisodeLedger", return_value=object()),
                     patch(
                         "catchuparr.sharing_runtime.retry_durable_open_cleanups",
                         side_effect=lambda *_args, **kwargs: (
@@ -1159,13 +1169,25 @@ class RecorderTaskTests(unittest.TestCase):
                         ),
                     ),
                 ):
+                    with patch(
+                        "catchuparr.sharing_recovery.recover_superseded_borrow",
+                        return_value=False,
+                    ):
+                        blocked = tasks.record_channel("channel-1", expected_generation, 6)
+                    self.assertEqual({"status": "sharing_cleanup_pending"}, blocked)
+                    self.assertEqual([], polls)
+                    self.assertEqual([], coordinator_sources)
+                    self.assertEqual([], recorder_inputs)
+                    recovery_events.clear()
+                    stop_event = StopEvent()
                     result = tasks.record_channel("channel-1", expected_generation, 6)
 
             self.assertEqual({"status": "stopped"}, result)
             self.assertEqual([True], coordinator_sources)
             self.assertEqual([True], polls)
             self.assertEqual(
-                [("cleanup", "channel-1"), "native_observation"], recovery_events,
+                [("cleanup", "channel-1"), "superseded_recovery", "native_observation"],
+                recovery_events,
             )
             self.assertEqual(1, len(recorder_inputs))
             self.assertEqual(

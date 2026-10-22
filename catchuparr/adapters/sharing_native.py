@@ -1316,6 +1316,8 @@ return 1
 
 def tombstone_expired_unprojected_opening(
     redis: Any, episode: BorrowEpisodeSnapshot, *, client_id: str,
+    expected_lease: str | None = None,
+    expected_authority: tuple[str, int, str, int] | None = None,
 ) -> bool:
     """Atomically prove absence and permanently fence a delayed expired opening.
 
@@ -1351,6 +1353,12 @@ def tombstone_expired_unprojected_opening(
         if isinstance(current_lease, bytes):
             current_lease = current_lease.decode("utf-8", errors="strict")
         if current_lease is not None and not isinstance(current_lease, str):
+            return False
+        if expected_lease is not None and current_lease != expected_lease:
+            return False
+        if expected_authority is not None and (
+            config, control, catalog, revision
+        ) != tuple(str(value) for value in expected_authority):
             return False
         keys = (
             current_key, episode_projection_key(channel), lease_key,

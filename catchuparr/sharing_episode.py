@@ -547,12 +547,19 @@ class BorrowEpisodeLedger:
         return self.read(row["channel_uuid"])
 
     def read(self, channel_uuid: str) -> BorrowEpisodeSnapshot:
+        snapshot = self.read_optional(channel_uuid)
+        if snapshot is None:
+            raise BorrowEpisodeRejected("no active borrow episode")
+        return snapshot
+
+    def read_optional(self, channel_uuid: str) -> BorrowEpisodeSnapshot | None:
+        """Distinguish an absent episode from an invalid persisted binding."""
         if not isinstance(channel_uuid, str) or not channel_uuid:
             raise ValueError("channel_uuid must be non-empty")
         with self._db() as db:
             row = db.execute("SELECT * FROM sharing_borrow_episodes WHERE channel_uuid=?", (channel_uuid,)).fetchone()
         if row is None:
-            raise BorrowEpisodeRejected("no active borrow episode")
+            return None
         return self._snapshot_from_row(row)
 
     def pending_cleanup(self) -> tuple[BorrowEpisodeSnapshot, ...]:

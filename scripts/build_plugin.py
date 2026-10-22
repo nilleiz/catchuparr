@@ -27,6 +27,7 @@ REQUIRED_MODULES = (
     "sharing_episode.py",
     "sharing_persistence.py",
     "sharing_planner.py",
+    "sharing_recovery.py",
     "sharing_runtime.py",
     "stats.py",
     "tasks.py",
