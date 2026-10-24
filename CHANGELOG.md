@@ -12,6 +12,8 @@ included here to explain the feature history leading to 0.4.0.
   local XC playback. Preserve the legacy 0.32.0 helper when the shared module
   is absent. A shared-policy denial or failure never falls back to an older,
   less restrictive visibility check.
+- Keep the local XC playlist timestamp parameter as `utc` on newer supported
+  cores, instead of selecting `start` for every version except exactly 0.32.0.
 
 ### Verification
 

@@ -295,6 +295,28 @@ class XCHookBehaviorTests(unittest.TestCase):
         self.assertEqual(content.count('catchup-source="'), 2)
         self.assertEqual(calls["m3u"], 2)
 
+    def test_newer_supported_core_m3u_keeps_utc_timestamp_contract(self):
+        for version in ("0.32.0", "0.32.1", "0.33.0", "1.0.0"):
+            with self.subTest(version=version):
+                output, timeshift, calls = modules()
+                calls["m3u_content"] = (
+                    '#EXTM3U\n#EXTINF:-1 tvg-name="Synthetic",Synthetic\n'
+                    "https://dispatcharr.test/live/viewer/secret/9\n"
+                )
+                installed = install_xc_hooks(
+                    output, timeshift, dispatcharr_version=version,
+                    callbacks=XCCallbacks(
+                        authorize_xc_m3u=lambda request, user: True,
+                        m3u_channel_archive_days=lambda user: {"9": 5},
+                    ),
+                )
+                self.assertTrue(installed.installed)
+                response = output.generate_m3u(Request(get={
+                    "username": "viewer", "password": "secret", "direct": "false",
+                }), user={"catchup": True})
+                self.assertIn("&utc={utc}&duration={duration:60}", response.content)
+                self.assertNotIn("&start={utc}", response.content)
+
     def test_032_m3u_hook_skips_direct_and_unauthorized_requests(self):
         output, timeshift, calls = modules()
         authorization_calls = []
