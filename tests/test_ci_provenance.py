@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from scripts.ci_provenance import (
     ARTIFACT_NAME,
+    REQUIRED_AIO_JOBS,
     REQUIRED_AIO_STEP,
     WORKFLOW_PATH,
     ProvenanceError,
@@ -71,6 +72,11 @@ def _run() -> dict:
                 "conclusion": "success",
                 "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
             },
+            {
+                "name": "AIO integration (0.33.0)",
+                "conclusion": "success",
+                "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
+            },
         ],
     }
 
@@ -123,6 +129,36 @@ def _merged_pr(**changes) -> dict:
 
 
 class CIProvenanceTest(unittest.TestCase):
+    def test_every_native_matrix_job_and_its_executed_step_is_required(self):
+        for name in REQUIRED_AIO_JOBS:
+            for failure in ("missing_job", "failed_job", "skipped_step", "missing_step"):
+                with self.subTest(version=name, failure=failure):
+                    run = _run()
+                    job = next(j for j in run["jobs"] if j["name"] == name)
+                    if failure == "missing_job":
+                        run["jobs"].remove(job)
+                    elif failure == "failed_job":
+                        job["conclusion"] = "failure"
+                    elif failure == "skipped_step":
+                        job["steps"][0]["conclusion"] = "skipped"
+                    else:
+                        job["steps"] = []
+                    self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
+        self.assertTrue(_trusted_run(_run(), REPOSITORY, WORKFLOW_ID))
+
+    def test_required_native_jobs_match_the_pinned_ci_matrix(self):
+        import yaml
+
+        workflow = yaml.safe_load(
+            (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text(),
+        )
+        matrix = workflow["jobs"]["aio-integration"]["strategy"]["matrix"]["include"]
+        self.assertEqual(REQUIRED_AIO_JOBS, {
+            f"AIO integration ({entry['version']})" for entry in matrix
+        })
+        for entry in matrix:
+            self.assertRegex(entry["image"], r"^ghcr\.io/dispatcharr/dispatcharr@sha256:[a-f0-9]{64}$")
+
     def test_inventory_matches_only_package_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "catchuparr"

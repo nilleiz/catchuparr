@@ -354,7 +354,9 @@ def install_xc_hooks(
             username = str(request.GET.get("username") or "")
             password = str(request.GET.get("password") or "")
             credentials = urlencode({"username": username, "password": password})
-            timestamp_parameter = "utc" if dispatcharr_version == "0.32.0" else "start"
+            # Both admitted core generations accept epoch timestamps as utc.
+            # Do not change this public playlist contract on newer versions.
+            timestamp_parameter = "utc"
             source_prefix = (
                 f"{base_url}/streaming/timeshift.php?{credentials}&stream="
             )

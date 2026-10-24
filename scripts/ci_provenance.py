@@ -19,7 +19,8 @@ from pathlib import Path, PurePosixPath
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 ARTIFACT_NAME = "catchuparr-plugin"
 SCHEMA_VERSION = 1
-REQUIRED_JOBS = {"test-and-package", "AIO integration (0.32.0)"}
+REQUIRED_AIO_JOBS = {"AIO integration (0.32.0)", "AIO integration (0.33.0)"}
+REQUIRED_JOBS = {"test-and-package", *REQUIRED_AIO_JOBS}
 REQUIRED_AIO_STEP = "Synthetic playback in actual Dispatcharr AIO"
 PACKAGE_SUFFIXES = {".py", ".json", ".png"}
 API_ROOT = "https://api.github.com"
@@ -278,14 +279,17 @@ def _required_job_records(run: dict) -> list[dict]:
 
 
 def _native_aio_step_succeeded(jobs: list[dict]) -> bool:
-    aio_job = next((job for job in jobs if job.get("name") == "AIO integration (0.32.0)"), None)
-    steps = aio_job.get("steps") if isinstance(aio_job, dict) else None
-    return isinstance(steps, list) and any(
-        isinstance(step, dict)
-        and step.get("name") == REQUIRED_AIO_STEP
-        and step.get("conclusion") == "success"
-        for step in steps
-    )
+    by_name = {job.get("name"): job for job in jobs if isinstance(job, dict)}
+    for name in REQUIRED_AIO_JOBS:
+        steps = by_name.get(name, {}).get("steps")
+        if not isinstance(steps, list) or not any(
+            isinstance(step, dict)
+            and step.get("name") == REQUIRED_AIO_STEP
+            and step.get("conclusion") == "success"
+            for step in steps
+        ):
+            return False
+    return True
 
 
 def _trusted_run(run: dict, repository: str, workflow_id: int) -> bool:
