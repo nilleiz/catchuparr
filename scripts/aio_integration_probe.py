@@ -590,7 +590,8 @@ def probe():
             require(service.end_session(token, str(selected_channel.uuid), lease),
                     "Synthetic HLS playback lease did not close")
 
-    time_key = "utc" if __version__ == "0.32.0" else "start"
+    # Supported cores (0.32+) use the UTC query parameter, including 0.33.
+    time_key = "utc"
     xc_params = {"username": user.username, "password": xc_password,
                  "stream": str(channel.id), "duration": "1"}
     params = {"access_token": token, "channel_id": str(channel.uuid),
@@ -957,15 +958,69 @@ def probe():
             == b"\x47" + bytes([2]) * 187,
             "Missing duration must use the actual EPG end from core helpers")
     bad_credentials = dict(xc_params, password="invalid", **{time_key: str(int(start.timestamp()))})
+    shared_xc_auth = callable(getattr(timeshift, "authorize_xc_client", None))
     require(timeshift.timeshift_proxy_query(request(
         "/streaming/timeshift.php", bad_credentials,
-    )).status_code == 403)
+    )).status_code == (401 if shared_xc_auth else 403),
+            "XC credentials must be rejected by the core authentication contract")
     forbidden_channel = dict(xc_params, stream=str(private_channel.id),
                              **{time_key: str(int(start.timestamp()))})
-    require(timeshift.timeshift_proxy_query(request(
-        "/streaming/timeshift.php", forbidden_channel,
-    )).status_code == 403)
-    user.custom_properties = {"catchup_enabled": False}
+    if shared_xc_auth:
+        from django.http import Http404
+
+        from catchuparr.xc_runtime import _channel_policy_allows
+
+        def require_hidden_channel(parameters):
+            try:
+                timeshift.timeshift_proxy_query(request("/streaming/timeshift.php", parameters))
+            except Http404:
+                return
+            raise RuntimeError("Core XC must hide inaccessible channels as not found")
+
+        require_hidden_channel(forbidden_channel)
+        # Verify the shared core ACL, including rules absent from the old
+        # private timeshift helper, without replacing it with a test stub.
+        properties_before = dict(user.custom_properties or {})
+        adult_before = channel.is_adult
+        try:
+            channel.is_adult = True
+            channel.save(update_fields=["is_adult"])
+            user.custom_properties = {**properties_before, "hide_adult_content": True}
+            user.save(update_fields=["custom_properties"])
+            require(not _channel_policy_allows(timeshift, user, channel),
+                    "Local XC must preserve the core adult-content denial")
+            require_hidden_channel(dict(xc_params, **{time_key: str(int(start.timestamp()))}))
+        finally:
+            channel.is_adult = adult_before
+            channel.save(update_fields=["is_adult"])
+            user.custom_properties = properties_before
+            user.save(update_fields=["custom_properties"])
+        require(_channel_policy_allows(timeshift, user, channel),
+                "Local XC must allow an authorized channel after restoring the fixture")
+        profile_was_assigned = user.channel_profiles.filter(pk=channel_profile.pk).exists()
+        membership = ChannelProfileMembership.objects.get(
+            channel_profile=channel_profile, channel=channel,
+        )
+        membership_enabled = membership.enabled
+        try:
+            user.channel_profiles.add(channel_profile)
+            membership.enabled = False
+            membership.save(update_fields=["enabled"])
+            require(not _channel_policy_allows(timeshift, user, channel),
+                    "Local XC must preserve disabled profile-membership denial")
+            require_hidden_channel(dict(xc_params, **{time_key: str(int(start.timestamp()))}))
+        finally:
+            membership.enabled = membership_enabled
+            membership.save(update_fields=["enabled"])
+            if not profile_was_assigned:
+                user.channel_profiles.remove(channel_profile)
+        require(_channel_policy_allows(timeshift, user, channel),
+                "Restored profile access must allow local XC playback")
+    else:
+        require(timeshift.timeshift_proxy_query(request(
+            "/streaming/timeshift.php", forbidden_channel,
+        )).status_code == 403)
+    user.custom_properties = {**(user.custom_properties or {}), "catchup_enabled": False}
     user.save(update_fields=["custom_properties"])
     cache.clear()
     disabled = views.archive_view(request("/catchuparr/archive", params))

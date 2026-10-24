@@ -4,6 +4,27 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.6.10] - Prerelease candidate
+
+### Fixed
+
+- Use the shared channel-access policy introduced in Dispatcharr 0.33.0 for
+  local XC playback. Preserve the legacy 0.32.0 helper when the shared module
+  is absent. A shared-policy denial or failure never falls back to an older,
+  less restrictive visibility check.
+- Keep the local XC playlist timestamp parameter as `utc` on newer supported
+  cores, instead of selecting `start` for every version except exactly 0.32.0.
+
+### Verification
+
+- Extend authoritative native CI to pinned Dispatcharr 0.32.0 and 0.33.0
+  images. Require both executed native steps for trusted release-artifact
+  reuse, alongside the successful package job.
+- Preserve the 0.32.0 minimum-version policy and API capability checks. Native
+  probes use the supported UTC query contract and distinguish the core's
+  legacy authentication denials from its newer unauthorized/not-found rules.
+- Required native acceptance is pending for this candidate.
+
 ## [0.6.9] - Prerelease candidate
 
 ### Fixed

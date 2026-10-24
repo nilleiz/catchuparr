@@ -538,8 +538,20 @@ def _authorized_channel(timeshift_views, channel_id, user):
 
 
 def _channel_policy_allows(timeshift_views, user, channel) -> bool:
-    function = getattr(timeshift_views, "_user_can_access_channel", None)
-    if function is None:
+    # Prefer the shared ACL on newer cores, including its adult-content and
+    # profile visibility rules. Never fall back after a denial or an import
+    # failure inside that implementation.
+    try:
+        from apps.channels.access import user_can_access_channel
+
+        function = user_can_access_channel
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"apps", "apps.channels", "apps.channels.access"}:
+            return False
+        function = getattr(timeshift_views, "_user_can_access_channel", None)
+    except Exception:
+        return False
+    if not callable(function):
         return False
     try:
         return bool(function(user, channel))

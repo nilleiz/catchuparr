@@ -1,4 +1,5 @@
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ from catchuparr.ts_http import (
 )
 from catchuparr.xc_runtime import (
     _active_hls_session_count,
+    _channel_policy_allows,
     _local_playback_window,
     _make_callbacks,
     _PlaybackHeartbeatIterator,
@@ -28,6 +30,58 @@ from catchuparr.xc_runtime import (
     _xc_session_keys,
     active_ts_session_count,
 )
+
+
+class ChannelACLCompatibilityTests(unittest.TestCase):
+    def central_module(self, policy):
+        module = types.ModuleType("apps.channels.access")
+        module.user_can_access_channel = policy
+        return patch.dict(sys.modules, {"apps.channels.access": module})
+
+    def test_new_core_acl_without_removed_timeshift_helper_allows_authorized_channel(self):
+        calls = []
+        user, channel = object(), object()
+        with self.central_module(lambda u, c: calls.append((u, c)) or True):
+            self.assertTrue(_channel_policy_allows(SimpleNamespace(), user, channel))
+        self.assertEqual([(user, channel)], calls)
+
+    def test_central_denial_or_error_never_uses_permissive_legacy_helper(self):
+        def legacy(*_args):
+            self.fail("Central ACL must never fall back after denial or error")
+
+        def unavailable(*_args):
+            raise RuntimeError("synthetic ACL failure")
+
+        for policy in (lambda *_args: False, unavailable, None):
+            with self.subTest(policy=policy), self.central_module(policy):
+                self.assertFalse(_channel_policy_allows(
+                    SimpleNamespace(_user_can_access_channel=legacy), object(), object(),
+                ))
+
+    def test_032_legacy_acl_retains_allow_and_deny_without_central_module(self):
+        with patch.dict(sys.modules, {"apps.channels.access": None}):
+            self.assertTrue(_channel_policy_allows(
+                SimpleNamespace(_user_can_access_channel=lambda *_: True), object(), object(),
+            ))
+            self.assertFalse(_channel_policy_allows(
+                SimpleNamespace(_user_can_access_channel=lambda *_: False), object(), object(),
+            ))
+            self.assertFalse(_channel_policy_allows(SimpleNamespace(), object(), object()))
+
+    def test_missing_dependency_inside_new_acl_module_fails_closed(self):
+        import builtins
+
+        original = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "apps.channels.access":
+                raise ModuleNotFoundError("synthetic dependency unavailable", name="acl_dependency")
+            return original(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=guarded_import):
+            self.assertFalse(_channel_policy_allows(
+                SimpleNamespace(_user_can_access_channel=lambda *_: True), object(), object(),
+            ))
 
 
 class _CoverageStore:
