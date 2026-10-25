@@ -165,7 +165,7 @@ def probe():
         )
         request = factory.get(
             path,
-            params,
+            dict(params, playback="continuous") if route_match is native_match else params,
             REMOTE_ADDR="127.0.0.1",
             HTTP_USER_AGENT="Synthetic parity probe/1",
         )

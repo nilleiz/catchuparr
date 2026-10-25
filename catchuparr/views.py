@@ -23,7 +23,8 @@ _ROUTE_NAMES = frozenset(
     {
         "catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive",
         "catchuparr-segment", "catchuparr-recorder",
-        "catchuparr-native-archive", "catchuparr-native-segment",
+        "catchuparr-native-archive", "catchuparr-native-archive-hls",
+        "catchuparr-native-segment",
         "catchuparr-sharing-borrow",
     }
 )
@@ -73,6 +74,11 @@ def install_routes() -> None:
             "catchuparr/native/archive",
             _native_archive_route,
             name="catchuparr-native-archive",
+        ),
+        path(
+            "catchuparr/native/archive.m3u8",
+            _native_archive_route,
+            name="catchuparr-native-archive-hls",
         ),
         path(
             "catchuparr/native/segment/<str:channel_id>/<str:segment_id>",
@@ -844,31 +850,30 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
 
     try:
         start_epoch = _catchup_epoch(request.GET.get("utc", ""))
-        raw_duration = request.GET.get("duration", "")
-        if not re.fullmatch(r"[0-9]{1,5}", raw_duration):
-            raise ValueError("invalid duration")
-        duration_seconds = int(raw_duration)
     except (TypeError, ValueError, OverflowError):
         return _no_cache(HttpResponse("Invalid catch-up time", status=400))
-    if not 0 < duration_seconds <= 24 * 60 * 60:
-        return _no_cache(HttpResponse("Invalid catch-up duration", status=400))
     now_epoch = datetime.now(timezone.utc).timestamp()
-    requested_end_epoch = start_epoch + duration_seconds
-    if (
-        start_epoch > now_epoch
-        or requested_end_epoch < now_epoch - config.retention_hours * 3600
-    ):
-        return _no_cache(HttpResponse("No archived programme", status=404))
     store = service.store
     programme_end_epoch, next_programme_end_epoch = _archive_epg_bounds(
         channel, start_epoch, store
     )
-    end_epoch, continuation_end_epoch = _archive_playback_window(
-        start_epoch,
-        duration_seconds,
-        programme_end_epoch,
-        next_programme_end_epoch,
-    )
+    from .catchup_request import archive_request_end
+
+    try:
+        requested_end_epoch = archive_request_end(
+            request.GET, start_epoch, now_epoch, programme_end=programme_end_epoch,
+        )
+        playback = request.GET.get("playback", "archive")
+        if playback not in {"archive", "continuous"}:
+            raise ValueError("invalid playback mode")
+    except (TypeError, ValueError, OverflowError):
+        return _no_cache(HttpResponse("Invalid catch-up range", status=400))
+    if (start_epoch > now_epoch
+            or requested_end_epoch < now_epoch - config.retention_hours * 3600):
+        return _no_cache(HttpResponse("No archived programme", status=404))
+    continuous = playback == "continuous"
+    end_epoch = (start_epoch + MAX_ARCHIVE_PLAYBACK_SECONDS
+                 if continuous else requested_end_epoch)
     if request.method == "HEAD":
         # Match GET's playlist eligibility without acquiring a lease or
         # persisting a manifest. The shared builder decides which indexed
@@ -891,11 +896,13 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
         channel,
         start_epoch,
         end_epoch,
-        live=_archive_window_live(service, str(user.id), channel, end_epoch, now_epoch),
+        live=(continuous and _archive_window_live(
+            service, str(user.id), channel, end_epoch, now_epoch,
+        )),
         request_identity_end=requested_end_epoch,
         programme_end_utc=None,
         continuation_end_utc=None,
-        continuous=True,
+        continuous=continuous,
     )
     if request.method == "GET" and response.status == 200 and response.body:
         _record_native_playback(

@@ -153,6 +153,63 @@ class NativeArchiveParityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.service.playlist.assert_called_once()
         self.service.store.segments.assert_not_called()
+        args = self.service.playlist.call_args
+        self.assertEqual(self.requested_end, args.args[3])
+        self.assertFalse(args.kwargs["live"])
+        self.assertFalse(args.kwargs["continuous"])
+
+    def test_unexpanded_duration_uses_server_epg_and_never_requires_client_replacement(self):
+        self.request.GET["duration"] = "{duration}"
+        self.request.GET["lutc"] = str(int(self.now))
+        response = self.call_archive()
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(self.requested_end + 60, self.service.playlist.call_args.args[3])
+
+    def test_missing_duration_and_malformed_duration_are_distinguished(self):
+        self.request.GET.pop("duration")
+        self.assertEqual(200, self.call_archive().status_code)
+        self.service.playlist.reset_mock()
+        self.request.GET["duration"] = "bad"
+        self.assertEqual(400, self.call_archive().status_code)
+        self.service.playlist.assert_not_called()
+
+    def test_continuous_playback_requires_explicit_opt_in(self):
+        self.request.GET["playback"] = "continuous"
+        self.assertEqual(200, self.call_archive().status_code)
+        self.assertTrue(self.service.playlist.call_args.kwargs["continuous"])
+        self.assertEqual(self.start + 86400, self.service.playlist.call_args.args[3])
+
+    def test_actual_manifest_contains_requested_archive_not_later_live_segments(self):
+        import tempfile
+        from datetime import timedelta
+        from pathlib import Path
+
+        from catchuparr.engine.store import ArchiveStore
+        from catchuparr.http import ArchiveHTTPService
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = ArchiveStore(Path(temp))
+            old_ids, live_ids = [], []
+            for offset in (0, 6, 12, 102, 108):
+                stamp = datetime.fromtimestamp(self.start + offset, timezone.utc)
+                path = Path(temp) / f"synthetic-{offset}.ts"
+                path.write_bytes(b"\x47" + bytes([offset]) * 187)
+                segment = store.add_segment("channel-synthetic", path, stamp,
+                                            stamp + timedelta(seconds=6))
+                (old_ids if offset < 60 else live_ids).append(str(segment.id))
+            self.service = ArchiveHTTPService(
+                store, SimpleNamespace(lookup=lambda token: "7" if token == "synthetic" else None),
+                authorize_user_channel=lambda *_: True, catchup_enabled=lambda *_: True,
+            )
+            response = self.call_archive()
+            self.assertEqual(200, response.status_code)
+            text = response.content.decode()
+            self.assertIn("#EXT-X-ENDLIST", text)
+            self.assertIn("#EXT-X-START:TIME-OFFSET=0.000", text)
+            for segment_id in old_ids:
+                self.assertIn(f"/{segment_id}?", text)
+            for segment_id in live_ids:
+                self.assertNotIn(f"/{segment_id}?", text)
 
     def test_head_checks_shared_manifest_without_creating_a_playlist(self):
         response = self.call_archive("HEAD")

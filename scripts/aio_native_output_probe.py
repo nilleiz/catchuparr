@@ -82,6 +82,7 @@ def probe_native_output(*, root, user, channel, channel_profile, start, runtime,
     from core.utils import RedisClient
     from django.core.cache import cache
     from django.urls import resolve, reverse
+    from django.utils import timezone
     from rest_framework.test import APIClient
     from rest_framework_simplejwt.tokens import AccessToken
 
@@ -95,7 +96,7 @@ def probe_native_output(*, root, user, channel, channel_profile, start, runtime,
             "Native output URL configuration is empty")
     m3u_url = reverse("output:m3u_endpoint", kwargs={"profile_name": channel_profile.name})
     epg_url = reverse("output:epg_endpoint", kwargs={"profile_name": channel_profile.name})
-    archive_url = reverse("catchuparr-native-archive")
+    archive_url = reverse("catchuparr-native-archive-hls")
     m3u_match = _resolve_wsgi_path(m3u_url, resolve, request)
     epg_match = _resolve_wsgi_path(epg_url, resolve, request)
     require(m3u_match.url_name == "m3u_endpoint"
@@ -104,7 +105,7 @@ def probe_native_output(*, root, user, channel, channel_profile, start, runtime,
     require(epg_match.url_name == "epg_endpoint"
             and epg_match.kwargs.get("profile_name") == channel_profile.name,
             "Native EPG resolver did not receive decoded WSGI profile PATH_INFO")
-    require(_resolve_wsgi_path(archive_url, resolve, request).url_name == "catchuparr-native-archive")
+    require(_resolve_wsgi_path(archive_url, resolve, request).url_name == "catchuparr-native-archive-hls")
 
     # Exercise Django's actual reverse -> RequestFactory PATH_INFO -> resolver
     # boundary for spaces, literal percent signs and UTF-8 profile names. The
@@ -273,6 +274,9 @@ def probe_native_output(*, root, user, channel, channel_profile, start, runtime,
                          if str(outside.uuid) in rows[index + 1])
         require("catchup-source" not in _parse_extinf_attributes(adult_row),
                 "Admission-user-hidden native channel received a capability")
+        require(urlsplit(cap_attrs["catchup-source"]).path.endswith("archive.m3u8")
+                and "{duration}" not in cap_attrs["catchup-source"],
+                "Generic native export must identify HLS without a duration placeholder")
         cap_query = parse_qs(urlsplit(cap_attrs["catchup-source"].replace('"', "")).query)
         capability = cap_query["token"][0]
         channel_key = cap_query["channel_id"][0]
@@ -332,6 +336,17 @@ def probe_native_output(*, root, user, channel, channel_profile, start, runtime,
             )
             require(False, failure_message)
         archive_body = archive.content.decode("utf-8")
+        require("#EXT-X-ENDLIST" in archive_body,
+                "Historical native catch-up must be a closed playlist")
+        partial_request = request(archive_url, {
+            "channel_id": channel_key, "token": capability,
+            "utc": str(start.timestamp()), "duration": "{duration}",
+            "lutc": str(int(timezone.now().timestamp())),
+        }, REMOTE_ADDR="127.0.0.1", HTTP_USER_AGENT="Synthetic Native Client/1")
+        partial_request.method = "HEAD"
+        partial_archive = archive_resolver.func(partial_request, **archive_resolver.kwargs)
+        require(partial_archive.status_code == 200 and not partial_archive.content,
+                "Partially substituted catch-up template failed bounded HEAD validation")
         segment_url = next(line for line in archive_body.splitlines()
                            if line and not line.startswith("#"))
         segment_parts = urlsplit(segment_url)

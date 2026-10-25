@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from catchuparr import stats
 from catchuparr.engine.playlist import build_hls_playlist
@@ -370,7 +370,7 @@ class XCRuntimeTests(unittest.TestCase):
                 channel_uuid, "core-format", "60", SimpleNamespace()
             ))
 
-        self.assertEqual(store.covered_end, edge)
+        self.assertEqual(store.covered_end, start + timedelta(seconds=6))
 
     def test_xc_short_duration_hint_still_has_bounded_cross_programme_window(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -421,7 +421,7 @@ class XCRuntimeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(service.window[0], start)
-        self.assertEqual(service.window[1], start + timedelta(minutes=480))
+        self.assertEqual(service.window[1], start + timedelta(minutes=1))
 
     def test_xc_missing_duration_uses_bounded_window_without_requiring_epg(self):
         programme_start = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
@@ -473,7 +473,7 @@ class XCRuntimeTests(unittest.TestCase):
                 (start, start + timedelta(minutes=480)),
             )
 
-    def test_xc_gap_inside_requested_minute_keeps_provider_fallback(self):
+    def test_xc_available_prefix_does_not_fall_back_for_later_gap(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = ArchiveStore(root)
@@ -499,9 +499,50 @@ class XCRuntimeTests(unittest.TestCase):
                 patch("catchuparr.xc_runtime._channel_policy_allows", return_value=True),
                 patch("catchuparr.xc_runtime._archive_store", return_value=store),
             ):
-                self.assertFalse(callbacks.playback_available(
+                self.assertTrue(callbacks.playback_available(
                     "channel-9", "timestamp", "1", SimpleNamespace()
                 ))
+
+    def test_xc_gap_serves_only_prefix_and_marks_partial_without_live_follow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ArchiveStore(root)
+            start = datetime.now(timezone.utc) - timedelta(days=1)
+            for index, offset in enumerate((0, 6, 24)):
+                path = root / f"synthetic-{index}.ts"
+                path.write_bytes(b"\x47" + bytes([index]) * 187)
+                store.add_segment("channel-9", path, start + timedelta(seconds=offset),
+                                  start + timedelta(seconds=offset + 6))
+            channel = SimpleNamespace(uuid="channel-9")
+            core = SimpleNamespace(
+                parse_catchup_timestamp=lambda _: start,
+                HttpResponse=lambda content, status=200: _FakeResponse(content, status),
+            )
+            callbacks = _make_callbacks(SimpleNamespace(), core)
+            config = SimpleNamespace(channel_uuids=("channel-9",), archive_root=root)
+            service = SimpleNamespace(stream_for_user=Mock(
+                return_value=TSHTTPResponse(200, {}, b"prefix")))
+            with (
+                patch("catchuparr.xc_runtime._load_config", return_value=config),
+                patch("catchuparr.xc_runtime._catchup_enabled", return_value=True),
+                patch("catchuparr.xc_runtime._channel_by_uuid", return_value=channel),
+                patch("catchuparr.xc_runtime._channel_policy_allows", return_value=True),
+                patch("catchuparr.xc_runtime._archive_store", return_value=store),
+                patch("catchuparr.xc_runtime._ts_service", return_value=service),
+            ):
+                self.assertTrue(callbacks.playback_available(
+                    "channel-9", "synthetic", "1", SimpleNamespace()))
+                response = callbacks.serve_local_playback(
+                    SimpleNamespace(GET={}, META={}, method="GET"),
+                    SimpleNamespace(id=9), channel, "synthetic", "1")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response["X-Catchuparr-Archive-Partial"], "true")
+                call = service.stream_for_user.call_args
+                self.assertEqual(call.args[2:4], (start, start + timedelta(seconds=12)))
+                self.assertFalse(call.kwargs["live"])
+                core.parse_catchup_timestamp = lambda _: start - timedelta(seconds=10)
+                self.assertFalse(callbacks.playback_available(
+                    "channel-9", "synthetic", "1", SimpleNamespace()))
 
     def test_xc_session_keys_are_stable_and_do_not_contain_credentials(self):
         request = SimpleNamespace(
