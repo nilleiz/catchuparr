@@ -796,9 +796,11 @@ def probe():
 
     def xc_playback(start_epoch, stream_id=channel.id, duration="1", *,
                     consume=True, remote_addr="127.0.0.40",
-                    range_header="bytes=0-187"):
+                    range_header="bytes=0-187", continuous=False):
         selected = dict(xc_params, stream=str(stream_id),
                         **{time_key: str(int(start_epoch))})
+        if continuous:
+            selected["playback"] = "continuous"
         if duration is None:
             selected.pop("duration")
         else:

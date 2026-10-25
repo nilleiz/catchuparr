@@ -23,7 +23,8 @@ _ROUTE_NAMES = frozenset(
     {
         "catchuparr-m3u", "catchuparr-xmltv", "catchuparr-archive",
         "catchuparr-segment", "catchuparr-recorder",
-        "catchuparr-native-archive", "catchuparr-native-segment",
+        "catchuparr-native-archive", "catchuparr-native-archive-hls",
+        "catchuparr-native-segment",
         "catchuparr-sharing-borrow",
     }
 )

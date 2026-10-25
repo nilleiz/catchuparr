@@ -612,7 +612,7 @@ def probe_actual_stats(*, root, request, user, channel, token, start, params,
     _require(bool(stopped_row[3]) and stopped_row[4] == ts_lease,
              "A late first chunk revived the stopped TS lease")
     replacement_body = xc_playback(
-        start.timestamp(), remote_addr="127.0.0.42",
+        start.timestamp(), remote_addr="127.0.0.42", continuous=True,
     )
     _require(replacement_body == b"\x47" + bytes(187),
              "Fresh native XC TS request did not return the expected byte range")
