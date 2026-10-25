@@ -4,6 +4,31 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.0] - Prerelease candidate
+
+### Fixed
+
+- Export native catch-up with an HLS suffix and optional duration. Resolve known
+  unexpanded duration placeholders using guide bounds or a bounded snapshot;
+  keep client `lutc` separate from programme end.
+- Close historical native playlists at the requested end instead of exposing
+  later live media. Explicit `playback=continuous` retains continuous playback.
+- Admit local XC media at the requested start even when later archive time is
+  missing. Serve only the contiguous prefix, mark partial responses with
+  `X-Catchuparr-Archive-Partial: true`, and stop before gaps or discontinuities.
+  Numeric XC durations remain minutes; native durations remain seconds.
+- Preserve authentication, current channel/network policies, session limits,
+  and provider fallback when no local starting media is available.
+
+### Verification
+
+- Focused synthetic regressions cover placeholder handling, historical media
+  isolation, finite XC windows, partial archives and missing starts. Native CI
+  checks these paths on Dispatcharr 0.32.0 and 0.33.0 before publication.
+- HLS recognition depends on client support. Real-player acceptance is not
+  implied by synthetic or native integration results. Missing archive material
+  is not recovered by this change and partial responses may end early.
+
 ## [0.6.10] - Prerelease candidate
 
 ### Fixed

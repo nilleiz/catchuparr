@@ -852,10 +852,27 @@ def probe():
         "XC playback must not require an EPG entry when local media is covered",
     )
 
+    # An available start must remain locally playable even with a later gap.
+    prefix_params = dict(xc_params, stream=str(continuous_channel.id), duration="1",
+                         **{time_key: str(int((start + timedelta(seconds=6)).timestamp()))})
+    prefix_response = timeshift.timeshift_proxy_query(request(
+        "/streaming/timeshift.php", prefix_params,
+        HTTP_USER_AGENT="Synthetic bounded XC client",
+    ))
+    require(prefix_response.status_code == 200
+            and prefix_response.get("X-Catchuparr-Archive-Partial") == "true",
+            "Incomplete local XC archive did not serve its marked contiguous prefix")
+    try:
+        require(b"".join(prefix_response.streaming_content) == b"\x47" + bytes([10]) * 187,
+                "Bounded XC did not stop at the exact available archive prefix")
+    finally:
+        prefix_response.close()
+
     continuous_xc_params = dict(
         xc_params,
         stream=str(continuous_channel.id),
         duration="1",
+        playback="continuous",
         **{time_key: str(int((start + timedelta(seconds=6)).timestamp()))},
     )
     continuous_recorder_lease = f"catchuparr:recorder:{continuous_channel.uuid}"

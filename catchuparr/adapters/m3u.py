@@ -165,7 +165,7 @@ def annotate_native_m3u(
         query = "&" if parts.query else "?"
         source = (
             f"{endpoint}{query}channel_id={quote(stream_id, safe='')}"
-            f"&token={quote(token, safe='')}&utc={{utc}}&duration={{duration}}"
+            f"&token={quote(token, safe='')}&utc={{utc}}&lutc={{lutc}}&playback=archive"
         )
         stripped = _set_extinf_attribute(stripped, "catchup", "default")
         stripped = _set_extinf_attribute(stripped, "catchup-source", source)
