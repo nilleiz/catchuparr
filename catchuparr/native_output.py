@@ -251,7 +251,7 @@ def _augment_native_m3u(response, context: _NativeContext, profile_name: str | N
         for channel in eligible
     }
     endpoint = build_absolute_uri_with_port(
-        context.request, "/catchuparr/native/archive"
+        context.request, "/catchuparr/native/archive.m3u8"
     )
     response.content = annotate_native_m3u(
         playlist,
