@@ -13,6 +13,7 @@ DIST = ROOT / "dist"
 REQUIRED_MODULES = (
     "__init__.py",
     "action_messages.py",
+    "catchup_request.py",
     "plugin.py",
     "compatibility.py",
     "configuration.py",

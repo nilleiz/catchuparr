@@ -274,26 +274,13 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
         if window is None:
             return False
         start, end = window
-        maximum_value = getattr(timeshift_views, "MAX_DURATION_MINUTES", None)
-        if maximum_value is None:
-            maximum_value = _timeshift_helper("MAX_DURATION_MINUTES", 480)
-        maximum = _positive_duration_constant(maximum_value, 480)
-        requested_minutes = _client_duration_minutes(duration_hint, maximum)
-        coverage_end = (
-            start + timedelta(minutes=requested_minutes)
-            if requested_minutes is not None
-            else start + timedelta(seconds=6)
-        )
-        end = min(end, coverage_end)
         now = datetime.now(timezone.utc)
         if start > now:
             return False
         store = _archive_store(config.archive_root)
-        if start <= now < end:
-            edge = _latest_edge(store, channel_uuid)
-            if edge is None or edge <= start or (now - edge).total_seconds() > _CURRENT_EDGE_MAX_AGE_SECONDS:
-                return False
-            end = min(end, edge)
+        # Admission requires media at the requested instant, not a complete
+        # programme. Serving still stops at the first gap; it never jumps it.
+        end = min(end, start + timedelta(seconds=6))
         return end > start and store.coverage(channel_uuid, start, end).complete
 
     def local_playback_supported(request, user, channel):
@@ -321,6 +308,28 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
             return _service_unavailable(timeshift_views)
         start, end = window
 
+        continuous = getattr(request, "GET", {}).get("playback") == "continuous"
+        if continuous:
+            maximum = _positive_duration_constant(
+                _timeshift_helper("MAX_DURATION_MINUTES", 480), 480
+            )
+            end = start + timedelta(minutes=maximum)
+        requested_end = end
+        store = _archive_store(config.archive_root)
+        cursor = start
+        for segment in store.segments(str(channel.uuid), start, end):
+            if segment.start_utc > cursor + timedelta(seconds=0.25):
+                break
+            if cursor > start and segment.discontinuity:
+                break
+            cursor = max(cursor, segment.end_utc)
+        if not continuous:
+            end = min(end, cursor)
+        if cursor <= start:
+            response = timeshift_views.HttpResponse("No archive at requested start", status=404)
+            return finalize_dispatcharr_response(timeshift_views, response)
+        partial = end < requested_end - timedelta(seconds=0.25)
+
         service = _ts_service(config.archive_root, timeshift_views)
         session_id, device_key = _xc_session_keys(request, user, channel, start)
         value = service.stream_for_user(
@@ -332,7 +341,7 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
             device_key=device_key,
             method=str(getattr(request, "method", "GET")),
             range_header=getattr(request, "META", {}).get("HTTP_RANGE"),
-            live=start <= datetime.now(timezone.utc) < end,
+            live=continuous and start <= datetime.now(timezone.utc) < end,
         )
         if (
             getattr(value, "status", None) in (200, 206)
@@ -359,7 +368,11 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
                     heartbeat(True)
             except Exception:
                 pass
-        return _to_django_response(value, timeshift_views)
+        response = _to_django_response(value, timeshift_views)
+        if partial:
+            response["X-Catchuparr-Archive-Partial"] = "true"
+            response["X-Catchuparr-Archive-Stop"] = "gap-or-end"
+        return response
 
     def authorize_xc_m3u(request, user):
         return _authorized_xc_request(request, user)
@@ -423,9 +436,8 @@ def _local_playback_window(timeshift_views, channel, timestamp, duration_hint):
     maximum = _positive_duration_constant(maximum_value, 480)
     if duration_hint is not None and _client_duration_minutes(duration_hint, maximum) is None:
         return None
-    # The URL duration identifies the selected programme. Keep the local
-    # resource open through later programmes, bounded by Dispatcharr's limit.
-    return start, start + timedelta(minutes=maximum)
+    minutes = _client_duration_minutes(duration_hint, maximum)
+    return start, start + timedelta(minutes=minutes if minutes is not None else maximum)
 
 
 def _timeshift_helper(name, default=None):
