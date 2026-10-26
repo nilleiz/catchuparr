@@ -495,10 +495,12 @@ def native_borrow_proof_reader(
             and current_grant.connected_at == ack.connected_at
         ):
             raise BorrowBindingLost("native episode changed during read authorization")
+        rejection_reasons: list[str] = []
         observed = observe_native_connection(
             redis, episode.channel_uuid,
             catalog_generation=current_grant.catalog_generation,
             assigned_sources=assigned_sources, observed_at=float(checked_at),
+            rejection_reasons=rejection_reasons,
         )
         # The Lua check and the richer source/catalog observation are two
         # separate Redis reads. If the last ordinary viewer disconnects
@@ -514,8 +516,11 @@ def native_borrow_proof_reader(
                     "ordinary viewer state remained inconsistent during grace reconciliation"
                 )
             return proof(reconciled_viewer_race=True)
-        if observed is None or observed.target.connection_identity != episode.identity:
-            raise BorrowBindingLost("native owner, source, or stream profile changed")
+        if observed is None:
+            reason = rejection_reasons[-1] if rejection_reasons else "native-observation-unavailable"
+            raise BorrowBindingLost(f"native borrow observation rejected: {reason}")
+        if observed.target.connection_identity != episode.identity:
+            raise BorrowBindingLost("native borrow observation rejected: native-binding-changed")
         target = observed.target
         return BorrowReadProof(
             connection_identity=target.connection_identity,

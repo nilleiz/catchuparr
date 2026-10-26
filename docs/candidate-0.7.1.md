@@ -35,7 +35,18 @@ wraparound, HTTP byte ranges and growing bounded HLS manifests. Existing raw TS
 safety checks remain required. The authoritative Dispatcharr 0.32.0/0.33.0 native
 matrix must accept the final source tree before publication.
 
-This change corrects playback around gaps. A historical failed recorder/borrow
-attempt cannot be diagnosed from media timestamps alone. Repeated source
-failures that created missing media remain a separate cause to establish; this
-candidate does not claim to prevent every recording gap.
+## Borrowed-connection stability
+
+The native observer previously read the buffer index before the newest chunk.
+A writer could publish a newer chunk between these reads, making a healthy
+connection appear inconsistent and ending its borrowed recorder. A deterministic
+interleaving regression fails on the old code and passes when the timestamp set
+is sampled before its upper index bound. Both tested native writers publish the
+index before that set. Owner, source/profile, lease, client and missing-chunk
+checks remain active, with fixed rejection categories exposed in borrow errors.
+
+This prevents the reproduced false invalidation and its fallback/re-attach
+cycle. It does not reconstruct missing recordings or claim that every historic
+failure had this cause: older logs retain a generic observation rejection
+without its individual failed predicate. Live acceptance requires an existing
+ordinary viewer connection; no provider session is started by diagnostics.
