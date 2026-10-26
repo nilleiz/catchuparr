@@ -59,6 +59,19 @@ class TransportClockTests(unittest.TestCase):
                 stamps.append(values[0])
             self.assertEqual(stamps, [BASE_CLOCK, BASE_CLOCK + 12 * CLOCK_HZ])
             self.assertEqual(len(chunks[0]), len(original))
+            self.assertTrue(first.discontinuity_packets)
+            for packet_offset in first.discontinuity_packets:
+                self.assertTrue(chunks[0][packet_offset + 5] & 0x80)
+                self.assertEqual(
+                    chunks[0][packet_offset:packet_offset + 5],
+                    original[packet_offset:packet_offset + 5],
+                )
+            # Markers are based on absolute file offsets, including reads that
+            # begin inside a TS header, not on the HTTP chunk boundaries.
+            for marker in first.discontinuity_packets:
+                with source.open("rb") as file:
+                    part = b"".join(mapped_chunks(file, marker + 4, 9, first))
+                self.assertEqual(part, chunks[0][marker + 4:marker + 13])
             from datetime import datetime, timedelta, timezone
 
             from catchuparr.engine.store import ArchiveStore
