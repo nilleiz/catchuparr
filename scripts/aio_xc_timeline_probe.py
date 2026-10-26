@@ -62,7 +62,14 @@ def probe_xc_timeline(*, root, store, channel, start, timeshift, request, xc_par
     decoded = subprocess.run([
         "ffmpeg", "-v", "error", "-xerror", "-i", str(output), "-map", "0:v:0",
         "-vsync", "0", "-f", "framemd5", "-",
-    ], check=True, capture_output=True, text=True, timeout=30)
+    ], check=False, capture_output=True, text=True, timeout=30)
+    if decoded.returncode:
+        # This command reads only the generated synthetic fixture. Never use
+        # this diagnostic for requests or production media containing secrets.
+        detail = decoded.stderr.replace(str(output), "synthetic-programme.ts")[-2000:]
+        raise RuntimeError(
+            f"Synthetic programme decode failed ({decoded.returncode}): {detail}"
+        )
     count = sum(1 for line in decoded.stdout.splitlines() if line and not line.startswith("#"))
     if count != 300:
         raise RuntimeError("Native XC lost decodable frames across its source reset")
