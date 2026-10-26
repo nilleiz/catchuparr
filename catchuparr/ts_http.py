@@ -127,7 +127,9 @@ class ArchiveTSPlaybackService:
     seeks. The lease protects the union of requested times and is capped at
     ``max_lease_span_seconds``. Responses read immutable segment files in
     bounded chunks. Full responses and byte ranges crossing a gap or explicit
-    discontinuity are rejected because raw TS concatenation is not safe there.
+    discontinuity are rejected in raw mode. Clock-mapped playback retains the
+    archive's forward time gaps and maps independent muxer clocks before serving
+    a stable, length-preserving HTTP byte resource.
     Live full responses follow newly indexed contiguous segments for a bounded
     idle interval and stop at real gaps.
 
@@ -252,6 +254,7 @@ class ArchiveTSPlaybackService:
         range_header: str | None = None,
         live: bool = False,
         live_follow_seconds: float = LIVE_EDGE_IDLE_TIMEOUT_SECONDS,
+        normalize_timestamps: bool = False,
     ) -> TSHTTPResponse | StreamingTSHTTPResponse:
         """Token-authenticated standalone entry point."""
         if self.tokens is None or not token:
@@ -272,6 +275,7 @@ class ArchiveTSPlaybackService:
             range_header=range_header,
             live=live,
             live_follow_seconds=live_follow_seconds,
+            normalize_timestamps=normalize_timestamps,
         )
 
     def stream_for_user(
@@ -287,6 +291,7 @@ class ArchiveTSPlaybackService:
         range_header: str | None = None,
         live: bool = False,
         live_follow_seconds: float = LIVE_EDGE_IDLE_TIMEOUT_SECONDS,
+        normalize_timestamps: bool = False,
     ) -> TSHTTPResponse | StreamingTSHTTPResponse:
         """Serve local TS for a user already authenticated by Dispatcharr."""
         method = method.upper()
@@ -363,9 +368,20 @@ class ArchiveTSPlaybackService:
             time.sleep(min(0.1, remaining))
             segments = self.store.segments(channel, start, end)
         segments = [item for item in segments if item.end_utc.timestamp() <= end]
+        if normalize_timestamps:
+            ordered = []
+            high_water = None
+            for item in sorted(segments, key=lambda item: (item.start_utc, item.id)):
+                if high_water is not None and item.start_utc.timestamp() < high_water - 0.25:
+                    continue
+                ordered.append(item)
+                high_water = item.end_utc.timestamp()
+            segments = ordered
         if not segments:
             finish_response()
             return _error(404, "no archived segments in requested range")
+
+        clocks = {}
 
         def files_for(candidate_segments):
             unsafe_boundaries: list[int] = []
@@ -381,6 +397,12 @@ class ArchiveTSPlaybackService:
                     if not path.is_file():
                         return None, None, _error(404, "segment not found")
                     length = path.stat().st_size
+                    if normalize_timestamps:
+                        from .engine.ts_timeline import SegmentClock
+
+                        clocks[segment.id] = SegmentClock.probe(
+                            path, segment.start_utc.timestamp() - start,
+                        )
                     selected_files.append((path, length))
             except (OSError, ValueError):
                 return None, None, _error(404, "segment not found")
@@ -431,7 +453,13 @@ class ArchiveTSPlaybackService:
                         continue
                     break
 
-        if unsafe_boundaries and (
+        if normalize_timestamps and any(clocks.values()) and not all(clocks.values()):
+            finish_response()
+            return _error(409, "Archive contains a segment without a mappable media clock")
+        timeline_safe = bool(normalize_timestamps and all(
+            clocks.get(segment.id) is not None for segment in segments
+        ))
+        if unsafe_boundaries and not timeline_safe and (
             (selected is None and range_header is None)
             or (
                 selected is not None
@@ -453,7 +481,8 @@ class ArchiveTSPlaybackService:
             )
 
         etag_source = "\0".join(
-            f"{segment.id}:{length}" for segment, (_, length) in zip(segments, files)
+            f"ts-clock-v1:{int(normalize_timestamps)}:{segment.id}:{length}:{start:.6f}"
+            for segment, (_, length) in zip(segments, files)
         )
         etag = hashlib.sha256(etag_source.encode("utf-8")).hexdigest()
         headers = {
@@ -463,6 +492,8 @@ class ArchiveTSPlaybackService:
             "ETag": f'"{etag}"',
             "X-Content-Type-Options": "nosniff",
         }
+        if timeline_safe:
+            headers["X-Catchuparr-Archive-Timeline"] = "programme"
         follow_live_edge = (
             method == "GET" and live and range_header is None and selected is None
         )
@@ -494,6 +525,15 @@ class ArchiveTSPlaybackService:
                         remaining = overlap_end - overlap_start + 1
                         with path.open("rb") as source:
                             source.seek(overlap_start - virtual_offset)
+                            clock = clocks.get(segment.id)
+                            if clock is not None:
+                                from .engine.ts_timeline import mapped_chunks
+
+                                mapped = iter(mapped_chunks(
+                                    source, overlap_start - virtual_offset, remaining, clock,
+                                ))
+                            else:
+                                mapped = None
                             while remaining:
                                 if time.monotonic() >= cancellation_check_at:
                                     if not self._response_stream_active(lease_id):
@@ -506,7 +546,8 @@ class ArchiveTSPlaybackService:
                                     ):
                                         raise OSError("playback lease expired during TS stream")
                                     renew_at = time.monotonic() + renewal_interval
-                                chunk = source.read(min(_TS_STREAM_CHUNK_BYTES, remaining))
+                                chunk = (next(mapped, b"") if mapped is not None else
+                                         source.read(min(_TS_STREAM_CHUNK_BYTES, remaining)))
                                 if not chunk:
                                     raise OSError("archive segment changed during TS stream")
                                 remaining -= len(chunk)
@@ -569,10 +610,11 @@ class ArchiveTSPlaybackService:
                             time.sleep(min(0.1, max(0.0, follow_deadline - time.monotonic())))
                             continue
                         segment = following[0]
-                        if (
+                        has_boundary = (
                             segment.start_utc.timestamp() > high_water + 0.25
                             or segment.discontinuity
-                        ):
+                        )
+                        if has_boundary and not normalize_timestamps:
                             break
                         if not self._renew_lease(
                             user, channel, lease_id, device_key, segment
@@ -582,10 +624,25 @@ class ArchiveTSPlaybackService:
                             path = Path(segment.path).resolve(strict=True)
                             path.relative_to(Path(self.store.root).resolve(strict=True))
                             file_size = path.stat().st_size
+                            clock = None
+                            if normalize_timestamps:
+                                from .engine.ts_timeline import SegmentClock
+
+                                clock = SegmentClock.probe(
+                                    path, segment.start_utc.timestamp() - start,
+                                )
+                                if has_boundary and clock is None:
+                                    break
                         except (OSError, ValueError):
                             break
                         with path.open("rb") as source:
                             remaining = file_size
+                            if clock is not None:
+                                from .engine.ts_timeline import mapped_chunks
+
+                                mapped = iter(mapped_chunks(source, 0, remaining, clock))
+                            else:
+                                mapped = None
                             while remaining:
                                 if time.monotonic() >= cancellation_check_at:
                                     if not self._response_stream_active(lease_id):
@@ -602,7 +659,8 @@ class ArchiveTSPlaybackService:
                                     ):
                                         raise OSError("playback lease expired during TS stream")
                                     renew_at = time.monotonic() + renewal_interval
-                                chunk = source.read(min(_TS_STREAM_CHUNK_BYTES, remaining))
+                                chunk = (next(mapped, b"") if mapped is not None else
+                                         source.read(min(_TS_STREAM_CHUNK_BYTES, remaining)))
                                 if not chunk:
                                     raise OSError("archive segment changed during TS stream")
                                 remaining -= len(chunk)

@@ -17,8 +17,8 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The package version is **0.7.0 prerelease candidate**. Publication and
-  required GitHub CI remain pending. See [candidate 0.7.0](docs/candidate-0.7.0.md)
+- The package version is **0.7.1 prerelease candidate**. Publication and
+  required GitHub CI remain pending. See [candidate 0.7.1](docs/candidate-0.7.1.md)
   and the [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.32.0**. The compatibility
   guard accepts well-formed versions at or above that minimum. The

@@ -503,7 +503,7 @@ class XCRuntimeTests(unittest.TestCase):
                     "channel-9", "timestamp", "1", SimpleNamespace()
                 ))
 
-    def test_xc_gap_serves_only_prefix_and_marks_partial_without_live_follow(self):
+    def test_xc_gap_preserves_programme_window_and_enables_clock_mapping(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = ArchiveStore(root)
@@ -538,7 +538,9 @@ class XCRuntimeTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response["X-Catchuparr-Archive-Partial"], "true")
                 call = service.stream_for_user.call_args
-                self.assertEqual(call.args[2:4], (start, start + timedelta(seconds=12)))
+                self.assertEqual(call.args[2:4], (start, start + timedelta(minutes=1)))
+                self.assertTrue(call.kwargs["normalize_timestamps"])
+                self.assertEqual(response["X-Catchuparr-Archive-Gaps"], "present")
                 self.assertFalse(call.kwargs["live"])
                 core.parse_catchup_timestamp = lambda _: start - timedelta(seconds=10)
                 self.assertFalse(callbacks.playback_available(
