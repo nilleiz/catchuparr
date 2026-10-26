@@ -898,6 +898,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
             probe._wait_for_allowed_source_request(
                 run, lambda: [], 0, timeout=0.1, sleep=sleep,
                 monotonic=lambda: now[0],
+                cleanup_diagnostic=lambda: {"sql_phase": "closed"},
             )
 
         line = next(
@@ -910,6 +911,27 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertEqual("switch_requested", diagnostic["attempts"][0]["status"])
         self.assertNotIn("synthetic-bearer-secret", line)
         self.assertNotIn("SyntheticSecretTokenABC123", line)
+
+    def test_return_cleanup_diagnostic_keeps_only_fixed_categories(self):
+        from catchuparr.adapters import sharing_native
+
+        ledger = SimpleNamespace(read=lambda _: SimpleNamespace(
+            phase="cleanup_pending", client_id="private-client-identity",
+        ))
+        with patch.object(sharing_native, "observe_native_episode_for_authority_drain",
+                          return_value=SimpleNamespace(state="known_revoked")), patch.object(
+            sharing_native, "native_registration_is_absent", return_value=False,
+        ):
+            diagnostic = probe._return_cleanup_diagnostic(object(), ledger, "private-channel")
+        self.assertEqual(diagnostic, {
+            "sql_phase": "cleanup_pending", "projection_state": "known_revoked",
+            "exact_native_registration_absent": False,
+        })
+        self.assertNotIn("private", json.dumps(diagnostic))
+        with patch.object(sharing_native, "observe_native_episode_for_authority_drain",
+                          side_effect=RuntimeError("private-error")):
+            self.assertEqual(probe._return_cleanup_diagnostic(object(), ledger, "private-channel"),
+                             {"cleanup_observation_failed": True})
 
     def test_allowed_source_wait_keeps_success_gate_without_diagnostic(self):
         output = io.StringIO()
