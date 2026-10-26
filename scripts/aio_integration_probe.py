@@ -818,6 +818,13 @@ def probe():
         finally:
             result.close()
 
+    from aio_xc_timeline_probe import probe_xc_timeline
+
+    probe_xc_timeline(
+        root=root, store=store, channel=channel, start=start,
+        timeshift=timeshift, request=request, xc_params=xc_params, time_key=time_key,
+    )
+
     # Run Stats' HLS admission while the synthetic one-slot user has no
     # outstanding native TS session.  The later XC checks intentionally open
     # a live session, which correctly occupies that same stream-limit slot.

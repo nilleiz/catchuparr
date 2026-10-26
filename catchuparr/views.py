@@ -896,9 +896,9 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
         channel,
         start_epoch,
         end_epoch,
-        live=(continuous and _archive_window_live(
+        live=_archive_window_live(
             service, str(user.id), channel, end_epoch, now_epoch,
-        )),
+        ),
         request_identity_end=requested_end_epoch,
         programme_end_utc=None,
         continuation_end_utc=None,

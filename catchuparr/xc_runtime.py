@@ -314,21 +314,10 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
                 _timeshift_helper("MAX_DURATION_MINUTES", 480), 480
             )
             end = start + timedelta(minutes=maximum)
-        requested_end = end
         store = _archive_store(config.archive_root)
-        cursor = start
-        for segment in store.segments(str(channel.uuid), start, end):
-            if segment.start_utc > cursor + timedelta(seconds=0.25):
-                break
-            if cursor > start and segment.discontinuity:
-                break
-            cursor = max(cursor, segment.end_utc)
-        if not continuous:
-            end = min(end, cursor)
-        if cursor <= start:
-            response = timeshift_views.HttpResponse("No archive at requested start", status=404)
-            return finalize_dispatcharr_response(timeshift_views, response)
-        partial = end < requested_end - timedelta(seconds=0.25)
+        coverage_end = min(end, datetime.now(timezone.utc))
+        coverage = store.coverage(str(channel.uuid), start, coverage_end)
+        partial = not coverage.complete
 
         service = _ts_service(config.archive_root, timeshift_views)
         session_id, device_key = _xc_session_keys(request, user, channel, start)
@@ -341,7 +330,8 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
             device_key=device_key,
             method=str(getattr(request, "method", "GET")),
             range_header=getattr(request, "META", {}).get("HTTP_RANGE"),
-            live=continuous and start <= datetime.now(timezone.utc) < end,
+            live=start <= datetime.now(timezone.utc) < end,
+            normalize_timestamps=not continuous,
         )
         if (
             getattr(value, "status", None) in (200, 206)
@@ -371,7 +361,7 @@ def _make_callbacks(output_views, timeshift_views) -> XCCallbacks:
         response = _to_django_response(value, timeshift_views)
         if partial:
             response["X-Catchuparr-Archive-Partial"] = "true"
-            response["X-Catchuparr-Archive-Stop"] = "gap-or-end"
+            response["X-Catchuparr-Archive-Gaps"] = "present"
         return response
 
     def authorize_xc_m3u(request, user):
