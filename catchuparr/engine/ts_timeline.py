@@ -71,6 +71,7 @@ def _pes_clock(packet):
 @dataclass(frozen=True)
 class SegmentClock:
     offset: int
+    discontinuity_packets: tuple[int, ...] = ()
 
     @classmethod
     def probe(cls, path: Path, elapsed_seconds: float):
@@ -80,15 +81,18 @@ class SegmentClock:
         value = _source_clock(str(path), stat.st_size, stat.st_mtime_ns)
         if value is None:
             return None
-        return cls(round(elapsed_seconds * CLOCK_HZ) + BASE_CLOCK - value)
+        return cls(round(elapsed_seconds * CLOCK_HZ) + BASE_CLOCK - value,
+                   _source_discontinuities(str(path), stat.st_size, stat.st_mtime_ns))
 
-    def transform(self, data: bytes) -> bytes:
+    def transform(self, data: bytes, *, file_offset: int = 0) -> bytes:
         if len(data) % PACKET_BYTES:
             raise ValueError("unaligned MPEG-TS block")
         result = bytearray(data)
         for index in range(0, len(result), PACKET_BYTES):
             packet = result[index:index + PACKET_BYTES]
             clock = _pes_clock(packet)
+            if file_offset + index in self.discontinuity_packets:
+                packet[5] |= 0x80  # Explicit muxer/continuity-counter boundary.
             if packet[3] & 0x20 and packet[4] >= 1:
                 flags = packet[5]
                 at = 6
@@ -113,6 +117,23 @@ class SegmentClock:
                     _write_pts(packet, at + 5, _read_pts(packet, at + 5) + self.offset)
             result[index:index + PACKET_BYTES] = packet
         return bytes(result)
+
+
+@lru_cache(maxsize=8192)
+def _source_discontinuities(path: str, size: int, mtime_ns: int):
+    """Mark each PID's first adaptation field without moving media bytes."""
+    seen = set()
+    markers = []
+    with Path(path).open("rb") as source:
+        data = source.read(min(size, PROBE_BYTES))
+    for offset in range(0, len(data), PACKET_BYTES):
+        packet = data[offset:offset + PACKET_BYTES]
+        _payload(packet)
+        pid = ((packet[1] & 31) << 8) | packet[2]
+        if pid not in seen and packet[3] & 0x20 and packet[4] >= 1:
+            seen.add(pid)
+            markers.append(offset)
+    return tuple(markers)
 
 
 @lru_cache(maxsize=8192)
@@ -145,13 +166,15 @@ def mapped_chunks(source, offset: int, length: int, clock: SegmentClock):
     prefix = offset - aligned
     source.seek(aligned)
     remaining = length
+    position = aligned
     while remaining:
         count = min(348 * PACKET_BYTES,
                     ((remaining + prefix + PACKET_BYTES - 1) // PACKET_BYTES) * PACKET_BYTES)
         data = source.read(count)
         if len(data) != count:
             raise OSError("archive segment changed during mapped read")
-        block = clock.transform(data)
+        block = clock.transform(data, file_offset=position)
+        position += count
         selected = block[prefix:prefix + remaining]
         remaining -= len(selected)
         prefix = 0
