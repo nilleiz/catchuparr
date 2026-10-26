@@ -10,8 +10,10 @@ def probe_xc_timeline(*, root, store, channel, start, timeshift, request, xc_par
     source = root / "synthetic-timeline-source.ts"
     subprocess.run([
         "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25",
-        "-t", "2", "-c:v", "mpeg2video", "-bf", "2", "-f", "mpegts", str(source),
+        "-t", "6", "-c:v", "mpeg2video", "-bf", "2", "-f", "mpegts", str(source),
     ], check=True, capture_output=True, timeout=30)
+    # Native XC admission requires the first six seconds to be covered.
+    # Keep that guard exercised before the later intentional archive gap.
     selected_start = start - timedelta(hours=2)
     for index, offset in enumerate((0, 12)):
         segment = root / f"synthetic-timeline-part-{index}.ts"
@@ -19,7 +21,7 @@ def probe_xc_timeline(*, root, store, channel, start, timeshift, request, xc_par
         store.add_segment(
             str(channel.uuid), segment,
             selected_start + timedelta(seconds=offset),
-            selected_start + timedelta(seconds=offset + 2), discontinuity=bool(index),
+            selected_start + timedelta(seconds=offset + 6), discontinuity=bool(index),
         )
     params = dict(xc_params, stream=str(channel.id), duration="1",
                   **{time_key: str(int(selected_start.timestamp()))})
@@ -55,14 +57,14 @@ def probe_xc_timeline(*, root, store, channel, start, timeshift, request, xc_par
         "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
         "default=nw=1:nk=1", str(output),
     ], check=True, capture_output=True, text=True, timeout=30)
-    if abs(float(duration.stdout) - 14) > 0.15:
+    if abs(float(duration.stdout) - 18) > 0.15:
         raise RuntimeError("Native XC exposed a segment duration instead of its archive programme span")
     decoded = subprocess.run([
         "ffmpeg", "-v", "error", "-xerror", "-i", str(output), "-map", "0:v:0",
         "-vsync", "0", "-f", "framemd5", "-",
     ], check=True, capture_output=True, text=True, timeout=30)
     count = sum(1 for line in decoded.stdout.splitlines() if line and not line.startswith("#"))
-    if count != 100:
+    if count != 300:
         raise RuntimeError("Native XC lost decodable frames across its source reset")
-    print(json.dumps({"xc_programme_timeline": "pass", "programme_seconds": 14,
+    print(json.dumps({"xc_programme_timeline": "pass", "programme_seconds": 18,
                       "decoded_frames": count, "byte_range_identical": True}))
