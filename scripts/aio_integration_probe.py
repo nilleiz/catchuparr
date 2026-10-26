@@ -870,7 +870,10 @@ def probe():
     ))
     require(prefix_response.status_code == 200
             and prefix_response.get("X-Catchuparr-Archive-Partial") == "true",
-            "Incomplete local XC archive did not serve its marked contiguous prefix")
+            "Incomplete local XC archive did not serve its marked contiguous prefix: "
+            f"status={prefix_response.status_code}, "
+            f"partial={prefix_response.get('X-Catchuparr-Archive-Partial') == 'true'}, "
+            f"timeline={prefix_response.get('X-Catchuparr-Archive-Timeline') == 'programme'}")
     try:
         require(b"".join(prefix_response.streaming_content) == b"\x47" + bytes([10]) * 187,
                 "Bounded XC did not stop at the exact available archive prefix")
