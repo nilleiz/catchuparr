@@ -1513,6 +1513,55 @@ class RecorderTaskTests(unittest.TestCase):
             )
 
 
+class BorrowCleanupRetryTests(unittest.TestCase):
+    def test_delayed_cleanup_retains_lease_and_never_starts_another_input(self):
+        with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
+            tasks = importlib.import_module("catchuparr.tasks")
+            event = Mock()
+            event.is_set.return_value = False
+            event.wait.return_value = False
+            cleanup = Mock(side_effect=[False, False, True])
+            lease = SimpleNamespace(renew=Mock(return_value=True))
+            pending = Mock()
+            self.assertTrue(tasks._finish_borrow_cleanup(
+                cleanup, lease, event, still_current=lambda: True, on_pending=pending,
+            ))
+            self.assertEqual(cleanup.call_count, 3)
+            self.assertEqual(lease.renew.call_count, 2)
+            self.assertEqual(pending.call_count, 2)
+            event.set.assert_not_called()
+            self.assertEqual(event.wait.call_count, 2)
+
+    def test_lost_authority_or_lease_blocks_retry_and_source_switch(self):
+        for current, renewed in ((False, True), (True, False)):
+            with self.subTest(current=current, renewed=renewed):
+                with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
+                    tasks = importlib.import_module("catchuparr.tasks")
+                    event = Mock()
+                    event.is_set.return_value = False
+                    cleanup = Mock(return_value=False)
+                    self.assertFalse(tasks._finish_borrow_cleanup(
+                        cleanup, SimpleNamespace(renew=lambda: renewed), event,
+                        still_current=lambda: current, on_pending=lambda: None,
+                    ))
+                    event.set.assert_called_once()
+                    event.wait.assert_not_called()
+                    cleanup.assert_called_once()
+
+    def test_stop_interrupts_pending_cleanup_without_fallback(self):
+        with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
+            tasks = importlib.import_module("catchuparr.tasks")
+            event = Mock()
+            event.is_set.return_value = False
+            event.wait.return_value = True
+            cleanup = Mock(return_value=False)
+            self.assertFalse(tasks._finish_borrow_cleanup(
+                cleanup, SimpleNamespace(renew=lambda: True), event,
+                still_current=lambda: True, on_pending=lambda: None,
+            ))
+            cleanup.assert_called_once()
+
+
 class RecorderAttemptCleanupTests(unittest.TestCase):
     def _run_cleanup(
         self, *, revokes=(True,), stops=(True,), acks=(True,), sharing=True,

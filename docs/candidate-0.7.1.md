@@ -50,3 +50,12 @@ cycle. It does not reconstruct missing recordings or claim that every historic
 failure had this cause: older logs retain a generic observation rejection
 without its individual failed predicate. Live acceptance requires an existing
 ordinary viewer connection; no provider session is started by diagnostics.
+
+### Delayed borrowed-client cleanup
+
+A borrowed HTTP stream may finish its native close callback after FFmpeg has
+already exited. The recorder now retains its current lease while retrying the
+exact cleanup acknowledgement, rather than exiting on the first pending result.
+It starts no replacement input before durable episode closure and exact private
+client absence are confirmed. Stop, changed admission and lost lease interrupt
+this wait. Diagnostics do not decide resource ownership.
