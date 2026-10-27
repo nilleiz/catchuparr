@@ -125,7 +125,7 @@ class NativeArchiveParityTests(unittest.TestCase):
         django_http.HttpResponse = self.Response
         self.django_modules = {"django": types.ModuleType("django"), "django.http": django_http}
 
-    def call_archive(self, method="GET"):
+    def call_archive(self, method="GET", live=False):
         self.request.method = method
         with (
             patch.dict(sys.modules, self.django_modules),
@@ -141,7 +141,7 @@ class NativeArchiveParityTests(unittest.TestCase):
                 "_archive_playback_window",
                 return_value=(self.requested_end, None),
             ),
-            patch.object(views, "_archive_window_live", return_value=False),
+            patch.object(views, "_archive_window_live", return_value=live),
             patch.object(views, "_record_native_playback"),
             patch.object(views, "_native_client_ip", return_value="192.0.2.10"),
         ):
@@ -210,6 +210,42 @@ class NativeArchiveParityTests(unittest.TestCase):
                 self.assertIn(f"/{segment_id}?", text)
             for segment_id in live_ids:
                 self.assertNotIn(f"/{segment_id}?", text)
+
+    def test_running_programme_appends_without_exposing_the_next_programme(self):
+        import tempfile
+        from datetime import timedelta
+        from pathlib import Path
+
+        from catchuparr.engine.store import ArchiveStore
+        from catchuparr.http import ArchiveHTTPService
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArchiveStore(Path(directory))
+            self.duration = 3600
+            self.requested_end = self.start + self.duration
+            self.request.GET["duration"] = str(self.duration)
+            self.service = ArchiveHTTPService(
+                store, SimpleNamespace(lookup=lambda token: "7"),
+                authorize_user_channel=lambda *_: True, catchup_enabled=lambda *_: True,
+            )
+            def add(offset):
+                stamp = datetime.fromtimestamp(self.start + offset, timezone.utc)
+                path = Path(directory) / f"synthetic-{offset}.ts"
+                path.write_bytes(b"\x47" + bytes(187))
+                return store.add_segment("channel-synthetic", path, stamp,
+                                         stamp + timedelta(seconds=6)).id
+            first = add(0)
+            initial = self.call_archive(live=True).content.decode()
+            self.assertNotIn("#EXT-X-ENDLIST", initial)
+            second = add(6)
+            later_programme = add(3606)
+            updated = self.call_archive(live=True).content.decode()
+            for identity in (first, second):
+                self.assertIn(f"/{identity}?", updated)
+            self.assertNotIn(f"/{later_programme}?", updated)
+            self.assertNotIn("#EXT-X-ENDLIST", updated)
+            closed = self.call_archive(live=False).content.decode()
+            self.assertIn("#EXT-X-ENDLIST", closed)
 
     def test_head_checks_shared_manifest_without_creating_a_playlist(self):
         response = self.call_archive("HEAD")

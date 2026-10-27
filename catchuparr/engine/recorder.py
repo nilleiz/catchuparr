@@ -238,6 +238,10 @@ class FFmpegCopyRecorder:
         list_path = output_dir / "segments.csv"
         offset = useful = 0
         self._session_anchor = None
+        # A new muxer has a fresh MPEG clock even if wall time is contiguous.
+        # Explicitly separate it from already archived transport timestamps.
+        if self._last_end_epoch is not None:
+            self._mark_next_discontinuity = True
         process = None
         start_clock = time.monotonic()
         last_useful_at = start_clock
@@ -350,6 +354,10 @@ class FFmpegCopyRecorder:
         list_path = output_dir / "segments.csv"
         offset = count = 0
         self._session_anchor = None
+        # A new muxer has a fresh MPEG clock even if wall time is contiguous.
+        # Explicitly separate it from already archived transport timestamps.
+        if self._last_end_epoch is not None:
+            self._mark_next_discontinuity = True
         process = None
         try:
             process = subprocess.Popen(self.command(output_dir), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -237,46 +237,47 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             and node.func.value.id == "stop_event"
         }
         self.assertEqual(stop_lines, set(probe._SUPERVISOR_STOP_REASONS_BY_LINE))
+        admission_line, stats_line, attempt_line, candidate_line, exception_line = sorted(stop_lines)
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 566,
+                "catchuparr.tasks", "supervise", admission_line,
                 {"current_admission": {"status": "ready"}},
             ),
             "lease_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 566,
+                "catchuparr.tasks", "supervise", admission_line,
                 {"current_admission": {"status": "stale_control"}},
             ),
             "admission_not_ready",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 589, {},
+                "catchuparr.tasks", "supervise", stats_line, {},
             ),
             "stats_capability_refresh",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 633, {},
+                "catchuparr.tasks", "supervise", attempt_line, {},
             ),
             "attempt_renewal",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 641, {},
+                "catchuparr.tasks", "supervise", candidate_line, {},
             ),
             "candidate_currentness",
         )
         self.assertEqual(
             probe._safe_supervisor_stop_reason(
-                "catchuparr.tasks", "supervise", 645, {},
+                "catchuparr.tasks", "supervise", exception_line, {},
             ),
             "exception",
         )
         self.assertEqual(
-            probe._safe_supervisor_stop_reason("untrusted", "supervise", 566, {}),
+            probe._safe_supervisor_stop_reason("untrusted", "supervise", admission_line, {}),
             "unavailable",
         )
 

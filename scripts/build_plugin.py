@@ -52,6 +52,7 @@ REQUIRED_MODULES = (
     "engine/playlist.py",
     "engine/recorder.py",
     "engine/store.py",
+    "engine/ts_timeline.py",
 )
 REQUIRED_ASSETS = ("logo.png",)
 

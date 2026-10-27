@@ -818,6 +818,13 @@ def probe():
         finally:
             result.close()
 
+    from aio_xc_timeline_probe import probe_xc_timeline
+
+    probe_xc_timeline(
+        root=root, store=store, channel=channel, start=start,
+        timeshift=timeshift, request=request, xc_params=xc_params, time_key=time_key,
+    )
+
     # Run Stats' HLS admission while the synthetic one-slot user has no
     # outstanding native TS session.  The later XC checks intentionally open
     # a live session, which correctly occupies that same stream-limit slot.
@@ -854,6 +861,27 @@ def probe():
         "XC playback must not require an EPG entry when local media is covered",
     )
 
+    def end_fixture_xc_session(selected_channel, selected_start, *, required=False):
+        # A Range request for a still-running programme intentionally retains
+        # its logical session for seeking. Stop that exact test-owned session
+        # before admitting another device under the one-slot account.
+        from catchuparr.xc_runtime import _ts_service
+
+        service = _ts_service(root, timeshift)
+        with service._connect() as db:
+            rows = db.execute(
+                "SELECT lease_id FROM ts_playback_sessions "
+                "WHERE user_id=? AND channel_id=? AND start_utc=? AND active=1",
+                (str(user.id), str(selected_channel.uuid), selected_start.timestamp()),
+            ).fetchall()
+        require(len(rows) == 1 if required else len(rows) <= 1,
+                "Synthetic XC cleanup did not identify its exact logical session")
+        for (lease_id,) in rows:
+            require(service.end_user_session(user.id, str(selected_channel.uuid), lease_id),
+                    "Synthetic XC session did not stop through the supported service")
+
+    end_fixture_xc_session(no_guide_channel, start, required=True)
+
     # An available start must remain locally playable even with a later gap.
     prefix_params = dict(xc_params, stream=str(continuous_channel.id), duration="1",
                          **{time_key: str(int((start + timedelta(seconds=6)).timestamp()))})
@@ -863,12 +891,16 @@ def probe():
     ))
     require(prefix_response.status_code == 200
             and prefix_response.get("X-Catchuparr-Archive-Partial") == "true",
-            "Incomplete local XC archive did not serve its marked contiguous prefix")
+            "Incomplete local XC archive did not serve its marked contiguous prefix: "
+            f"status={prefix_response.status_code}, "
+            f"partial={prefix_response.get('X-Catchuparr-Archive-Partial') == 'true'}, "
+            f"timeline={prefix_response.get('X-Catchuparr-Archive-Timeline') == 'programme'}")
     try:
         require(b"".join(prefix_response.streaming_content) == b"\x47" + bytes([10]) * 187,
                 "Bounded XC did not stop at the exact available archive prefix")
     finally:
         prefix_response.close()
+        end_fixture_xc_session(continuous_channel, start + timedelta(seconds=6))
 
     continuous_xc_params = dict(
         xc_params,

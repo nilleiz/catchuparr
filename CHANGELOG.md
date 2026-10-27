@@ -4,6 +4,36 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.1] - Prerelease candidate
+
+### Fixed
+
+- Keep healthy borrowed connections attached when the native buffer advances
+  between Redis reads. Observe the published chunk before its index bound;
+  retain all owner, lease, source, client and missing-chunk rejection checks.
+  Emit fixed observation rejection categories instead of misreporting every
+  failure as an owner/source/profile change.
+- Map independent MPEG-TS PES/PCR clocks onto one archive-relative XC timeline.
+  Preserve byte offsets and HTTP Range semantics while allowing playable media
+  after gaps and source/muxer changes. Missing archive time remains a forward
+  clock jump; it is never filled with live or repeated media.
+- Keep native catch-up playlists appendable while their bounded programme is
+  still recording. Close completed historical windows and exclude later shows.
+- Mark fresh recorder muxer attempts as discontinuities even when their archive
+  wall-clock intervals are adjacent.
+- Retain authentication, lease/session cancellation and raw-mode gap rejection.
+  Mixed or unmappable clocks across unsafe boundaries fail closed.
+
+### Verification
+
+- Synthetic audio/video regression checks decoder output, programme duration,
+  timestamp wraparound, and byte ranges across independently muxed segments.
+- Native 0.32.0/0.33.0 CI and external-player acceptance remain pending for this
+  candidate. No production deployment is implied by source preparation.
+- Missing recordings are not reconstructed. The buffer-progress invalidation
+  is reproducible with the old source; individual historical failures cannot
+  all be uniquely attributed because older logs omit the rejected predicate.
+
 ## [0.7.0] - Prerelease candidate
 
 ### Fixed

@@ -804,6 +804,35 @@ def _recorder_task_early_exit_diagnostic(run) -> dict:
     }
 
 
+def _return_cleanup_diagnostic(redis_client, episode_ledger, channel_uuid):
+    """Read only fixed cleanup categories for the synthetic return fixture."""
+    from catchuparr.adapters.sharing_native import (
+        native_registration_is_absent,
+        observe_native_episode_for_authority_drain,
+    )
+
+    try:
+        episode = episode_ledger.read(str(channel_uuid))
+        projection = observe_native_episode_for_authority_drain(
+            redis_client, str(channel_uuid),
+        )
+        phase = episode.phase
+        projection_state = getattr(projection, "state", None)
+        return {
+            "sql_phase": phase if phase in {
+                "opening", "active", "cleanup_pending", "closed",
+            } else "other",
+            "projection_state": projection_state if projection_state in {
+                "absent", "known_revoked", "active", "unknown",
+            } else "other",
+            "exact_native_registration_absent": native_registration_is_absent(
+                redis_client, channel_uuid=str(channel_uuid), client_id=episode.client_id,
+            ) if episode.client_id else False,
+        }
+    except Exception:
+        return {"cleanup_observation_failed": True}
+
+
 def _wait_for_allowed_source_request(
     run,
     request_times_reader,
@@ -812,6 +841,7 @@ def _wait_for_allowed_source_request(
     timeout: float,
     sleep=time.sleep,
     monotonic=time.monotonic,
+    cleanup_diagnostic=None,
 ) -> float:
     """Wait for the existing allowed-source request gate and report task state on failure."""
     message = "Allowed B did not start after the observed native return deadline"
@@ -823,7 +853,10 @@ def _wait_for_allowed_source_request(
     _require_with_failure_diagnostic(
         len(request_times) > request_baseline,
         message,
-        lambda: _recorder_task_early_exit_diagnostic(run),
+        lambda: {
+            **_recorder_task_early_exit_diagnostic(run),
+            **({"return_cleanup": cleanup_diagnostic()} if cleanup_diagnostic else {}),
+        },
         diagnostic_label="CATCHUPARR_RECORDER_EARLY_EXIT_DIAGNOSTIC",
     )
     return request_times[request_baseline]
@@ -5603,6 +5636,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             share_b_request_baseline,
             timeout=150,
             sleep=gevent_sleep,
+            cleanup_diagnostic=lambda: _return_cleanup_diagnostic(
+                redis_client, sharing_episode_ledger, channel.uuid,
+            ),
         )
         callback_deadline = time.monotonic() + 5
         while not source_server.request_callback_finished.is_set():
