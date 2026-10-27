@@ -471,6 +471,38 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual([base, base + 6, base + 12], [item.start_utc.timestamp() for item in published])
         self.assertTrue(published[-1].discontinuity)
 
+    def test_fresh_muxer_marks_reset_even_with_adjacent_wall_times(self):
+        import os
+        from datetime import timedelta
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        initial = self.root / "original.ts"
+        initial.write_bytes(b"synthetic media")
+        self.store.add_segment("ch1", initial, base - timedelta(seconds=6), base)
+        recorder = FFmpegCopyRecorder(
+            self.store, "ch1", "http://synthetic.invalid/stream", self.root / "work",
+        )
+        class FinishedMuxer:
+            def __init__(self, command, **kwargs):
+                listing = Path(command[command.index("-segment_list") + 1])
+                media = listing.parent / "segment.ts"
+                media.write_bytes(b"synthetic media")
+                closed_at = base.timestamp() + 6
+                os.utime(media, (closed_at, closed_at))
+                listing.write_text("segment.ts,0,6\n")
+
+            def poll(self):
+                return 0
+
+        with patch("catchuparr.engine.recorder.subprocess.Popen", FinishedMuxer), patch(
+            "catchuparr.engine.recorder.has_useful_transport_stream", return_value=True,
+        ):
+            recorder.run_candidate(threading.Event())
+        segments = self.store.segments("ch1")
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0].end_utc, segments[1].start_utc)
+        self.assertFalse(segments[0].discontinuity)
+        self.assertTrue(segments[1].discontinuity)
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg and ffprobe are required")
     def test_real_ffmpeg_stream_copy_keeps_pts_monotonic_across_segments(self):
         source = self.root / "synthetic.ts"

@@ -291,6 +291,7 @@ def observe_native_connection(
     assigned_sources: Iterable[NativeAssignedSource],
     observed_at: float,
     recording_allowed_account_ids: frozenset[str] | None = None,
+    rejection_reasons: list[str] | None = None,
 ) -> NativeSharingObservation | None:
     """Observe an existing native connection, independent of source filters.
 
@@ -304,11 +305,16 @@ def observe_native_connection(
         raise ValueError("catalog_generation is required")
     if isinstance(observed_at, bool) or not isinstance(observed_at, (int, float)) or not math.isfinite(float(observed_at)):
         raise ValueError("observed_at must be a finite wall-clock timestamp")
+    def rejected(reason: str):
+        if rejection_reasons is not None:
+            rejection_reasons.append(reason)
+        return None
+
     try:
         owner_value = redis.get(f"live:channel:{channel_uuid}:owner")
         metadata_raw = redis.hgetall(f"live:channel:{channel_uuid}:metadata") or {}
         if not owner_value or not metadata_raw:
-            return None
+            return rejected("native-metadata-unavailable")
         owner_value = _text(owner_value)
         metadata = {_text(key): _text(value) for key, value in metadata_raw.items()}
         owner = metadata.get("owner", "")
@@ -326,15 +332,15 @@ def observe_native_connection(
             or int(redis.ttl(f"live:channel:{channel_uuid}:owner")) <= 0
             or redis.exists(f"live:channel:{channel_uuid}:stopping")
         ):
-            return None
+            return rejected("native-owner-or-state-stale")
         heartbeat_key = f"live:worker:{owner}:heartbeat"
         if not redis.exists(heartbeat_key) or int(redis.ttl(heartbeat_key)) <= 0:
-            return None
+            return rejected("native-owner-unhealthy")
         stream_id = metadata.get("stream_id", "")
         m3u_profile_id = metadata.get("m3u_profile", "")
         input_profile_id = metadata.get("stream_profile", "")
         if not stream_id or not m3u_profile_id or not input_profile_id:
-            return None
+            return rejected("native-source-incomplete")
         matches = [
             source for source in assigned_sources
             if source.channel_uuid == channel_uuid
@@ -344,29 +350,33 @@ def observe_native_connection(
             and source.assigned
         ]
         if len(matches) != 1:
-            return None
+            return rejected("native-assignment-mismatch")
         source = matches[0]
         if (
             not source.account_active or not source.profile_active
             or not source.media_compatible or not source.supported_worker_kind
             or source.redirect_channel or source.vod_or_preview
         ):
-            return None
+            return rejected("native-source-unavailable")
 
-        head_raw = redis.get(f"live:channel:{channel_uuid}:input:buffer:index")
-        head = int(_text(head_raw)) if head_raw is not None else 0
-        if head < 1:
-            return None
+        # Both tested native writers publish the index before the timestamp set.
+        # Read the set first, then its upper bound. Reading index first can
+        # compare an old head with a newly published chunk and falsely tear
+        # down a healthy borrow on ordinary forward buffer progress.
         newest = redis.zrevrange(
             f"live:channel:{channel_uuid}:input:buffer:chunk_timestamps", 0, 0,
         )
         if not newest:
-            return None
+            return rejected("native-buffer-empty")
+        head_raw = redis.get(f"live:channel:{channel_uuid}:input:buffer:index")
+        head = int(_text(head_raw)) if head_raw is not None else 0
+        if head < 1:
+            return rejected("native-buffer-empty")
         chunk_id = int(_text(newest[0]))
-        if chunk_id < 1 or chunk_id > head or not redis.exists(
-            f"live:channel:{channel_uuid}:input:buffer:chunk:{chunk_id}"
-        ):
-            return None
+        if chunk_id < 1 or chunk_id > head:
+            return rejected("native-buffer-index-inconsistent")
+        if not redis.exists(f"live:channel:{channel_uuid}:input:buffer:chunk:{chunk_id}"):
+            return rejected("native-buffer-chunk-unavailable")
 
         clients_key = f"live:channel:{channel_uuid}:clients"
         ordinary: list[str] = []
@@ -374,7 +384,7 @@ def observe_native_connection(
             client_id = _text(raw_client_id)
             private = _private_client(redis, channel_uuid, client_id)
             if private is None:
-                return None
+                return rejected("native-client-classification-unknown")
             if private:
                 continue
             record = redis.hgetall(f"live:channel:{channel_uuid}:clients:{client_id}") or {}
@@ -419,7 +429,7 @@ def observe_native_connection(
             catalog_generation=catalog_generation,
         )
     except (TypeError, ValueError, UnicodeError, OverflowError):
-        return None
+        return rejected("native-data-invalid")
 
 
 _PROJECT_EPISODE_LUA = """

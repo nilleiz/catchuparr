@@ -19,6 +19,28 @@ RECORDER_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 RECORDER_CLEANUP_RETRY_SECONDS = 1.0
 
 
+def _finish_borrow_cleanup(cleanup, lease, stop_event, *, still_current, on_pending):
+    """Hold this recorder lease until the exact borrowed HTTP cleanup finishes."""
+    while True:
+        if cleanup():
+            return True
+        try:
+            on_pending()
+        except Exception:
+            pass  # Diagnostics cannot authorize or abort cleanup.
+        if stop_event.is_set():
+            return False
+        try:
+            current = still_current() and lease.renew()
+        except Exception:
+            current = False
+        if not current:
+            stop_event.set()
+            return False
+        if stop_event.wait(RECORDER_CLEANUP_RETRY_SECONDS):
+            return False
+
+
 def _finish_recorder_attempt(
     redis, attempt, lease, stop_event, *, sharing, still_current, on_pending,
 ):
@@ -786,7 +808,20 @@ def record_channel(
                 # run_candidate has reaped FFmpeg, so exact reader cleanup may
                 # now be retried. Never switch inputs while its native client
                 # or episode projection can still be live.
-                cleanup_acknowledged = cleanup_prepared_borrow(prepared)
+                def borrow_cleanup_current():
+                    return _recorder_admission_state(
+                        channel_uuid, expected_generation, expected_control_generation,
+                    )["status"] == "ready"
+
+                def borrow_cleanup_pending():
+                    publish_borrow_diagnostic(
+                        prepared, "cleanup_pending", started_at=borrow_started_at,
+                    )
+
+                cleanup_acknowledged = _finish_borrow_cleanup(
+                    lambda: cleanup_prepared_borrow(prepared), lease, stop_event,
+                    still_current=borrow_cleanup_current, on_pending=borrow_cleanup_pending,
+                )
                 if cleanup_acknowledged and sharing_coordinator is not None:
                     cleanup_acknowledged = sharing_coordinator.record_return_after_cleanup(
                         prepared, now=time.time(), outcome=borrow_outcome,

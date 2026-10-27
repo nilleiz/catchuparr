@@ -192,6 +192,54 @@ class NativeSharingTests(unittest.TestCase):
         self.assertFalse(result.target.account_allowed_by_recording_policy)
         self.assertTrue(result.target.useful_buffer_available)
 
+    def test_buffer_progress_between_reads_does_not_invalidate_healthy_viewer(self):
+        class AdvancingRedis(NativeObservationRedis):
+            def get(self, key):
+                value = super().get(key)
+                if key == f"live:channel:{CHANNEL}:input:buffer:index":
+                    # The native publisher writes a new chunk between the
+                    # observer's individual Redis commands, not a source switch.
+                    self.strings[key] = "9"
+                    self.strings[f"live:channel:{CHANNEL}:input:buffer:chunk:9"] = "new-ts"
+                    self.zsets[f"live:channel:{CHANNEL}:input:buffer:chunk_timestamps"] = [(9, 101.0)]
+                return value
+        source = NativeAssignedSource(
+            channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],
+            m3u_profile_id=IDENTITY[6], input_profile_id=IDENTITY[7], assigned=True,
+            account_active=True, profile_active=True, media_compatible=True,
+        )
+        observed = observe_native_connection(
+            AdvancingRedis(), CHANNEL, catalog_generation="catalog-synthetic-4",
+            assigned_sources=(source,), observed_at=101,
+        )
+        self.assertIsNotNone(observed)
+        self.assertEqual(observed.target.connection_identity, IDENTITY)
+        self.assertEqual(observed.ordinary_viewer_ids, ("viewer-synthetic-1",))
+
+    def test_future_or_missing_buffer_chunk_still_fails_closed(self):
+        source = NativeAssignedSource(
+            channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],
+            m3u_profile_id=IDENTITY[6], input_profile_id=IDENTITY[7], assigned=True,
+            account_active=True, profile_active=True, media_compatible=True,
+        )
+        for future in (False, True):
+            with self.subTest(future=future):
+                redis = NativeObservationRedis()
+                if future:
+                    redis.zsets[f"live:channel:{CHANNEL}:input:buffer:chunk_timestamps"] = [(9, 101.0)]
+                    redis.strings[f"live:channel:{CHANNEL}:input:buffer:chunk:9"] = "ts"
+                else:
+                    redis.strings.pop(f"live:channel:{CHANNEL}:input:buffer:chunk:8")
+                reasons = []
+                self.assertIsNone(observe_native_connection(
+                    redis, CHANNEL, catalog_generation="catalog-synthetic-4",
+                    assigned_sources=(source,), observed_at=101, rejection_reasons=reasons,
+                ))
+                expected = ("native-buffer-index-inconsistent" if future
+                            else "native-buffer-chunk-unavailable")
+                self.assertEqual(reasons, [expected])
+                self.assertNotIn(CHANNEL, reasons[0])
+
     def test_exact_recorder_capability_marker_is_excluded_without_user_agent_guessing(self):
         redis = NativeObservationRedis()
         redis.strings.update({
