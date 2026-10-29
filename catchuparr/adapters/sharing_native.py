@@ -321,7 +321,6 @@ def observe_native_connection(
         state = metadata.get("state", "").lower()
         if (
             owner != owner_value
-            or state not in {"active", "waiting_for_clients"}
             # Native metadata is already scoped by the channel-specific Redis
             # key. Current Dispatcharr writers do not store channel_uuid in
             # this hash; reject it only when a writer supplies a contradiction.
@@ -333,6 +332,8 @@ def observe_native_connection(
             or redis.exists(f"live:channel:{channel_uuid}:stopping")
         ):
             return rejected("native-owner-or-state-stale")
+        if state not in {"active", "waiting_for_clients"}:
+            return rejected("native-buffering" if state == "buffering" else "native-owner-or-state-stale")
         heartbeat_key = f"live:worker:{owner}:heartbeat"
         if not redis.exists(heartbeat_key) or int(redis.ttl(heartbeat_key)) <= 0:
             return rejected("native-owner-unhealthy")

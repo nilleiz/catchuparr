@@ -601,7 +601,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "_assert_live_overview"
         ]
-        self.assertEqual(2, len(calls))
+        self.assertEqual(3, len(calls))
         self.assertTrue(all(
             isinstance(call.args[0], ast.Name)
             and call.args[0].id == "archive_root"

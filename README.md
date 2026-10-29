@@ -17,9 +17,9 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The package version is **0.7.2**. Its prerelease is gated by native and package
-  CI. See [candidate 0.7.2](docs/candidate-0.7.2.md)
-  and the [validation record](docs/validation.md).
+- The package version is **0.7.3**. Its prerelease is gated by native and package
+  CI. See the [0.7.2 design record](docs/candidate-0.7.2.md) and the
+  [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.33.0**. The compatibility
   guard accepts well-formed versions at or above that minimum. The
   native CI covers the pinned 0.33.0 image; this run must

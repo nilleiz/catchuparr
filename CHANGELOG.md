@@ -4,6 +4,26 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.3] - Prerelease
+
+### Fixed
+
+- Keep an existing borrowed reader open across a short native buffering state.
+  Pause publication while the native proof is unavailable and recheck the
+  exact owner, source, client, recorder lease and authority before resuming.
+  A new borrow still requires a ready native connection. Persistent buffering
+  remains bounded and fails closed after three seconds.
+- Preserve the attached status during a short buffering state when the exact
+  borrowed grant, native owner, client and recorder lease are still current.
+
+### Verification and limitations
+
+- Focused regression checks cover buffering recovery, changed identities,
+  bounded failure and cancellation. Native Dispatcharr 0.33.0 and package CI
+  gate publication.
+- Actual missing or stalled input cannot be reconstructed. Sustained buffering
+  may still require a switch and can leave a gap in the archive.
+
 ## [0.7.2] - Prerelease
 
 ### Changed

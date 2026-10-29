@@ -543,7 +543,7 @@ def _borrowed_grant_match(redis, record, channel_uuid):
                 or metadata.get("stream_id") != grant.stream_id
                 or metadata.get("m3u_profile") != grant.m3u_profile_id
                 or metadata.get("stream_profile") != grant.input_profile_id
-                or metadata.get("state", "").lower() not in {"active", "waiting_for_clients"}
+                or metadata.get("state", "").lower() not in {"active", "waiting_for_clients", "buffering"}
                 or ("channel_uuid" in metadata and metadata["channel_uuid"] != channel_uuid)):
             return False
         lease = redis.get(f"catchuparr:recorder:{channel_uuid}")

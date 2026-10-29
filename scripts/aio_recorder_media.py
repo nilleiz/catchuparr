@@ -5525,6 +5525,70 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             cooperative_sleep=gevent_sleep,
         )
         _require(bool(borrowed_segments), "Borrowed live A did not reach the archive")
+
+        # A short native buffering label must pause authorization, not destroy
+        # this exact already-registered reader. Exercise the real Lua proof and
+        # the real recorder with the provider and ordinary viewer still active.
+        from catchuparr.adapters import sharing_borrow_route
+        from catchuparr.adapters.sharing_native import read_native_episode_grant
+
+        prior_grant = read_native_episode_grant(redis_client, worker_id)
+        _require(prior_grant is not None and prior_grant.client_id == borrow_client_id,
+                 "Borrowed reader was not active before the buffering probe")
+        source_before_buffering = source_server.snapshot()
+        ids_before_buffering = {segment.id for segment in store.segments(worker_id)}
+        with run_share._lock:
+            input_count_before_buffering = len(run_share.input_headers)
+        original_touch = sharing_borrow_route.check_and_touch_borrowed_client
+        buffering_rejections = []
+
+        def observe_buffering_touch(redis, grant, **kwargs):
+            result = original_touch(redis, grant, **kwargs)
+            reasons = kwargs.get("rejection_reasons") or []
+            if grant.channel_uuid == worker_id and reasons and reasons[-1] == "native-state":
+                buffering_rejections.append(True)
+            return result
+
+        try:
+            with patch.object(sharing_borrow_route, "check_and_touch_borrowed_client", observe_buffering_touch):
+                buffering_deadline = time.monotonic() + 2.0
+                while len(buffering_rejections) < 2 and time.monotonic() < buffering_deadline:
+                    current_state = _redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE))
+                    _require(current_state in {ChannelState.ACTIVE, ChannelState.BUFFERING},
+                             "Native source changed during the buffering probe")
+                    _require(_redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner
+                             and _native_source_metadata(redis_client, metadata_key) == source_metadata,
+                             "Native source identity changed during the buffering probe")
+                    if current_state != ChannelState.BUFFERING:
+                        redis_client.hset(metadata_key, ChannelMetadataField.STATE, ChannelState.BUFFERING)
+                    gevent_sleep(0.05)
+                _require(len(buffering_rejections) >= 2,
+                         "The real borrowed reader did not recheck transient native buffering")
+                _assert_live_overview(archive_root, active_path, control_path, worker_id, "borrowed")
+        finally:
+            if (_redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE)) == ChannelState.BUFFERING
+                    and _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner
+                    and _native_source_metadata(redis_client, metadata_key) == source_metadata):
+                redis_client.hset(metadata_key, ChannelMetadataField.STATE, ChannelState.ACTIVE)
+
+        after_buffering = read_native_episode_grant(redis_client, worker_id)
+        _require(after_buffering is not None
+                 and after_buffering.episode_id == prior_grant.episode_id
+                 and after_buffering.client_id == prior_grant.client_id
+                 and after_buffering.lease_value == prior_grant.lease_value,
+                 "Transient buffering replaced the original borrowed reader")
+        _require(source_server.snapshot() == source_before_buffering,
+                 "Transient buffering opened or closed a provider connection")
+        with run_share._lock:
+            _require(len(run_share.input_headers) == input_count_before_buffering
+                     and not run_share.failures,
+                     "Transient buffering restarted the recorder input")
+        recovered_segments = _wait_for_indexed_tone(
+            run_share, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=ids_before_buffering, minimum=1, timeout=45,
+            cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(recovered_segments), "Borrowed archive did not advance after native buffering")
         from aio_recorder_diagnostics_probe import probe_live_borrowed_diagnostic
 
         borrowed_diagnostic_cleanup = probe_live_borrowed_diagnostic(redis_client, worker_id)
