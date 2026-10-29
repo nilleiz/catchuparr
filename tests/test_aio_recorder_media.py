@@ -280,7 +280,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
         )
         recovered = SimpleNamespace(intent=token, revision=4, state=state)
         committed_state = SimpleNamespace(
-            phase=SimpleNamespace(value="dedicated"), pending_action=None,
+            phase=SimpleNamespace(value="failed"), pending_action=None,
             last_switch_at=201.0, intent_epoch=12,
             configuration_generation="config", control_generation=7,
             recorder_fence=9,
@@ -299,6 +299,12 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertFalse(check(
             token, recovered, token, 201.0,
             SimpleNamespace(revision=6, intent=None, state=committed_state), **kwargs,
+        ))
+        self.assertFalse(check(
+            token, recovered, token, 201.0,
+            SimpleNamespace(revision=5, intent=None, state=SimpleNamespace(
+                **(vars(committed_state) | {"phase": SimpleNamespace(value="dedicated")}),
+            )), **kwargs,
         ))
 
     def test_failure_cleanup_barrier_requires_exact_closed_episode_and_native_absence(self):

@@ -15,12 +15,21 @@ included here to explain the feature history leading to 0.4.0.
   remains bounded and fails closed after three seconds.
 - Preserve the attached status during a short buffering state when the exact
   borrowed grant, native owner, client and recorder lease are still current.
+- Preserve the failure-recovery path after an allowed recorder resumes and
+  after a failed opening is cleaned up. A fresh eligible viewer is retried
+  without ordinary stability or switch cooldowns, while exact cleanup and
+  current authority remain required. Ordinary viewer departures retain their
+  configured return and switching delays.
+- Allow the optional overlap proof to compare exact encoded audio and video
+  when a source also contains subtitle tracks. Subtitle continuity is not
+  implied, and the new muxer remains marked as a discontinuity.
 
 ### Verification and limitations
 
-- Focused regression checks cover buffering recovery, changed identities,
-  bounded failure and cancellation. Native Dispatcharr 0.33.0 and package CI
-  gate publication.
+- Focused regression checks cover buffering recovery, exact failure cleanup,
+  immediate retry despite configured cooldowns, subtitle-bearing media,
+  changed identities, bounded failure and cancellation. Native Dispatcharr
+  0.33.0 and package CI gate publication.
 - Actual missing or stalled input cannot be reconstructed. Sustained buffering
   may still require a switch and can leave a gap in the archive.
 

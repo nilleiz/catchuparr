@@ -236,9 +236,11 @@ The recorder's channel fence remains in force.
 applied with the other settings. When enabled, a running dedicated recorder may
 briefly stage its already-authorized viewer input and compare complete encoded
 audio/video segments. If a current overlap is proven, the staged reader
-continues from that boundary without reopening it. On return, the borrowed
-client is cleaned up first, then the new dedicated reader is compared with the
-archived tail; no simultaneous provider reader is opened for this comparison.
+continues from that boundary without reopening it. Subtitle tracks may differ
+between the sources and are not covered by the audio/video proof. On return,
+the borrowed client is cleaned up first, then the new dedicated reader is
+compared with the archived tail; no simultaneous provider reader is opened for
+this comparison.
 Without a match, the same reader continues with its captured media. A failed
 borrow uses the normal fast recovery path. A match is not always available,
 and this option does not promise gapless recordings.
