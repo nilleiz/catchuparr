@@ -21,8 +21,10 @@ from catchuparr.adapters.sharing_native import (
 )
 from catchuparr.adapters.sharing_reader import (
     BorrowBindingLost,
+    BorrowNativeBuffering,
     BorrowReadBinding,
     BorrowReaderUnavailable,
+    ReadOnlyTsBufferReader,
     validate_borrow_read_proof,
 )
 from catchuparr.sharing_episode import (
@@ -189,6 +191,147 @@ class SharingBorrowRouteTests(unittest.TestCase):
         self.assertEqual("native client grant was revoked: native-stopping", str(caught.exception))
         self.assertNotIn(episode.channel_uuid, str(caught.exception))
         self.assertNotIn(ack.client_id, str(caught.exception))
+
+    def test_buffering_then_recovery_revalidates_before_resuming_reader(self):
+        episode, ack, grant, target = self._current_proof_inputs()
+        redis = SimpleNamespace(hget=lambda _key, _field: b"buffering")
+        attempts = []
+
+        def touch(*_args, **kwargs):
+            attempts.append(True)
+            if len(attempts) == 1:
+                kwargs["rejection_reasons"].append("native-state")
+                return False, None, None
+            return True, 130.0, grant.version
+
+        with (
+            patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant", return_value=grant),
+            patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client", side_effect=touch),
+            patch("catchuparr.adapters.sharing_borrow_route.observe_native_connection",
+                  return_value=SimpleNamespace(target=target)) as observe,
+        ):
+            native_proof = native_borrow_proof_reader(
+                redis=redis, episode=episode, ack=ack,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+            )
+            reader = object.__new__(ReadOnlyTsBufferReader)
+            reader.binding = BorrowReadBinding(
+                IDENTITY, episode.configuration_generation, episode.control_generation,
+                episode.recorder_fence, dynamic_grace=True,
+            )
+            reader.proof_reader = native_proof
+            reader.poll_interval = 0.001
+            reader._verify()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(observe.call_count, 1)
+
+    def test_buffering_race_after_native_cas_rechecks_the_full_proof(self):
+        episode, ack, grant, target = self._current_proof_inputs()
+        redis = SimpleNamespace(hget=lambda _key, _field: b"buffering")
+        observations = []
+
+        def observe(*_args, **kwargs):
+            observations.append(True)
+            if len(observations) == 1:
+                kwargs["rejection_reasons"].append("native-buffering")
+                return None
+            return SimpleNamespace(target=target)
+
+        with (
+            patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant", return_value=grant),
+            patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client",
+                  return_value=(True, 130.0, grant.version)) as touch,
+            patch("catchuparr.adapters.sharing_borrow_route.observe_native_connection", side_effect=observe),
+        ):
+            native_proof = native_borrow_proof_reader(
+                redis=redis, episode=episode, ack=ack,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+            )
+            reader = object.__new__(ReadOnlyTsBufferReader)
+            reader.binding = BorrowReadBinding(
+                IDENTITY, episode.configuration_generation, episode.control_generation,
+                episode.recorder_fence, dynamic_grace=True,
+            )
+            reader.proof_reader = native_proof
+            reader.poll_interval = 0.001
+            reader._verify()
+        self.assertEqual(touch.call_count, 2)
+        self.assertEqual(len(observations), 2)
+
+    def test_buffering_retry_rejects_replaced_lease_before_touching_native_client(self):
+        episode, ack, grant, _target = self._current_proof_inputs()
+        replacement = replace(grant, lease_value="replacement-lease-synthetic")
+        redis = SimpleNamespace(hget=lambda _key, _field: b"buffering")
+
+        def touch(*_args, **kwargs):
+            kwargs["rejection_reasons"].append("native-state")
+            return False, None, None
+
+        with (
+            patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant",
+                  side_effect=(grant, replacement)),
+            patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client", side_effect=touch) as cas,
+        ):
+            native_proof = native_borrow_proof_reader(
+                redis=redis, episode=episode, ack=ack,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+            )
+            reader = object.__new__(ReadOnlyTsBufferReader)
+            reader.binding = BorrowReadBinding(
+                IDENTITY, episode.configuration_generation, episode.control_generation,
+                episode.recorder_fence, dynamic_grace=True,
+            )
+            reader.proof_reader = native_proof
+            reader.poll_interval = 0.001
+            with self.assertRaisesRegex(BorrowBindingLost, "active Redis episode"):
+                reader._verify()
+        self.assertEqual(cas.call_count, 1)
+
+    def test_other_native_states_and_revocations_are_not_buffering_retries(self):
+        episode, ack, grant, _target = self._current_proof_inputs()
+        for state in (b"error", b"stopping", b"connecting", None):
+            with self.subTest(state=state):
+                redis = SimpleNamespace(hget=lambda _key, _field: state)
+
+                def touch(*_args, **kwargs):
+                    kwargs["rejection_reasons"].append("native-state")
+                    return False, None, None
+
+                with (
+                    patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant", return_value=grant),
+                    patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client", side_effect=touch),
+                ):
+                    native_proof = native_borrow_proof_reader(
+                        redis=redis, episode=episode, ack=ack,
+                        assigned_sources=(self._assigned_source(),),
+                        catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+                    )
+                    with self.assertRaises(BorrowBindingLost) as caught:
+                        native_proof()
+                self.assertNotIsInstance(caught.exception, BorrowNativeBuffering)
+
+        calls = []
+        redis = SimpleNamespace(hget=lambda *_args: calls.append(True))
+
+        def wrong_owner(*_args, **kwargs):
+            kwargs["rejection_reasons"].append("native-owner")
+            return False, None, None
+
+        with (
+            patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant", return_value=grant),
+            patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client", side_effect=wrong_owner),
+        ):
+            native_proof = native_borrow_proof_reader(
+                redis=redis, episode=episode, ack=ack,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+            )
+            with self.assertRaisesRegex(BorrowBindingLost, "native-owner"):
+                native_proof()
+        self.assertEqual(calls, [])
 
     def test_observation_rejection_retains_fixed_reason_without_identity_values(self):
         episode, ack, grant, _target = self._current_proof_inputs()

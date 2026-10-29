@@ -1,12 +1,14 @@
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from catchuparr.adapters.sharing_reader import (
     _REMOVE_EXACT_NATIVE_CLIENT_LUA,
     _TOUCH_NATIVE_CLIENT_LUA,
     BorrowBindingLost,
     BorrowedClientRegistration,
+    BorrowNativeBuffering,
     BorrowReadBinding,
     BorrowReaderUnavailable,
     BorrowReadProof,
@@ -528,6 +530,95 @@ class SharingReaderTests(unittest.TestCase):
         iterator = reader.iter_chunks()
         with self.assertRaises(BorrowBindingLost):
             next(iterator)
+
+    def test_reader_waits_for_fresh_proof_before_publishing_a_buffered_batch(self):
+        buffer = task_local_buffer(index=5, batches=[([PACKET], 6)])
+        waiting = threading.Event()
+        recovered = threading.Event()
+        calls = []
+
+        def current_proof():
+            calls.append(True)
+            if len(calls) > 1 and not recovered.is_set():
+                waiting.set()
+                raise BorrowNativeBuffering("temporary buffering")
+            return proof()
+
+        reader = ReadOnlyTsBufferReader(buffer, binding(), current_proof, poll_interval=0.01)
+        received = []
+        thread = threading.Thread(target=lambda: received.append(next(reader.iter_chunks())))
+        thread.start()
+        self.assertTrue(waiting.wait(1))
+        self.assertEqual(received, [])
+        self.assertEqual(buffer.read_calls, [5])
+        recovered.set()
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(received, [PACKET])
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_reader_never_publishes_if_binding_changes_during_buffering(self):
+        buffer = task_local_buffer(index=5, batches=[([PACKET], 6)])
+        calls = []
+
+        def current_proof():
+            calls.append(True)
+            if len(calls) == 1:
+                return proof()
+            if len(calls) == 2:
+                raise BorrowNativeBuffering("temporary buffering")
+            return proof(identity=IDENTITY[:-1] + ("replaced-profile",))
+
+        reader = ReadOnlyTsBufferReader(buffer, binding(), current_proof, poll_interval=0.001)
+        with self.assertRaises(BorrowBindingLost):
+            next(reader.iter_chunks())
+        self.assertEqual(len(calls), 3)
+
+    def test_buffering_grace_is_bounded_and_does_not_reuse_a_stale_proof(self):
+        buffer = task_local_buffer(index=5, batches=[([PACKET], 6)])
+        now = [0.0]
+
+        class FakeStop:
+            def wait(self, delay):
+                now[0] += delay
+                return False
+
+        reader = ReadOnlyTsBufferReader(
+            buffer, binding(), lambda: (_ for _ in ()).throw(BorrowNativeBuffering("buffering")),
+            poll_interval=0.5,
+        )
+        with patch("catchuparr.adapters.sharing_reader.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(BorrowBindingLost, "did not recover"):
+                reader._verify(FakeStop())
+        self.assertEqual(now[0], 3.0)
+        self.assertEqual(buffer.read_calls, [])
+
+    def test_reader_stop_interrupts_buffering_wait_without_publishing(self):
+        buffer = task_local_buffer(index=5, batches=[([PACKET], 6)])
+        waiting = threading.Event()
+        stop = threading.Event()
+        outcomes = []
+
+        def current_proof():
+            waiting.set()
+            raise BorrowNativeBuffering("temporary buffering")
+
+        reader = ReadOnlyTsBufferReader(buffer, binding(), current_proof, poll_interval=0.1)
+
+        def consume():
+            try:
+                outcomes.append(next(reader.iter_chunks(stop)))
+            except StopIteration:
+                outcomes.append("stopped")
+
+        thread = threading.Thread(target=consume)
+        thread.start()
+        self.assertTrue(waiting.wait(1))
+        stop.set()
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes, ["stopped"])
+        self.assertEqual(buffer.read_calls, [])
 
     def test_reader_skips_expired_chunks_using_only_read_lookup(self):
         buffer = task_local_buffer(index=9, batches=[([], 5), ([PACKET], 10)])

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping
 
 _TASK_LOCAL_BUFFER_MARKER = object()
+NATIVE_BUFFERING_GRACE_SECONDS = 3.0
 
 
 def redis_backend_signature(redis_client: Any) -> str:
@@ -109,6 +110,10 @@ def _validate_native_buffer_namespace(buffer: Any, channel_uuid: str) -> None:
 
 class BorrowBindingLost(RuntimeError):
     """The borrowed native identity or its recorder fence is no longer current."""
+
+
+class BorrowNativeBuffering(BorrowBindingLost):
+    """Native buffering temporarily prevents a fresh read authorization."""
 
 
 class BorrowReaderUnavailable(RuntimeError):
@@ -526,20 +531,35 @@ class ReadOnlyTsBufferReader:
             self.buffer.index = head
         return self.buffer.index
 
-    def _verify(self) -> None:
-        try:
-            proof = self.proof_reader()
-            validate_borrow_read_proof(self.binding, proof)
-        except BorrowBindingLost:
-            raise
-        except Exception as exc:
-            raise BorrowBindingLost("native borrow proof could not be refreshed") from exc
+    def _verify(self, stop: threading.Event | None = None) -> bool:
+        deadline = None
+        while True:
+            try:
+                proof = self.proof_reader()
+                validate_borrow_read_proof(self.binding, proof)
+                return True
+            except BorrowNativeBuffering as exc:
+                if deadline is None:
+                    deadline = time.monotonic() + NATIVE_BUFFERING_GRACE_SECONDS
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BorrowBindingLost("native buffering did not recover in time") from exc
+                delay = min(self.poll_interval, remaining)
+                if stop is None:
+                    time.sleep(delay)
+                elif stop.wait(delay):
+                    return False
+            except BorrowBindingLost:
+                raise
+            except Exception as exc:
+                raise BorrowBindingLost("native borrow proof could not be refreshed") from exc
 
     def iter_chunks(self, stop: threading.Event | None = None) -> Iterator[bytes]:
         """Yield aligned TS chunks while the same current native identity is proven."""
         stop = stop or threading.Event()
         while not stop.is_set():
-            self._verify()
+            if not self._verify(stop):
+                return
             if stop.is_set():
                 return
             self._refresh_private_head()
@@ -561,7 +581,8 @@ class ReadOnlyTsBufferReader:
                 for chunk in prepared:
                     if stop.is_set():
                         return
-                    self._verify()
+                    if not self._verify(stop):
+                        return
                     if stop.is_set():
                         return
                     yield chunk

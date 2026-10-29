@@ -216,6 +216,28 @@ class NativeSharingTests(unittest.TestCase):
         self.assertEqual(observed.target.connection_identity, IDENTITY)
         self.assertEqual(observed.ordinary_viewer_ids, ("viewer-synthetic-1",))
 
+    def test_buffering_never_admits_new_borrow_and_does_not_mask_stale_owner(self):
+        redis = NativeObservationRedis()
+        redis.hashes[f"live:channel:{CHANNEL}:metadata"]["state"] = "buffering"
+        source = NativeAssignedSource(
+            channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],
+            m3u_profile_id=IDENTITY[6], input_profile_id=IDENTITY[7], assigned=True,
+            account_active=True, profile_active=True, media_compatible=True,
+        )
+        reasons = []
+        self.assertIsNone(observe_native_connection(
+            redis, CHANNEL, catalog_generation="catalog-synthetic-4",
+            assigned_sources=(source,), observed_at=101, rejection_reasons=reasons,
+        ))
+        self.assertEqual(reasons, ["native-buffering"])
+        redis.strings[f"live:channel:{CHANNEL}:owner"] = "replacement-owner"
+        reasons = []
+        self.assertIsNone(observe_native_connection(
+            redis, CHANNEL, catalog_generation="catalog-synthetic-4",
+            assigned_sources=(source,), observed_at=101, rejection_reasons=reasons,
+        ))
+        self.assertEqual(reasons, ["native-owner-or-state-stale"])
+
     def test_future_or_missing_buffer_chunk_still_fails_closed(self):
         source = NativeAssignedSource(
             channel_uuid=CHANNEL, stream_id=IDENTITY[4], account_id=IDENTITY[5],
