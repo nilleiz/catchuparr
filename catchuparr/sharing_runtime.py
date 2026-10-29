@@ -930,6 +930,13 @@ class RecorderBorrowCoordinator:
                 return None
         except Exception:
             return None
+        if (self.state_record.intent is None
+                and self.state_record.state.phase in {SharingPhase.BORROWED, SharingPhase.WAIT_RETURN}):
+            # Native cleanup can remove its projection before the recorder has
+            # reaped the reader and recorded its fenced return. The persisted
+            # state has no borrowed identity, so ordinary observation here
+            # would otherwise erase the return phase and its grace clocks.
+            return None
         if (
             self.state_record.intent is not None
             or control_generation != self.control_generation

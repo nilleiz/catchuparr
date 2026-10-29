@@ -994,6 +994,8 @@ def record_channel(
                         cleanup_acknowledged = sharing_coordinator.record_return_after_cleanup(
                             prepared, now=time.time(), outcome=borrow_outcome,
                         )
+                        if not cleanup_acknowledged:
+                            error("sharing_return_recovery_pending", callsite="return_completion")
                         if cleanup_acknowledged:
                             return_token = sharing_coordinator.pending_return_intent()
                             if (return_token is not None
