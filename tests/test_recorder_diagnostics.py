@@ -344,6 +344,7 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
         )
         redis = DiagnosticReaderRedis(live=diagnostic)
         redis.alive = True
+        redis.native_state = "active"
         redis.hgetall = lambda key: (
             diagnostic if ":diagnostic:" in key else
             {"configuration_generation": self.control.configuration_generation,
@@ -352,7 +353,7 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
             {client_id: episode_id} if ":sharing:private:" in key else
             {"worker_id": native_id, "connected_at": "1000"} if f":clients:{client_id}" in key else
             {"owner": native_owner, "stream_id": "31", "m3u_profile": "9",
-             "stream_profile": "4", "state": "active"} if ":metadata" in key else {}
+             "stream_profile": "4", "state": redis.native_state} if ":metadata" in key else {}
         )
         redis.get = lambda key: native_owner if key.endswith(":owner") else redis.lease
         redis.sismember = lambda _key, member: member == client_id
@@ -374,8 +375,18 @@ class RecorderDiagnosticReaderTests(unittest.TestCase):
             self.assertIn(self.channel, read_recorder_diagnostics(
                 redis, self.settings, self.control, now=1010,
             ))
+            # Buffering does not by itself change the current native identity.
+            redis.native_state = "buffering"
+            self.assertIn(self.channel, read_recorder_diagnostics(
+                redis, self.settings, self.control, now=1010,
+            ))
             redis.owner_heartbeat_exists = False
             # A live channel UUID heartbeat cannot substitute for the owner process.
+            self.assertNotIn(self.channel, read_recorder_diagnostics(
+                redis, self.settings, self.control, now=1010,
+            ))
+            redis.owner_heartbeat_ttl = 20
+            redis.native_state = "stopping"
             self.assertNotIn(self.channel, read_recorder_diagnostics(
                 redis, self.settings, self.control, now=1010,
             ))

@@ -3360,7 +3360,7 @@ def _failure_return_ack_matches_admitted_window(
             and ack_token.not_before < media_at < ordinary_deadline
             and committed_record.revision == ack_token.revision + 1
             and committed_record.intent is None
-            and committed_state.phase.value == "dedicated"
+            and committed_state.phase.value == "failed"
             and committed_state.pending_action is None
             and committed_state.last_switch_at == media_at
             and committed_state.intent_epoch == ack_token.intent_epoch
@@ -5525,6 +5525,70 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             cooperative_sleep=gevent_sleep,
         )
         _require(bool(borrowed_segments), "Borrowed live A did not reach the archive")
+
+        # A short native buffering label must pause authorization, not destroy
+        # this exact already-registered reader. Exercise the real Lua proof and
+        # the real recorder with the provider and ordinary viewer still active.
+        from catchuparr.adapters import sharing_borrow_route
+        from catchuparr.adapters.sharing_native import read_native_episode_grant
+
+        prior_grant = read_native_episode_grant(redis_client, worker_id)
+        _require(prior_grant is not None and prior_grant.client_id == borrow_client_id,
+                 "Borrowed reader was not active before the buffering probe")
+        source_before_buffering = source_server.snapshot()
+        ids_before_buffering = {segment.id for segment in store.segments(worker_id)}
+        with run_share._lock:
+            input_count_before_buffering = len(run_share.input_headers)
+        original_touch = sharing_borrow_route.check_and_touch_borrowed_client
+        buffering_rejections = []
+
+        def observe_buffering_touch(redis, grant, **kwargs):
+            result = original_touch(redis, grant, **kwargs)
+            reasons = kwargs.get("rejection_reasons") or []
+            if grant.channel_uuid == worker_id and reasons and reasons[-1] == "native-state":
+                buffering_rejections.append(True)
+            return result
+
+        try:
+            with patch.object(sharing_borrow_route, "check_and_touch_borrowed_client", observe_buffering_touch):
+                buffering_deadline = time.monotonic() + 2.0
+                while len(buffering_rejections) < 2 and time.monotonic() < buffering_deadline:
+                    current_state = _redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE))
+                    _require(current_state in {ChannelState.ACTIVE, ChannelState.BUFFERING},
+                             "Native source changed during the buffering probe")
+                    _require(_redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner
+                             and _native_source_metadata(redis_client, metadata_key) == source_metadata,
+                             "Native source identity changed during the buffering probe")
+                    if current_state != ChannelState.BUFFERING:
+                        redis_client.hset(metadata_key, ChannelMetadataField.STATE, ChannelState.BUFFERING)
+                    gevent_sleep(0.05)
+                _require(len(buffering_rejections) >= 2,
+                         "The real borrowed reader did not recheck transient native buffering")
+                _assert_live_overview(archive_root, active_path, control_path, worker_id, "borrowed")
+        finally:
+            if (_redis_text(redis_client.hget(metadata_key, ChannelMetadataField.STATE)) == ChannelState.BUFFERING
+                    and _redis_text(redis_client.get(RedisKeys.channel_owner(worker_id))) == native_owner
+                    and _native_source_metadata(redis_client, metadata_key) == source_metadata):
+                redis_client.hset(metadata_key, ChannelMetadataField.STATE, ChannelState.ACTIVE)
+
+        after_buffering = read_native_episode_grant(redis_client, worker_id)
+        _require(after_buffering is not None
+                 and after_buffering.episode_id == prior_grant.episode_id
+                 and after_buffering.client_id == prior_grant.client_id
+                 and after_buffering.lease_value == prior_grant.lease_value,
+                 "Transient buffering replaced the original borrowed reader")
+        _require(source_server.snapshot() == source_before_buffering,
+                 "Transient buffering opened or closed a provider connection")
+        with run_share._lock:
+            _require(len(run_share.input_headers) == input_count_before_buffering
+                     and not run_share.failures,
+                     "Transient buffering restarted the recorder input")
+        recovered_segments = _wait_for_indexed_tone(
+            run_share, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=ids_before_buffering, minimum=1, timeout=45,
+            cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(recovered_segments), "Borrowed archive did not advance after native buffering")
         from aio_recorder_diagnostics_probe import probe_live_borrowed_diagnostic
 
         borrowed_diagnostic_cleanup = probe_live_borrowed_diagnostic(redis_client, worker_id)
@@ -7125,6 +7189,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         return_ack_events = []
         return_ack_snapshots = []
         return_ack_lock = threading.Lock()
+        failure_observation_gate = {"held": False, "blocked": 0, "ack_at": None, "prepared_at": None}
         real_acknowledge_return_media = RecorderBorrowCoordinator.acknowledge_return_media
         real_coordinator_poll = RecorderBorrowCoordinator.poll
 
@@ -7145,6 +7210,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             if result:
                 committed = return_ledger.read(worker_id)
                 with return_ack_lock:
+                    if failure_observation_gate["held"]:
+                        failure_observation_gate["ack_at"] = time.time()
+                    failure_observation_gate["held"] = False
                     if "supervisor_ack" not in return_ack_events:
                         return_ack_snapshots.append((
                             token, recovered_return, media_at, committed,
@@ -7157,7 +7225,12 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 if ("supervisor_ack" in return_ack_events
                         and "poll_after_supervisor_ack" not in return_ack_events):
                     return_ack_events.append("poll_after_supervisor_ack")
-            return real_coordinator_poll(self, **kwargs)
+            prepared = real_coordinator_poll(self, **kwargs)
+            with return_ack_lock:
+                if (prepared is not None and failure_observation_gate["ack_at"] is not None
+                        and failure_observation_gate["prepared_at"] is None):
+                    failure_observation_gate["prepared_at"] = time.time()
+            return prepared
 
         def read_return_ack_events():
             with return_ack_lock:
@@ -7354,6 +7427,31 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(bool(second_borrowed_segments),
                  "Post-restart borrow did not archive fresh A media")
 
+        # The viewer remains connected, but one failed attach can coincide
+        # with a temporarily unreadable native observation. Keep it unavailable
+        # until the dedicated recorder's exact return-media ACK has committed;
+        # subsequent polls use the real native observer and all normal guards.
+        from catchuparr import sharing_runtime as failure_runtime_module
+
+        real_failure_observer = failure_runtime_module.observe_native_connection
+
+        def temporarily_unavailable_failure_viewer(redis, channel_uuid, **kwargs):
+            with return_ack_lock:
+                if str(channel_uuid) == str(worker_id) and failure_observation_gate["held"]:
+                    failure_observation_gate["blocked"] += 1
+                    return None
+            return real_failure_observer(redis, channel_uuid, **kwargs)
+
+        failure_native_observation_patch = patch.object(
+            failure_runtime_module, "observe_native_connection",
+            side_effect=temporarily_unavailable_failure_viewer,
+        )
+        failure_native_observation_patch_started = False
+        with return_ack_lock:
+            failure_observation_gate["held"] = True
+        failure_native_observation_patch.start()
+        failure_native_observation_patch_started = True
+
         # Keep the current native borrow healthy through the existing media
         # proof, then fail only its next committed segment.
         run_restart.fail_borrow_after_next_media = True
@@ -7547,6 +7645,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and failure_return_token.not_before >= failure_media_at,
             "Failure RETURN did not bypass only the persisted admission deadline",
         )
+        from catchuparr.engine.recorder import SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS
+
+        # This scenario deliberately holds the viewer observation until the
+        # dedicated media ACK. The enabled overlap attempt may then stage the
+        # target for its normal bounded interval while the old input records.
+        # Check prompt *admission* separately from that configured staging.
+        failure_recovery_window = 20.0 + SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS
 
         def fast_recovery_snapshot():
             with run_restart._lock:
@@ -7559,16 +7664,27 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 ]
                 task_alive = run_restart.thread is not None and run_restart.thread.is_alive()
                 no_failures = not run_restart.failures
+            with return_ack_lock:
+                failure_ack_committed = "supervisor_ack" in return_ack_events
+                target_was_temporarily_unavailable = failure_observation_gate["blocked"] > 0
+                failure_ack_at = failure_observation_gate["ack_at"]
+                failure_prepared_at = failure_observation_gate["prepared_at"]
             recovered_at = borrowed[1][1] if len(borrowed) >= 2 else None
             return {
                 "conditions": {
                     "fresh_borrow_started": recovered_at is not None,
+                    "failure_return_ack_committed": failure_ack_committed,
+                    "target_was_temporarily_unavailable": target_was_temporarily_unavailable,
+                    "prompt_after_return_ack": (
+                        failure_prepared_at is not None and failure_ack_at is not None
+                        and 0 <= failure_prepared_at - failure_ack_at <= 5.0
+                    ),
                     "before_normal_cooldown": (
                         recovered_at is not None and recovered_at < ordinary_return_deadline
                     ),
                     "within_fast_recovery_window": (
                         recovered_at is not None
-                        and 0 <= recovered_at - failure_return_token.not_before <= 20.0
+                        and 0 <= recovered_at - failure_return_token.not_before <= failure_recovery_window
                     ),
                     "task_alive": task_alive,
                     "task_has_no_unexpected_failure": no_failures,
@@ -7577,7 +7693,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             }
 
         fast_recovery_ready, fast_recovery = _wait_for_readiness_snapshot(
-            fast_recovery_snapshot, 20.0,
+            fast_recovery_snapshot, failure_recovery_window,
             monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
         )
         _require_with_failure_diagnostic(
@@ -7586,6 +7702,22 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             lambda: fast_recovery,
             diagnostic_label="CATCHUPARR_FAILURE_FAST_REATTACH_DIAGNOSTIC",
         )
+        ack_snapshots = read_return_ack_snapshots()
+        _require(
+            len(ack_snapshots) == 1
+            and _failure_return_ack_matches_admitted_window(
+                failure_return_token, ack_snapshots[0][1], ack_snapshots[0][0],
+                ack_snapshots[0][2], ack_snapshots[0][3],
+                channel_uuid=worker_id,
+                configuration_generation=run_restart.expected_generation,
+                control_generation=run_restart.expected_control_generation,
+                return_seconds=return_seconds,
+                minimum_switch_seconds=minimum_switch_seconds,
+            ),
+            "Failure recovery did not preserve its exact return-media ACK",
+        )
+        failure_native_observation_patch.stop()
+        failure_native_observation_patch_started = False
         failure_capture_patch.stop()
         failure_capture_patch_started = False
         return_poll_patch.stop()
@@ -7786,6 +7918,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     finally:
         if locals().get("run_restart") is not None:
             run_restart.borrow_failure_result_release.set()
+        if locals().get("failure_native_observation_patch_started"):
+            try:
+                failure_native_observation_patch.stop()
+            except Exception:
+                pass
         if locals().get("return_sync_probe_started"):
             try:
                 return_sync_probe_patch.stop()

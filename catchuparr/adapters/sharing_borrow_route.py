@@ -36,6 +36,7 @@ from .sharing_native import (
 )
 from .sharing_reader import (
     BorrowBindingLost,
+    BorrowNativeBuffering,
     BorrowReadBinding,
     BorrowReaderUnavailable,
     BorrowReadProof,
@@ -451,6 +452,15 @@ def native_borrow_proof_reader(
     ):
         raise BorrowReaderUnavailable("native borrowed proof inputs are incomplete")
 
+    def transient_buffer_state() -> bool:
+        try:
+            state = redis.hget(f"live:channel:{episode.channel_uuid}:metadata", "state")
+            if isinstance(state, bytes):
+                state = state.decode("utf-8", errors="strict")
+            return state in {"buffering", "active", "waiting_for_clients"}
+        except Exception:
+            return False
+
     def proof(*, reconciled_viewer_race: bool = False) -> BorrowReadProof:
         checked_at = clock()
         if (
@@ -483,6 +493,8 @@ def native_borrow_proof_reader(
         )
         if not current or version is None:
             reason = touch_rejections[-1] if touch_rejections else "unknown"
+            if reason == "native-state" and transient_buffer_state():
+                raise BorrowNativeBuffering("native buffering requires a fresh proof")
             raise BorrowBindingLost(f"native client grant was revoked: {reason}")
         current_grant = read_native_episode_grant(redis, episode.channel_uuid)
         if current_grant is None or current_grant.version != version or not (
@@ -521,6 +533,8 @@ def native_borrow_proof_reader(
             return proof(reconciled_viewer_race=True)
         if observed is None:
             reason = rejection_reasons[-1] if rejection_reasons else "native-observation-unavailable"
+            if reason == "native-buffering":
+                raise BorrowNativeBuffering("native buffering requires a fresh proof")
             raise BorrowBindingLost(f"native borrow observation rejected: {reason}")
         if observed.target.connection_identity != episode.identity:
             raise BorrowBindingLost("native borrow observation rejected: native-binding-changed")
