@@ -2,14 +2,14 @@
 
 import re
 
-MINIMUM_DISPATCHARR_VERSION = "0.32.0"
-TESTED_DISPATCHARR_VERSIONS = ("0.32.0",)
+MINIMUM_DISPATCHARR_VERSION = "0.33.0"
+TESTED_DISPATCHARR_VERSIONS = ("0.33.0",)
 _MINIMUM_PARTS = tuple(int(part) for part in MINIMUM_DISPATCHARR_VERSION.split("."))
 
 # Compatibility aliases for callers that imported the earlier constants.
 # These identify the tested baseline, not an exact allowlist.
 SUPPORTED_DISPATCHARR_VERSIONS = TESTED_DISPATCHARR_VERSIONS
-SUPPORTED_DISPATCHARR_VERSION = "0.32.0"
+SUPPORTED_DISPATCHARR_VERSION = "0.33.0"
 
 _VERSION = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"

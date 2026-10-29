@@ -4,7 +4,44 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
-## [0.7.1] - Prerelease candidate
+## [0.7.2] - Prerelease
+
+### Changed
+
+- Detect viewer and source changes promptly while preserving configured
+  stability, minimum-switch and last-viewer return delays. Wake a pending
+  recorder switch immediately and retry exact cleanup at shorter intervals.
+- Add an opt-in, bounded attempt to match encoded audio and video when a
+  dedicated recorder switches to a viewer or returns to a dedicated source.
+  Return still requires exact viewer cleanup first. Keep the same staged reader
+  after a proven overlap, and otherwise use the normal switch.
+- Require Dispatcharr 0.33.0 or newer. Native acceptance targets the pinned
+  0.33.0 image and remains subject to interface capability checks.
+- After a failed borrowed recording, retry a fresh eligible viewer once the
+  exact previous registration has been cleaned up and all current authority,
+  lease, catalog and single-use claim checks pass. Ordinary viewer departures
+  retain their configured return and switching waits.
+- Map HLS and XC transport clocks onto available media across independent
+  recorder sessions. Skip missing archive time, preserve encoded audio/video
+  and authenticated byte ranges, and retain absolute HLS programme dates.
+  A short decoder guard separates independent muxers. XC response duration
+  reflects available media rather than elapsed time across missing intervals.
+- Display an unconfirmed recorder state as `unconfirmed` instead of asserting
+  a failure without evidence. Genuine error states remain marked as failed.
+
+### Verification and limitations
+
+- Focused synthetic regressions exercise transition timing, exact cleanup,
+  audio/video decoding across muxer changes and gaps, and byte-range identity.
+- Native Dispatcharr 0.33.0 and package CI gate publication. A previous
+  intermittent borrowed-connection rejection was observed, but its
+  exact predicate was not retained by older logs; new fixed rejection categories
+  support future diagnosis without exposing identifiers or credentials.
+- Missing recordings cannot be recovered. Some source changes cannot be
+  matched; return to a dedicated source requires exact borrower cleanup first.
+  A gapless recording is not guaranteed.
+
+## [0.7.1] - Prerelease
 
 ### Fixed
 
@@ -28,8 +65,8 @@ included here to explain the feature history leading to 0.4.0.
 
 - Synthetic audio/video regression checks decoder output, programme duration,
   timestamp wraparound, and byte ranges across independently muxed segments.
-- Native 0.32.0/0.33.0 CI and external-player acceptance remain pending for this
-  candidate. No production deployment is implied by source preparation.
+- The native 0.32.0/0.33.0 matrix passed for the released source tree; external
+  player acceptance is separate from that integration evidence.
 - Missing recordings are not reconstructed. The buffer-progress invalidation
   is reproducible with the old source; individual historical failures cannot
   all be uniquely attributed because older logs omit the rejected predicate.

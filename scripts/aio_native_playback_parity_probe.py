@@ -60,7 +60,7 @@ def probe():
     from catchuparr.engine.store import ArchiveStore
     from catchuparr.native_output_security import create_native_capability
 
-    require(__version__ == "0.32.0", "Focused parity probe requires Dispatcharr 0.32.0")
+    require(__version__ == "0.33.0", "Focused parity probe requires Dispatcharr 0.33.0")
     require(not Channel.objects.exists() and not User.objects.exists(),
             "Focused parity probe requires a clean disposable AIO database")
 

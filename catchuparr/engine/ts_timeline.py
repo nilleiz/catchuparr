@@ -1,8 +1,8 @@
 """Length-preserving MPEG-TS clock mapping for a bounded archive resource.
 
 Archive segments may originate from separate muxer runs. Map their PES and
-PCR clocks onto archive time without altering encoded media or byte offsets.
-Missing archive time remains a forward clock jump, never replayed live media.
+PCR clocks onto a continuous available-media timeline without altering encoded
+media or byte offsets. Missing archive time is skipped, not replaced by media.
 """
 from __future__ import annotations
 
@@ -10,11 +10,14 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from .store import TIMELINE_GAP_TOLERANCE_SECONDS
+
 PACKET_BYTES = 188
 CLOCK_HZ = 90_000
 CLOCK_WRAP = 1 << 33
 BASE_CLOCK = 3600 * CLOCK_HZ
 PROBE_BYTES = PACKET_BYTES * 4096
+TRANSITION_GUARD_SECONDS = 0.1
 
 
 def _payload(packet):
@@ -117,6 +120,48 @@ class SegmentClock:
                     _write_pts(packet, at + 5, _read_pts(packet, at + 5) + self.offset)
             result[index:index + PACKET_BYTES] = packet
         return bytes(result)
+
+
+class PlaybackClockMap:
+    """Map successive archive segments while keeping each muxer's own clock.
+
+    A new independent muxer can carry audio slightly before its first video
+    PTS. A small guard at an explicit reset keeps that overlap away from the
+    preceding muxer; genuine missing archive time is skipped in playback.
+    """
+
+    def __init__(self, origin: float):
+        self.origin = float(origin)
+        self.elapsed = None
+        self.previous_end = None
+        self.group_offset = None
+
+    def append(self, segment, path: Path) -> SegmentClock | None:
+        start = segment.start_utc.timestamp()
+        end = segment.end_utc.timestamp()
+        boundary = self.previous_end is not None and (
+            segment.discontinuity or start > self.previous_end + TIMELINE_GAP_TOLERANCE_SECONDS
+        )
+        if self.elapsed is None:
+            self.elapsed = start - self.origin
+        elif boundary:
+            self.elapsed += TRANSITION_GUARD_SECONDS
+        try:
+            probe = SegmentClock.probe(path, self.elapsed)
+        except (OSError, ValueError):
+            probe = None
+        if probe is None:
+            self.group_offset = None
+            result = None
+        else:
+            if self.group_offset is None or boundary:
+                self.group_offset = probe.offset
+            # Every MPEG-TS file can restart transport continuity counters,
+            # even when its media clock continues within the same FFmpeg run.
+            result = SegmentClock(self.group_offset, probe.discontinuity_packets)
+        self.elapsed += end - start
+        self.previous_end = end if self.previous_end is None else max(self.previous_end, end)
+        return result
 
 
 @lru_cache(maxsize=8192)

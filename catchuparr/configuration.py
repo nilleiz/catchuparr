@@ -1604,6 +1604,9 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
     native_output_catchup = settings.get("native_output_catchup", False)
     if type(native_output_catchup) is not bool:
         raise ValueError("native_output_catchup must be boolean")
+    synchronize_before_switch = settings.get("synchronize_before_switch", False)
+    if type(synchronize_before_switch) is not bool:
+        raise ValueError("synchronize_before_switch must be boolean")
     applicable: dict[str, Any] = {
         "archive_root": str(parsed.archive_root),
         "retention_hours": parsed.retention_hours,
@@ -1614,6 +1617,7 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
         "show_archive_playback_in_stats": show_archive_playback,
         "hide_recorders_in_stats": hide_recorders,
         "native_output_catchup": native_output_catchup,
+        "synchronize_before_switch": synchronize_before_switch,
     }
     raw_user_id = settings.get("playback_user_id")
     if isinstance(raw_user_id, bool):
@@ -2015,6 +2019,7 @@ def _validate_active_document(data: dict[str, Any]) -> None:
                 "recording_enabled", "log_level", "public_base_url",
                 "show_archive_playback_in_stats", "hide_recorders_in_stats",
                 "native_output_catchup", "native_output_key_id",
+                "synchronize_before_switch",
             }
         )
     if version >= 7:
@@ -2133,6 +2138,11 @@ def _validate_active_document(data: dict[str, Any]) -> None:
             and type(settings["native_output_catchup"]) is not bool
         ):
             raise ValueError("Active Catchuparr native_output_catchup is invalid")
+        if (
+            "synchronize_before_switch" in settings
+            and type(settings["synchronize_before_switch"]) is not bool
+        ):
+            raise ValueError("Active Catchuparr synchronize_before_switch is invalid")
         key_id = settings.get("native_output_key_id")
         if key_id is not None and not native_key_id_valid(key_id):
             raise ValueError("Active Catchuparr native output key ID is invalid")

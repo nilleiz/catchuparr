@@ -47,6 +47,8 @@ class ConfigurationTests(unittest.TestCase):
         for key in configuration.GLOBAL_SHARING_DEFAULTS:
             snapshot["settings"].pop(key, None)
         snapshot["settings"].pop("connection_sharing_migration_confirmed", None)
+        if version < 4:
+            snapshot["settings"].pop("synchronize_before_switch", None)
 
     def write_v6_sharing_snapshot(self, per_channel_values):
         snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
@@ -774,6 +776,7 @@ class ConfigurationTests(unittest.TestCase):
             ("show_archive_playback_in_stats", "false"),
             ("hide_recorders_in_stats", 1),
             ("native_output_catchup", "false"),
+            ("synchronize_before_switch", "false"),
         ):
             with self.subTest(key=key, value=value):
                 document = json.loads(json.dumps(valid_document))
@@ -784,6 +787,39 @@ class ConfigurationTests(unittest.TestCase):
                 self.active_path.write_text(json.dumps(document), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, key):
                     load_active_configuration(self.active_path)
+
+    def test_switch_synchronization_is_boolean_and_only_changes_after_apply(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        original = load_active_configuration(self.active_path)
+        self.assertIs(original["synchronize_before_switch"], False)
+        enabled = dict(self.settings, synchronize_before_switch=True)
+        validate_configuration(enabled, self.catalog, self.active_path)
+        self.assertIs(load_active_configuration(self.active_path)["synchronize_before_switch"], False)
+        apply_configuration(enabled, self.catalog, self.active_path)
+        active = load_active_configuration(self.active_path)
+        self.assertIs(active["synchronize_before_switch"], True)
+        self.assertNotEqual(
+            configuration.active_configuration_generation(original),
+            configuration.active_configuration_generation(active),
+        )
+        with self.assertRaisesRegex(ValueError, "synchronize_before_switch must be boolean"):
+            validate_configuration(
+                dict(self.settings, synchronize_before_switch="true"), self.catalog, self.active_path,
+            )
+
+    def test_preexisting_snapshot_without_sync_option_stays_readable(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+        snapshot["settings"].pop("synchronize_before_switch")
+        self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        active = load_active_configuration(self.active_path)
+        sidecar_path = self.active_path.with_name(".catchuparr-recorder-control.json")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["configuration_generation"] = configuration.active_configuration_generation(active)
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+        restored, control = load_applied_state(self.active_path)
+        self.assertFalse(restored.get("synchronize_before_switch", False))
+        self.assertEqual(control.configuration_generation, configuration.active_configuration_generation(restored))
 
     def test_stats_settings_default_true_and_change_only_through_apply(self):
         applied = apply_configuration(self.settings, self.catalog, self.active_path)

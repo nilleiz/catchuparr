@@ -455,7 +455,7 @@ class RecordingOverviewTests(unittest.TestCase):
             result = current_recordings(
                 self.settings, None, redis_client=self.redis, now=self.now,
             )
-        self.assertEqual(result["message"], "Synthetic Channel A - — [failed: unknown]")
+        self.assertEqual(result["message"], "Synthetic Channel A - — [unconfirmed]")
         self.assertEqual(result["channels"][0]["state"], "unknown")
         self.settings["recording_schedule"] = {}
         unavailable = current_recordings(
@@ -516,7 +516,7 @@ class RecordingOverviewTests(unittest.TestCase):
         row["state"] = "cleanup_pending"
         self.assertEqual(_message_row(row), "Synthetic Channel - — [failed: cleanup-pending]")
         row["state"] = "unknown"
-        self.assertEqual(_message_row(row), "Synthetic Channel - — [failed: unknown]")
+        self.assertEqual(_message_row(row), "Synthetic Channel - — [unconfirmed]")
         row.update(state="error", error_code="unrecognized_private_error")
         self.assertEqual(_message_row(row), "Synthetic Channel - — [failed: unknown]")
         self.assertNotIn("no-tuners", _message_row(row))

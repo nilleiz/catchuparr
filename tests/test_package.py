@@ -25,9 +25,9 @@ class PackageTest(unittest.TestCase):
             self.assertFalse(any("__pycache__" in name for name in names))
             manifest = json.loads(archive.read("catchuparr/plugin.json"))
             self.assertEqual(manifest["name"], "Catchuparr")
-            self.assertEqual(manifest["version"], "0.7.1")
+            self.assertEqual(manifest["version"], "0.7.2")
             self.assertEqual(Plugin.version, manifest["version"])
-            self.assertEqual(Path(archive_path).name, "catchuparr-0.7.1.zip")
+            self.assertEqual(Path(archive_path).name, "catchuparr-0.7.2.zip")
             self.assertEqual(
                 archive.read("catchuparr/logo.png"),
                 Path("docs/assets/catchuparr-icon-256.png").read_bytes(),
@@ -36,7 +36,7 @@ class PackageTest(unittest.TestCase):
             self.assertIn("filter_config", field_ids)
             self.assertNotIn("connection_sharing_config", field_ids)
             self.assertTrue({
-                "connection_sharing_enabled", "live_stability_seconds",
+                "connection_sharing_enabled", "synchronize_before_switch", "live_stability_seconds",
                 "last_viewer_return_seconds", "min_switch_interval_seconds",
             } <= set(field_ids))
             self.assertIn("recording_enabled", field_ids)
@@ -100,6 +100,7 @@ class PackageTest(unittest.TestCase):
                 "catchuparr.adapters.sharing_reader",
                 "catchuparr.adapters.xc",
                 "catchuparr.engine.admission",
+                "catchuparr.engine.handover",
                 "catchuparr.engine.leases",
                 "catchuparr.engine.playlist",
                 "catchuparr.engine.recorder",

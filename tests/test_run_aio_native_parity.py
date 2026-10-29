@@ -97,7 +97,7 @@ class NativeParityRunnerTests(unittest.TestCase):
             _success_receipt("")
         with self.assertRaisesRegex(RuntimeError, "omitted one or more"):
             _success_receipt(
-                '{"status":"pass","dispatcharr_version":"0.32.0","cases":{}}\n'
+                '{"status":"pass","dispatcharr_version":"0.33.0","cases":{}}\n'
             )
         cases = {
             name: {
@@ -109,7 +109,7 @@ class NativeParityRunnerTests(unittest.TestCase):
         }
         receipt = {
             "status": "pass",
-            "dispatcharr_version": "0.32.0",
+            "dispatcharr_version": "0.33.0",
             "cases": cases,
             "authorization": {
                 "legacy_missing_token": 401,
