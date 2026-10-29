@@ -220,6 +220,31 @@ class ArchiveTSPlaybackTests(unittest.TestCase):
         self.assertEqual(b"".join(response.body), b"cdefghi")
         response.close()
 
+    def test_growing_range_does_not_insert_late_overlap_before_its_existing_prefix(self):
+        self.add_segment("first.ts", 0, b"abcdef")
+        clock = [0.0]
+        added = [False]
+
+        def append_during_wait(seconds):
+            clock[0] += seconds
+            if not added[0]:
+                self.add_segment("late-overlap.ts", 3, b"BADBAD")
+                self.add_segment("following.ts", 6, b"good!")
+                added[0] = True
+
+        with patch("catchuparr.ts_http.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("catchuparr.ts_http.time.sleep", side_effect=append_during_wait):
+            response = self.request(
+                range_header="bytes=6-9", live=True, live_follow_seconds=1,
+                normalize_timestamps=True,
+            )
+            try:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.headers["Content-Range"], "bytes 6-9/11")
+                self.assertEqual(b"".join(response.body), b"good")
+            finally:
+                response.close()
+
     def test_seek_reuses_and_expands_lease_backwards(self):
         early = self.add_segment("early.ts", 0, b"early!")
         late = self.add_segment("late.ts", 18, b"later!")

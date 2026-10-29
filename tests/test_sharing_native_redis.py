@@ -1700,6 +1700,24 @@ class NativeLuaRedisTests(unittest.TestCase):
         self.assertEqual(self.redis.hgetall(keys["episode"]), before_projection)
         self.assertEqual(self.redis.smembers(keys["clients"]), before_members)
 
+    def test_check_reports_fixed_rejection_category_without_mutating_grant(self):
+        self._register()
+        keys = _keys()
+        grant = read_native_episode_grant(self.redis, CHANNEL)
+        self.redis.command("SET", f"live:channel:{CHANNEL}:stopping", "1")
+        before = self.redis.hgetall(keys["episode"])
+        reasons = []
+        ok, _, _ = check_and_touch_borrowed_client(self.redis, grant, rejection_reasons=reasons)
+        self.assertFalse(ok)
+        self.assertEqual(["native-stopping"], reasons)
+        self.assertEqual(before, self.redis.hgetall(keys["episode"]))
+        self.redis.command("DEL", f"live:channel:{CHANNEL}:stopping")
+        self.redis.command("HSET", keys["episode"], "version", str(grant.version + 1))
+        reasons = []
+        ok, _, _ = check_and_touch_borrowed_client(self.redis, grant, rejection_reasons=reasons)
+        self.assertFalse(ok)
+        self.assertEqual(["episode-version"], reasons)
+
     def test_check_and_touch_executes_active_and_viewer_return_grace_transitions(self):
         self._register()
         keys = _keys()

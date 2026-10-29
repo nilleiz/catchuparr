@@ -349,6 +349,8 @@ def _message_row(row):
         status = "failed: cleanup-pending"
     elif row.get("state") == "no_media_progress":
         status = "failed: no-media"
+    elif row.get("state") == "unknown":
+        status = "unconfirmed"
     else:
         status = "failed: unknown"
     attached = row.get("state") == "recording" and row.get("recent_media_progress") is True \

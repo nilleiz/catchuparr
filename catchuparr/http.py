@@ -19,6 +19,7 @@ import time
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import quote
@@ -76,6 +77,29 @@ class _PlaylistSegment:
     @property
     def duration(self) -> float:
         return (self.end_utc - self.start_utc).total_seconds()
+
+
+@lru_cache(maxsize=16)
+def _hls_playback_groups(records: tuple):
+    """Plan append-only muxer groups without opening every archive file."""
+    from .engine.ts_timeline import TRANSITION_GUARD_SECONDS
+
+    result = {}
+    elapsed = 0.0
+    previous_end = None
+    leader = None
+    for segment_id, start, end, discontinuity, relative in records:
+        boundary = previous_end is not None and (
+            discontinuity or start > previous_end + TIMELINE_GAP_TOLERANCE_SECONDS
+        )
+        if boundary:
+            elapsed += TRANSITION_GUARD_SECONDS
+        if leader is None or boundary:
+            leader = (relative, elapsed)
+        result[segment_id] = leader
+        elapsed += end - start
+        previous_end = end if previous_end is None else max(previous_end, end)
+    return result
 
 
 SESSION_REPLACEMENT_GRACE_SECONDS = 30.0
@@ -1109,15 +1133,52 @@ class ArchiveHTTPService:
         except (OSError, ValueError):
             return _error(404, "segment not found")
 
+        clock = None
+        if path.suffix.lower() == ".ts" and size and size % 188 == 0:
+            try:
+                session = self._session_state(lease_id)
+                if session is not None:
+                    manifest = self._manifest_segments(
+                        channel_id, session["manifest_json"], [], allow_append=False,
+                    )
+                    archive_root = Path(self.store.root)
+                    records = tuple((
+                        item.id, item.start_utc.timestamp(), item.end_utc.timestamp(),
+                        item.discontinuity, str(item.path.relative_to(archive_root)),
+                    ) for item in manifest)
+                    plan = _hls_playback_groups(records).get(segment.id)
+                    if plan is not None:
+                        from .engine.ts_timeline import SegmentClock
+
+                        leader, elapsed = plan
+                        leader_path = (root / leader).resolve(strict=True)
+                        leader_path.relative_to(root)
+                        try:
+                            leader_clock = SegmentClock.probe(leader_path, elapsed)
+                            target_clock = (
+                                leader_clock if path == leader_path
+                                else SegmentClock.probe(path, elapsed)
+                            )
+                        except ValueError:
+                            leader_clock = target_clock = None
+                        if leader_clock is not None and target_clock is not None:
+                            clock = SegmentClock(leader_clock.offset, target_clock.discontinuity_packets)
+            except (OSError, ValueError, TypeError, sqlite3.Error):
+                return _error(503, "archive timeline temporarily unavailable")
+
         content_type = (
             "video/mp2t" if path.suffix.lower() == ".ts"
             else mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         )
+        etag = segment.id
+        if clock is not None:
+            clock_key = f"{segment.id}:hls-clock-v2:{clock.offset}:{clock.discontinuity_packets}"
+            etag = hashlib.sha256(clock_key.encode()).hexdigest()
         headers = {
             "Accept-Ranges": "bytes",
             "Cache-Control": "private, max-age=31536000, immutable",
             "Content-Type": content_type,
-            "ETag": f'"{segment.id}"',
+            "ETag": f'"{etag}"',
             "X-Content-Type-Options": "nosniff",
         }
         if selected is None:
@@ -1130,9 +1191,14 @@ class ArchiveHTTPService:
             return HTTPResponse(status, headers, playback_lease_id=lease_id)
         try:
             with path.open("rb") as source:
-                source.seek(offset)
-                body = source.read(length)
-        except OSError:
+                if clock is not None:
+                    from .engine.ts_timeline import mapped_chunks
+
+                    body = b"".join(mapped_chunks(source, offset, length, clock))
+                else:
+                    source.seek(offset)
+                    body = source.read(length)
+        except (OSError, ValueError):
             return _error(404, "segment not found")
         if len(body) != length:
             # Files are immutable after publication; a short read indicates a

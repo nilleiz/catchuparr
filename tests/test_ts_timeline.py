@@ -8,6 +8,7 @@ from catchuparr.engine.ts_timeline import (
     BASE_CLOCK,
     CLOCK_HZ,
     CLOCK_WRAP,
+    PlaybackClockMap,
     SegmentClock,
     _pes_clock,
     _read_pts,
@@ -79,12 +80,23 @@ class TransportClockTests(unittest.TestCase):
             from catchuparr.ts_http import ArchiveTSPlaybackService
             store = ArchiveStore(root / "archive")
             start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            stored = []
             for index, offset in enumerate((0, 12)):
                 path = root / f"synthetic-copy-{index}.ts"
                 path.write_bytes(original)
-                store.add_segment("synthetic", path, start + timedelta(seconds=offset),
-                                  start + timedelta(seconds=offset + 2),
-                                  discontinuity=bool(index))
+                stored.append(store.add_segment(
+                    "synthetic", path, start + timedelta(seconds=offset),
+                    start + timedelta(seconds=offset + 2), discontinuity=bool(index),
+                ))
+            mapper = PlaybackClockMap(start.timestamp())
+            available_parts = []
+            for item in stored:
+                clock = mapper.append(item, item.path)
+                with item.path.open("rb") as file:
+                    available_parts.append(b"".join(mapped_chunks(file, 0, len(original), clock)))
+            available = b"".join(available_parts)
+            compact = root / "available.ts"
+            compact.write_bytes(available)
             tokens = TokenStore(store.root)
             token = tokens.create("synthetic-viewer")
             service = ArchiveTSPlaybackService(
@@ -99,7 +111,8 @@ class TransportClockTests(unittest.TestCase):
                 session_id="programme", normalize_timestamps=True,
             )
             self.assertEqual(normalized.status, 200)
-            self.assertEqual(b"".join(normalized), combined.read_bytes())
+            self.assertEqual(normalized.headers["X-Catchuparr-Archive-Timeline"], "available-media")
+            self.assertEqual(b"".join(normalized), available)
             normalized.close()
             ranged = service.stream(
                 token, "synthetic", start, start + timedelta(seconds=30),
@@ -107,7 +120,7 @@ class TransportClockTests(unittest.TestCase):
                 range_header=f"bytes={len(original) + 191}-{len(original) + 500}",
             )
             self.assertEqual(ranged.status, 206)
-            self.assertEqual(b"".join(ranged), combined.read_bytes()[len(original) + 191:len(original) + 501])
+            self.assertEqual(b"".join(ranged), available[len(original) + 191:len(original) + 501])
             ranged.close()
             with source.open("rb") as file:
                 selected = b"".join(mapped_chunks(file, 191, len(original) - 388, following))
@@ -117,6 +130,11 @@ class TransportClockTests(unittest.TestCase):
                 "-of", "default=nw=1:nk=1", str(combined),
             ], check=True, capture_output=True, text=True)
             self.assertAlmostEqual(float(result.stdout), 14.0, delta=0.15)
+            compact_duration = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1", str(compact),
+            ], check=True, capture_output=True, text=True)
+            self.assertAlmostEqual(float(compact_duration.stdout), 4.1, delta=0.15)
             def decoded_frames(path):
                 decoded = subprocess.run([
                     "ffmpeg", "-v", "error", "-xerror", "-i", str(path), "-map", "0",
@@ -130,6 +148,7 @@ class TransportClockTests(unittest.TestCase):
                 return streams
             original_frames = decoded_frames(source)
             programme_frames = decoded_frames(combined)
+            self.assertEqual(decoded_frames(compact), programme_frames)
             self.assertEqual(len(programme_frames["0"]), 100)
             self.assertEqual(programme_frames["0"], original_frames["0"] * 2)
             for stream, frames in original_frames.items():
@@ -157,7 +176,7 @@ class TransportClockTests(unittest.TestCase):
             appended.write_bytes(original)
             store.add_segment("growing", appended, start + timedelta(seconds=12),
                               start + timedelta(seconds=14), discontinuity=True)
-            self.assertEqual(beginning + b"".join(iterator), combined.read_bytes())
+            self.assertEqual(beginning + b"".join(iterator), available)
             growing.close()
             unknown = root / "clockless.ts"
             unknown.write_bytes(b"\x47" + bytes(187))

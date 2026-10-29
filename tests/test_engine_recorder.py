@@ -12,6 +12,7 @@ from catchuparr.engine import ArchiveStore
 from catchuparr.engine.recorder import (
     FFmpegCopyRecorder,
     RecorderAttemptSwitch,
+    _wait_for_switch_or_stop,
     has_useful_transport_stream,
 )
 
@@ -239,6 +240,76 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(1, result.useful_segments)
         self.assertEqual(["terminate", "wait"], events)
         self.assertEqual(1, len(self.store.segments("ch1")))
+
+    def test_switch_interrupts_segment_poll_without_waiting_for_poll_interval(self):
+        switch = RecorderAttemptSwitch()
+        stop = threading.Event()
+        waiting = threading.Event()
+        completed = threading.Event()
+        outcome = []
+
+        class RunningProcess:
+            def __init__(self, *_args, **_kwargs):
+                self.return_code = None
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self):
+                self.return_code = -15
+
+            def wait(self, timeout=None):
+                return self.return_code
+
+            def kill(self):
+                self.return_code = -9
+
+        wait = switch.wait
+
+        def observed_wait(timeout):
+            waiting.set()
+            return wait(timeout)
+
+        def record():
+            try:
+                outcome.append(self.recorder.run_candidate(
+                    stop, attempt_switch=switch, poll_interval=30,
+                ))
+            finally:
+                completed.set()
+
+        with patch("catchuparr.engine.recorder.subprocess.Popen", RunningProcess), \
+                patch.object(switch, "wait", side_effect=observed_wait):
+            thread = threading.Thread(target=record)
+            thread.start()
+            try:
+                self.assertTrue(waiting.wait(2), "recorder never reached its poll wait")
+                switch.request()
+                self.assertTrue(completed.wait(2), "switch did not wake the recorder")
+            finally:
+                stop.set()
+                switch.request()
+                thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome[0].status, "switch_requested")
+        self.assertEqual(outcome[0].attempt_switch_id, switch.attempt_id)
+
+    def test_owner_stop_interrupts_a_long_switch_wait(self):
+        stop = threading.Event()
+        switch = RecorderAttemptSwitch()
+        completed = threading.Event()
+        thread = threading.Thread(target=lambda: (
+            _wait_for_switch_or_stop(stop, switch, 30), completed.set(),
+        ))
+        thread.start()
+        try:
+            stop.set()
+            self.assertTrue(completed.wait(2), "owner stop did not wake the recorder")
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(switch.is_set())
 
     def test_attempt_switch_terminates_only_current_ffmpeg_and_blocks_late_old_rows(self):
         events = []

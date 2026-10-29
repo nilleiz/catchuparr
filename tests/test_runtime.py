@@ -16,7 +16,7 @@ from catchuparr.runtime import require_supported_version, status
 
 class RuntimeStatusTests(unittest.TestCase):
     def _status_with_celery_probe(self, active, *, paused=False, schedule=None, probe_error=None):
-        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        channel = "00000000-0000-4000-8000-000000000033"
         celery = types.ModuleType("celery")
 
         class Inspector:
@@ -164,7 +164,7 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual([(Path("/tmp/synthetic-catchuparr"), 9)], issued)
 
     def test_status_reports_last_segment_and_storage_usage(self):
-        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        channel = "00000000-0000-4000-8000-000000000033"
         with tempfile.TemporaryDirectory() as directory, patch(
             "catchuparr.recorder_control.load_recorder_control",
             return_value=RecorderControlState(False, 0),
@@ -195,7 +195,7 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertIn("in an unknown state", result["message"])
 
     def test_status_uses_active_celery_recording_tasks_not_recorder_leases(self):
-        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        channel = "00000000-0000-4000-8000-000000000033"
         running = self._status_with_celery_probe({"worker-a": [{
             "name": "catchuparr.record_channel", "args": [channel, "synthetic-config", 1],
         }]})
@@ -222,7 +222,7 @@ class RuntimeStatusTests(unittest.TestCase):
                 self.assertIn("in an unknown state", result["message"])
 
     def test_status_reports_schedule_and_pause_eligibility_reasons(self):
-        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        channel = "00000000-0000-4000-8000-000000000033"
         outside_schedule = self._status_with_celery_probe(
             {"worker-a": []},
             schedule={"timezone": "UTC", "channels": {channel: {
@@ -236,12 +236,12 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual("paused", paused["channels"][0]["recorder_reason"])
 
     def test_runtime_version_matrix(self):
-        for version in ("0.32.0", "0.32.1", "0.33.0", "1.0.0"):
+        for version in ("0.33.0", "0.33.1", "0.34.0", "1.0.0"):
             with self.subTest(version=version), patch.dict(
                 sys.modules, {"version": types.SimpleNamespace(__version__=version)}
             ):
                 require_supported_version()
-        for version in ("0.31.9", "0.32.0-rc.1", "not-a-version"):
+        for version in ("0.31.9", "0.32.0", "0.32.99", "0.33.0-rc.1", "not-a-version"):
             with self.subTest(version=version), patch.dict(
                 sys.modules, {"version": types.SimpleNamespace(__version__=version)}
             ):
@@ -296,7 +296,7 @@ class RuntimeStatusTests(unittest.TestCase):
         models.PluginConfig = type("PluginConfig", (), {"objects": Manager()})
         plugins.models = models
         apps.plugins = plugins
-        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        channel = "00000000-0000-4000-8000-000000000033"
         active = {
             "channel_uuids": channel,
             "archive_root": "/tmp/synthetic-active-root",
@@ -334,7 +334,7 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertIn("apply filter_config", result["configuration_status"])
 
     def test_status_exposes_recording_control_without_affecting_archive_stats(self):
-        channel = "33ef4df1-b5b2-4e0c-a1c4-97f6ae6dbb47"
+        channel = "00000000-0000-4000-8000-000000000033"
         with tempfile.TemporaryDirectory() as directory:
             result = status({
                 "channel_uuids": channel,

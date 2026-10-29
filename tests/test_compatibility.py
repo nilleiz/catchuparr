@@ -6,14 +6,14 @@ from catchuparr.compatibility import is_supported_dispatcharr_version
 class DispatcharrMinimumVersionTests(unittest.TestCase):
     def test_accepts_minimum_and_newer_stable_versions(self):
         for version in (
-            "0.32.0", "0.32.1", "0.33.0", "1.0.0", "0.32.0+build.7",
-            "0.33.0-alpha.2",
+            "0.33.0", "0.33.1", "0.34.0", "1.0.0", "0.33.0+build.7",
+            "0.34.0-alpha.2",
         ):
             with self.subTest(version=version):
                 self.assertTrue(is_supported_dispatcharr_version(version))
 
     def test_rejects_versions_below_minimum_and_minimum_prereleases(self):
-        for version in ("0.31.9", "0.32.0-alpha", "0.32.0-rc.1"):
+        for version in ("0.31.9", "0.32.0", "0.32.99", "0.33.0-alpha", "0.33.0-rc.1"):
             with self.subTest(version=version):
                 self.assertFalse(is_supported_dispatcharr_version(version))
 
