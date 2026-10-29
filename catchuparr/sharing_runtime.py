@@ -748,7 +748,7 @@ class RecorderBorrowCoordinator:
                 self.state_record = current
                 return True
             if (current.intent != token
-                    or current.state.phase.value != "wait_return"
+                    or current.state.phase not in {SharingPhase.WAIT_RETURN, SharingPhase.FAILED}
                     or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED
                     or current.state.intent_epoch != token.intent_epoch):
                 return False
