@@ -176,7 +176,82 @@ class RecorderMediaProbeTests(unittest.TestCase):
         self.assertFalse(ready)
         self.assertIs(evidence, task_failure)
 
-    def test_both_borrow_gates_use_shared_readiness_proof(self):
+    def test_synchronized_borrow_waits_for_consumed_reader_and_exact_provider_cleanup(self):
+        base = {
+            "previous_client_is_distinct": True,
+            "recorder_client_verified": True,
+            "native_registration_present": True,
+            "native_manager_running": True,
+            "native_owner_present": True,
+            "native_owner_matches_expected": True,
+            "source_metadata_matches_expected": True,
+            "global_native_client_count": 2,
+            "local_native_client_count": 1,
+            "source_a_request_delta": 1,
+            "source_a_active_count": 1,
+            "source_b_active_count": 1,
+            "task_alive": True,
+            "task_has_no_unexpected_failure": True,
+            "stage": "after_synchronized_handover",
+        }
+
+        def snapshot(*, source_b_active_count=1, staged_reader_count=0,
+                     staged_reader_matched=False, staged_reader_consumed=False,
+                     source_b_request_delta=1, source_a_request_delta=1):
+            native = probe._healthy_borrow_gate_snapshot(**(
+                base | {"source_b_active_count": source_b_active_count,
+                        "source_a_request_delta": source_a_request_delta}
+            ))
+            return probe._synchronized_borrow_gate_snapshot(
+                native, staged_reader_count=staged_reader_count,
+                staged_reader_matched=staged_reader_matched,
+                staged_reader_consumed=staged_reader_consumed,
+                source_b_request_delta=source_b_request_delta,
+            )
+
+        # Registration alone is insufficient: B remains intentionally active
+        # during the overlap, then the staged reader must actually be consumed.
+        overlap = snapshot()
+        draining = snapshot(staged_reader_count=1)
+        unconsumed = snapshot(source_b_active_count=0, staged_reader_count=1)
+        complete = snapshot(source_b_active_count=0, staged_reader_count=1,
+                            staged_reader_consumed=True)
+        self.assertTrue(complete["healthy_borrow_gate_passed"])
+        self.assertFalse(any(s["healthy_borrow_gate_passed"]
+                             for s in (overlap, draining, unconsumed)))
+        states = iter((overlap, draining, unconsumed, complete))
+        now = [0.0]
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: next(states), 1, monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+        self.assertTrue(ready)
+        self.assertEqual(evidence, complete)
+
+        for rejected in (
+            snapshot(source_a_request_delta=2),
+            snapshot(source_b_request_delta=2),
+            snapshot(source_b_active_count=2),
+            snapshot(staged_reader_count=2),
+            snapshot(staged_reader_count=1, staged_reader_matched=True),
+        ):
+            with self.subTest(rejected=rejected):
+                ready, evidence = probe._wait_for_healthy_borrow_gate(
+                    lambda: rejected, 1,
+                    sleep=lambda _delay: self.fail("unsafe handover must fail immediately"),
+                )
+                self.assertFalse(ready)
+                self.assertEqual(evidence, rejected)
+
+        now[0] = 0.0
+        ready, evidence = probe._wait_for_healthy_borrow_gate(
+            lambda: unconsumed, 0.2, monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+        self.assertFalse(ready)
+        self.assertEqual(evidence, unconsumed)
+
+    def test_all_borrow_gates_use_shared_readiness_proof(self):
         source = Path(probe.__file__).read_text()
         tree = ast.parse(source)
         target = next(
@@ -190,7 +265,7 @@ class RecorderMediaProbeTests(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "_wait_for_healthy_borrow_gate"
         ]
-        self.assertEqual(len(readiness_calls), 2)
+        self.assertEqual(len(readiness_calls), 3)
 
     def test_failure_return_ack_requires_exact_admitted_and_normal_deadline_window(self):
         token = SimpleNamespace(

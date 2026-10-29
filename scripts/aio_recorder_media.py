@@ -3444,6 +3444,7 @@ def _wait_for_healthy_borrow_gate(
         if (
             snapshot.get("new_client_identity") is False
             or snapshot.get("exact_A_request_delta", 0) > 1
+            or snapshot.get("handover_irrecoverable") is True
             or snapshot.get("global_native_client_count", 0) > 2
             or snapshot.get("local_native_client_count", 0) > 1
             or snapshot.get("task_alive") is False
@@ -3454,6 +3455,34 @@ def _wait_for_healthy_borrow_gate(
         if remaining <= 0:
             return False, snapshot
         sleep(min(poll_interval, remaining))
+
+
+def _synchronized_borrow_gate_snapshot(
+    snapshot, *, staged_reader_count, staged_reader_matched,
+    staged_reader_consumed, source_b_request_delta,
+):
+    """Require the real staged reader to be consumed after the old source drains."""
+    result = dict(snapshot)
+    result.update({
+        "staged_reader_count": int(staged_reader_count),
+        "staged_reader_matched": bool(staged_reader_matched),
+        "staged_reader_consumed": bool(staged_reader_consumed),
+        "exact_B_request_delta": int(source_b_request_delta),
+    })
+    result["handover_irrecoverable"] = bool(
+        staged_reader_count > 1
+        or (staged_reader_count == 1 and staged_reader_matched)
+        or source_b_request_delta > 1
+        or result.get("B_active_count", 0) > 1
+    )
+    result["healthy_borrow_gate_passed"] = bool(
+        result.get("healthy_borrow_gate_passed")
+        and staged_reader_count == 1
+        and not staged_reader_matched
+        and staged_reader_consumed
+        and source_b_request_delta == 1
+    )
+    return result
 
 
 def _failure_cleanup_ack_conditions(
@@ -6646,7 +6675,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 raise RuntimeError("Recorder failed while resuming allowed source B")
             gevent_sleep(0.1)
         _require(
-            len(source_server.request_times("source-b.ts")) > share_b_request_baseline
+            len(source_server.request_times("source-b.ts")) == share_b_request_baseline + 1
             and resumed_active["source-a.ts"] == 0
             and resumed_active["source-b.ts"] == 1,
             "Recorder did not resume the allowed B source after the paused episode",
@@ -6704,6 +6733,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             source_server.snapshot()[0]["source-a.ts"] == second_cycle_a_baseline + 1,
             "Second-cycle viewer did not open exactly one native A connection",
         )
+        second_native_manager = native_server.stream_managers.get(worker_id)
+        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
         second_borrow_headers = None
         second_cycle_deadline = time.monotonic() + 90
         while time.monotonic() < second_cycle_deadline:
@@ -6735,28 +6767,75 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and catchuparr_stats._is_recorder_client(worker_id, second_borrow_client_id),
             "Second borrow did not create a distinct verified recorder reader",
         )
-        second_native_manager = native_server.stream_managers.get(worker_id)
-        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
-        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
-        second_source_counts, second_active_counts = source_server.snapshot()
-        _require(
-            second_native_manager is not None and second_native_manager.running
-            and second_native_owner is not None
-            and second_source_counts["source-a.ts"] == second_cycle_a_baseline + 1
-            and second_active_counts["source-a.ts"] == 1
-            and second_active_counts["source-b.ts"] == 0,
-            "Second borrow opened an extra provider source instead of reading A",
+        def second_synchronized_borrow_snapshot():
+            with run_share._lock:
+                task_alive = run_share.thread is not None and run_share.thread.is_alive()
+                task_has_no_unexpected_failure = not run_share.failures
+                staged_switches = [
+                    result.staged_input for result in run_share.results
+                    if getattr(result, "staged_input", None) is not None
+                ]
+            registered = {
+                _redis_text(value)
+                for value in redis_client.smembers(RedisKeys.clients(worker_id))
+            }
+            client_manager = native_server.client_managers.get(worker_id)
+            local_count = int(client_manager.get_client_count()) if client_manager else -1
+            native_manager = native_server.stream_managers.get(worker_id)
+            owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+            source_counts, active_counts = source_server.snapshot()
+            snapshot = _healthy_borrow_gate_snapshot(
+                previous_client_is_distinct=second_borrow_client_id != borrow_client_id,
+                recorder_client_verified=catchuparr_stats._is_recorder_client(
+                    worker_id, second_borrow_client_id,
+                ),
+                native_registration_present=bool(
+                    second_borrow_client_id in registered
+                    and redis_client.exists(
+                        f"live:channel:{worker_id}:clients:{second_borrow_client_id}"
+                    )
+                ),
+                native_manager_running=bool(
+                    native_manager is second_native_manager
+                    and native_manager is not None and native_manager.running
+                ),
+                native_owner_present=owner is not None,
+                native_owner_matches_expected=bool(
+                    owner is not None and owner == second_native_owner
+                ),
+                source_metadata_matches_expected=(
+                    _native_source_metadata(redis_client, metadata_key) == second_source_metadata
+                ),
+                global_native_client_count=len(registered),
+                local_native_client_count=local_count,
+                source_a_request_delta=source_counts["source-a.ts"] - second_cycle_a_baseline,
+                source_a_active_count=active_counts["source-a.ts"],
+                source_b_active_count=active_counts["source-b.ts"],
+                task_alive=task_alive,
+                task_has_no_unexpected_failure=task_has_no_unexpected_failure,
+                stage="after_synchronized_handover",
+            )
+            return _synchronized_borrow_gate_snapshot(
+                snapshot,
+                staged_reader_count=len(staged_switches),
+                staged_reader_matched=bool(staged_switches and staged_switches[0].matched),
+                staged_reader_consumed=bool(staged_switches and staged_switches[0].consumed),
+                source_b_request_delta=source_counts["source-b.ts"] - share_b_request_baseline,
+            )
+
+        from catchuparr.engine.recorder import SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS
+
+        handover_timeout = SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS + _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
         )
-        with run_share._lock:
-            staged_switches = [
-                result.staged_input for result in run_share.results
-                if getattr(result, "staged_input", None) is not None
-            ]
-        _require(
-            len(staged_switches) == 1
-            and not staged_switches[0].matched
-            and staged_switches[0].consumed,
-            "Different synthetic sources did not retain one staged reader for safe fallback",
+        second_borrow_ready, second_borrow_evidence = _wait_for_healthy_borrow_gate(
+            second_synchronized_borrow_snapshot, handover_timeout, sleep=gevent_sleep,
+        )
+        _require_with_failure_diagnostic(
+            second_borrow_ready,
+            "Synchronized borrow did not complete the exact A handover and B cleanup",
+            lambda: second_borrow_evidence,
         )
         second_borrowed_ids = {
             segment.id for segment in store.segments(worker_id)
