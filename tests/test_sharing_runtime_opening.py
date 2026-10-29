@@ -1159,6 +1159,54 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             ))
         self.assertEqual(270.0, self.intent_ledger.read(CHANNEL).state.last_switch_at)
 
+    def test_failure_return_ack_retries_without_stopping_current_recorder(self):
+        coordinator, _opening, pending, receipt = self._pending_return(outcome="failure")
+        self.assertEqual(SharingPhase.FAILED, pending.state.phase)
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        attempt_state = {
+            "attempt": attempt, "return_prepared": receipt,
+            "return_token": pending.intent, "return_media_at": None,
+            "completed_return_media": None,
+        }
+        stop_event = threading.Event()
+        fake_celery = types.ModuleType("celery")
+        fake_celery.shared_task = lambda *, name: lambda function: function
+        with patch.dict(sys.modules, {"celery": fake_celery}):
+            tasks = importlib.import_module("catchuparr.tasks")
+
+        # Failure recovery must still reject unconfirmed cleanup or a stale lease.
+        with self._return_guards(coordinator, cleanup=False):
+            self.assertFalse(coordinator.return_ack_retryable(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+        with self._return_guards(coordinator, lease=False):
+            self.assertFalse(coordinator.return_ack_retryable(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+
+        with self._return_guards(coordinator), patch.object(
+            self.intent_ledger, "save", side_effect=OSError("synthetic pre-commit failure"),
+        ), patch("catchuparr.logging_utils.error"):
+            self.assertFalse(tasks._complete_return_media(
+                threading.RLock(), attempt_state, coordinator, stop_event,
+                attempt, receipt, pending.intent, candidate, 270.0,
+            ))
+            self.assertFalse(stop_event.is_set())
+            self.assertEqual(pending.intent, self.intent_ledger.read(CHANNEL).intent)
+
+        with self._return_guards(coordinator):
+            self.assertTrue(tasks._complete_return_media(
+                threading.RLock(), attempt_state, coordinator, stop_event,
+                attempt, receipt, pending.intent, candidate, 271.0,
+            ))
+        committed = self.intent_ledger.read(CHANNEL)
+        self.assertFalse(stop_event.is_set())
+        self.assertEqual(pending.revision + 1, committed.revision)
+        self.assertEqual(SharingPhase.FAILED, committed.state.phase)
+        self.assertEqual(270.0, committed.state.last_switch_at)
+        self.assertIsNone(committed.intent)
+
     def test_same_lease_receipt_and_media_ack_fail_closed_on_stale_proof(self):
         coordinator, opening, pending, receipt = self._pending_return()
         self.assertIsNotNone(receipt)
