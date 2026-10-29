@@ -7189,7 +7189,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         return_ack_events = []
         return_ack_snapshots = []
         return_ack_lock = threading.Lock()
-        failure_observation_gate = {"held": False, "blocked": 0, "ack_at": None}
+        failure_observation_gate = {"held": False, "blocked": 0, "ack_at": None, "prepared_at": None}
         real_acknowledge_return_media = RecorderBorrowCoordinator.acknowledge_return_media
         real_coordinator_poll = RecorderBorrowCoordinator.poll
 
@@ -7225,7 +7225,12 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 if ("supervisor_ack" in return_ack_events
                         and "poll_after_supervisor_ack" not in return_ack_events):
                     return_ack_events.append("poll_after_supervisor_ack")
-            return real_coordinator_poll(self, **kwargs)
+            prepared = real_coordinator_poll(self, **kwargs)
+            with return_ack_lock:
+                if (prepared is not None and failure_observation_gate["ack_at"] is not None
+                        and failure_observation_gate["prepared_at"] is None):
+                    failure_observation_gate["prepared_at"] = time.time()
+            return prepared
 
         def read_return_ack_events():
             with return_ack_lock:
@@ -7640,6 +7645,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and failure_return_token.not_before >= failure_media_at,
             "Failure RETURN did not bypass only the persisted admission deadline",
         )
+        from catchuparr.engine.recorder import SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS
+
+        # This scenario deliberately holds the viewer observation until the
+        # dedicated media ACK. The enabled overlap attempt may then stage the
+        # target for its normal bounded interval while the old input records.
+        # Check prompt *admission* separately from that configured staging.
+        failure_recovery_window = 20.0 + SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS
 
         def fast_recovery_snapshot():
             with run_restart._lock:
@@ -7656,6 +7668,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 failure_ack_committed = "supervisor_ack" in return_ack_events
                 target_was_temporarily_unavailable = failure_observation_gate["blocked"] > 0
                 failure_ack_at = failure_observation_gate["ack_at"]
+                failure_prepared_at = failure_observation_gate["prepared_at"]
             recovered_at = borrowed[1][1] if len(borrowed) >= 2 else None
             return {
                 "conditions": {
@@ -7663,15 +7676,15 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     "failure_return_ack_committed": failure_ack_committed,
                     "target_was_temporarily_unavailable": target_was_temporarily_unavailable,
                     "prompt_after_return_ack": (
-                        recovered_at is not None and failure_ack_at is not None
-                        and 0 <= recovered_at - failure_ack_at <= 5.0
+                        failure_prepared_at is not None and failure_ack_at is not None
+                        and 0 <= failure_prepared_at - failure_ack_at <= 5.0
                     ),
                     "before_normal_cooldown": (
                         recovered_at is not None and recovered_at < ordinary_return_deadline
                     ),
                     "within_fast_recovery_window": (
                         recovered_at is not None
-                        and 0 <= recovered_at - failure_return_token.not_before <= 20.0
+                        and 0 <= recovered_at - failure_return_token.not_before <= failure_recovery_window
                     ),
                     "task_alive": task_alive,
                     "task_has_no_unexpected_failure": no_failures,
@@ -7680,7 +7693,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             }
 
         fast_recovery_ready, fast_recovery = _wait_for_readiness_snapshot(
-            fast_recovery_snapshot, 20.0,
+            fast_recovery_snapshot, failure_recovery_window,
             monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
         )
         _require_with_failure_diagnostic(
