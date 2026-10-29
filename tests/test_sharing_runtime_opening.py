@@ -685,6 +685,70 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertIsNone(coordinator.state_record.intent)
         self.assertGreater(coordinator.state_record.state.intent_epoch, self.saved.state.intent_epoch)
 
+    def test_closed_failed_opening_retries_without_switch_or_stability_cooldowns(self):
+        saved = self.intent_ledger.save(
+            replace(self.saved.state, last_switch_at=199.0),
+            action=SharingAction.ATTACH_BORROW, expected_revision=self.saved.revision,
+            target_identity=IDENTITY, target_admitted=True, not_before=200.0, updated_at=200.0,
+        )
+        self.intent_ledger.clock = lambda: 200.0
+        self.assertTrue(self.intent_ledger.run_if_current(
+            saved.intent, fresh_validate=lambda _token: True, side_effect=lambda _token: True,
+        )[0])
+        opening = self.episode_ledger.begin_open(
+            saved.intent, lease_digest=sha256(LEASE.encode()).hexdigest(), identity=IDENTITY,
+            client_id="catchuparr-client-failed-opening-cooldown-synthetic",
+        )
+        self.episode_ledger.revoke(
+            opening.episode_id, expected_version=opening.version,
+            reason="closed", cleanup_acknowledged=True,
+        )
+        coordinator = self._pending_attach_coordinator()
+        coordinator.state_record = saved
+        coordinator.dedicated_source_available = True
+        coordinator.active["connection_sharing"][CHANNEL].update({
+            "live_stability_seconds": 30, "min_switch_interval_seconds": 90,
+        })
+        with (
+            patch("catchuparr.adapters.sharing_native.observe_native_episode_for_authority_drain",
+                  return_value=SimpleNamespace(state="known_revoked")),
+            patch("catchuparr.adapters.sharing_native.native_registration_is_absent", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=200.0),
+        ):
+            self.assertTrue(coordinator._recover_closed_attach())
+        self.assertEqual(SharingPhase.FAILED, coordinator.state_record.state.phase)
+        self.assertIsNone(coordinator.state_record.intent)
+
+        self.intent_ledger.clock = lambda: 201.0
+        opened = object()
+        effects = []
+
+        def prepare(_redis, ledger, _episodes, token, _target, **kwargs):
+            return ledger.run_if_current(
+                token, fresh_validate=kwargs["fresh_validate"],
+                side_effect=lambda _exact: effects.append(opened) or opened,
+            )
+
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant", return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation", return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog", return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.observe_native_connection", return_value=SimpleNamespace(target=target())),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged", return_value=True),
+            patch("catchuparr.sharing_runtime.prepare_borrow_opening", side_effect=prepare),
+            patch("catchuparr.sharing_runtime._django_secret", return_value=b"synthetic-secret"),
+            patch("catchuparr.sharing_runtime.time.time", return_value=201.0),
+        ):
+            self.assertIs(opened, coordinator.poll(active=coordinator.active, control_generation=2))
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+        current = self.intent_ledger.read(CHANNEL)
+        self.assertGreater(current.intent.intent_epoch, saved.intent.intent_epoch)
+        self.assertEqual(199.0, current.state.last_switch_at)
+        self.assertEqual(201.0, current.intent.not_before)
+        self.assertTrue(self.intent_ledger.claim_was_consumed(current.intent))
+        self.assertEqual([opened], effects)
+
     def test_borrow_cleanup_gate_requires_closed_episode_and_absent_native_client(self):
         from catchuparr.adapters.sharing_borrow_route import sign_borrow_capability
 
@@ -1095,6 +1159,54 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             ))
         self.assertEqual(270.0, self.intent_ledger.read(CHANNEL).state.last_switch_at)
 
+    def test_failure_return_ack_retries_without_stopping_current_recorder(self):
+        coordinator, _opening, pending, receipt = self._pending_return(outcome="failure")
+        self.assertEqual(SharingPhase.FAILED, pending.state.phase)
+        attempt = self._return_attempt()
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        attempt_state = {
+            "attempt": attempt, "return_prepared": receipt,
+            "return_token": pending.intent, "return_media_at": None,
+            "completed_return_media": None,
+        }
+        stop_event = threading.Event()
+        fake_celery = types.ModuleType("celery")
+        fake_celery.shared_task = lambda *, name: lambda function: function
+        with patch.dict(sys.modules, {"celery": fake_celery}):
+            tasks = importlib.import_module("catchuparr.tasks")
+
+        # Failure recovery must still reject unconfirmed cleanup or a stale lease.
+        with self._return_guards(coordinator, cleanup=False):
+            self.assertFalse(coordinator.return_ack_retryable(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+        with self._return_guards(coordinator, lease=False):
+            self.assertFalse(coordinator.return_ack_retryable(
+                receipt, pending.intent, attempt, candidate, media_at=270.0,
+            ))
+
+        with self._return_guards(coordinator), patch.object(
+            self.intent_ledger, "save", side_effect=OSError("synthetic pre-commit failure"),
+        ), patch("catchuparr.logging_utils.error"):
+            self.assertFalse(tasks._complete_return_media(
+                threading.RLock(), attempt_state, coordinator, stop_event,
+                attempt, receipt, pending.intent, candidate, 270.0,
+            ))
+            self.assertFalse(stop_event.is_set())
+            self.assertEqual(pending.intent, self.intent_ledger.read(CHANNEL).intent)
+
+        with self._return_guards(coordinator):
+            self.assertTrue(tasks._complete_return_media(
+                threading.RLock(), attempt_state, coordinator, stop_event,
+                attempt, receipt, pending.intent, candidate, 271.0,
+            ))
+        committed = self.intent_ledger.read(CHANNEL)
+        self.assertFalse(stop_event.is_set())
+        self.assertEqual(pending.revision + 1, committed.revision)
+        self.assertEqual(SharingPhase.FAILED, committed.state.phase)
+        self.assertEqual(270.0, committed.state.last_switch_at)
+        self.assertIsNone(committed.intent)
+
     def test_same_lease_receipt_and_media_ack_fail_closed_on_stale_proof(self):
         coordinator, opening, pending, receipt = self._pending_return()
         self.assertIsNotNone(receipt)
@@ -1284,6 +1396,75 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         self.assertEqual(failed.state.last_switch_at, current.state.last_switch_at)
         self.assertTrue(self.intent_ledger.claim_was_consumed(current.intent))
         self.assertEqual(effects, [opening])
+
+    def test_failure_remains_immediate_after_dedicated_media_ack_and_transient_viewer_loss(self):
+        coordinator, prepared, pending, _receipt = self._pending_return(outcome="failure")
+        coordinator.active["connection_sharing"][CHANNEL].update({
+            "live_stability_seconds": 30, "min_switch_interval_seconds": 90,
+        })
+        coordinator.assigned_sources = ()
+        attempt = SimpleNamespace(
+            channel_uuid=CHANNEL, config_generation="config-synthetic",
+            control_generation=2, sharing_catalog_generation="catalog-synthetic",
+            stream_id="stream-synthetic", account_id="account-synthetic",
+            sharing_authority_revision=7,
+        )
+        candidate = {"id": attempt.stream_id, "account_id": attempt.account_id}
+        with (
+            patch("catchuparr.sharing_runtime.borrow_cleanup_acknowledged", return_value=True),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.candidate_is_current", return_value=True),
+            patch("catchuparr.recorder_proxy.sharing_operation_is_current", return_value=True),
+            patch("catchuparr.recorder_proxy.current_sharing_authority_context", return_value={
+                "authority_revision": 7, "catalog_generation": "catalog-synthetic",
+            }),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+        ):
+            self.assertTrue(coordinator.acknowledge_return_media(
+                prepared, pending.intent, attempt, candidate, media_at=201.0,
+            ))
+
+        self.intent_ledger.clock = lambda: 202.0
+        opened = object()
+        effects = []
+
+        def prepare(_redis, ledger, _episodes, token, _target, **kwargs):
+            return ledger.run_if_current(
+                token, fresh_validate=kwargs["fresh_validate"],
+                side_effect=lambda _exact: effects.append(opened) or opened,
+            )
+
+        with (
+            patch("catchuparr.adapters.sharing_native.read_native_episode_grant", return_value=None),
+            patch("catchuparr.configuration._sharing_catalog_generation", return_value="catalog-synthetic"),
+            patch("catchuparr.recorder_proxy.configuration_generation", return_value="config-synthetic"),
+            patch("catchuparr.sharing_runtime._native_source_catalog", return_value=((), "catalog-synthetic")),
+            patch("catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged") as cleanup,
+            patch("catchuparr.sharing_runtime.prepare_borrow_opening", side_effect=prepare),
+            patch("catchuparr.sharing_runtime._django_secret", return_value=b"synthetic-secret"),
+            patch.object(coordinator, "_recovery_is_current", return_value=True),
+            patch("catchuparr.sharing_runtime.time.time", return_value=202.0),
+            patch("catchuparr.sharing_runtime.observe_native_connection") as native,
+        ):
+            # Failure never bypasses proof that the prior private client is gone.
+            native.return_value = SimpleNamespace(target=target())
+            cleanup.return_value = False
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+            cleanup.return_value = True
+            # A temporary unreadable/buffering viewer must not erase the
+            # exact completed failure recovery before the next observation.
+            native.return_value = None
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+            native.return_value = SimpleNamespace(target=target())
+            self.assertIs(opened, coordinator.poll(active=coordinator.active, control_generation=2))
+            self.assertIsNone(coordinator.poll(active=coordinator.active, control_generation=2))
+
+        current = self.intent_ledger.read(CHANNEL)
+        self.assertEqual(SharingAction.ATTACH_BORROW, current.intent.action)
+        self.assertEqual(202.0, current.intent.not_before)
+        self.assertEqual(201.0, current.state.last_switch_at)
+        self.assertTrue(self.intent_ledger.claim_was_consumed(current.intent))
+        self.assertEqual([opened], effects)
 
     def test_failed_borrow_without_dedicated_source_reattaches_when_viewer_exists(self):
         coordinator, _opening, failed, _receipt = self._pending_return(
@@ -1810,7 +1991,7 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             patch("catchuparr.sharing_runtime._native_source_catalog",
                   return_value=((), "catalog-synthetic")),
             patch.object(coordinator, "_recovery_is_current", return_value=True),
-            patch("catchuparr.sharing_runtime.time.time", side_effect=(260.0, 264.0, 265.0)),
+            patch("catchuparr.sharing_runtime.time.time", return_value=202.0),
             patch("catchuparr.sharing_runtime._django_secret",
                   return_value=b"failure-return-completion-synthetic-secret"),
             patch.object(sharing_runtime, "prepare_borrow_opening",
@@ -1819,17 +2000,11 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
             self.assertIsNone(coordinator.poll(
                 active=coordinator.active, control_generation=2,
             ))
-            self.assertIsNone(coordinator.poll(
-                active=coordinator.active, control_generation=2,
-            ))
-            later_attach = coordinator.poll(
-                active=coordinator.active, control_generation=2,
-            )
-        self.assertIsNotNone(later_attach)
-        self.assertEqual(
-            SharingAction.ATTACH_BORROW, self.intent_ledger.read(channel).intent.action,
-        )
-        self.assertEqual(1, prepare_opening.call_count)
+        # This fixture deliberately has no durable closed episode. Never
+        # trade the fast failure path for an unproven private-client cleanup.
+        self.assertIsNone(self.intent_ledger.read(channel).intent)
+        self.assertEqual(SharingPhase.FAILED, self.intent_ledger.read(channel).state.phase)
+        prepare_opening.assert_not_called()
 
     def test_native_viewer_grace_first_zero_time_is_persisted(self):
         current = self.intent_ledger.read(CHANNEL)
@@ -2175,6 +2350,9 @@ class SharingRuntimeOpeningTests(unittest.TestCase):
         ), patch(
             "catchuparr.sharing_runtime.observe_native_connection",
             return_value=SimpleNamespace(target=target()),
+        ), patch(
+            "catchuparr.sharing_runtime.borrow_return_cleanup_acknowledged",
+            return_value=True,
         ), patch(
             "catchuparr.sharing_runtime.prepare_borrow_opening",
             return_value=(True, prepared_sentinel),

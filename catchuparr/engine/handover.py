@@ -34,7 +34,12 @@ def _packet_fingerprints(path: Path, *, timeout: float = PROBE_TIMEOUT_SECONDS) 
             return None
         tracks = []
         for stream in streams:
-            # Subtitle, private and data tracks cannot yet be proven continuous.
+            # Subtitle tracks are independent of A/V alignment and may differ
+            # between sources. The new muxer remains a marked discontinuity;
+            # do not claim subtitle continuity from this proof.
+            if stream.get("codec_type") == "subtitle":
+                continue
+            # Unknown private and data tracks still fail closed.
             if stream.get("codec_type") not in {"video", "audio"}:
                 return None
             index = stream["index"]
@@ -71,7 +76,8 @@ def matching_completed_segments(old_path: Path, staged_path: Path, *, deadline: 
     """Prove the same complete, keyframe-aligned encoded A/V packet sequences.
 
     Distinct input clocks are allowed only when every packet in every track has
-    the same offset. Repeated static content and unsupported tracks fail closed.
+    the same offset. Repeated static content and unknown data tracks fail
+    closed. Subtitle tracks may differ and are not covered by this A/V proof.
     This proves the overlap, not availability of future input packets.
     """
     def probe(path):
