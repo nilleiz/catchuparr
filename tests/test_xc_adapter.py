@@ -85,7 +85,7 @@ def modules():
 
 class XCHookInstallTests(unittest.TestCase):
     def test_version_guard_accepts_minimum_and_newer_versions(self):
-        for version in ("0.32.0", "0.32.1", "0.33.0", "1.0.0"):
+        for version in ("0.33.0", "0.33.1", "0.34.0", "1.0.0"):
             with self.subTest(version=version):
                 output, timeshift, _ = modules()
                 result = install_xc_hooks(
@@ -96,7 +96,7 @@ class XCHookInstallTests(unittest.TestCase):
         output, timeshift, _ = modules()
         original = output._xc_channel_entry
         result = install_xc_hooks(
-            output, timeshift, dispatcharr_version="0.31.0", callbacks=XCCallbacks(),
+            output, timeshift, dispatcharr_version="0.32.0", callbacks=XCCallbacks(),
         )
         self.assertFalse(result.installed)
         self.assertIn("unsupported Dispatcharr version", result.reason)
@@ -131,13 +131,13 @@ class XCHookInstallTests(unittest.TestCase):
         self.assertTrue(second.installed)
         self.assertIs(output._xc_channel_entry, wrapper)
 
-    def test_032_m3u_hook_signature_is_guarded_without_partial_install(self):
+    def test_033_m3u_hook_signature_is_guarded_without_partial_install(self):
         output, timeshift, _ = modules()
         original_entry = output._xc_channel_entry
         output.generate_m3u = lambda request, user=None: Response("#EXTM3U\n")
 
         result = install_xc_hooks(
-            output, timeshift, dispatcharr_version="0.32.0", callbacks=XCCallbacks(),
+            output, timeshift, dispatcharr_version="0.33.0", callbacks=XCCallbacks(),
         )
 
         self.assertFalse(result.installed)
@@ -250,7 +250,7 @@ class XCHookBehaviorTests(unittest.TestCase):
         self.assertTrue(removed.installed)
         self.assertEqual((output._xc_channel_entry, output.xc_get_epg, timeshift._serve_catchup), originals)
 
-    def test_032_m3u_adds_local_template_after_core_filtering_and_preserves_provider_values(self):
+    def test_033_m3u_adds_local_template_after_core_filtering_and_preserves_provider_values(self):
         output, timeshift, calls = modules()
         provider_source = "https://provider.example/timeshift?start={utc}"
         calls["m3u_content"] = (
@@ -268,7 +268,7 @@ class XCHookBehaviorTests(unittest.TestCase):
             m3u_channel_archive_days=lambda user: {"8": 5, "9": 5},
         )
         self.assertTrue(install_xc_hooks(
-            output, timeshift, dispatcharr_version="0.32.0", callbacks=callbacks,
+            output, timeshift, dispatcharr_version="0.33.0", callbacks=callbacks,
         ).installed)
         request = Request(get={
             "username": "viewer", "password": "secret", "direct": "false",
@@ -296,7 +296,7 @@ class XCHookBehaviorTests(unittest.TestCase):
         self.assertEqual(calls["m3u"], 2)
 
     def test_newer_supported_core_m3u_keeps_utc_timestamp_contract(self):
-        for version in ("0.32.0", "0.32.1", "0.33.0", "1.0.0"):
+        for version in ("0.33.0", "0.33.1", "0.34.0", "1.0.0"):
             with self.subTest(version=version):
                 output, timeshift, calls = modules()
                 calls["m3u_content"] = (
@@ -317,7 +317,7 @@ class XCHookBehaviorTests(unittest.TestCase):
                 self.assertIn("&utc={utc}&duration={duration:60}", response.content)
                 self.assertNotIn("&start={utc}", response.content)
 
-    def test_032_m3u_hook_skips_direct_and_unauthorized_requests(self):
+    def test_033_m3u_hook_skips_direct_and_unauthorized_requests(self):
         output, timeshift, calls = modules()
         authorization_calls = []
         callbacks = XCCallbacks(
@@ -325,7 +325,7 @@ class XCHookBehaviorTests(unittest.TestCase):
             m3u_channel_archive_days=lambda user: {"8": 5},
         )
         self.assertTrue(install_xc_hooks(
-            output, timeshift, dispatcharr_version="0.32.0", callbacks=callbacks,
+            output, timeshift, dispatcharr_version="0.33.0", callbacks=callbacks,
         ).installed)
         user = {"catchup": True}
         direct = output.generate_m3u(Request(get={
@@ -452,7 +452,7 @@ class XCHookBehaviorTests(unittest.TestCase):
                 self.assertTrue(install_xc_hooks(
                     output,
                     timeshift,
-                    dispatcharr_version="0.32.0",
+                    dispatcharr_version="0.33.0",
                     callbacks=XCCallbacks(
                         playback_available=lambda *args: True,
                         authorize_local_playback=(

@@ -68,11 +68,6 @@ def _run() -> dict:
         "jobs": [
             {"name": "test-and-package", "conclusion": "success"},
             {
-                "name": "AIO integration (0.32.0)",
-                "conclusion": "success",
-                "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
-            },
-            {
                 "name": "AIO integration (0.33.0)",
                 "conclusion": "success",
                 "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
@@ -145,6 +140,11 @@ class CIProvenanceTest(unittest.TestCase):
                         job["steps"] = []
                     self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
         self.assertTrue(_trusted_run(_run(), REPOSITORY, WORKFLOW_ID))
+
+    def test_old_032_native_job_alone_is_not_release_evidence(self):
+        run = _run()
+        run["jobs"][1]["name"] = "AIO integration (0.32.0)"
+        self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
 
     def test_required_native_jobs_match_the_pinned_ci_matrix(self):
         import yaml

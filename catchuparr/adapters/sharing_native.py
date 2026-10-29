@@ -642,61 +642,63 @@ for i = 1, #allowed do
   local kind = redis.call('TYPE', KEYS[i]).ok
   local valid = false
   for _, expected in ipairs(allowed[i]) do if kind == expected then valid = true end end
-  if not valid then return 0 end
+  if not valid then return {0, "key-type"} end
 end
 local ttl = tonumber(ARGV[20])
-if not ttl or ttl < 1 or ttl > 720 or ttl % 1 ~= 0 then return 0 end
+if not ttl or ttl < 1 or ttl > 720 or ttl % 1 ~= 0 then return {0, "invalid-ttl"} end
 local metadata_channel = redis.call('HGET', KEYS[6], 'channel_uuid')
-if metadata_channel and metadata_channel ~= ARGV[10] then return 0 end
+if metadata_channel and metadata_channel ~= ARGV[10] then return {0, "metadata-channel"} end
 local phase = redis.call('HGET', KEYS[1], 'phase')
-if (phase ~= 'active' and phase ~= 'wait_return')
-   or redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[7]
-   or redis.call('HGET', KEYS[1], 'version') ~= ARGV[8]
-   or redis.call('HGET', KEYS[1], 'intent_epoch') ~= ARGV[9]
-   or redis.call('HGET', KEYS[1], 'channel_uuid') ~= ARGV[10]
-   or redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1]
-   or redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[2]
-   or redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[3]
-   or redis.call('HGET', KEYS[1], 'recorder_fence') ~= ARGV[4]
-   or redis.call('HGET', KEYS[1], 'lease_value') ~= ARGV[5]
-   or redis.call('GET', KEYS[3]) ~= ARGV[5]
-   or redis.call('GET', KEYS[4]) ~= ARGV[6]
-   or redis.call('HGET', KEYS[1], 'owner_lock_value') ~= ARGV[6]
-   or redis.call('HGET', KEYS[1], 'worker_id') ~= ARGV[12]
-   or redis.call('HGET', KEYS[1], 'metadata_owner') ~= ARGV[11]
-   or redis.call('HGET', KEYS[1], 'stream_id') ~= ARGV[13]
-   or redis.call('HGET', KEYS[1], 'account_id') ~= ARGV[14]
-   or redis.call('HGET', KEYS[1], 'm3u_profile_id') ~= ARGV[15]
-   or redis.call('HGET', KEYS[1], 'input_profile_id') ~= ARGV[16]
-   or redis.call('HGET', KEYS[1], 'client_id') ~= ARGV[17]
-   or redis.call('HGET', KEYS[1], 'connected_at') ~= ARGV[18]
-   or redis.call('HGET', KEYS[1], 'client_worker_id') ~= ARGV[19]
-   or redis.call('HGET', KEYS[2], 'configuration_generation') ~= ARGV[1]
-   or redis.call('HGET', KEYS[2], 'control_generation') ~= ARGV[2]
-   or redis.call('HGET', KEYS[2], 'catalog_generation') ~= ARGV[3]
-   or redis.call('HGET', KEYS[6], 'owner') ~= ARGV[11]
-   or redis.call('HGET', KEYS[6], 'stream_id') ~= ARGV[13]
-   or redis.call('HGET', KEYS[6], 'm3u_profile') ~= ARGV[15]
-   or redis.call('HGET', KEYS[6], 'stream_profile') ~= ARGV[16]
-   or (redis.call('HGET', KEYS[6], 'state') ~= 'active'
-       and redis.call('HGET', KEYS[6], 'state') ~= 'waiting_for_clients')
-   or redis.call('EXISTS', KEYS[7]) ~= 0
-   or redis.call('EXISTS', KEYS[11]) ~= 0
-   or redis.call('HGET', KEYS[8], 'connected_at') ~= ARGV[18]
-   or redis.call('HGET', KEYS[8], 'worker_id') ~= ARGV[19]
-   or redis.call('HGET', KEYS[8], 'user_id') ~= '0'
-   or redis.call('HGET', KEYS[8], 'output_format') ~= 'mpegts'
-   or redis.call('HGET', KEYS[8], 'output_profile_id') ~= ''
-   or redis.call('SISMEMBER', KEYS[9], ARGV[17]) ~= 1
-   or redis.call('HGET', KEYS[10], ARGV[17]) ~= ARGV[7] then return 0 end
-if redis.call('TTL', KEYS[1]) <= 0 or redis.call('TTL', KEYS[3]) <= 0
-   or redis.call('TTL', KEYS[4]) <= 0 or redis.call('TTL', KEYS[5]) <= 0
-   or redis.call('TTL', KEYS[8]) <= 0 then return 0 end
+if (phase ~= 'active' and phase ~= 'wait_return') then return {0, "episode-phase"} end
+if redis.call('HGET', KEYS[1], 'episode_id') ~= ARGV[7] then return {0, "episode-id"} end
+if redis.call('HGET', KEYS[1], 'version') ~= ARGV[8] then return {0, "episode-version"} end
+if redis.call('HGET', KEYS[1], 'intent_epoch') ~= ARGV[9] then return {0, "intent-epoch"} end
+if redis.call('HGET', KEYS[1], 'channel_uuid') ~= ARGV[10] then return {0, "channel-binding"} end
+if redis.call('HGET', KEYS[1], 'configuration_generation') ~= ARGV[1] then return {0, "episode-config"} end
+if redis.call('HGET', KEYS[1], 'control_generation') ~= ARGV[2] then return {0, "episode-control"} end
+if redis.call('HGET', KEYS[1], 'catalog_generation') ~= ARGV[3] then return {0, "episode-catalog"} end
+if redis.call('HGET', KEYS[1], 'recorder_fence') ~= ARGV[4] then return {0, "episode-fence"} end
+if redis.call('HGET', KEYS[1], 'lease_value') ~= ARGV[5] then return {0, "episode-lease"} end
+if redis.call('GET', KEYS[3]) ~= ARGV[5] then return {0, "live-lease"} end
+if redis.call('GET', KEYS[4]) ~= ARGV[6] then return {0, "native-owner"} end
+if redis.call('HGET', KEYS[1], 'owner_lock_value') ~= ARGV[6] then return {0, "episode-owner"} end
+if redis.call('HGET', KEYS[1], 'worker_id') ~= ARGV[12] then return {0, "episode-worker"} end
+if redis.call('HGET', KEYS[1], 'metadata_owner') ~= ARGV[11] then return {0, "episode-metadata-owner"} end
+if redis.call('HGET', KEYS[1], 'stream_id') ~= ARGV[13] then return {0, "episode-stream"} end
+if redis.call('HGET', KEYS[1], 'account_id') ~= ARGV[14] then return {0, "episode-account"} end
+if redis.call('HGET', KEYS[1], 'm3u_profile_id') ~= ARGV[15] then return {0, "episode-m3u-profile"} end
+if redis.call('HGET', KEYS[1], 'input_profile_id') ~= ARGV[16] then return {0, "episode-input-profile"} end
+if redis.call('HGET', KEYS[1], 'client_id') ~= ARGV[17] then return {0, "episode-client"} end
+if redis.call('HGET', KEYS[1], 'connected_at') ~= ARGV[18] then return {0, "episode-connected-at"} end
+if redis.call('HGET', KEYS[1], 'client_worker_id') ~= ARGV[19] then return {0, "episode-client-worker"} end
+if redis.call('HGET', KEYS[2], 'configuration_generation') ~= ARGV[1] then return {0, "authority-config"} end
+if redis.call('HGET', KEYS[2], 'control_generation') ~= ARGV[2] then return {0, "authority-control"} end
+if redis.call('HGET', KEYS[2], 'catalog_generation') ~= ARGV[3] then return {0, "authority-catalog"} end
+if redis.call('HGET', KEYS[6], 'owner') ~= ARGV[11] then return {0, "native-metadata-owner"} end
+if redis.call('HGET', KEYS[6], 'stream_id') ~= ARGV[13] then return {0, "native-metadata-stream"} end
+if redis.call('HGET', KEYS[6], 'm3u_profile') ~= ARGV[15] then return {0, "native-metadata-m3u-profile"} end
+if redis.call('HGET', KEYS[6], 'stream_profile') ~= ARGV[16] then return {0, "native-metadata-input-profile"} end
+if (redis.call('HGET', KEYS[6], 'state') ~= 'active'
+       and redis.call('HGET', KEYS[6], 'state') ~= 'waiting_for_clients') then return {0, "native-state"} end
+if redis.call('EXISTS', KEYS[7]) ~= 0 then return {0, "native-stopping"} end
+if redis.call('EXISTS', KEYS[11]) ~= 0 then return {0, "client-stop"} end
+if redis.call('HGET', KEYS[8], 'connected_at') ~= ARGV[18] then return {0, "client-connected-at"} end
+if redis.call('HGET', KEYS[8], 'worker_id') ~= ARGV[19] then return {0, "client-worker"} end
+if redis.call('HGET', KEYS[8], 'user_id') ~= '0' then return {0, "client-user"} end
+if redis.call('HGET', KEYS[8], 'output_format') ~= 'mpegts' then return {0, "client-format"} end
+if redis.call('HGET', KEYS[8], 'output_profile_id') ~= '' then return {0, "client-output-profile"} end
+if redis.call('SISMEMBER', KEYS[9], ARGV[17]) ~= 1 then return {0, "client-membership"} end
+if redis.call('HGET', KEYS[10], ARGV[17]) ~= ARGV[7] then return {0, "client-private-marker"} end
+if redis.call('TTL', KEYS[1]) <= 0 then return {0, "episode-expired"} end
+if redis.call('TTL', KEYS[3]) <= 0 then return {0, "recorder-lease-expired"} end
+if redis.call('TTL', KEYS[4]) <= 0 then return {0, "owner-expired"} end
+if redis.call('TTL', KEYS[5]) <= 0 then return {0, "worker-heartbeat-expired"} end
+if redis.call('TTL', KEYS[8]) <= 0 then return {0, "client-expired"} end
 local head = tonumber(redis.call('GET', KEYS[12]) or '')
 local newest = redis.call('ZREVRANGE', KEYS[13], 0, 0)
-if not head or head < 1 or head % 1 ~= 0 or #newest == 0 then return 0 end
+if not head or head < 1 or head % 1 ~= 0 or #newest == 0 then return {0, "buffer-empty"} end
 local chunk_key = 'live:channel:' .. ARGV[10] .. ':input:buffer:chunk:' .. newest[1]
-if redis.call('TYPE', chunk_key).ok ~= 'string' then return 0 end
+if redis.call('TYPE', chunk_key).ok ~= 'string' then return {0, "buffer-chunk-missing"} end
 local ordinary = 0
 for _, id in ipairs(redis.call('SMEMBERS', KEYS[9])) do
   local client_key = 'live:channel:' .. ARGV[10] .. ':clients:' .. id
@@ -704,11 +706,11 @@ for _, id in ipairs(redis.call('SMEMBERS', KEYS[9])) do
   local client_type = redis.call('TYPE', client_key).ok
   local stop_type = redis.call('TYPE', stop_key).ok
   if (client_type ~= 'none' and client_type ~= 'hash')
-     or (stop_type ~= 'none' and stop_type ~= 'string') then return 0 end
+     or (stop_type ~= 'none' and stop_type ~= 'string') then return {0, "viewer-key-type"} end
   local connected_at = client_type == 'hash' and tonumber(redis.call('HGET', client_key, 'connected_at') or '') or nil
   local worker_id = client_type == 'hash' and redis.call('HGET', client_key, 'worker_id') or nil
   local private = private_client(id, ARGV[10])
-  if private == nil then return 0 end
+  if private == nil then return {0, "viewer-classification"} end
   if not private and client_type == 'hash'
      and connected_at and connected_at > 0 and connected_at == connected_at
      and connected_at < math.huge and worker_id and worker_id ~= '' and stop_type == 'none' then
@@ -722,12 +724,12 @@ local minimum_switch = tonumber(redis.call('HGET', KEYS[1], 'minimum_switch_seco
 local last_switch = tonumber(redis.call('HGET', KEYS[1], 'last_switch_at') or '')
 if not return_seconds or return_seconds < 0 or return_seconds > 3600 or return_seconds % 1 ~= 0
    or not minimum_switch or minimum_switch < 0 or minimum_switch > 3600 or minimum_switch % 1 ~= 0
-   or not last_switch or last_switch < 0 or last_switch ~= last_switch or last_switch == math.huge then return 0 end
+   or not last_switch or last_switch < 0 or last_switch ~= last_switch or last_switch == math.huge then return {0, "invalid-timing"} end
 local deadline_raw = redis.call('HGET', KEYS[1], 'return_deadline') or ''
 local deadline = nil
 if deadline_raw ~= '' then
   deadline = tonumber(deadline_raw)
-  if not deadline or deadline < 0 or deadline ~= deadline or deadline == math.huge then return 0 end
+  if not deadline or deadline < 0 or deadline ~= deadline or deadline == math.huge then return {0, "invalid-deadline"} end
 end
 local next_phase = phase
 local changed = false
@@ -737,14 +739,14 @@ if phase == 'active' and ordinary == 0 then
   next_phase = 'wait_return'
   changed = true
 elseif phase == 'wait_return' then
-  if deadline == nil or now >= deadline then return 0 end
+  if deadline == nil or now >= deadline then return {0, "return-deadline-reached"} end
   if ordinary > 0 then
     next_phase = 'active'
     deadline = nil
     changed = true
   end
 end
-if ordinary == 0 and deadline ~= nil and now >= deadline then return 0 end
+if ordinary == 0 and deadline ~= nil and now >= deadline then return {0, "return-deadline-reached"} end
 local nowstr = string.format('%.6f', now)
 redis.call('HSET', KEYS[8], 'last_active', nowstr)
 redis.call('EXPIRE', KEYS[8], ttl)
@@ -1601,8 +1603,64 @@ def cleanup_borrowed_client(redis: Any, ack: NativeClientRegistrationAck, *,
     return True
 
 
+_TOUCH_REJECTION_REASONS = frozenset({
+    "episode-phase",
+    "episode-id",
+    "episode-version",
+    "intent-epoch",
+    "channel-binding",
+    "episode-config",
+    "episode-control",
+    "episode-catalog",
+    "episode-fence",
+    "episode-lease",
+    "live-lease",
+    "native-owner",
+    "episode-owner",
+    "episode-worker",
+    "episode-metadata-owner",
+    "episode-stream",
+    "episode-account",
+    "episode-m3u-profile",
+    "episode-input-profile",
+    "episode-client",
+    "episode-connected-at",
+    "episode-client-worker",
+    "authority-config",
+    "authority-control",
+    "authority-catalog",
+    "native-metadata-owner",
+    "native-metadata-stream",
+    "native-metadata-m3u-profile",
+    "native-metadata-input-profile",
+    "native-state",
+    "native-stopping",
+    "client-stop",
+    "client-connected-at",
+    "client-worker",
+    "client-user",
+    "client-format",
+    "client-output-profile",
+    "client-membership",
+    "client-private-marker",
+    "key-type",
+    "invalid-ttl",
+    "metadata-channel",
+    "episode-expired", "recorder-lease-expired", "owner-expired",
+    "worker-heartbeat-expired", "client-expired",
+    "buffer-empty",
+    "buffer-chunk-missing",
+    "viewer-key-type",
+    "viewer-classification",
+    "invalid-timing",
+    "invalid-deadline",
+    "return-deadline-reached",
+})
+
+
 def check_and_touch_borrowed_client(redis: Any, grant: NativeEpisodeGrant, *,
-                                    client_record_ttl: int = 60) -> tuple[bool, float | None, int | None]:
+                                    client_record_ttl: int = 60,
+                                    rejection_reasons: list[str] | None = None) -> tuple[bool, float | None, int | None]:
     """Revalidate current Redis grant and heartbeat the exact client before publication."""
     if not isinstance(grant, NativeEpisodeGrant):
         return False, None, None
@@ -1633,6 +1691,12 @@ def check_and_touch_borrowed_client(redis: Any, grant: NativeEpisodeGrant, *,
         grant.client_worker_id, client_record_ttl,
     )
     if not isinstance(result, (list, tuple)) or len(result) != 3 or result[0] != 1:
+        if rejection_reasons is not None:
+            try:
+                reason = _text(result[1]) if isinstance(result, (list, tuple)) and len(result) == 2 else "unknown"
+            except (TypeError, ValueError, UnicodeError):
+                reason = "unknown"
+            rejection_reasons.append(reason if reason in _TOUCH_REJECTION_REASONS else "unknown")
         return False, None, None
     try:
         raw_deadline = _text(result[1])

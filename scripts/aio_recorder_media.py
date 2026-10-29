@@ -3444,6 +3444,7 @@ def _wait_for_healthy_borrow_gate(
         if (
             snapshot.get("new_client_identity") is False
             or snapshot.get("exact_A_request_delta", 0) > 1
+            or snapshot.get("handover_irrecoverable") is True
             or snapshot.get("global_native_client_count", 0) > 2
             or snapshot.get("local_native_client_count", 0) > 1
             or snapshot.get("task_alive") is False
@@ -3454,6 +3455,34 @@ def _wait_for_healthy_borrow_gate(
         if remaining <= 0:
             return False, snapshot
         sleep(min(poll_interval, remaining))
+
+
+def _synchronized_borrow_gate_snapshot(
+    snapshot, *, staged_reader_count, staged_reader_matched,
+    staged_reader_consumed, source_b_request_delta,
+):
+    """Require the real staged reader to be consumed after the old source drains."""
+    result = dict(snapshot)
+    result.update({
+        "staged_reader_count": int(staged_reader_count),
+        "staged_reader_matched": bool(staged_reader_matched),
+        "staged_reader_consumed": bool(staged_reader_consumed),
+        "exact_B_request_delta": int(source_b_request_delta),
+    })
+    result["handover_irrecoverable"] = bool(
+        staged_reader_count > 1
+        or (staged_reader_count == 1 and staged_reader_matched)
+        or source_b_request_delta > 1
+        or result.get("B_active_count", 0) > 1
+    )
+    result["healthy_borrow_gate_passed"] = bool(
+        result.get("healthy_borrow_gate_passed")
+        and staged_reader_count == 1
+        and not staged_reader_matched
+        and staged_reader_consumed
+        and source_b_request_delta == 1
+    )
+    return result
 
 
 def _failure_cleanup_ack_conditions(
@@ -6601,6 +6630,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # bounded supervisor ACK while retaining the 60-second switch guard.
         sharing_settings = dict(sharing_settings)
         sharing_settings["last_viewer_return_seconds"] = 30
+        # A and B deliberately carry different synthetic programmes. Exercise
+        # the real enabled staging path and require its safe no-match fallback.
+        sharing_settings["synchronize_before_switch"] = True
         resumed_plugin = PluginConfig.objects.get(key="catchuparr")
         resumed_plugin.settings = dict(sharing_settings)
         resumed_plugin.save(update_fields=("settings",))
@@ -6608,6 +6640,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(applied_resume.get("applied") is True,
                  "Unified Apply rejected restoring the B-only source policy")
         active_resume = load_active_configuration(active_path)
+        _require(active_resume.get("synchronize_before_switch") is True,
+                 "The synchronized-handover option was not applied")
         assert_applied_global_sharing(
             active_resume, worker_id, enabled=True, live_stability_seconds=1,
             last_viewer_return_seconds=30, min_switch_interval_seconds=60,
@@ -6641,7 +6675,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 raise RuntimeError("Recorder failed while resuming allowed source B")
             gevent_sleep(0.1)
         _require(
-            len(source_server.request_times("source-b.ts")) > share_b_request_baseline
+            len(source_server.request_times("source-b.ts")) == share_b_request_baseline + 1
             and resumed_active["source-a.ts"] == 0
             and resumed_active["source-b.ts"] == 1,
             "Recorder did not resume the allowed B source after the paused episode",
@@ -6699,6 +6733,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             source_server.snapshot()[0]["source-a.ts"] == second_cycle_a_baseline + 1,
             "Second-cycle viewer did not open exactly one native A connection",
         )
+        second_native_manager = native_server.stream_managers.get(worker_id)
+        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
         second_borrow_headers = None
         second_cycle_deadline = time.monotonic() + 90
         while time.monotonic() < second_cycle_deadline:
@@ -6730,17 +6767,75 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             and catchuparr_stats._is_recorder_client(worker_id, second_borrow_client_id),
             "Second borrow did not create a distinct verified recorder reader",
         )
-        second_native_manager = native_server.stream_managers.get(worker_id)
-        second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
-        second_source_metadata = _native_source_metadata(redis_client, metadata_key)
-        second_source_counts, second_active_counts = source_server.snapshot()
-        _require(
-            second_native_manager is not None and second_native_manager.running
-            and second_native_owner is not None
-            and second_source_counts["source-a.ts"] == second_cycle_a_baseline + 1
-            and second_active_counts["source-a.ts"] == 1
-            and second_active_counts["source-b.ts"] == 0,
-            "Second borrow opened an extra provider source instead of reading A",
+        def second_synchronized_borrow_snapshot():
+            with run_share._lock:
+                task_alive = run_share.thread is not None and run_share.thread.is_alive()
+                task_has_no_unexpected_failure = not run_share.failures
+                staged_switches = [
+                    result.staged_input for result in run_share.results
+                    if getattr(result, "staged_input", None) is not None
+                ]
+            registered = {
+                _redis_text(value)
+                for value in redis_client.smembers(RedisKeys.clients(worker_id))
+            }
+            client_manager = native_server.client_managers.get(worker_id)
+            local_count = int(client_manager.get_client_count()) if client_manager else -1
+            native_manager = native_server.stream_managers.get(worker_id)
+            owner = redis_client.get(RedisKeys.channel_owner(worker_id))
+            source_counts, active_counts = source_server.snapshot()
+            snapshot = _healthy_borrow_gate_snapshot(
+                previous_client_is_distinct=second_borrow_client_id != borrow_client_id,
+                recorder_client_verified=catchuparr_stats._is_recorder_client(
+                    worker_id, second_borrow_client_id,
+                ),
+                native_registration_present=bool(
+                    second_borrow_client_id in registered
+                    and redis_client.exists(
+                        f"live:channel:{worker_id}:clients:{second_borrow_client_id}"
+                    )
+                ),
+                native_manager_running=bool(
+                    native_manager is second_native_manager
+                    and native_manager is not None and native_manager.running
+                ),
+                native_owner_present=owner is not None,
+                native_owner_matches_expected=bool(
+                    owner is not None and owner == second_native_owner
+                ),
+                source_metadata_matches_expected=(
+                    _native_source_metadata(redis_client, metadata_key) == second_source_metadata
+                ),
+                global_native_client_count=len(registered),
+                local_native_client_count=local_count,
+                source_a_request_delta=source_counts["source-a.ts"] - second_cycle_a_baseline,
+                source_a_active_count=active_counts["source-a.ts"],
+                source_b_active_count=active_counts["source-b.ts"],
+                task_alive=task_alive,
+                task_has_no_unexpected_failure=task_has_no_unexpected_failure,
+                stage="after_synchronized_handover",
+            )
+            return _synchronized_borrow_gate_snapshot(
+                snapshot,
+                staged_reader_count=len(staged_switches),
+                staged_reader_matched=bool(staged_switches and staged_switches[0].matched),
+                staged_reader_consumed=bool(staged_switches and staged_switches[0].consumed),
+                source_b_request_delta=source_counts["source-b.ts"] - share_b_request_baseline,
+            )
+
+        from catchuparr.engine.recorder import SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS
+
+        handover_timeout = SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS + _native_teardown_readiness_timeout(
+            float(ConfigHelper.channel_shutdown_delay()),
+            float(ConfigHelper.cleanup_check_interval()),
+        )
+        second_borrow_ready, second_borrow_evidence = _wait_for_healthy_borrow_gate(
+            second_synchronized_borrow_snapshot, handover_timeout, sleep=gevent_sleep,
+        )
+        _require_with_failure_diagnostic(
+            second_borrow_ready,
+            "Synchronized borrow did not complete the exact A handover and B cleanup",
+            lambda: second_borrow_evidence,
         )
         second_borrowed_ids = {
             segment.id for segment in store.segments(worker_id)
@@ -6772,6 +6867,39 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         restart_b_profile_baseline = profile_baselines[profile_b.id]
         source_server.set_mode("source-b.ts", "unavailable")
         restart_b_request_baseline = len(source_server.request_times("source-b.ts"))
+
+        # Observe the enabled return attempt at the actual task boundary. It
+        # must happen after the exact borrowed client has been cleaned up and
+        # while the RETURN authority and previous archive tail still match.
+        from catchuparr.engine.recorder import FFmpegCopyRecorder
+
+        return_sync_evidence = []
+        original_prepare_return = FFmpegCopyRecorder.prepare_synchronized_return
+
+        def capture_return_sync(recorder, previous_segment_id, stop_event, switch):
+            episode = sharing_episode_ledger.read(worker_id)
+            intent_record = return_ledger.read(worker_id)
+            segments = store.segments(worker_id)
+            valid = bool(
+                episode.phase == "closed"
+                and episode.episode_id == second_capability.episode_id
+                and not redis_client.exists(
+                    f"live:channel:{worker_id}:clients:{second_borrow_client_id}"
+                )
+                and intent_record is not None
+                and intent_record.intent is not None
+                and intent_record.intent.action.value == "return_to_allowed"
+                and segments and segments[-1].id == previous_segment_id
+            )
+            return_sync_evidence.append((recorder, valid))
+            _require(valid, "Return synchronization ran before exact borrower cleanup or authority")
+            return original_prepare_return(recorder, previous_segment_id, stop_event, switch)
+
+        return_sync_probe_patch = patch.object(
+            FFmpegCopyRecorder, "prepare_synchronized_return", capture_return_sync,
+        )
+        return_sync_probe_patch.start()
+        return_sync_probe_started = True
         live_session.close()
         live_session = None
         live_reader = None
@@ -6807,6 +6935,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             _require(time.monotonic() < b_unavailable_deadline,
                      "Task did not attempt B while the RETURN intent was pending")
             gevent_sleep(0.05)
+        _require(
+            bool(return_sync_evidence)
+            and all(valid for _, valid in return_sync_evidence)
+            and len({id(recorder) for recorder, _ in return_sync_evidence}) == len(return_sync_evidence),
+                 "Enabled return synchronization did not inspect the exact cleaned-up archive tail")
         (
             restart_b_attempt_ids,
             restart_b_attempt_bindings,
@@ -6818,6 +6951,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             stream_id=str(stream_b.id),
             cooperative_sleep=gevent_sleep,
         )
+        return_sync_probe_patch.stop()
+        return_sync_probe_started = False
         _require(
             restart_b_attempts_bound,
             "Pending RETURN did not expose stable exact B attempt bindings after task join",
@@ -7336,6 +7471,21 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             float(ConfigHelper.cleanup_check_interval()),
             stopping_marker_ttl=90,
         )
+        failure_return_records = []
+        real_record_return_after_cleanup = RecorderBorrowCoordinator.record_return_after_cleanup
+
+        def capture_failure_return(self, prepared, *, now, outcome):
+            result = real_record_return_after_cleanup(self, prepared, now=now, outcome=outcome)
+            if result and outcome == "failure":
+                with return_ack_lock:
+                    failure_return_records.append(return_ledger.read(worker_id))
+            return result
+
+        failure_capture_patch = patch.object(
+            RecorderBorrowCoordinator, "record_return_after_cleanup", capture_failure_return,
+        )
+        failure_capture_patch.start()
+        failure_capture_patch_started = True
         failure_cleanup_ready = False
         try:
             failure_cleanup_ready, failure_cleanup_readiness = (
@@ -7352,37 +7502,28 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             )
         finally:
             run_restart.borrow_failure_result_release.set()
-        failure_return_holder = {}
-
         def failure_return_snapshot():
-            record = return_ledger.read(worker_id)
+            with return_ack_lock:
+                record = failure_return_records[-1] if failure_return_records else None
             intent = record.intent if record is not None else None
-            is_failure_return = (
+            accepted = (
                 intent is not None
                 and intent.action.value == "return_to_allowed"
+                and record.state.phase.value == "failed"
                 and intent.intent_epoch > second_capability.intent_epoch
                 and intent.not_before >= failure_media_at
                 and record.state.last_viewer_left_at == intent.not_before
             )
-            if is_failure_return:
-                failure_return_holder["record"] = record
             return {
                 "conditions": {
                     "borrow_failure_callback_seen": failure_media_at is not None,
-                    "failure_return_persisted": is_failure_return,
+                    "failure_return_persisted": accepted,
                 },
-                "failure_return_action": (
-                    intent.action.value if intent is not None else "none"
-                ),
+                "failure_return_action": intent.action.value if intent is not None else "none",
             }
 
-        failure_return_timeout = _native_teardown_readiness_timeout(
-            float(ConfigHelper.channel_shutdown_delay()),
-            float(ConfigHelper.cleanup_check_interval()),
-            stopping_marker_ttl=90,
-        )
         failure_return_ready, failure_return_readiness = _wait_for_readiness_snapshot(
-            failure_return_snapshot, failure_return_timeout,
+            failure_return_snapshot, failure_cleanup_timeout,
             monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
         )
         _require_with_failure_diagnostic(
@@ -7391,12 +7532,8 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             lambda: failure_return_readiness,
             diagnostic_label="CATCHUPARR_FAILURE_RETURN_DIAGNOSTIC",
         )
-        failure_return_record = failure_return_holder["record"]
-        # RETURN persistence follows borrowed-process reap and its final CSV
-        # flush, so this boundary excludes every trailing A segment.
-        failure_b_media_baseline = {
-            segment.id for segment in store.segments(worker_id)
-        }
+        with return_ack_lock:
+            failure_return_record = failure_return_records[-1]
         failure_return_token = failure_return_record.intent
         failure_return_state = failure_return_record.state
         return_seconds = float(sharing_settings["last_viewer_return_seconds"])
@@ -7411,94 +7548,50 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             "Failure RETURN did not bypass only the persisted admission deadline",
         )
 
-        failure_return_media = _wait_for_indexed_tone(
-            run_restart, store, worker_id, ffmpeg, ffprobe,
-            expected_hz=880, existing_ids=failure_b_media_baseline,
-            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
-        )
-        _require(bool(failure_return_media),
-                 "Failure RETURN did not archive fresh dedicated B media")
-        failure_ack_timeout = 10.0 + 2.0
-        failure_ack_evidence = _wait_for_supervisor_return_ack(
-            run_restart,
-            read_return_ack_events,
-            read_return_ack_snapshots,
-            timeout=failure_ack_timeout,
-            cooperative_sleep=gevent_sleep,
-        )
-        return_poll_patch.stop()
-        return_poll_patch_started = False
-        return_ack_patch.stop()
-        return_ack_patch_started = False
-        failure_ack_token, recovered_failure_return, failure_ack_media_at, failure_committed = (
-            failure_ack_evidence
-        )
-        _require(
-            _failure_return_ack_matches_admitted_window(
-                failure_return_token, recovered_failure_return,
-                failure_ack_token, failure_ack_media_at, failure_committed,
-                channel_uuid=worker_id,
-                configuration_generation=run_restart.expected_generation,
-                control_generation=run_restart.expected_control_generation,
-                return_seconds=return_seconds,
-                minimum_switch_seconds=minimum_switch_seconds,
-            ),
-            "Failure RETURN did not commit its exact first-media timestamp before normal cooldown",
-        )
-
-        live_stability = float(sharing_settings["live_stability_seconds"])
-        minimum_switch = minimum_switch_seconds
-        ordinary_connected_at = float(post_restart_ordinary_identity["connected_at"])
-        normal_reattach_deadline = max(
-            failure_ack_media_at + minimum_switch,
-            ordinary_connected_at + live_stability,
-        )
-
-        def later_borrow_snapshot():
+        def fast_recovery_snapshot():
             with run_restart._lock:
-                borrow_times = [
-                    observed_at
+                borrowed = [
+                    (dict(headers), observed_at)
                     for headers, observed_at in zip(
                         run_restart.input_headers, run_restart.input_header_times,
                     )
                     if "X-Catchuparr-Borrow" in headers
                 ]
-                task_alive = (
-                    run_restart.thread is not None and run_restart.thread.is_alive()
-                )
-                failures = list(run_restart.failures)
+                task_alive = run_restart.thread is not None and run_restart.thread.is_alive()
+                no_failures = not run_restart.failures
+            recovered_at = borrowed[1][1] if len(borrowed) >= 2 else None
             return {
                 "conditions": {
-                    "reattached_after_normal_deadline": (
-                        len(borrow_times) >= 2
-                        and borrow_times[1] >= normal_reattach_deadline
+                    "fresh_borrow_started": recovered_at is not None,
+                    "before_normal_cooldown": (
+                        recovered_at is not None and recovered_at < ordinary_return_deadline
+                    ),
+                    "within_fast_recovery_window": (
+                        recovered_at is not None
+                        and 0 <= recovered_at - failure_return_token.not_before <= 20.0
                     ),
                     "task_alive": task_alive,
-                    "task_has_no_unexpected_failures": not failures,
+                    "task_has_no_unexpected_failure": no_failures,
                 },
-                "borrow_count": len(borrow_times),
-                "second_borrow_at_or_after_deadline": (
-                    len(borrow_times) >= 2
-                    and borrow_times[1] >= normal_reattach_deadline
-                ),
+                "borrow_count": len(borrowed),
             }
 
-        normal_reattach_timeout = (
-            max(0.0, normal_reattach_deadline - time.time())
-            + run_restart.startup_timeout + 12.0
-        )
-        normal_reattach_ready, normal_reattach_snapshot = _wait_for_readiness_snapshot(
-            later_borrow_snapshot, normal_reattach_timeout,
+        fast_recovery_ready, fast_recovery = _wait_for_readiness_snapshot(
+            fast_recovery_snapshot, 20.0,
             monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
         )
         _require_with_failure_diagnostic(
-            normal_reattach_ready
-            and normal_reattach_snapshot["second_borrow_at_or_after_deadline"],
-            "Recorder did not reattach after normal post-return cooldown and stability",
-            lambda: normal_reattach_snapshot,
-            diagnostic_label="CATCHUPARR_POST_RETURN_REATTACH_DIAGNOSTIC",
+            fast_recovery_ready,
+            "Recorder did not promptly reattach the still-present viewer after failure",
+            lambda: fast_recovery,
+            diagnostic_label="CATCHUPARR_FAILURE_FAST_REATTACH_DIAGNOSTIC",
         )
-        post_failure_borrow_headers = None
+        failure_capture_patch.stop()
+        failure_capture_patch_started = False
+        return_poll_patch.stop()
+        return_poll_patch_started = False
+        return_ack_patch.stop()
+        return_ack_patch_started = False
         with run_restart._lock:
             borrowed_header_pairs = [
                 (dict(headers), observed_at)
@@ -7508,32 +7601,44 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 if "X-Catchuparr-Borrow" in headers
             ]
         _require(len(borrowed_header_pairs) >= 2,
-                 "Post-failure normal reattach omitted its native borrow capability")
-        post_failure_borrow_headers = borrowed_header_pairs[1][0]
-        post_restart_borrow_headers = post_failure_borrow_headers
+                 "Fast failure recovery omitted its fresh native borrow capability")
+        post_restart_borrow_headers = borrowed_header_pairs[1][0]
         previous_failure_borrow_client_id = second_borrow_client_id
+        previous_capability = second_capability
         second_capability = decode_borrow_capability(
             post_restart_borrow_headers["X-Catchuparr-Borrow"],
         )
+        _require(
+            second_capability.recorder_fence == previous_capability.recorder_fence
+            and second_capability.configuration_generation == previous_capability.configuration_generation
+            and second_capability.control_generation == previous_capability.control_generation
+            and second_capability.connection_identity == previous_capability.connection_identity
+            and second_capability.intent_epoch > previous_capability.intent_epoch,
+            "Fast recovery did not preserve the exact authority with a fresh intent",
+        )
         second_borrow_client_id = f"catchuparr-client-{second_capability.nonce}"
-        post_failure_borrow_gate_ready, post_failure_borrow_gate = (
-            _wait_for_healthy_borrow_gate(
-                lambda: read_healthy_borrow_gate_snapshot(
-                    client_id=second_borrow_client_id,
-                    previous_client_id=previous_failure_borrow_client_id,
-                    request_baseline=second_cycle_a_baseline,
-                    stage="after_normal_reattach_deadline",
-                ),
-                20.0, monotonic=time.monotonic, sleep=gevent_sleep,
-                poll_interval=0.1,
-            )
+        post_failure_borrow_gate_ready, post_failure_borrow_gate = _wait_for_healthy_borrow_gate(
+            lambda: read_healthy_borrow_gate_snapshot(
+                client_id=second_borrow_client_id,
+                previous_client_id=previous_failure_borrow_client_id,
+                request_baseline=second_cycle_a_baseline,
+                stage="after_fast_failure_reattach",
+            ),
+            20.0, monotonic=time.monotonic, sleep=gevent_sleep, poll_interval=0.1,
         )
         _require_with_failure_diagnostic(
             post_failure_borrow_gate_ready,
-            "Post-failure normal reattach opened a provider source instead of reading A",
+            "Fast failure reattach opened another provider source instead of reading A",
             lambda: post_failure_borrow_gate,
             diagnostic_label="CATCHUPARR_POST_FAILURE_BORROW_GATE_DIAGNOSTIC",
         )
+        reattached_baseline = {segment.id for segment in store.segments(worker_id)}
+        reattached_media = _wait_for_indexed_tone(
+            run_restart, store, worker_id, ffmpeg, ffprobe,
+            expected_hz=440, existing_ids=reattached_baseline,
+            minimum=1, timeout=45, cooperative_sleep=gevent_sleep,
+        )
+        _require(bool(reattached_media), "Fast failure reattach produced no fresh A media")
         second_native_manager = native_server.stream_managers.get(worker_id)
         second_native_owner = redis_client.get(RedisKeys.channel_owner(worker_id))
         second_source_metadata = _native_source_metadata(redis_client, metadata_key)
@@ -7681,6 +7786,16 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     finally:
         if locals().get("run_restart") is not None:
             run_restart.borrow_failure_result_release.set()
+        if locals().get("return_sync_probe_started"):
+            try:
+                return_sync_probe_patch.stop()
+            except Exception:
+                pass
+        if locals().get("failure_capture_patch_started"):
+            try:
+                failure_capture_patch.stop()
+            except Exception:
+                pass
         if locals().get("return_poll_patch_started"):
             try:
                 return_poll_patch.stop()

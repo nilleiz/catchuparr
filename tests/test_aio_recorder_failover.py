@@ -422,6 +422,14 @@ class RecorderFailoverMediaTests(unittest.TestCase):
             probe._classify_stop_set_source("catchuparr.tasks", "supervise"),
         )
         self.assertEqual(
+            "tasks.claimed_borrow",
+            probe._classify_stop_set_source("catchuparr.tasks", "run_claimed_borrow"),
+        )
+        self.assertEqual(
+            "tasks.borrow_cleanup",
+            probe._classify_stop_set_source("catchuparr.tasks", "_finish_borrow_cleanup"),
+        )
+        self.assertEqual(
             "tasks.other",
             probe._classify_stop_set_source("catchuparr.tasks", "unknown_callable"),
         )

@@ -93,7 +93,7 @@ def _recording_task_fake_modules(redis):
         "core.utils": _fake_module(
             "core.utils", RedisClient=SimpleNamespace(get_client=lambda: redis)
         ),
-        "version": _fake_module("version", __version__="0.32.0"),
+        "version": _fake_module("version", __version__="0.33.0"),
     }
 
 
@@ -164,6 +164,66 @@ def _isolated_plugin_modules(fake_modules):
 
 
 class RecorderTaskTests(unittest.TestCase):
+    def test_claimed_handover_exception_closes_staged_input_and_cleans_exact_opening(self):
+        with _isolated_plugin_modules({
+            "celery": _fake_module("celery", shared_task=lambda *, name: lambda function: function),
+        }):
+            tasks = importlib.import_module("catchuparr.tasks")
+            opening = object()
+            staged = Mock()
+            cleanup = Mock(return_value=False)
+            pending = Mock()
+            run = Mock(side_effect=RuntimeError("synthetic"))
+            with self.assertRaisesRegex(RuntimeError, "synthetic"):
+                tasks._run_claimed_borrow_with_cleanup(opening, staged, run, cleanup, pending)
+            staged.close.assert_called_once_with()
+            cleanup.assert_called_once_with(opening)
+            pending.assert_called_once_with()
+
+    def test_viewer_switch_respects_applied_sync_toggle_and_falls_back_safely(self):
+        from catchuparr.engine.recorder import RecorderAttemptSwitch
+
+        with _isolated_plugin_modules({
+            "celery": _fake_module("celery", shared_task=lambda *, name: lambda function: function),
+        }):
+            tasks = importlib.import_module("catchuparr.tasks")
+            prepared = object()
+            target = object()
+            factory = Mock(return_value=target)
+            state = {"syncing": False}
+            disabled = RecorderAttemptSwitch()
+            self.assertFalse(tasks._request_viewer_switch(disabled, {}, prepared, factory, state))
+            self.assertTrue(disabled.is_set())
+            factory.assert_not_called()
+            self.assertFalse(state["syncing"])
+
+            returning = RecorderAttemptSwitch()
+            state["return_syncing"] = True
+            returning_factory = Mock(return_value=target)
+            self.assertFalse(tasks._request_viewer_switch(
+                returning, {"synchronize_before_switch": True}, prepared, returning_factory, state,
+            ))
+            self.assertTrue(returning.is_set())
+            returning_factory.assert_not_called()
+            self.assertFalse(state["syncing"])
+            state["return_syncing"] = False
+
+            enabled = RecorderAttemptSwitch()
+            self.assertTrue(tasks._request_viewer_switch(
+                enabled, {"synchronize_before_switch": True}, prepared, factory, state,
+            ))
+            self.assertFalse(enabled.is_set())
+            self.assertIs(enabled.take_synchronized_input(), target)
+            self.assertTrue(state["syncing"])
+
+            denied = RecorderAttemptSwitch()
+            failing_factory = Mock(side_effect=RuntimeError("synthetic"))
+            self.assertFalse(tasks._request_viewer_switch(
+                denied, {"synchronize_before_switch": True}, prepared, failing_factory, state,
+            ))
+            self.assertTrue(denied.is_set())
+            self.assertFalse(state["syncing"])
+
     def test_failed_first_media_diagnostic_is_remembered_and_retried(self):
         with _isolated_plugin_modules({
             "celery": _fake_module(
@@ -663,7 +723,7 @@ class RecorderTaskTests(unittest.TestCase):
             "apps.channels.models": apps_channels_models,
             "core": core,
             "core.utils": core_utils,
-            "version": _fake_module("version", __version__="0.32.0"),
+            "version": _fake_module("version", __version__="0.33.0"),
         }
         active = _active_configuration()
         expected_generation = configuration_generation(active)
@@ -753,7 +813,7 @@ class RecorderTaskTests(unittest.TestCase):
             "core.utils": _fake_module(
                 "core.utils", RedisClient=SimpleNamespace(get_client=lambda: redis),
             ),
-            "version": _fake_module("version", __version__="0.32.0"),
+            "version": _fake_module("version", __version__="0.33.0"),
         }
         with _isolated_plugin_modules(fake_modules):
             tasks = importlib.import_module("catchuparr.tasks")
@@ -818,7 +878,7 @@ class RecorderTaskTests(unittest.TestCase):
             "apps.channels.tasks": apps_channels_tasks,
             "core": core,
             "core.utils": core_utils,
-            "version": _fake_module("version", __version__="0.32.0"),
+            "version": _fake_module("version", __version__="0.33.0"),
         }
         applied_state = {"active": active, "control": SimpleNamespace(paused=False, generation=3)}
         with _isolated_plugin_modules(fake_modules):
@@ -906,7 +966,7 @@ class RecorderTaskTests(unittest.TestCase):
             "core.utils": _fake_module(
                 "core.utils", RedisClient=SimpleNamespace(get_client=lambda: redis)
             ),
-            "version": _fake_module("version", __version__="0.32.0"),
+            "version": _fake_module("version", __version__="0.33.0"),
         }
         with _isolated_plugin_modules(fake_modules):
             tasks = importlib.import_module("catchuparr.tasks")
@@ -958,7 +1018,7 @@ class RecorderTaskTests(unittest.TestCase):
                 "apps.channels.tasks": apps_channels_tasks,
                 "core": core,
                 "core.utils": core_utils,
-                "version": _fake_module("version", __version__="0.32.0"),
+                "version": _fake_module("version", __version__="0.33.0"),
             }
 
             with _isolated_plugin_modules(fake_modules):
@@ -1099,7 +1159,7 @@ class RecorderTaskTests(unittest.TestCase):
                 "apps.channels.tasks": apps_channels_tasks,
                 "core": core,
                 "core.utils": core_utils,
-                "version": _fake_module("version", __version__="0.32.0"),
+                "version": _fake_module("version", __version__="0.33.0"),
             }
             with _isolated_plugin_modules(fake_modules):
                 tasks = importlib.import_module("catchuparr.tasks")
@@ -1422,7 +1482,7 @@ class RecorderTaskTests(unittest.TestCase):
                 "apps.channels.tasks": apps_channels_tasks,
                 "core": core,
                 "core.utils": core_utils,
-                "version": _fake_module("version", __version__="0.32.0"),
+                "version": _fake_module("version", __version__="0.33.0"),
             }
 
             def ranked_candidates(_channel, _active, *, all_sources):
@@ -1513,7 +1573,90 @@ class RecorderTaskTests(unittest.TestCase):
             )
 
 
+class SharingWakeupTests(unittest.TestCase):
+    def test_deadline_uses_applied_stability_and_switch_settings(self):
+        from catchuparr.sharing_planner import SharingPhase, SharingState
+        with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
+            tasks = importlib.import_module("catchuparr.tasks")
+            state = SharingState(
+                channel_uuid="synthetic-channel", configuration_generation="config",
+                control_generation=1, recorder_fence=1, phase=SharingPhase.WAIT_LIVE,
+                candidate_since=100.0, last_switch_at=100.0,
+            )
+            coordinator = SimpleNamespace(
+                channel_uuid="synthetic-channel", state_record=SimpleNamespace(state=state, intent=None),
+                active={"connection_sharing": {"synthetic-channel": {
+                    "live_stability_seconds": 30, "min_switch_interval_seconds": 90,
+                }}},
+            )
+            self.assertFalse(tasks._sharing_deadline_due(coordinator, 189.99))
+            self.assertTrue(tasks._sharing_deadline_due(coordinator, 190.0))
+            coordinator.state_record.state = __import__("dataclasses").replace(state, last_switch_at=None)
+            self.assertTrue(tasks._sharing_deadline_due(coordinator, 100.0))
+
+    def test_observation_detects_viewer_and_source_changes_without_writes(self):
+        class ReadOnlyRedis:
+            def __init__(self):
+                self.clients = set()
+                self.state = "active"
+                self.stopped = set()
+
+            def pipeline(self, transaction=False):
+                owner = self
+                class Pipeline:
+                    def __init__(self):
+                        self.results = []
+                    def get(self, key):
+                        self.results.append("worker")
+                    def hmget(self, key, *fields):
+                        self.results.append([owner.state, "worker", "stream", "profile", "input"]
+                                            if key.endswith(":metadata") else ["100", "worker"])
+                    def smembers(self, key):
+                        self.results.append(set(owner.clients))
+                    def exists(self, key):
+                        self.results.append(int(key.rsplit(":", 2)[-2] in owner.stopped)
+                                            if key.endswith(":stop") else 1)
+                    def execute(self):
+                        return self.results
+                return Pipeline()
+
+        with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
+            tasks = importlib.import_module("catchuparr.tasks")
+            redis = ReadOnlyRedis()
+            empty = tasks._sharing_watch_signature(redis, "synthetic-channel")
+            self.assertEqual(empty, tasks._sharing_watch_signature(redis, "synthetic-channel"))
+            redis.clients.add("viewer")
+            viewer = tasks._sharing_watch_signature(redis, "synthetic-channel")
+            self.assertNotEqual(empty, viewer)
+            redis.stopped.add("viewer")
+            stopped = tasks._sharing_watch_signature(redis, "synthetic-channel")
+            self.assertNotEqual(viewer, stopped)
+            redis.state = "waiting_for_clients"
+            self.assertNotEqual(stopped, tasks._sharing_watch_signature(redis, "synthetic-channel"))
+
+
 class BorrowCleanupRetryTests(unittest.TestCase):
+    def test_prepared_borrow_interrupts_source_retry_backoff(self):
+        with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
+            tasks = importlib.import_module("catchuparr.tasks")
+            stop, wake = threading.Event(), threading.Event()
+            result = []
+            waiter = threading.Thread(target=lambda: result.append(
+                tasks._wait_for_borrow_wakeup(stop, wake, 30.0),
+            ))
+            waiter.start()
+            wake.set()
+            waiter.join(timeout=2)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(result, ["borrow"])
+
+    def test_stop_interrupts_borrow_wait(self):
+        with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
+            tasks = importlib.import_module("catchuparr.tasks")
+            stop, wake = threading.Event(), threading.Event()
+            stop.set()
+            self.assertEqual(tasks._wait_for_borrow_wakeup(stop, wake, 30.0), "stop")
+
     def test_delayed_cleanup_retains_lease_and_never_starts_another_input(self):
         with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
             tasks = importlib.import_module("catchuparr.tasks")
@@ -1531,6 +1674,19 @@ class BorrowCleanupRetryTests(unittest.TestCase):
             self.assertEqual(pending.call_count, 2)
             event.set.assert_not_called()
             self.assertEqual(event.wait.call_count, 2)
+
+    def test_failure_recovery_immediately_queues_only_one_fresh_borrow(self):
+        with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):
+            tasks = importlib.import_module("catchuparr.tasks")
+            opened = object()
+            coordinator = SimpleNamespace(poll=Mock(return_value=opened))
+            state = {"borrow": None, "return_prepared": object()}
+            lock = threading.RLock()
+            self.assertTrue(tasks._retry_failure_attach(coordinator, {}, 3, lock, state))
+            self.assertIs(state["borrow"], opened)
+            self.assertIsNone(state["return_prepared"])
+            self.assertFalse(tasks._retry_failure_attach(coordinator, {}, 3, lock, state))
+            coordinator.poll.assert_called_once_with(active={}, control_generation=3)
 
     def test_lost_authority_or_lease_blocks_retry_and_source_switch(self):
         for current, renewed in ((False, True), (True, False)):
@@ -1614,7 +1770,7 @@ class RecorderAttemptCleanupTests(unittest.TestCase):
         self.assertTrue(run.result)
         self.assertEqual(2, run.attempt.revoke.call_count)
         self.assertEqual(1, run.stop.call_count)
-        self.assertEqual([1.0], run.event.waits)
+        self.assertEqual([0.2], run.event.waits)
 
     def test_native_stop_and_http_ack_can_complete_on_different_retries(self):
         run = self._run_cleanup(stops=(False, True, True), acks=(False, True))
@@ -1623,7 +1779,7 @@ class RecorderAttemptCleanupTests(unittest.TestCase):
         self.assertEqual(3, run.stop.call_count)
         self.assertEqual(2, run.attempt.acknowledge_reaped.call_count)
         self.assertEqual(2, run.lease.renew.call_count)
-        self.assertEqual([1.0, 1.0], run.event.waits)
+        self.assertEqual([0.2, 0.2], run.event.waits)
         self.assertFalse(run.event.is_set())
 
     def test_transient_cleanup_error_retries_only_while_lease_is_current(self):

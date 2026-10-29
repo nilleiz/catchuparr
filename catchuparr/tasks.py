@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from threading import Event as _WakeEvent
 
 from celery import shared_task
 
@@ -16,7 +17,59 @@ RECORDER_CAPABILITY_HEADER = "X-Catchuparr-Recorder"
 RECORDER_CAPABILITY_TTL_SECONDS = 30
 RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS = 2.0
 RECORDER_CANDIDATE_RETRY_MAX_SECONDS = 30.0
-RECORDER_CLEANUP_RETRY_SECONDS = 1.0
+RECORDER_CLEANUP_RETRY_SECONDS = 0.2
+SHARING_WATCH_INTERVAL_SECONDS = 1.0
+RECORDER_SUPERVISION_INTERVAL_SECONDS = 10.0
+
+
+def _sharing_watch_signature(redis, channel_uuid):
+    """Read native viewer/source changes without refreshing or mutating them."""
+    prefix = f"live:channel:{channel_uuid}"
+    try:
+        first = redis.pipeline(transaction=False)
+        first.get(f"{prefix}:owner")
+        first.hmget(f"{prefix}:metadata", "state", "owner", "stream_id", "m3u_profile", "stream_profile")
+        first.smembers(f"{prefix}:clients")
+        first.exists(f"{prefix}:input:buffer:index")
+        first.exists(f"{prefix}:input:buffer:chunk_timestamps")
+        owner, metadata, clients, index_exists, timestamps_exist = first.execute()
+        clients = sorted(clients, key=lambda value: str(value))
+        second = redis.pipeline(transaction=False)
+        for client in clients:
+            if isinstance(client, bytes):
+                client = client.decode("utf-8", errors="strict")
+            second.hmget(f"{prefix}:clients:{client}", "connected_at", "worker_id")
+            second.exists(f"{prefix}:client:{client}:stop")
+        details = second.execute() if clients else []
+        return (owner, tuple(metadata), tuple(clients), bool(index_exists),
+                bool(timestamps_exist), tuple(tuple(x) if isinstance(x, list) else x for x in details))
+    except Exception:
+        return None
+
+
+def _sharing_deadline_due(coordinator, now):
+    """Wake at an admitted attach deadline without changing its configured delay."""
+    try:
+        from .sharing_planner import SharingAction, SharingPhase
+
+        record = coordinator.state_record
+        token = record.intent
+        if token is not None:
+            return token.action is SharingAction.ATTACH_BORROW and now >= token.not_before
+        state = record.state
+        if state.phase is not SharingPhase.WAIT_LIVE or state.candidate_since is None:
+            return False
+        setting = coordinator.active["connection_sharing"][coordinator.channel_uuid]
+        stability = setting["live_stability_seconds"]
+        minimum = setting["min_switch_interval_seconds"]
+        if type(stability) is not int or type(minimum) is not int:
+            return False
+        deadline = state.candidate_since + (stability if state.last_switch_at is not None else 0)
+        if state.last_switch_at is not None:
+            deadline = max(deadline, state.last_switch_at + minimum)
+        return now >= deadline
+    except Exception:
+        return False
 
 
 def _finish_borrow_cleanup(cleanup, lease, stop_event, *, still_current, on_pending):
@@ -39,6 +92,66 @@ def _finish_borrow_cleanup(cleanup, lease, stop_event, *, still_current, on_pend
             return False
         if stop_event.wait(RECORDER_CLEANUP_RETRY_SECONDS):
             return False
+
+
+def _wait_for_borrow_wakeup(stop_event, wakeup, timeout, *, clock=time.monotonic):
+    """Wake an exhausted-source recorder on ATTACH without waiting its backoff."""
+    deadline = clock() + timeout
+    while not stop_event.is_set():
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return "timeout"
+        if wakeup.wait(min(remaining, 0.2)):
+            return "borrow"
+    return "stop"
+
+
+def _retry_failure_attach(coordinator, active, control_generation, state_lock, attempt_state):
+    """Try one fresh, fenced attach immediately after exact failure cleanup."""
+    with state_lock:
+        if attempt_state.get("borrow") is not None:
+            return False
+        prepared = coordinator.poll(active=active, control_generation=control_generation)
+        if prepared is None:
+            return False
+        attempt_state["borrow"] = prepared
+        # The fresh ATTACH superseded the old RETURN token and receipt.
+        attempt_state["return_prepared"] = None
+        return True
+
+
+def _request_viewer_switch(switch, active, prepared, make_recorder, attempt_state):
+    """Offer one staged reader only for the enabled, current attempt."""
+    if switch is None:
+        return False
+    offered = False
+    if (active.get("synchronize_before_switch") is True
+            and not attempt_state.get("return_syncing", False)):
+        try:
+            target = make_recorder(prepared)
+            attempt_state["syncing"] = True
+            offered = switch.offer_synchronized_input(target)
+        except Exception:
+            offered = False
+        if not offered:
+            attempt_state["syncing"] = False
+    if not offered:
+        switch.request()
+    return offered
+
+
+def _run_claimed_borrow_with_cleanup(prepared, staged_input, run, cleanup, on_pending):
+    """Retain the exact cleanup obligation when a claimed handover raises."""
+    try:
+        return run(prepared, staged_input)
+    except BaseException:
+        try:
+            if staged_input is not None:
+                staged_input.close()
+        finally:
+            if not cleanup(prepared):
+                on_pending()
+        raise
 
 
 def _finish_recorder_attempt(
@@ -348,6 +461,7 @@ def record_channel(
         DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
         DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
         FFmpegCopyRecorder,
+        RecorderAttemptResult,
     )
     from .engine.store import ArchiveStore
     from .logging_utils import error, event
@@ -388,15 +502,19 @@ def record_channel(
     stats_capability_digest = None
     stop_event = None
     monitor = None
+    cleanup_prepared_borrow = None
     # The diagnostic callback and supervisor renewal share this lock across the
     # Redis CAS so an older phase cannot overwrite a newer first-media phase.
     attempt_state_lock = threading.RLock()
+    borrow_wakeup = _WakeEvent()
     attempt_state = {
         "attempt": None, "candidate": None, "switch": None, "borrow": None,
         "active_borrow": None, "return_prepared": None, "return_token": None,
         "return_media_at": None, "completed_return_media": None,
         "diagnostic": None,
         "cleaning_up": False,
+        "syncing": False, "prepared_input": None,
+        "return_syncing": False, "return_sync_marker": None,
     }
 
     def publish_dedicated_diagnostic(
@@ -576,8 +694,36 @@ def record_channel(
                 attempt, prepared, token, candidate, media_at,
             )
 
+        def make_borrow_recorder(prepared):
+            from .adapters.sharing_borrow_route import encode_borrow_capability
+
+            return FFmpegCopyRecorder(
+                store,
+                channel_uuid,
+                f"{proxy_base_url}/catchuparr/sharing/{channel_uuid}",
+                config.archive_root / "work",
+                fencing_token=fence,
+                input_headers={
+                    "X-Catchuparr-Borrow": encode_borrow_capability(prepared.capability),
+                    "X-Catchuparr-Stats-Recorder": stats_capability,
+                },
+                require_media_progress=True,
+            )
+
         def supervise():
-            while not stop_event.wait(10):
+            signature = None
+            next_full_check = time.monotonic() + RECORDER_SUPERVISION_INTERVAL_SECONDS
+            interval = (SHARING_WATCH_INTERVAL_SECONDS if sharing_coordinator is not None
+                        else RECORDER_SUPERVISION_INTERVAL_SECONDS)
+            while not stop_event.wait(interval):
+                if sharing_coordinator is not None:
+                    current_signature = _sharing_watch_signature(redis, channel_uuid)
+                    changed = current_signature is not None and current_signature != signature
+                    signature = current_signature
+                    if (not changed and time.monotonic() < next_full_check
+                            and not _sharing_deadline_due(sharing_coordinator, time.time())):
+                        continue
+                next_full_check = time.monotonic() + RECORDER_SUPERVISION_INTERVAL_SECONDS
                 try:
                     current_admission = _supervisor_recorder_admission_state(
                         channel_uuid, expected_generation, expected_control_generation
@@ -621,7 +767,9 @@ def record_channel(
                     # revoked capability or preparing another native input.
                     if cleaning_up:
                         continue
-                    if sharing_coordinator is not None:
+                    with attempt_state_lock:
+                        syncing = attempt_state["syncing"]
+                    if sharing_coordinator is not None and not syncing:
                         prepared = sharing_coordinator.poll(
                             active=current_active,
                             control_generation=expected_control_generation,
@@ -630,13 +778,16 @@ def record_channel(
                             with attempt_state_lock:
                                 if attempt_state["borrow"] is None:
                                     attempt_state["borrow"] = prepared
+                                    borrow_wakeup.set()
                                 else:
                                     prepared = None
                             if prepared is not None:
                                 with attempt_state_lock:
                                     current_switch = attempt_state["switch"]
-                                if current_switch is not None:
-                                    current_switch.request()
+                                    _request_viewer_switch(
+                                        current_switch, current_active, prepared,
+                                        make_borrow_recorder, attempt_state,
+                                    )
                     with attempt_state_lock:
                         if attempt_state["cleaning_up"]:
                             continue
@@ -733,8 +884,22 @@ def record_channel(
                 with attempt_state_lock:
                     prepared = attempt_state["borrow"]
                     attempt_state["borrow"] = None
+                    staged_input = attempt_state["prepared_input"]
+                    attempt_state["prepared_input"] = None
+                    attempt_state["syncing"] = False
+                    borrow_wakeup.clear()
                 if prepared is None:
+                    if staged_input is not None:
+                        staged_input.close()
                     return False
+                with attempt_state_lock:
+                    attempt_state["return_sync_marker"] = None
+                return _run_claimed_borrow_with_cleanup(
+                    prepared, staged_input, run_claimed_borrow, cleanup_prepared_borrow,
+                    lambda: error("borrow_cleanup_pending", callsite="borrowed_cleanup"),
+                )
+
+            def run_claimed_borrow(prepared, staged_input) -> bool:
                 current_state = _recorder_admission_state(
                     channel_uuid, expected_generation, expected_control_generation
                 )
@@ -742,29 +907,20 @@ def record_channel(
                     # The opening claim has been consumed. Do not fall through
                     # to an allowlisted recorder while its native registration
                     # may still be present.
+                    if staged_input is not None:
+                        staged_input.close()
                     if not cleanup_prepared_borrow(prepared):
                         error("borrow_cleanup_pending", callsite="borrowed_cleanup")
                     stop_event.set()
                     return True
-                from .adapters.sharing_borrow_route import encode_borrow_capability
-
-                recorder = FFmpegCopyRecorder(
-                    store,
-                    channel_uuid,
-                    f"{proxy_base_url}/catchuparr/sharing/{channel_uuid}",
-                    config.archive_root / "work",
-                    fencing_token=fence,
-                    input_headers={
-                        "X-Catchuparr-Borrow": encode_borrow_capability(prepared.capability),
-                        "X-Catchuparr-Stats-Recorder": stats_capability,
-                    },
-                    require_media_progress=True,
-                )
+                recorder = staged_input.recorder if staged_input is not None else make_borrow_recorder(prepared)
                 recorder._mark_next_discontinuity = True
                 current_state = _recorder_admission_state(
                     channel_uuid, expected_generation, expected_control_generation
                 )
                 if stop_event.is_set() or current_state["status"] != "ready":
+                    if staged_input is not None:
+                        staged_input.close()
                     if not cleanup_prepared_borrow(prepared):
                         error("borrow_cleanup_pending", callsite="borrowed_cleanup")
                     stop_event.set()
@@ -786,8 +942,11 @@ def record_channel(
                         stop_event, startup_timeout=DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
                         media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
                         on_first_media=record_borrow_media,
+                        **({"staged_input": staged_input} if staged_input is not None else {}),
                     )
                 except Exception as exc:
+                    if staged_input is not None:
+                        staged_input.close()
                     error("borrowed_recorder_worker_stopped", exc, callsite="borrowed_worker")
                     publish_borrow_diagnostic(
                         prepared, "error", error_code="borrowed_recorder_worker_stopped",
@@ -805,6 +964,12 @@ def record_channel(
                         borrow_outcome = "return"
                     elif borrow_result.status == "stopped":
                         borrow_outcome = "stop"
+                return_sync_marker = (
+                    getattr(recorder, "_current_attempt_segment_id", None)
+                    if (borrow_outcome == "return"
+                        and active.get("synchronize_before_switch") is True)
+                    else None
+                )
                 # run_candidate has reaped FFmpeg, so exact reader cleanup may
                 # now be retried. Never switch inputs while its native client
                 # or episode projection can still be live.
@@ -818,33 +983,56 @@ def record_channel(
                         prepared, "cleanup_pending", started_at=borrow_started_at,
                     )
 
-                cleanup_acknowledged = _finish_borrow_cleanup(
-                    lambda: cleanup_prepared_borrow(prepared), lease, stop_event,
-                    still_current=borrow_cleanup_current, on_pending=borrow_cleanup_pending,
-                )
-                if cleanup_acknowledged and sharing_coordinator is not None:
-                    cleanup_acknowledged = sharing_coordinator.record_return_after_cleanup(
-                        prepared, now=time.time(), outcome=borrow_outcome,
+                with attempt_state_lock:
+                    attempt_state["cleaning_up"] = True
+                try:
+                    cleanup_acknowledged = _finish_borrow_cleanup(
+                        lambda: cleanup_prepared_borrow(prepared), lease, stop_event,
+                        still_current=borrow_cleanup_current, on_pending=borrow_cleanup_pending,
                     )
-                    if cleanup_acknowledged:
-                        return_token = sharing_coordinator.pending_return_intent()
-                        if (return_token is not None
-                                and return_token.intent_epoch > prepared.capability.intent_epoch):
-                            with attempt_state_lock:
-                                attempt_state["return_prepared"] = prepared
-                if not cleanup_acknowledged:
-                    error("borrow_cleanup_pending", callsite="borrowed_cleanup")
-                    publish_borrow_diagnostic(
-                        prepared, "cleanup_pending", started_at=borrow_started_at,
-                    )
-                    stop_event.set()
-                else:
+                    if cleanup_acknowledged and sharing_coordinator is not None:
+                        cleanup_acknowledged = sharing_coordinator.record_return_after_cleanup(
+                            prepared, now=time.time(), outcome=borrow_outcome,
+                        )
+                        if not cleanup_acknowledged:
+                            error("sharing_return_recovery_pending", callsite="return_completion")
+                        if cleanup_acknowledged:
+                            return_token = sharing_coordinator.pending_return_intent()
+                            if (return_token is not None
+                                    and return_token.intent_epoch > prepared.capability.intent_epoch):
+                                with attempt_state_lock:
+                                    attempt_state["return_prepared"] = prepared
+                                    attempt_state["return_sync_marker"] = return_sync_marker
+                            if borrow_outcome == "failure" and not stop_event.is_set():
+                                # Re-observe immediately after the exact cleanup;
+                                # normal viewer departures keep their settings.
+                                try:
+                                    admission = _recorder_admission_state(
+                                        channel_uuid, expected_generation, expected_control_generation,
+                                    )
+                                    if admission["status"] == "ready":
+                                        _retry_failure_attach(
+                                            sharing_coordinator, admission["active"],
+                                            expected_control_generation, attempt_state_lock, attempt_state,
+                                        )
+                                except Exception as exc:
+                                    error("sharing_observation_failed", exc, callsite="native_observation")
+                    if not cleanup_acknowledged:
+                        error("borrow_cleanup_pending", callsite="borrowed_cleanup")
+                        publish_borrow_diagnostic(
+                            prepared, "cleanup_pending", started_at=borrow_started_at,
+                        )
+                        stop_event.set()
+                    else:
+                        with attempt_state_lock:
+                            current_diagnostic = attempt_state.get("diagnostic")
+                            if (isinstance(current_diagnostic, dict)
+                                    and current_diagnostic.get("kind") == "borrowed"
+                                    and current_diagnostic.get("prepared") is prepared):
+                                attempt_state["diagnostic"] = None
+                finally:
                     with attempt_state_lock:
-                        current_diagnostic = attempt_state.get("diagnostic")
-                        if (isinstance(current_diagnostic, dict)
-                                and current_diagnostic.get("kind") == "borrowed"
-                                and current_diagnostic.get("prepared") is prepared):
-                            attempt_state["diagnostic"] = None
+                        attempt_state["cleaning_up"] = False
                 return True
 
             candidate_index = 0
@@ -858,6 +1046,7 @@ def record_channel(
                     return_token = None
                     with attempt_state_lock:
                         return_prepared = attempt_state["return_prepared"]
+                        return_sync_marker = attempt_state["return_sync_marker"]
                     if return_prepared is not None and sharing_coordinator is not None:
                         return_token = sharing_coordinator.pending_return_intent()
                         return_origin_epoch = (
@@ -980,15 +1169,46 @@ def record_channel(
 
                             first_media_callback = acknowledge_return_media
                             try:
-                                result = recorder.run_candidate(
-                                    stop_event,
-                                    startup_timeout=DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
-                                    media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
-                                    **({"attempt_switch": attempt_switch}
-                                       if attempt_switch is not None else {}),
-                                    **({"on_first_media": first_media_callback}
-                                       if first_media_callback is not None else {}),
-                                )
+                                staged_return = None
+                                tried_return_sync = False
+                                if (return_token is not None and return_sync_marker is not None
+                                        and attempt_switch is not None
+                                        and current_state["active"].get("synchronize_before_switch") is True):
+                                    tried_return_sync = True
+                                    with attempt_state_lock:
+                                        attempt_state["return_syncing"] = True
+                                    try:
+                                        staged_return = recorder.prepare_synchronized_return(
+                                            return_sync_marker, stop_event, attempt_switch,
+                                        )
+                                    finally:
+                                        with attempt_state_lock:
+                                            attempt_state["return_syncing"] = False
+                                if (tried_return_sync and staged_return is None
+                                        and (stop_event.is_set() or attempt_switch.is_set())):
+                                    status = "stopped" if stop_event.is_set() else "switch_requested"
+                                    result = RecorderAttemptResult(
+                                        status, 0, None,
+                                        attempt_switch_id=(
+                                            attempt_switch.attempt_id if status == "switch_requested" else None
+                                        ),
+                                    )
+                                else:
+                                    result = recorder.run_candidate(
+                                        stop_event,
+                                        startup_timeout=DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
+                                        media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
+                                        **({"attempt_switch": attempt_switch}
+                                           if attempt_switch is not None else {}),
+                                        **({"on_first_media": first_media_callback}
+                                           if first_media_callback is not None else {}),
+                                        **({"staged_input": staged_return}
+                                           if staged_return is not None else {}),
+                                    )
+                                with attempt_state_lock:
+                                    attempt_state["prepared_input"] = getattr(result, "staged_input", None)
+                                    if result.useful_segments:
+                                        attempt_state["return_sync_marker"] = None
                             except Exception as exc:
                                 error("recorder_worker_stopped", exc, callsite="dedicated_worker")
                                 publish_dedicated_diagnostic(
@@ -1007,6 +1227,12 @@ def record_channel(
                                         attempt, "no_media_progress",
                                         started_at=dedicated_started_at,
                                     )
+                            finally:
+                                if staged_return is not None:
+                                    try:
+                                        staged_return.close()
+                                    except Exception as exc:
+                                        error("recorder_cleanup_pending", exc, callsite="dedicated_worker")
                     finally:
                         with attempt_state_lock:
                             attempt_state["cleaning_up"] = True
@@ -1018,6 +1244,10 @@ def record_channel(
 
                         def cleanup_pending():
                             error("recorder_cleanup_pending", callsite="attempt_reconciliation")
+                            with attempt_state_lock:
+                                staged = attempt_state["prepared_input"]
+                            if staged is not None:
+                                staged.within_limits()
                             publish_dedicated_diagnostic(
                                 attempt, "cleanup_pending", started_at=dedicated_started_at,
                             )
@@ -1050,6 +1280,7 @@ def record_channel(
                     if result is not None and result.useful_segments > 0:
                         candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
                     if result is not None and result.status == "stopped":
+                        run_prepared_borrow()
                         break
                     if run_prepared_borrow():
                         # The prior attempt was reaped and its sharing operation
@@ -1071,8 +1302,11 @@ def record_channel(
                 # new ATTACH decisions indefinitely. Retry the ranked sources
                 # as a fresh cycle with bounded backoff, while rechecking task
                 # authority and refreshing the source list before any new work.
-                if stop_event.wait(candidate_retry_seconds):
+                wake = _wait_for_borrow_wakeup(stop_event, borrow_wakeup, candidate_retry_seconds)
+                if wake == "stop":
                     break
+                if wake == "borrow":
+                    continue
                 retry_admission = _recorder_admission_state(
                     channel_uuid, expected_generation, expected_control_generation
                 )
@@ -1106,6 +1340,19 @@ def record_channel(
             if monitor is not None and monitor.ident is not None:
                 monitor.join(timeout=12)
         finally:
+            with attempt_state_lock:
+                pending_prepared = attempt_state["borrow"]
+                pending_input = attempt_state["prepared_input"]
+                attempt_state["borrow"] = None
+                attempt_state["prepared_input"] = None
+            if pending_input is not None:
+                try:
+                    pending_input.close()
+                except Exception as exc:
+                    error("borrow_cleanup_pending", exc, callsite="borrowed_cleanup")
+            if pending_prepared is not None and cleanup_prepared_borrow is not None:
+                if not cleanup_prepared_borrow(pending_prepared):
+                    error("borrow_cleanup_pending", callsite="borrowed_cleanup")
             if stats_capability_key is not None:
                 try:
                     redis.delete(stats_capability_key)

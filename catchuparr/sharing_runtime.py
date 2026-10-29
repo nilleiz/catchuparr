@@ -133,23 +133,32 @@ class RecorderBorrowCoordinator:
         try:
             current = self.intent_ledger.read(self.channel_uuid)
             token = current.intent if current is not None else None
-            if (token is None or token.action is not SharingAction.RETURN_TO_ALLOWED
-                    or current.state.phase.value != "wait_return"
-                    or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED
-                    or current.state.intent_epoch != token.intent_epoch
+            if (current is None
                     or current.state.configuration_generation != self.configuration_generation
                     or current.state.control_generation != self.control_generation
-                    or current.state.recorder_fence != self.recorder_fence
-                    or token.configuration_generation != self.configuration_generation
-                    or token.control_generation != self.control_generation
-                    or token.recorder_fence != self.recorder_fence):
+                    or current.state.recorder_fence != self.recorder_fence):
                 return None
+            if token is None:
+                if (current.state.phase is not SharingPhase.FAILED
+                        or current.state.pending_action is not None):
+                    return None
+                epoch_limit = current.state.intent_epoch + 1
+            elif (token.action is not SharingAction.RETURN_TO_ALLOWED
+                  or current.state.phase not in {SharingPhase.WAIT_RETURN, SharingPhase.FAILED}
+                  or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED
+                  or current.state.intent_epoch != token.intent_epoch
+                  or token.configuration_generation != self.configuration_generation
+                  or token.control_generation != self.control_generation
+                  or token.recorder_fence != self.recorder_fence):
+                return None
+            else:
+                epoch_limit = token.intent_epoch
             episode = self.episode_ledger.read(self.channel_uuid)
             if (episode.phase != "closed" or not episode.client_id
                     or episode.configuration_generation != self.configuration_generation
                     or episode.control_generation != self.control_generation
                     or episode.recorder_fence > self.recorder_fence
-                    or episode.intent_epoch >= token.intent_epoch
+                    or episode.intent_epoch >= epoch_limit
                     or episode.identity is None):
                 return None
             # Equal-fence recovery is allowed only when the closed episode was
@@ -419,7 +428,8 @@ class RecorderBorrowCoordinator:
                 from dataclasses import replace
 
                 paused = replace(
-                    state, phase=type(state.phase).PAUSED,
+                    state, phase=(type(state.phase).FAILED if outcome == "failure"
+                                  else type(state.phase).PAUSED),
                     candidate_identity=None, candidate_connection_identity=None,
                     candidate_since=None, borrowed_identity=None,
                     pending_action=None,
@@ -461,7 +471,8 @@ class RecorderBorrowCoordinator:
                     if state.last_switch_at is not None else float(left_at),
                 )
             next_state = replace(
-                state, phase=type(state.phase).WAIT_RETURN,
+                state, phase=(type(state.phase).FAILED if outcome == "failure"
+                              else type(state.phase).WAIT_RETURN),
                 candidate_identity=None, candidate_connection_identity=None,
                 candidate_since=None, borrowed_identity=None,
                 last_viewer_left_at=float(left_at),
@@ -639,7 +650,7 @@ class RecorderBorrowCoordinator:
                 self.state_record = current
                 return True
             if (current.intent != token
-                    or current.state.phase.value != "wait_return"
+                    or current.state.phase not in {SharingPhase.WAIT_RETURN, SharingPhase.FAILED}
                     or current.state.pending_action is not SharingAction.RETURN_TO_ALLOWED
                     or current.state.intent_epoch != token.intent_epoch
                     or current.state.configuration_generation != self.configuration_generation
@@ -812,7 +823,8 @@ class RecorderBorrowCoordinator:
             receipt = self._read_return_receipt()
             if (receipt is None or receipt.intent_epoch >= token.intent_epoch
                     or receipt.recorder_fence > self.recorder_fence
-                    or target.connection_identity == receipt.connection_identity
+                    or (target.connection_identity == receipt.connection_identity
+                        and current.state.phase is not SharingPhase.FAILED)
                     or not borrow_return_cleanup_acknowledged(
                         self.redis, self.episode_ledger, receipt,
                     )):
@@ -855,7 +867,15 @@ class RecorderBorrowCoordinator:
                 recording_enabled=True, schedule_open=True,
                 dedicated_source_available=self.dedicated_source_available,
             )
-            decision = observe(base, observation)
+            failure_recovery = latest.state.phase is SharingPhase.FAILED
+            planning = replace(base, last_switch_at=None) if failure_recovery else base
+            decision = observe(planning, observation)
+            if failure_recovery:
+                # Preserve the true switch time for subsequent normal moves;
+                # this one exact, freshly admitted failure recovery is exempt.
+                decision = replace(decision, state=replace(
+                    decision.state, last_switch_at=base.last_switch_at,
+                ))
             action = decision.action if decision.action not in {
                 SharingAction.WAIT, SharingAction.NOOP,
             } else None
@@ -909,6 +929,13 @@ class RecorderBorrowCoordinator:
                     self._sync_viewer_grace(live_episode)
                 return None
         except Exception:
+            return None
+        if (self.state_record.intent is None
+                and self.state_record.state.phase in {SharingPhase.BORROWED, SharingPhase.WAIT_RETURN}):
+            # Native cleanup can remove its projection before the recorder has
+            # reaped the reader and recorded its fenced return. The persisted
+            # state has no borrowed identity, so ordinary observation here
+            # would otherwise erase the return phase and its grace clocks.
             return None
         if (
             self.state_record.intent is not None
@@ -987,8 +1014,34 @@ class RecorderBorrowCoordinator:
             target=native.target if native is not None else None,
             dedicated_source_available=self.dedicated_source_available,
         )
-        decision = observe(self.state_record.state, observation)
-        if decision.action is SharingAction.NOOP and decision.state == self.state_record.state:
+        state = self.state_record.state
+        if (state.phase is SharingPhase.FAILED and observation.target is None
+                and not self.dedicated_source_available):
+            # Keep the failure marker until a viewer appears; no private
+            # source can resume recording while the allowed list is empty.
+            return None
+        failure_recovery = False
+        if state.phase is SharingPhase.FAILED and observation.target is not None:
+            # Only the exact, durably closed failure episode can authorize
+            # bypassing normal cooldowns. No viewer means normal fallback.
+            receipt = self._read_return_receipt()
+            failure_recovery = bool(
+                receipt is not None
+                and receipt.intent_epoch == state.intent_epoch
+                and receipt.recorder_fence == self.recorder_fence
+                and borrow_return_cleanup_acknowledged(self.redis, self.episode_ledger, receipt)
+            )
+        if failure_recovery:
+            from dataclasses import replace
+
+            planning_state = replace(state, last_switch_at=None)
+            decision = observe(planning_state, observation)
+            decision = replace(decision, state=replace(
+                decision.state, last_switch_at=state.last_switch_at,
+            ))
+        else:
+            decision = observe(state, observation)
+        if decision.action is SharingAction.NOOP and decision.state == state:
             return None
         token_action = decision.action if decision.action not in {SharingAction.WAIT, SharingAction.NOOP} else None
         target_identity = (
@@ -1236,6 +1289,7 @@ def acknowledge_opened_borrow(
         current.state, SharingAction.ATTACH_BORROW, succeeded=True,
         now=float(now), current_state=current.state,
         current_observation=observation,
+        admitted_attach_deadline=token.not_before,
     )
     if resolved.pending_action is not None or resolved.last_switch_at != float(now):
         return False

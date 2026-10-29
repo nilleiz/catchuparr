@@ -1089,6 +1089,8 @@ def _classify_stop_set_source(module_name, function_name) -> str:
         return {
             "supervise": "tasks.supervisor",
             "run_prepared_borrow": "tasks.borrow_runner",
+            "run_claimed_borrow": "tasks.claimed_borrow",
+            "_finish_borrow_cleanup": "tasks.borrow_cleanup",
             "acknowledge_return_media": "tasks.return_ack",
             "run": "tasks.recorder_loop",
         }.get(function_name, "tasks.other")
@@ -1110,11 +1112,11 @@ def _safe_supervisor_admission_status(module_name, function_name, frame_locals) 
 
 
 _SUPERVISOR_STOP_REASONS_BY_LINE = {
-    588: "admission_or_lease_renewal",
-    611: "stats_capability_refresh",
-    655: "attempt_renewal",
-    663: "candidate_currentness",
-    667: "exception",
+    734: "admission_or_lease_renewal",
+    757: "stats_capability_refresh",
+    806: "attempt_renewal",
+    814: "candidate_currentness",
+    818: "exception",
 }
 
 _SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({
@@ -1444,6 +1446,9 @@ class _RecorderTaskRun:
                 with self._lock:
                     self.input_headers.append(dict(headers))
                     self.input_header_times.append(time.time())
+                    staged_input = native_timeouts.get("staged_input")
+                    if staged_input is not None:
+                        self._candidate_processes[threading.get_ident()] = staged_input.process
             on_first_media = native_timeouts.get("on_first_media")
             is_borrow = (
                 isinstance(headers, dict)
@@ -1485,7 +1490,7 @@ class _RecorderTaskRun:
                     poll_interval=POLL_INTERVAL,
                     **{
                         key: native_timeouts[key]
-                        for key in ("attempt_switch", "on_first_media")
+                        for key in ("attempt_switch", "on_first_media", "staged_input")
                         if key in native_timeouts
                     },
                 )
