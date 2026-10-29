@@ -693,6 +693,7 @@ class SharingIntentLedger:
         now: float,
         expected_revision: int | None,
         recovery_is_current: Callable[[str, int | None, str, int, int], bool],
+        failed_attach: bool = False,
     ) -> PersistedSharingState:
         """Restore clocks only after exact revision and current-owner validation.
 
@@ -711,6 +712,7 @@ class SharingIntentLedger:
             or recorder_fence < 0
             or (expected_revision is not None and (type(expected_revision) is not int or expected_revision < 1))
             or not callable(recovery_is_current)
+            or type(failed_attach) is not bool
         ):
             raise ValueError("recovery identity and revision must be valid")
         if recovery_is_current(
@@ -727,8 +729,17 @@ class SharingIntentLedger:
             ):
                 db.rollback()
                 raise StaleSharingIntent("sharing state revision changed during recovery")
+            if failed_attach and (
+                row is None
+                or row["action"] != SharingAction.ATTACH_BORROW.value
+                or row["configuration_generation"] != configuration_generation
+                or int(row["control_generation"]) != control_generation
+                or int(row["recorder_fence"]) != recorder_fence
+            ):
+                db.rollback()
+                raise StaleSharingIntent("failed attach recovery requires the exact current intent")
             if (row is not None
-                    and row["action"] == SharingAction.RETURN_TO_ALLOWED.value):
+                    and (row["action"] == SharingAction.RETURN_TO_ALLOWED.value or failed_attach)):
                 # Recovery may rebind a valid RETURN intent to the new worker
                 # fence. Validate its complete old row before changing any
                 # columns; a malformed deadline/target/snapshot must never be
@@ -802,7 +813,8 @@ class SharingIntentLedger:
                 )
                 state = replace(
                     restored,
-                    phase=(SharingPhase.WAIT_RETURN if preserve_return else SharingPhase.DEDICATED),
+                    phase=(SharingPhase.FAILED if failed_attach else
+                           SharingPhase.WAIT_RETURN if preserve_return else SharingPhase.DEDICATED),
                     borrowed_identity=None,
                     pending_action=(SharingAction.RETURN_TO_ALLOWED if preserve_return else None),
                     intent_epoch=max(restored.intent_epoch, old_epoch) + 1,

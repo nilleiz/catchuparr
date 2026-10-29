@@ -8,6 +8,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.engine.handover import matching_completed_segments
@@ -22,6 +23,61 @@ from catchuparr.engine.store import ArchiveStore
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires FFmpeg")
 class HandoverEvidenceTests(unittest.TestCase):
+    def test_teletext_does_not_prevent_exact_audio_video_proof(self):
+        def document(*, offset, subtitle, video_prefix="video"):
+            streams = [
+                {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                {"index": 1, "codec_type": "audio", "codec_name": "ac3"},
+            ]
+            if subtitle:
+                streams.append({"index": 2, "codec_type": "subtitle", "codec_name": "dvb_teletext"})
+            packets = [
+                {"stream_index": 0, "pts_time": str(offset + i / 25),
+                 "flags": "K" if i == 0 else "", "data_hash": f"SHA256:{video_prefix}{i}"}
+                for i in range(30)
+            ] + [
+                {"stream_index": 1, "pts_time": str(offset + i * 0.032),
+                 "flags": "", "data_hash": f"SHA256:audio{i}"}
+                for i in range(20)
+            ]
+            return SimpleNamespace(stdout=json.dumps({"streams": streams, "packets": packets}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            old, new = Path(directory) / "old.ts", Path(directory) / "new.ts"
+            old.write_bytes(b"synthetic")
+            new.write_bytes(b"synthetic")
+            old_result = document(offset=0, subtitle=True)
+            new_result = document(offset=2, subtitle=False)
+            with patch("catchuparr.engine.handover.subprocess.run", side_effect=[old_result, new_result]):
+                self.assertTrue(matching_completed_segments(old, new))
+            changed = document(offset=2, subtitle=False, video_prefix="different")
+            with patch("catchuparr.engine.handover.subprocess.run", side_effect=[old_result, changed]):
+                self.assertFalse(matching_completed_segments(old, new))
+            document_with_data = json.loads(new_result.stdout)
+            document_with_data["streams"].append({"index": 3, "codec_type": "data", "codec_name": "unknown"})
+            with patch("catchuparr.engine.handover.subprocess.run", side_effect=[
+                old_result, SimpleNamespace(stdout=json.dumps(document_with_data)),
+            ]):
+                self.assertFalse(matching_completed_segments(old, new))
+
+    def test_real_probe_accepts_matching_av_when_subtitle_track_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subtitle = root / "synthetic.srt"
+            subtitle.write_text("1\n00:00:00,100 --> 00:00:01,000\nSynthetic text\n", encoding="utf-8")
+            source, av_only = root / "source.mkv", root / "av-only.mkv"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-i", str(subtitle),
+                "-t", "3", "-map", "0:v", "-map", "1:a", "-map", "2:s",
+                "-c:v", "mpeg2video", "-g", "25", "-c:a", "mp2", "-c:s", "srt", str(source),
+            ], check=True, capture_output=True, timeout=30)
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-i", str(source), "-map", "0:v", "-map", "0:a",
+                "-c", "copy", str(av_only),
+            ], check=True, capture_output=True, timeout=30)
+            self.assertTrue(matching_completed_segments(source, av_only))
+
     def test_independent_mux_clocks_with_identical_av_match_but_other_media_does_not(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

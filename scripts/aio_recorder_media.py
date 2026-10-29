@@ -3360,7 +3360,7 @@ def _failure_return_ack_matches_admitted_window(
             and ack_token.not_before < media_at < ordinary_deadline
             and committed_record.revision == ack_token.revision + 1
             and committed_record.intent is None
-            and committed_state.phase.value == "dedicated"
+            and committed_state.phase.value == "failed"
             and committed_state.pending_action is None
             and committed_state.last_switch_at == media_at
             and committed_state.intent_epoch == ack_token.intent_epoch
@@ -7189,6 +7189,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         return_ack_events = []
         return_ack_snapshots = []
         return_ack_lock = threading.Lock()
+        failure_observation_gate = {"held": False, "blocked": 0, "ack_at": None}
         real_acknowledge_return_media = RecorderBorrowCoordinator.acknowledge_return_media
         real_coordinator_poll = RecorderBorrowCoordinator.poll
 
@@ -7209,6 +7210,9 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             if result:
                 committed = return_ledger.read(worker_id)
                 with return_ack_lock:
+                    if failure_observation_gate["held"]:
+                        failure_observation_gate["ack_at"] = time.time()
+                    failure_observation_gate["held"] = False
                     if "supervisor_ack" not in return_ack_events:
                         return_ack_snapshots.append((
                             token, recovered_return, media_at, committed,
@@ -7418,6 +7422,31 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         _require(bool(second_borrowed_segments),
                  "Post-restart borrow did not archive fresh A media")
 
+        # The viewer remains connected, but one failed attach can coincide
+        # with a temporarily unreadable native observation. Keep it unavailable
+        # until the dedicated recorder's exact return-media ACK has committed;
+        # subsequent polls use the real native observer and all normal guards.
+        from catchuparr import sharing_runtime as failure_runtime_module
+
+        real_failure_observer = failure_runtime_module.observe_native_connection
+
+        def temporarily_unavailable_failure_viewer(redis, channel_uuid, **kwargs):
+            with return_ack_lock:
+                if str(channel_uuid) == str(worker_id) and failure_observation_gate["held"]:
+                    failure_observation_gate["blocked"] += 1
+                    return None
+            return real_failure_observer(redis, channel_uuid, **kwargs)
+
+        failure_native_observation_patch = patch.object(
+            failure_runtime_module, "observe_native_connection",
+            side_effect=temporarily_unavailable_failure_viewer,
+        )
+        failure_native_observation_patch_started = False
+        with return_ack_lock:
+            failure_observation_gate["held"] = True
+        failure_native_observation_patch.start()
+        failure_native_observation_patch_started = True
+
         # Keep the current native borrow healthy through the existing media
         # proof, then fail only its next committed segment.
         run_restart.fail_borrow_after_next_media = True
@@ -7623,10 +7652,20 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 ]
                 task_alive = run_restart.thread is not None and run_restart.thread.is_alive()
                 no_failures = not run_restart.failures
+            with return_ack_lock:
+                failure_ack_committed = "supervisor_ack" in return_ack_events
+                target_was_temporarily_unavailable = failure_observation_gate["blocked"] > 0
+                failure_ack_at = failure_observation_gate["ack_at"]
             recovered_at = borrowed[1][1] if len(borrowed) >= 2 else None
             return {
                 "conditions": {
                     "fresh_borrow_started": recovered_at is not None,
+                    "failure_return_ack_committed": failure_ack_committed,
+                    "target_was_temporarily_unavailable": target_was_temporarily_unavailable,
+                    "prompt_after_return_ack": (
+                        recovered_at is not None and failure_ack_at is not None
+                        and 0 <= recovered_at - failure_ack_at <= 5.0
+                    ),
                     "before_normal_cooldown": (
                         recovered_at is not None and recovered_at < ordinary_return_deadline
                     ),
@@ -7650,6 +7689,22 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             lambda: fast_recovery,
             diagnostic_label="CATCHUPARR_FAILURE_FAST_REATTACH_DIAGNOSTIC",
         )
+        ack_snapshots = read_return_ack_snapshots()
+        _require(
+            len(ack_snapshots) == 1
+            and _failure_return_ack_matches_admitted_window(
+                failure_return_token, ack_snapshots[0][1], ack_snapshots[0][0],
+                ack_snapshots[0][2], ack_snapshots[0][3],
+                channel_uuid=worker_id,
+                configuration_generation=run_restart.expected_generation,
+                control_generation=run_restart.expected_control_generation,
+                return_seconds=return_seconds,
+                minimum_switch_seconds=minimum_switch_seconds,
+            ),
+            "Failure recovery did not preserve its exact return-media ACK",
+        )
+        failure_native_observation_patch.stop()
+        failure_native_observation_patch_started = False
         failure_capture_patch.stop()
         failure_capture_patch_started = False
         return_poll_patch.stop()
@@ -7850,6 +7905,11 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     finally:
         if locals().get("run_restart") is not None:
             run_restart.borrow_failure_result_release.set()
+        if locals().get("failure_native_observation_patch_started"):
+            try:
+                failure_native_observation_patch.stop()
+            except Exception:
+                pass
         if locals().get("return_sync_probe_started"):
             try:
                 return_sync_probe_patch.stop()

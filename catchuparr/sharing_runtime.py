@@ -245,6 +245,7 @@ class RecorderBorrowCoordinator:
                 now=time.time(),
                 expected_revision=self.state_record.revision,
                 recovery_is_current=self._recovery_is_current,
+                failed_attach=True,
             )
             self.state_record = recovered
             return True
@@ -398,6 +399,10 @@ class RecorderBorrowCoordinator:
                 return False
             self.state_record = current
             token = current.intent
+            if outcome == "stop":
+                # Exact cleanup was checked above. A control/Stop path must
+                # not create a failure retry or require the revoked lease.
+                return True
             if token is not None:
                 # A route that failed before activation consumes ATTACH, but it
                 # is not a successful source switch and earns no cooldown.
@@ -407,10 +412,6 @@ class RecorderBorrowCoordinator:
                     and self._recover_closed_attach()
                 )
             state = current.state
-            if outcome == "stop":
-                # Exact cleanup was checked above. A control/Stop path must
-                # not require the revoked lease or create a fallback intent.
-                return True
             if (
                 state.phase.value not in {"borrowed", "wait_return", "failed"}
                 or state.intent_epoch != prepared.capability.intent_epoch
@@ -543,7 +544,7 @@ class RecorderBorrowCoordinator:
             and state.control_generation == token.control_generation
             and state.recorder_fence == token.recorder_fence
             and state.intent_epoch == token.intent_epoch
-            and state.phase.value == "dedicated"
+            and state.phase in {SharingPhase.DEDICATED, SharingPhase.FAILED}
             and state.pending_action is None
             and state.last_switch_at == float(media_at)
             and state.last_viewer_left_at is None
@@ -680,6 +681,13 @@ class RecorderBorrowCoordinator:
                 current_observation=observation,
                 admitted_return_deadline=token.not_before,
             )
+            if current.state.phase is SharingPhase.FAILED and resolved.pending_action is None:
+                # Dedicated media is available, but the failed borrowed route
+                # still needs a fresh viewer attach. Persist that obligation
+                # without changing the true media/switch timestamp.
+                from dataclasses import replace
+
+                resolved = replace(resolved, phase=SharingPhase.FAILED)
             if (resolved.pending_action is not None
                     or resolved.last_switch_at != float(media_at)):
                 from .logging_utils import error
@@ -1015,22 +1023,22 @@ class RecorderBorrowCoordinator:
             dedicated_source_available=self.dedicated_source_available,
         )
         state = self.state_record.state
-        if (state.phase is SharingPhase.FAILED and observation.target is None
-                and not self.dedicated_source_available):
-            # Keep the failure marker until a viewer appears; no private
-            # source can resume recording while the allowed list is empty.
-            return None
         failure_recovery = False
-        if state.phase is SharingPhase.FAILED and observation.target is not None:
-            # Only the exact, durably closed failure episode can authorize
-            # bypassing normal cooldowns. No viewer means normal fallback.
+        if state.phase is SharingPhase.FAILED:
+            # The marker also survives a media-confirmed return to an allowed
+            # source. Do not consume it during an unreadable/buffering viewer
+            # observation; an exact closed episode and current native absence
+            # are required before a fresh attach can bypass the cooldowns.
             receipt = self._read_return_receipt()
             failure_recovery = bool(
                 receipt is not None
-                and receipt.intent_epoch == state.intent_epoch
-                and receipt.recorder_fence == self.recorder_fence
+                and receipt.intent_epoch in {state.intent_epoch, state.intent_epoch - 1}
+                and receipt.recorder_fence <= self.recorder_fence
                 and borrow_return_cleanup_acknowledged(self.redis, self.episode_ledger, receipt)
             )
+            if (not failure_recovery or observation.target is None
+                    or not observation.target.eligible_for_new_borrow(self.channel_uuid)):
+                return None
         if failure_recovery:
             from dataclasses import replace
 
