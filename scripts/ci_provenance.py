@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 ARTIFACT_NAME = "catchuparr-plugin"
 SCHEMA_VERSION = 1
-REQUIRED_AIO_JOBS = {"AIO integration (0.32.0)", "AIO integration (0.33.0)"}
+REQUIRED_AIO_JOBS = {"AIO integration (0.33.0)"}
 REQUIRED_JOBS = {"test-and-package", *REQUIRED_AIO_JOBS}
 REQUIRED_AIO_STEP = "Synthetic playback in actual Dispatcharr AIO"
 PACKAGE_SUFFIXES = {".py", ".json", ".png"}

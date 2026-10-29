@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterator
 
 from .engine.admission import playback_admission_lock
 from .engine.recorder import LIVE_EDGE_IDLE_TIMEOUT_SECONDS
+from .engine.store import TIMELINE_GAP_TOLERANCE_SECONDS
 from .http import RangeNotSatisfiable, parse_byte_range
 
 _TS_STREAM_CHUNK_BYTES = 64 * 1024
@@ -372,7 +373,8 @@ class ArchiveTSPlaybackService:
             ordered = []
             high_water = None
             for item in sorted(segments, key=lambda item: (item.start_utc, item.id)):
-                if high_water is not None and item.start_utc.timestamp() < high_water - 0.25:
+                if (high_water is not None
+                        and item.start_utc.timestamp() < high_water - TIMELINE_GAP_TOLERANCE_SECONDS):
                     continue
                 ordered.append(item)
                 high_water = item.end_utc.timestamp()
@@ -382,11 +384,20 @@ class ArchiveTSPlaybackService:
             return _error(404, "no archived segments in requested range")
 
         clocks = {}
+        timeline_mapper = None
 
         def files_for(candidate_segments):
+            nonlocal timeline_mapper
             unsafe_boundaries: list[int] = []
             byte_offset = 0
             selected_files: list[tuple[Path, int]] = []
+            new_clocks = {}
+            if normalize_timestamps:
+                from .engine.ts_timeline import PlaybackClockMap
+
+                mapper = PlaybackClockMap(start)
+            else:
+                mapper = None
             try:
                 root = Path(self.store.root).resolve(strict=True)
                 for segment in candidate_segments:
@@ -397,12 +408,8 @@ class ArchiveTSPlaybackService:
                     if not path.is_file():
                         return None, None, _error(404, "segment not found")
                     length = path.stat().st_size
-                    if normalize_timestamps:
-                        from .engine.ts_timeline import SegmentClock
-
-                        clocks[segment.id] = SegmentClock.probe(
-                            path, segment.start_utc.timestamp() - start,
-                        )
+                    if mapper is not None:
+                        new_clocks[segment.id] = mapper.append(segment, path)
                     selected_files.append((path, length))
             except (OSError, ValueError):
                 return None, None, _error(404, "segment not found")
@@ -417,6 +424,9 @@ class ArchiveTSPlaybackService:
                     previous_end or segment.end_utc.timestamp(), segment.end_utc.timestamp()
                 )
                 byte_offset += length
+            clocks.clear()
+            clocks.update(new_clocks)
+            timeline_mapper = mapper
             return selected_files, unsafe_boundaries, None
 
         files, unsafe_boundaries, file_error = files_for(segments)
@@ -436,6 +446,20 @@ class ArchiveTSPlaybackService:
                         break
                     time.sleep(min(0.1, remaining))
                     refreshed = self.store.segments(channel, start, end)
+                    if normalize_timestamps:
+                        # A growing resource must preserve its existing byte
+                        # prefix even when an older archive row arrives late.
+                        seen_ids = {item.id for item in segments}
+                        high_water = segments[-1].end_utc.timestamp()
+                        additions = []
+                        for item in sorted(refreshed, key=lambda value: (value.start_utc, value.id)):
+                            if (item.id in seen_ids or item.end_utc.timestamp() > end
+                                    or item.start_utc.timestamp() < high_water - TIMELINE_GAP_TOLERANCE_SECONDS):
+                                continue
+                            additions.append(item)
+                            seen_ids.add(item.id)
+                            high_water = max(high_water, item.end_utc.timestamp())
+                        refreshed = [*segments, *additions]
                     if len(refreshed) <= len(segments):
                         continue
                     refreshed_files, refreshed_boundaries, file_error = files_for(refreshed)
@@ -481,7 +505,7 @@ class ArchiveTSPlaybackService:
             )
 
         etag_source = "\0".join(
-            f"ts-clock-v1:{int(normalize_timestamps)}:{segment.id}:{length}:{start:.6f}"
+            f"ts-clock-v2:{int(normalize_timestamps)}:{segment.id}:{length}:{start:.6f}"
             for segment, (_, length) in zip(segments, files)
         )
         etag = hashlib.sha256(etag_source.encode("utf-8")).hexdigest()
@@ -493,7 +517,7 @@ class ArchiveTSPlaybackService:
             "X-Content-Type-Options": "nosniff",
         }
         if timeline_safe:
-            headers["X-Catchuparr-Archive-Timeline"] = "programme"
+            headers["X-Catchuparr-Archive-Timeline"] = "available-media"
         follow_live_edge = (
             method == "GET" and live and range_header is None and selected is None
         )
@@ -603,6 +627,8 @@ class ArchiveTSPlaybackService:
                                 if item.id not in seen_ids
                                 and item.end_utc.timestamp() > high_water
                                 and item.end_utc.timestamp() <= end
+                                and (not normalize_timestamps or item.start_utc.timestamp()
+                                     >= high_water - TIMELINE_GAP_TOLERANCE_SECONDS)
                             ),
                             key=lambda item: (item.start_utc, item.id),
                         )
@@ -614,7 +640,7 @@ class ArchiveTSPlaybackService:
                             segment.start_utc.timestamp() > high_water + 0.25
                             or segment.discontinuity
                         )
-                        if has_boundary and not normalize_timestamps:
+                        if has_boundary and not timeline_safe:
                             break
                         if not self._renew_lease(
                             user, channel, lease_id, device_key, segment
@@ -625,13 +651,9 @@ class ArchiveTSPlaybackService:
                             path.relative_to(Path(self.store.root).resolve(strict=True))
                             file_size = path.stat().st_size
                             clock = None
-                            if normalize_timestamps:
-                                from .engine.ts_timeline import SegmentClock
-
-                                clock = SegmentClock.probe(
-                                    path, segment.start_utc.timestamp() - start,
-                                )
-                                if has_boundary and clock is None:
+                            if timeline_safe:
+                                clock = timeline_mapper.append(segment, path)
+                                if clock is None:
                                     break
                         except (OSError, ValueError):
                             break

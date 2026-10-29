@@ -590,7 +590,7 @@ def probe():
             require(service.end_session(token, str(selected_channel.uuid), lease),
                     "Synthetic HLS playback lease did not close")
 
-    # Supported cores (0.32+) use the UTC query parameter, including 0.33.
+    # Supported cores use the UTC query parameter.
     time_key = "utc"
     xc_params = {"username": user.username, "password": xc_password,
                  "stream": str(channel.id), "duration": "1"}
@@ -823,6 +823,7 @@ def probe():
     probe_xc_timeline(
         root=root, store=store, channel=channel, start=start,
         timeshift=timeshift, request=request, xc_params=xc_params, time_key=time_key,
+        views=views, hls_params=params, close_hls_session=close_hls_session,
     )
 
     # Run Stats' HLS admission while the synthetic one-slot user has no
@@ -894,7 +895,7 @@ def probe():
             "Incomplete local XC archive did not serve its marked contiguous prefix: "
             f"status={prefix_response.status_code}, "
             f"partial={prefix_response.get('X-Catchuparr-Archive-Partial') == 'true'}, "
-            f"timeline={prefix_response.get('X-Catchuparr-Archive-Timeline') == 'programme'}")
+            f"timeline={prefix_response.get('X-Catchuparr-Archive-Timeline') == 'available-media'}")
     try:
         require(b"".join(prefix_response.streaming_content) == b"\x47" + bytes([10]) * 187,
                 "Bounded XC did not stop at the exact available archive prefix")

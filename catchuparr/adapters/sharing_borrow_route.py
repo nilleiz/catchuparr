@@ -476,11 +476,14 @@ def native_borrow_proof_reader(
         ):
             raise BorrowBindingLost("active Redis episode no longer matches this reader")
 
+        touch_rejections: list[str] = []
         current, deadline, version = check_and_touch_borrowed_client(
             redis, grant, client_record_ttl=client_record_ttl,
+            rejection_reasons=touch_rejections,
         )
         if not current or version is None:
-            raise BorrowBindingLost("native client grant was revoked")
+            reason = touch_rejections[-1] if touch_rejections else "unknown"
+            raise BorrowBindingLost(f"native client grant was revoked: {reason}")
         current_grant = read_native_episode_grant(redis, episode.channel_uuid)
         if current_grant is None or current_grant.version != version or not (
             current_grant.episode_id == episode.episode_id

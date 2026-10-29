@@ -49,6 +49,9 @@ _EVENTS = frozenset({
     "sharing_return_cleanup_pending",
     "sharing_return_media_unconfirmed",
     "sharing_return_binding_stale",
+    "sync_handover_overlap_found",
+    "sync_handover_fallback",
+    "sync_handover_media_committed",
 })
 _ERROR_CATEGORIES = frozenset({
     "configuration_recovery_failed",

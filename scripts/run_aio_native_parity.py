@@ -35,8 +35,8 @@ def _success_receipt(stdout: str) -> dict:
             break
     if receipt is None:
         raise RuntimeError("Focused parity probe produced no structured success receipt")
-    if receipt.get("dispatcharr_version") != "0.32.0":
-        raise RuntimeError("Focused parity probe receipt is not from Dispatcharr 0.32.0")
+    if receipt.get("dispatcharr_version") != "0.33.0":
+        raise RuntimeError("Focused parity probe receipt is not from Dispatcharr 0.33.0")
     cases = receipt.get("cases")
     if not isinstance(cases, dict) or set(cases) != _EXPECTED_CASES:
         raise RuntimeError("Focused parity probe receipt omitted one or more playback cases")

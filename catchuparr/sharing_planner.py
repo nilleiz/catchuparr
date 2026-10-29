@@ -654,6 +654,7 @@ def resolve_transition(
     current_state: SharingState,
     current_observation: SharingObservation,
     admitted_return_deadline: float | None = None,
+    admitted_attach_deadline: float | None = None,
 ) -> SharingState:
     """Commit only successful route changes; failures never advance switch time."""
     if not isinstance(state, SharingState) or not isinstance(current_state, SharingState):
@@ -673,6 +674,13 @@ def resolve_transition(
         or not math.isfinite(float(admitted_return_deadline))
     ):
         raise ValueError("admitted return deadline must be finite and bound to RETURN_TO_ALLOWED")
+    if admitted_attach_deadline is not None and (
+        action is not SharingAction.ATTACH_BORROW
+        or isinstance(admitted_attach_deadline, bool)
+        or not isinstance(admitted_attach_deadline, (int, float))
+        or not math.isfinite(float(admitted_attach_deadline))
+    ):
+        raise ValueError("admitted attach deadline must be finite and bound to ATTACH_BORROW")
     if (
         not current_observation.lease_is_current
         or current_observation.channel_uuid != state.channel_uuid
@@ -740,6 +748,7 @@ def resolve_transition(
         deadline = _completion_deadline(
             current_state, current_observation, action,
             admitted_return_deadline=admitted_return_deadline,
+            admitted_attach_deadline=admitted_attach_deadline,
         )
         if deadline is not None and (
             float(now) < deadline or float(current_observation.now) < deadline
@@ -809,6 +818,7 @@ def _completion_deadline(
     action: SharingAction,
     *,
     admitted_return_deadline: float | None = None,
+    admitted_attach_deadline: float | None = None,
 ) -> float | None:
     """Recheck normal switching deadlines at transition completion.
 
@@ -816,6 +826,8 @@ def _completion_deadline(
     bypass cooldowns. Only ordinary viewer-driven transitions are delayed.
     """
     if action == SharingAction.ATTACH_BORROW:
+        if admitted_attach_deadline is not None:
+            return float(admitted_attach_deadline)
         if state.phase != SharingPhase.WAIT_LIVE or state.candidate_since is None:
             return None
         return _later_deadline(

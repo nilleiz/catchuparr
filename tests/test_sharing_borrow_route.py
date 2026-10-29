@@ -168,6 +168,28 @@ class SharingBorrowRouteTests(unittest.TestCase):
         self.assertEqual(proof.pending_return_deadline, 130.0)
         self.assertTrue(proof.borrowed_client_current)
 
+    def test_native_grant_rejection_reports_only_the_fixed_guard_category(self):
+        episode, ack, grant, _target = self._current_proof_inputs()
+
+        def rejected(*_args, **kwargs):
+            kwargs["rejection_reasons"].append("native-stopping")
+            return False, None, None
+
+        with (
+            patch("catchuparr.adapters.sharing_borrow_route.read_native_episode_grant", return_value=grant),
+            patch("catchuparr.adapters.sharing_borrow_route.check_and_touch_borrowed_client", side_effect=rejected),
+        ):
+            reader = native_borrow_proof_reader(
+                redis=object(), episode=episode, ack=ack,
+                assigned_sources=(self._assigned_source(),),
+                catalog_generation="catalog-route-synthetic", clock=lambda: 120.0,
+            )
+            with self.assertRaises(BorrowBindingLost) as caught:
+                reader()
+        self.assertEqual("native client grant was revoked: native-stopping", str(caught.exception))
+        self.assertNotIn(episode.channel_uuid, str(caught.exception))
+        self.assertNotIn(ack.client_id, str(caught.exception))
+
     def test_observation_rejection_retains_fixed_reason_without_identity_values(self):
         episode, ack, grant, _target = self._current_proof_inputs()
         def rejected(*args, **kwargs):

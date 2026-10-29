@@ -25,16 +25,17 @@ For the 0.5.1 named-profile inheritance prerelease, see [its candidate guide](ca
 The 453-test suite and full pinned AIO probes passed on Dispatcharr 0.31.0
 and 0.32.0. CI, isolated Dev verification and publication remain pending.
 
-Dispatcharr v0.32.0 accepts a manual update at authenticated admin
+The previously inspected Dispatcharr v0.32.0 accepted a manual update at authenticated admin
 `POST /api/plugins/plugins/import/` with multipart field `file` and explicit
 `overwrite=true`; the response must contain `success: true` and the expected
 plugin key/version. `POST /api/plugins/plugins/reload/` refreshes web-process
 discovery. Restart the isolated AIO after the import so its Celery workers use
 the same package, then verify plugin status, recording and playback. Keep the
 previous ZIP for rollback. Both POST routes require an admin account in the
-inspected image.
+inspected image. It is no longer a supported runtime; use the Plugins page or
+verify the equivalent admin interface on the current image.
 
-The minimum supported Dispatcharr version is v0.32.0. Well-formed versions at or above that minimum pass version admission; runtime API capability checks remain mandatory. Authoritative CI covers pinned 0.32.0 and 0.33.0 images. Both native playback steps and the package job must succeed before release-artifact reuse; a missing, skipped or failed matrix job is insufficient. Custom images must retain the inspected core signatures and pass request tests before compatibility is claimed.
+The minimum supported Dispatcharr version is v0.33.0. Well-formed versions at or above that minimum pass version admission; runtime API capability checks remain mandatory. Authoritative CI covers the pinned 0.33.0 image. The native playback step and package job must succeed before release-artifact reuse; missing, skipped or failed evidence is insufficient. Custom images must retain the inspected core signatures and pass request tests before compatibility is claimed.
 
 Create a separate archive access token for each playback device. Session identity is scoped to the credential, not proof of physical device identity: copying a playlist to another player shares its slot. Playlist reloads for the same programme reuse its session; switching programmes replaces that credential's session while preserving its previous segment URLs for a 30-second grace period.
 
@@ -56,9 +57,10 @@ session is limited to 24 hours, and HLS adds `#EXT-X-ENDLIST` after the archive
 edge is stale and no recorder lease is active.
 
 Native XC requests keep Dispatcharr's minute-based duration contract. The
-authenticated archive route follows contiguous indexed segments across guide
-boundaries and does not require later EPG entries. A real timeline gap ends raw
-TS playback. At the live edge it waits up to 125 seconds, matching the
+authenticated archive route follows indexed segments across guide boundaries
+and does not require later EPG entries. Normalized playback skips missing time
+without inventing media; raw TS playback stops at a real gap. At the live edge
+it waits up to 125 seconds, matching the
 recorder's 120-second media-idle timeout plus five seconds for indexing and
 finalization. If the recorder's Redis lease is absent, follow mode ends
 promptly; if Redis health cannot be checked, the finite timeout still applies.
@@ -93,10 +95,10 @@ restore point while preserving the current archive directory, recordings and
 archive database. Do not restore or replace archive data as part of an ordinary
 rollback.
 
-## Upgrading the isolated AIO to 0.32.0
+## Upgrading the isolated AIO to 0.33.0
 
-Use `ghcr.io/dispatcharr/dispatcharr@sha256:b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3`
-with `DISPATCHARR_ENV=aio`. This remains one container with PostgreSQL 17,
+Use `ghcr.io/dispatcharr/dispatcharr@sha256:96bc548978c68e684677da7895692eeeefb7f0b2edfa38311dac2b702c61d236`
+with `DISPATCHARR_ENV=aio`. This remains one container with PostgreSQL,
 Redis, web and workers. The official image replaces the Dev custom image only;
 production is not updated. Preserve Dev bind addresses, volumes and egress rules.
 
@@ -124,13 +126,13 @@ production is not updated. Preserve Dev bind addresses, volumes and egress rules
 
 For a rebuild instead of an in-place upgrade, use the backup ZIP/API restoration
 procedure below. Run `python3 scripts/run_aio_integration.py --image <pinned-image>`
-once for each pinned Dispatcharr version. Each invocation creates a uniquely
+once for the pinned Dispatcharr version. Each invocation creates a uniquely
 named, networkless container with its own anonymous `/data` volume and no fixed
-host ports, so the two version checks can run in parallel. Capture each run's
+host ports. Capture the run's
 output in a separate private log outside the repository. The runner refuses
 databases containing users or channels and removes only its own container and
-volume; verify both exit codes and cleanup before recording acceptance. CI runs
-the same synthetic probe against both supported releases and collects no
+volume; verify its exit code and cleanup before recording acceptance. CI runs
+the same synthetic probe against the pinned baseline and collects no
 container data, recordings or credentials as artifacts.
 
 ## Isolated development stack

@@ -17,12 +17,12 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The package version is **0.7.1 prerelease candidate**. Publication and
-  required GitHub CI remain pending. See [candidate 0.7.1](docs/candidate-0.7.1.md)
+- The package version is **0.7.2**. Its prerelease is gated by native and package
+  CI. See [candidate 0.7.2](docs/candidate-0.7.2.md)
   and the [validation record](docs/validation.md).
-- The minimum supported Dispatcharr version is **0.32.0**. The compatibility
+- The minimum supported Dispatcharr version is **0.33.0**. The compatibility
   guard accepts well-formed versions at or above that minimum. The
-  native CI matrix covers pinned 0.32.0 and 0.33.0 images; both runs must
+  native CI covers the pinned 0.33.0 image; this run must
   pass before this candidate is accepted. API-specific guards still fail
   closed when the expected Dispatcharr interfaces do not match.
 - The primary playback path is authenticated M3U/XMLTV with local HLS playback
@@ -65,6 +65,7 @@ immediate operational actions.
 | --- | --- |
 | **Channel and source filter (YAML)** | Channel selection, assigned M3U source include/exclude and priority, schedule and timezone. Blank YAML selects no channels. |
 | **Share existing live connections** | Optional global reuse of compatible existing viewer connections on all selected channels. Disabled by default. |
+| **Try to synchronize before switching streams** | Optional, bounded overlap check when switching to a viewer or returning to a dedicated source. Disabled by default. |
 | **Live stability delay** | Delay before later switches to a new viewer connection. The first eligible attach is immediate. |
 | **Return delay after last viewer leaves** | Grace before returning to an allowed source. |
 | **Minimum interval between switches** | Cooldown applied to later source switches. |
@@ -228,28 +229,37 @@ After a borrow, the recorder waits until both the last-viewer grace and the
 remaining minimum switch interval have elapsed, then returns to an allowed
 source. If none is available, it stays paused. Explicit Stop, invalidated
 authority and recorder failure take the cleanup path without waiting for normal
-viewer cooldowns. A switch ends the current FFmpeg attempt and starts the next
-with a segment discontinuity. The recorder's channel fence remains in force.
+viewer cooldowns. A switch marks the new muxer with a segment discontinuity.
+The recorder's channel fence remains in force.
 
-**0.6.1 is still a candidate.** The 0.6.0 feature's pinned synthetic AIO
-acceptance passed; the 0.6.1 global settings and migration changes have focused
-unit coverage. Required GitHub CI and publication remain pending. Synthetic
-tests do not establish real-player acceptance. See
-[candidate 0.6.1](docs/candidate-0.6.1.md) for the remaining gates.
+**Try to synchronize before switching streams** is off by default and can be
+applied with the other settings. When enabled, a running dedicated recorder may
+briefly stage its already-authorized viewer input and compare complete encoded
+audio/video segments. If a current overlap is proven, the staged reader
+continues from that boundary without reopening it. On return, the borrowed
+client is cleaned up first, then the new dedicated reader is compared with the
+archived tail; no simultaneous provider reader is opened for this comparison.
+Without a match, the same reader continues with its captured media. A failed
+borrow uses the normal fast recovery path. A match is not always available,
+and this option does not promise gapless recordings.
 
-## Continuous catch-up playback (0.6.2 candidate)
+The [0.6.1 candidate notes](docs/candidate-0.6.1.md) retain the historical
+settings and migration details. Synthetic tests do not establish acceptance
+by every real player.
+
+## Continuous catch-up playback
 
 Catch-up playback can continue across programme boundaries using the same
 authenticated archive session. M3U/XMLTV HLS playback does not require later
 EPG rows and can append newly indexed segments for up to 24 hours from the
-requested start. XC playback follows contiguous indexed TS segments within the
-Dispatcharr duration limit. XC stops at a real archive gap and waits no longer
-than 125 seconds for a next segment after the current edge. That bound covers
+requested start. Normalized XC playback maps available indexed TS segments
+within the Dispatcharr duration limit, skipping missing archive time without
+inventing media. Raw TS playback stops at a real gap. At the current edge XC
+waits no longer than 125 seconds for a next segment. That bound covers
 the recorder's 120-second media-idle timeout plus five seconds for indexing
 and finalization; a missing recorder lease closes XC follow mode promptly.
 HLS uses the same 125-second edge window and recorder lease, with a 24-hour
-session bound. This candidate has focused synthetic coverage only; CI and
-real-player acceptance remain pending.
+session bound. Synthetic coverage does not replace real-player acceptance.
 
 ## Access tokens and playback
 
@@ -365,12 +375,11 @@ ruff check .
 python3 scripts/build_plugin.py
 ```
 
-Release CI requires both pinned Dispatcharr 0.32.0 and 0.33.0 AIO integration
-jobs, including their executed native playback steps. The 0.6.0
-candidate passed its full synthetic native AIO integration, including
+Release CI requires the pinned Dispatcharr 0.33.0 AIO integration
+job, including its executed native playback step. The synthetic AIO checks include
 ordinary-viewer retention, first-viewer borrowing, cooldown timing, Stop and
 Apply revocation, restart recovery, exact client cleanup, source switching,
-and retryable acknowledgements. Required GitHub CI and publication are pending.
+and retryable acknowledgements.
 The synthetic server checks do not establish real-player acceptance.
 
 See the [changelog](CHANGELOG.md), [release roadmap](docs/roadmap.md),

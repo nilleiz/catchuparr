@@ -1,7 +1,7 @@
 # CI and release evidence
 
 Pull requests always run the unit and package checks. The pinned Dispatcharr
-0.32.0 native AIO probe runs unless every changed path is explicitly limited to
+0.33.0 native AIO probe runs unless every changed path is explicitly limited to
 the provenance helper and its tests, Markdown documentation, README or
 changelog, or workflow YAML files. Unknown files and unavailable diff metadata
 run the full probe. Manual workflow dispatch runs it by default. The workflow
@@ -22,7 +22,7 @@ The release workflow does not invoke CI. It searches successful, same-repository
 pull-request runs of the trusted CI workflow and accepts a run only when its
 Git tree exactly matches the release checkout. A merge commit SHA can differ
 from the release commit SHA; their tree identities must match. The
-`test-and-package` and `AIO integration (0.32.0)` jobs must both have succeeded,
+`test-and-package` and `AIO integration (0.33.0)` jobs must both have succeeded,
 and the named native playback step inside the AIO job must itself have
 succeeded. An infrastructure-only run with the AIO step skipped is not release
 acceptance evidence.

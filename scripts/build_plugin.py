@@ -48,6 +48,7 @@ REQUIRED_MODULES = (
     "adapters/sharing_reader.py",
     "engine/__init__.py",
     "engine/admission.py",
+    "engine/handover.py",
     "engine/leases.py",
     "engine/playlist.py",
     "engine/recorder.py",
