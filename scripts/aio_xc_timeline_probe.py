@@ -7,6 +7,26 @@ from datetime import timedelta
 from urllib.parse import parse_qs, urlsplit
 
 
+def _hls_transition_prefix(playlist_text, expected_ids):
+    """Isolate the exact fixture transition from a continuous HLS playlist."""
+    urls = [line for line in playlist_text.splitlines() if line and not line.startswith("#")]
+    if len(urls) < 2 or [urlsplit(url).path.rstrip("/").split("/")[-1] for url in urls[:2]] != list(expected_ids):
+        raise RuntimeError("Native HLS did not begin with the exact synthetic transition segments")
+    prefix = []
+    for line in playlist_text.splitlines():
+        prefix.append(line)
+        if line == urls[1]:
+            break
+    first = prefix.index(urls[0])
+    second = prefix.index(urls[1])
+    if (prefix.count("#EXT-X-DISCONTINUITY") != 1
+            or "#EXT-X-DISCONTINUITY" not in prefix[first + 1:second]):
+        raise RuntimeError("Native HLS did not mark the exact synthetic source transition")
+    # The actual route is continuous and may append later fixture media. Decode
+    # only this selected transition while retaining its real playlist tags.
+    return "\n".join([*prefix, "#EXT-X-ENDLIST", ""]), urls[:2], len(urls) - 2
+
+
 def probe_xc_timeline(*, root, store, channel, start, timeshift, request, xc_params, time_key,
                       views, hls_params, close_hls_session):
     source = root / "synthetic-timeline-source.ts"
@@ -20,14 +40,15 @@ def probe_xc_timeline(*, root, store, channel, start, timeshift, request, xc_par
     # Keep that guard exercised before the later intentional archive gap.
     # Stay within the fixture's one-hour retention for both native routes.
     selected_start = start - timedelta(minutes=30)
+    transition_segments = []
     for index, offset in enumerate((0, 12)):
         segment = root / f"synthetic-timeline-part-{index}.ts"
         segment.write_bytes(source.read_bytes())
-        store.add_segment(
+        transition_segments.append(store.add_segment(
             str(channel.uuid), segment,
             selected_start + timedelta(seconds=offset),
             selected_start + timedelta(seconds=offset + 6), discontinuity=bool(index),
-        )
+        ))
     params = dict(xc_params, stream=str(channel.id), duration="1",
                   **{time_key: str(int(selected_start.timestamp()))})
 
@@ -90,10 +111,11 @@ def probe_xc_timeline(*, root, store, channel, start, timeshift, request, xc_par
     if hls.status_code != 200:
         raise RuntimeError("Native HLS did not expose the synthetic archive transition")
     try:
-        text = hls.content.decode()
-        urls = [line for line in text.splitlines() if line and not line.startswith("#")]
-        if len(urls) != 2 or text.count("#EXT-X-DISCONTINUITY") != 1:
-            raise RuntimeError("Native HLS did not mark the exact synthetic source transition")
+        text, urls, later_segments = _hls_transition_prefix(
+            hls.content.decode(), [item.id for item in transition_segments],
+        )
+        if later_segments < 1:
+            raise RuntimeError("Native continuous HLS did not retain later synthetic archive media")
         hls_body = []
         for index, url in enumerate(urls):
             parts = urlsplit(url)
