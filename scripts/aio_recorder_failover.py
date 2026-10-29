@@ -1089,6 +1089,8 @@ def _classify_stop_set_source(module_name, function_name) -> str:
         return {
             "supervise": "tasks.supervisor",
             "run_prepared_borrow": "tasks.borrow_runner",
+            "run_claimed_borrow": "tasks.claimed_borrow",
+            "_finish_borrow_cleanup": "tasks.borrow_cleanup",
             "acknowledge_return_media": "tasks.return_ack",
             "run": "tasks.recorder_loop",
         }.get(function_name, "tasks.other")
