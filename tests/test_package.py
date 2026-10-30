@@ -25,9 +25,9 @@ class PackageTest(unittest.TestCase):
             self.assertFalse(any("__pycache__" in name for name in names))
             manifest = json.loads(archive.read("catchuparr/plugin.json"))
             self.assertEqual(manifest["name"], "Catchuparr")
-            self.assertEqual(manifest["version"], "0.7.6")
+            self.assertEqual(manifest["version"], "0.7.7")
             self.assertEqual(Plugin.version, manifest["version"])
-            self.assertEqual(Path(archive_path).name, "catchuparr-0.7.6.zip")
+            self.assertEqual(Path(archive_path).name, "catchuparr-0.7.7.zip")
             self.assertEqual(
                 archive.read("catchuparr/logo.png"),
                 Path("docs/assets/catchuparr-icon-256.png").read_bytes(),

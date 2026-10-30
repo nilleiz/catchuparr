@@ -8,9 +8,10 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from .action_messages import format_action_message
+from .action_messages import deliver_action_message
 from .engine.recorder import (
     ARCHIVE_INDEX_FINALIZATION_GRACE_SECONDS,
     DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
@@ -160,7 +161,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         message = "Recording schedule unavailable."
         status = "unavailable"
     elif visible:
-        message = format_action_message(_message_row(row) for row in visible)
+        message = _deliver_rows(visible)
         status = "ok"
     else:
         message = "No recordings scheduled now."
@@ -400,6 +401,14 @@ def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now):
         return False, True
 
 
+def _deliver_rows(visible):
+    return deliver_action_message(
+        (_message_row(row) for row in visible),
+        title="Status",
+        run_key=f"status-{uuid4().hex[:12]}",
+    )
+
+
 def _channel_metadata(channel_ids):
     try:
         from .recording_schedule_overview import channel_metadata
@@ -441,7 +450,7 @@ def _unknown_all(settings, channel_ids, control_state, reason, *, now=None):
     visible = [row for row in rows if row.get("scheduled_now") is True]
     message = (
         "Recording schedule unavailable." if schedule_unknown else
-        format_action_message(_message_row(row) for row in visible) if visible else
+        _deliver_rows(visible) if visible else
         "No recordings scheduled now."
     )
     return {
