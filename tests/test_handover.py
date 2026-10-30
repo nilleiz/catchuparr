@@ -580,6 +580,80 @@ class HandoverEvidenceTests(unittest.TestCase):
                         process.wait()
                 worker.join(timeout=5)
 
+    def test_staggered_live_readers_splice_without_repeated_or_lost_pictures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.ts"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                "testsrc2=size=64x64:rate=25", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=48000", "-t", "14",
+                "-c:v", "mpeg2video", "-g", "25", "-c:a", "mp2", "-f", "mpegts", str(source),
+            ], check=True, capture_output=True, timeout=30)
+            old_fifo, new_fifo = root / "old.pipe", root / "new.pipe"
+            os.mkfifo(old_fifo)
+            os.mkfifo(new_fifo)
+            store = ArchiveStore(root / "archive")
+            old = FFmpegCopyRecorder(store, "synthetic", str(old_fifo), root / "work", segment_seconds=4)
+            target = FFmpegCopyRecorder(store, "synthetic", str(new_fifo), root / "work", segment_seconds=4)
+            stop, switch = threading.Event(), RecorderAttemptSwitch()
+            result, feeders = [], []
+
+            def feed(path, seek):
+                feeders.append(subprocess.Popen([
+                    "ffmpeg", "-v", "error", "-re", "-ss", str(seek), "-i", str(source), "-map", "0",
+                    "-c", "copy", "-f", "mpegts", "-y", str(path),
+                ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+            def hashes(path, stream):
+                probe = subprocess.run([
+                    "ffprobe", "-v", "error", "-select_streams", stream, "-show_packets",
+                    "-show_data_hash", "sha256", "-show_entries", "packet=data_hash", "-of", "json", str(path),
+                ], check=True, capture_output=True, timeout=30)
+                return [packet["data_hash"] for packet in json.loads(probe.stdout)["packets"]]
+
+            worker = threading.Thread(target=lambda: result.append(
+                old.run_candidate(stop, attempt_switch=switch, poll_interval=0.1)))
+            worker.start()
+            feed(old_fifo, 0)
+            try:
+                time.sleep(0.5)
+                self.assertTrue(switch.offer_synchronized_input(target))
+                # The second reader joins later and its segment boundaries differ.
+                feed(new_fifo, 2)
+                worker.join(timeout=20)
+                self.assertFalse(worker.is_alive())
+                staged = result[0].staged_input
+                self.assertIsNotNone(staged)
+                self.assertTrue(staged.matched)
+                self.assertIsNotNone(staged.cut)
+                before = store.segments("synthetic")
+                resumed = target.run_candidate(stop, staged_input=staged, poll_interval=0.1)
+                self.assertGreater(resumed.useful_segments, 0)
+                after = store.segments("synthetic")
+                self.assertEqual(after[len(before)].start_utc, before[-1].end_utc)
+                recorded = [digest for segment in after for digest in hashes(segment.path, "v:0")]
+                reference = hashes(source, "v:0")
+                self.assertEqual(recorded, reference[:len(recorded)], "pictures repeated or lost")
+                audio = [digest for segment in after for digest in hashes(segment.path, "a:0")]
+                self.assertEqual(len(audio), len(set(audio)), "audio frames repeated")
+                joined = subprocess.run([
+                    "ffmpeg", "-v", "error", "-xerror", "-i", "concat:" + "|".join(str(s.path) for s in after),
+                    "-f", "null", "-",
+                ], capture_output=True, timeout=30)
+                self.assertEqual(joined.returncode, 0, joined.stderr)
+            finally:
+                stop.set()
+                for process in feeders:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                worker.join(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()

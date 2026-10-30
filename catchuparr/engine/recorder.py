@@ -120,6 +120,9 @@ class StagedRecorderInput:
     expected_start: float | None = None
     matched: bool = False
     consumed: bool = False
+    # Exact packet cut of the first published row: (CSV file name, replacement
+    # path, seconds removed from the row start).
+    cut: tuple[str, Path, float] | None = None
     started_at: float = field(default_factory=time.monotonic)
 
     def within_limits(self) -> bool:
@@ -231,6 +234,7 @@ class FFmpegCopyRecorder:
         self._mark_next_discontinuity = False
         self._current_attempt_segment_id: str | None = None
         self._last_commit_monotonic: float | None = None
+        self._pending_cut: tuple[str, Path, float] | None = None
 
     def command(self, output_dir: Path) -> list[str]:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -296,6 +300,13 @@ class FFmpegCopyRecorder:
             segment_path = Path(name)
             if not segment_path.is_absolute():
                 segment_path = list_path.parent / segment_path
+            replaced_source = None
+            if self._pending_cut is not None and segment_path.name == self._pending_cut[0]:
+                replaced_source, segment_path, removed = segment_path, self._pending_cut[1], self._pending_cut[2]
+                start_s += removed
+                if end_s <= start_s:
+                    self._mark_next_discontinuity = True
+                    continue
             if require_useful_media and not has_useful_transport_stream(segment_path):
                 segment_path.unlink(missing_ok=True)
                 self._mark_next_discontinuity = True
@@ -340,6 +351,9 @@ class FFmpegCopyRecorder:
             else:
                 publish_segment()
             segment_path.unlink(missing_ok=True)
+            if replaced_source is not None:
+                replaced_source.unlink(missing_ok=True)
+                self._pending_cut = None
             self._last_end_epoch = end
             self._mark_next_discontinuity = False
             committed += 1
@@ -359,6 +373,45 @@ class FFmpegCopyRecorder:
             shutil.rmtree(output_dir, ignore_errors=True)
             raise
         return StagedRecorderInput(self, output_dir, process)
+
+    @staticmethod
+    def _prepare_cut(latest, staged, path, start, end, deadline):
+        """Cut a staged row so it resumes exactly after the archive tail."""
+        from .splice import cut_segment, find_splice
+
+        splice = find_splice(latest.path, path, deadline=deadline)
+        if splice is None:
+            return None
+        payload = cut_segment(path, splice, deadline)
+        if (payload is None or not 0 < splice.cut_offset < end - start
+                or time.monotonic() >= deadline
+                or sum(item.stat().st_size for item in staged.output_dir.iterdir() if item.is_file())
+                + len(payload) > STAGED_INPUT_MAX_BYTES):
+            return None
+        replacement = staged.output_dir / f".cut-{uuid.uuid4().hex}.ts"
+        replacement.write_bytes(payload)
+        return path.name, replacement, splice.cut_offset
+
+    def _fallback_offset(self, rows, complete_offset: int) -> int:
+        """Resume at the first staged row that does not repeat archived time.
+
+        Without a proven splice, rows that closed before the archive's end are
+        still skipped, but later complete rows are kept so the unavoidable gap
+        is no longer than the time the comparison itself needed.
+        """
+        end = self._last_end_epoch
+        if end is None:
+            return complete_offset
+        previous = 0
+        for path, start, row_end, row_offset in rows:
+            try:
+                wall_start = path.stat().st_mtime - (row_end - start)
+            except OSError:
+                return complete_offset
+            if wall_start >= end - 0.5:
+                return previous
+            previous = row_offset
+        return complete_offset
 
     def _try_synchronized_handover(
         self, target, current_process, list_path, offset, stop_event, switch, notify,
@@ -403,10 +456,13 @@ class FFmpegCopyRecorder:
                             if pair in tested:
                                 continue
                             tested.add(pair)
-                            if abs((end - start) - latest.duration) > 0.025:
-                                continue
-                            if not matching_completed_segments(latest.path, path, deadline=deadline):
-                                continue
+                            cut = None
+                            full = (abs((end - start) - latest.duration) <= 0.025
+                                    and matching_completed_segments(latest.path, path, deadline=deadline))
+                            if not full:
+                                cut = self._prepare_cut(latest, staged, path, start, end, deadline)
+                                if cut is None:
+                                    continue
 
                             def still_last():
                                 records = self.store.segments(self.channel_id)
@@ -422,9 +478,17 @@ class FFmpegCopyRecorder:
                                 )
 
                             if switch.request_if_current(still_last):
-                                staged.offset = row_offset
-                                staged.anchor = latest.end_utc.timestamp() - end
-                                staged.expected_start = end
+                                if cut is None:
+                                    staged.offset = row_offset
+                                    staged.anchor = latest.end_utc.timestamp() - end
+                                    staged.expected_start = end
+                                else:
+                                    # Resume inside this row, at the packet after the archive tail.
+                                    index = next(i for i, row in enumerate(rows) if row[0] == path)
+                                    staged.offset = rows[index - 1][3] if index else 0
+                                    staged.anchor = latest.end_utc.timestamp() - (start + cut[2])
+                                    staged.expected_start = start
+                                    staged.cut = cut
                                 staged.matched = True
                                 event("sync_handover_overlap_found")
                                 return staged, offset, committed_total
@@ -432,7 +496,7 @@ class FFmpegCopyRecorder:
                         or time.monotonic() >= deadline):
                     # The attempted comparison timed out or an input stopped.
                     # Retain this exact one-use reader for the normal handover.
-                    staged.offset = complete_offset
+                    staged.offset = self._fallback_offset(rows, complete_offset)
                     event("sync_handover_fallback")
                     switch.request()
                     return staged, offset, committed_total
@@ -488,17 +552,26 @@ class FFmpegCopyRecorder:
                     if path.name in tested:
                         continue
                     tested.add(path.name)
-                    if abs((end - start) - latest.duration) > 0.025:
-                        continue
-                    if not matching_completed_segments(latest.path, path, deadline=deadline):
-                        continue
+                    cut = None
+                    if not (abs((end - start) - latest.duration) <= 0.025
+                            and matching_completed_segments(latest.path, path, deadline=deadline)):
+                        cut = self._prepare_cut(latest, staged, path, start, end, deadline)
+                        if cut is None:
+                            continue
                     current = self.store.segments(self.channel_id)
                     if (current and current[-1].id == previous_segment_id
                             and not stop_event.is_set() and not switch.is_set()
                             and staged.process.poll() is None):
-                        staged.offset = row_offset
-                        staged.anchor = latest.end_utc.timestamp() - end
-                        staged.expected_start = end
+                        if cut is None:
+                            staged.offset = row_offset
+                            staged.anchor = latest.end_utc.timestamp() - end
+                            staged.expected_start = end
+                        else:
+                            index = next(i for i, row in enumerate(rows) if row[0] == path)
+                            staged.offset = rows[index - 1][3] if index else 0
+                            staged.anchor = latest.end_utc.timestamp() - (start + cut[2])
+                            staged.expected_start = start
+                            staged.cut = cut
                         staged.matched = True
                         event("sync_handover_overlap_found")
                         return staged
@@ -576,6 +649,7 @@ class FFmpegCopyRecorder:
         if self._last_end_epoch is not None:
             self._mark_next_discontinuity = True
         process = staged_input.process if staged_input is not None else None
+        self._pending_cut = staged_input.cut if staged_input is not None else None
         if staged_input is not None:
             staged_input.consumed = True
         next_input = None
