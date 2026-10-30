@@ -28,6 +28,16 @@ included here to explain the feature history leading to 0.4.0.
   handover continues as before. Both inputs use a provider connection while
   they overlap. Without the section nothing changes.
 
+### Changed
+
+- The green toast of the current-recordings and today's-schedule actions only
+  summarises what follows, for example `Current recordings: 12 channels, 1 with
+  problems. Details in 2 toasts.` or `Today's schedule: 9 channels in 3
+  periods.`; a paused recorder is named first. All rows now appear in the blue
+  `Catchuparr – Status 1/2` and `Catchuparr – Schedule` toasts. Results without
+  rows stay a single green toast. If the push is unavailable, the green toast
+  shows the rows as before and names how many were not shown.
+
 ### Verification and limitations
 
 - Synthetic tests use audio of a stream delayed by 60 seconds and encoded
@@ -37,6 +47,8 @@ included here to explain the feature history leading to 0.4.0.
 - The extended overlap applies to a delayed source handing over to a viewer's
   faster source. A return to a faster dedicated source after a borrow does not
   open a second connection and can still leave a gap.
+- Unit tests cover the summary texts, the detail toasts and the fallback
+  without a push. The toast layout itself is unchanged from 0.7.7.
 
 ## [0.7.7] - Prerelease
 
