@@ -133,16 +133,19 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             f"{start}–{end}" for start, end in key
         )
         lines.extend(split_group_row(period, groups[key]))
-    if not lines:
-        lines.append("No recordings scheduled today.")
-    if paused is True:
-        lines.insert(0, "Recording paused")
+    channel_total = sum(len(names) for names in groups.values())
+    summary = ("Recording paused. " if paused is True else "") + (
+        f"Today's schedule: {channel_total} {'channel' if channel_total == 1 else 'channels'} "
+        f"in {len(groups)} {'period' if len(groups) == 1 else 'periods'}."
+        if lines else "No recordings scheduled today."
+    )
     pause_label = "paused" if paused is True else "active" if paused is False else "unknown"
     window_count = sum(len(row["windows"]) for row in rows)
     return {
         "status": "ok",
         "message": deliver_action_message(
-            lines, title="Schedule", run_key=f"schedule-{uuid4().hex[:12]}",
+            lines, title="Schedule", summary=summary,
+            run_key=f"schedule-{uuid4().hex[:12]}",
         ),
         "channels": rows,
         "summary": {

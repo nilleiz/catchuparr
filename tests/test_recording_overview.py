@@ -81,23 +81,32 @@ class ActionMessageFormattingTests(unittest.TestCase):
             [name for row in rows for name in row.split(" › ", 1)[1].split(", ")], names,
         )
 
-    def test_single_page_sends_nothing(self):
+    def test_empty_rows_return_only_the_summary(self):
         sent = []
-        message = deliver_action_message(("A", "B"), title="T", run_key="k",
-                                         sender=sent.append, delay_seconds=0)
-        self.assertEqual(message, join_rows(("A", "B")))
+        message = deliver_action_message((), title="T", summary="Nothing to show.",
+                                         run_key="k", sender=sent.append, delay_seconds=0)
+        self.assertEqual(message, "Nothing to show.")
         self.assertEqual(sent, [])
 
-    def test_further_pages_are_pushed_as_numbered_admin_toasts(self):
+    def test_single_page_goes_to_one_unnumbered_detail_toast(self):
+        sent = []
+        message = deliver_action_message(("A", "B"), title="Status", summary="Two rows.",
+                                         run_key="k", sender=sent.append, delay_seconds=0)
+        self.assertEqual(message, "Two rows. Details in 1 toast.")
+        self.assertEqual([item["title"] for item in sent], ["Catchuparr – Status"])
+        self.assertEqual(sent[0]["message"], join_rows(("A", "B")))
+
+    def test_all_pages_are_pushed_as_numbered_admin_toasts(self):
         rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
         pages = paginate_rows(rows)
         sent = []
-        message = deliver_action_message(rows, title="Status", run_key="run",
-                                         sender=sent.append, delay_seconds=0)
+        message = deliver_action_message(rows, title="Status", summary="Thirty rows.",
+                                         run_key="run", sender=sent.append, delay_seconds=0)
         total = len(pages)
-        self.assertEqual(message.split(ROW_SEPARATOR)[0], f"1/{total} · {rows[0]}")
-        self.assertEqual(len(sent), total - 1)
-        for number, (notification, page) in enumerate(zip(sent, pages[1:]), start=2):
+        self.assertGreater(total, 1)
+        self.assertEqual(message, f"Thirty rows. Details in {total} toasts.")
+        self.assertEqual(len(sent), total)
+        for number, (notification, page) in enumerate(zip(sent, pages), start=1):
             self.assertEqual(notification["title"], f"Catchuparr – Status {number}/{total}")
             self.assertEqual(notification["message"], join_rows(page))
             self.assertEqual(notification["notification_key"], f"catchuparr-run-{number}")
@@ -105,28 +114,53 @@ class ActionMessageFormattingTests(unittest.TestCase):
             self.assertIs(notification["admin_only"], True)
             self.assertIs(notification["is_dismissed"], True)
 
-    def test_unavailable_push_names_missing_rows(self):
+    def test_unavailable_push_shows_rows_with_missing_note(self):
         rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
 
         def failing(_notification):
             raise RuntimeError("unavailable")
 
-        message = deliver_action_message(rows, title="T", run_key="k",
-                                         sender=failing, delay_seconds=0)
+        message = deliver_action_message(rows, title="T", summary="Thirty rows.",
+                                         run_key="k", sender=failing, delay_seconds=0)
         shown = message.split(ROW_SEPARATOR)
+        self.assertEqual(shown[0], "Thirty rows.")
         self.assertRegex(shown[-1], r"^\+\d+ more not shown$")
-        self.assertEqual(len(shown) - 1 + int(shown[-1].split()[0]), len(rows))
+        self.assertEqual(len(shown) - 2 + int(shown[-1].split()[0][1:]), len(rows))
         self.assertLessEqual(sum(map(wrapped_line_count, shown)), MAX_LINES_PER_TOAST)
+        short = deliver_action_message(("A",), title="T", summary="One row.",
+                                       run_key="k", sender=failing, delay_seconds=0)
+        self.assertEqual(short, join_rows(("One row.", "A")))
 
-    def test_missing_host_push_falls_back_to_note(self):
+    def test_missing_host_push_falls_back_to_rows(self):
         rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
         with patch.dict(sys.modules, {"core.utils": ModuleType("core.utils")}):
-            message = deliver_action_message(rows, title="T", run_key="k", delay_seconds=0)
+            message = deliver_action_message(rows, title="T", summary="S.", run_key="k",
+                                             delay_seconds=0)
+        self.assertTrue(message.startswith("S."))
         self.assertIn("more not shown", message)
 
 
 class RecordingOverviewTests(unittest.TestCase):
+    def _capture_detail_toasts(self):
+        self.sent = []
+        for target, value in (
+            ("catchuparr.action_messages._default_sender", lambda: self.sent.append),
+            ("catchuparr.action_messages.FOLLOW_UP_DELAY_SECONDS", 0),
+        ):
+            patcher = patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def shown(self, result):
+        """Return the detail rows a run pushed, or the summary when none were."""
+        if not self.sent:
+            return result["message"]
+        rows = [row for item in self.sent for row in item["message"].split(ROW_SEPARATOR)]
+        self.sent.clear()
+        return join_rows(rows)
+
     def setUp(self):
+        self._capture_detail_toasts()
         self.channel = str(uuid.uuid4())
         self.now = datetime(2026, 10, 19, 12, tzinfo=timezone.utc)
         self.root = Path(tempfile.mkdtemp())
@@ -193,7 +227,7 @@ class RecordingOverviewTests(unittest.TestCase):
             row["last_confirmed_progress_at"],
         )
         self.assertFalse(row["last_confirmed_progress_none"])
-        self.assertIn("Synthetic Channel A", result["message"])
+        self.assertIn("Synthetic Channel A", self.shown(result))
 
     def test_old_segments_do_not_count_and_startup_becomes_no_progress(self):
         started = self.now.timestamp() - 120
@@ -252,12 +286,12 @@ class RecordingOverviewTests(unittest.TestCase):
         self.control.configuration_generation = active_configuration_generation(self.settings)
         cleanup = self._call(self._diagnostic(started=self.now.timestamp(), phase="cleanup_pending"))
         self.assertEqual(cleanup["channels"][0]["state"], "cleanup_pending")
-        self.assertEqual(cleanup["message"], "No recordings scheduled now.")
+        self.assertEqual(self.shown(cleanup), "No recordings scheduled now.")
         error = self._diagnostic(started=self.now.timestamp(), phase="error")
         error[self.channel]["error_code"] = "recorder_worker_stopped"
         failed = self._call(error)
         self.assertEqual(failed["channels"][0]["state"], "error")
-        self.assertNotIn("failed:", failed["message"])
+        self.assertNotIn("failed:", self.shown(failed))
 
     def test_borrowed_source_displays_only_current_grant_metadata(self):
         diagnostic = self._diagnostic(started=self.now.timestamp(), phase="starting")
@@ -332,12 +366,12 @@ class RecordingOverviewTests(unittest.TestCase):
             result = current_recordings(
                 self.settings, self.control, redis_client=self.redis, now=self.now,
             )
-        self.assertEqual(result["message"], "Synthetic Channel A - Synthetic [starting]")
+        self.assertEqual(self.shown(result), "Synthetic Channel A - Synthetic [starting]")
         self.assertEqual(result["channels"][0]["source"]["provider_name"], "Synthetic Provider")
         self.assertEqual(result["channels"][0]["source"]["stream_name"], "Synthetic Stream A")
         self.assertEqual(result["channels"][0]["last_confirmed_progress_at"], None)
-        self.assertNotIn("provider Synthetic Provider", result["message"])
-        self.assertNotIn("id 17", result["message"])
+        self.assertNotIn("provider Synthetic Provider", self.shown(result))
+        self.assertNotIn("id 17", self.shown(result))
 
     def test_current_recordings_action_uses_short_m3u_label_and_padding_only_in_message(self):
         second = str(uuid.uuid4())
@@ -402,17 +436,19 @@ class RecordingOverviewTests(unittest.TestCase):
 
         self.assertEqual([row["state"] for row in result["channels"]], ["starting", "starting"])
         self.assertEqual(
-            result["message"].split(ROW_SEPARATOR),
+            self.shown(result).split(ROW_SEPARATOR),
             ["Synthetic Channel A - M3UActual [starting]",
              "Synthetic Channel B - Alternate [starting]"],
         )
-        self.assertNotIn("\u00a0", result["message"])
-        self.assertNotIn("\n", result["message"])
-        self.assertNotIn("731", result["message"])
-        self.assertNotIn("842", result["message"])
-        self.assertNotIn("Distinct Stream Full Name", result["message"])
-        self.assertNotIn("M3UActual Full Profile", result["message"])
-        self.assertNotIn("Synthetic Provider Full Name", result["message"])
+        self.assertNotIn("\u00a0", self.shown(result))
+        self.assertEqual(result["message"],
+                         "Current recordings: 2 channels, no problems. Details in 1 toast.")
+        self.assertNotIn("\n", self.shown(result))
+        self.assertNotIn("731", self.shown(result))
+        self.assertNotIn("842", self.shown(result))
+        self.assertNotIn("Distinct Stream Full Name", self.shown(result))
+        self.assertNotIn("M3UActual Full Profile", self.shown(result))
+        self.assertNotIn("Synthetic Provider Full Name", self.shown(result))
         rows = {row["channel_uuid"]: row for row in result["channels"]}
         self.assertEqual(rows[self.channel]["number"], 731)
         self.assertEqual(rows[self.channel]["source"]["stream_name"], "Distinct Stream Full Name")
@@ -438,7 +474,7 @@ class RecordingOverviewTests(unittest.TestCase):
             result = current_recordings(
                 self.settings, self.control, redis_client=self.redis, now=self.now,
             )
-        self.assertEqual(result["message"],
+        self.assertEqual(self.shown(result),
                          "Synthetic Channel A - Synthetic [ok, attached]")
         self.assertEqual(result["channels"][0]["state"], "recording")
 
@@ -446,13 +482,13 @@ class RecordingOverviewTests(unittest.TestCase):
         error = self._diagnostic(started=self.now.timestamp(), phase="error")
         error[self.channel]["error_code"] = "recorder_worker_stopped"
         result = self._call(error)
-        self.assertEqual(result["message"],
+        self.assertEqual(self.shown(result),
                          "Synthetic Channel A - — [failed: recorder-stopped]")
-        self.assertNotIn("recorder_worker_stopped", result["message"])
+        self.assertNotIn("recorder_worker_stopped", self.shown(result))
         self.settings["recording_schedule"] = {}
         unknown = self._call(error)
         self.assertEqual(unknown["status"], "unavailable")
-        self.assertEqual(unknown["message"], "Recording schedule unavailable.")
+        self.assertEqual(self.shown(unknown), "Recording schedule unavailable.")
 
     def test_redis_failure_outside_window_is_not_rendered_as_current_recording(self):
         self.settings["recording_schedule"]["channels"][self.channel] = normalize_schedule(
@@ -465,7 +501,7 @@ class RecordingOverviewTests(unittest.TestCase):
                 raise OSError("unavailable")
 
         result = current_recordings(self.settings, self.control, redis_client=BrokenRedis(), now=self.now)
-        self.assertEqual(result["message"], "No recordings scheduled now.")
+        self.assertEqual(self.shown(result), "No recordings scheduled now.")
         self.assertEqual(result["channels"][0]["state"], "unknown")
         self.assertEqual(result["channels"][0]["reason"], "redis_unavailable")
 
@@ -476,14 +512,16 @@ class RecordingOverviewTests(unittest.TestCase):
             result = current_recordings(
                 self.settings, None, redis_client=self.redis, now=self.now,
             )
-        self.assertEqual(result["message"], "Synthetic Channel A - — [unconfirmed]")
+        self.assertEqual(self.shown(result), "Synthetic Channel A - — [unconfirmed]")
+        self.assertEqual(result["message"],
+                         "Current recordings: 1 channel, 1 with problems. Details in 1 toast.")
         self.assertEqual(result["channels"][0]["state"], "unknown")
         self.settings["recording_schedule"] = {}
         unavailable = current_recordings(
             self.settings, None, redis_client=self.redis, now=self.now,
         )
         self.assertEqual(unavailable["status"], "unavailable")
-        self.assertEqual(unavailable["message"], "Recording schedule unavailable.")
+        self.assertEqual(self.shown(unavailable), "Recording schedule unavailable.")
 
     def test_bad_timezone_is_unavailable_for_continuous_schedule_in_normal_and_fallback_paths(self):
         self.settings["recording_schedule"]["timezone"] = "Invalid/Zone"
@@ -492,14 +530,14 @@ class RecordingOverviewTests(unittest.TestCase):
         diagnostic[self.channel]["error_code"] = "recorder_worker_stopped"
         normal = self._call(diagnostic)
         self.assertEqual(normal["status"], "unavailable")
-        self.assertEqual(normal["message"], "Recording schedule unavailable.")
+        self.assertEqual(self.shown(normal), "Recording schedule unavailable.")
         self.assertEqual(normal["channels"][0]["state"], "error")
         self.assertEqual(normal["summary"]["error"], 1)
         fallback = current_recordings(
             self.settings, None, redis_client=self.redis, now=self.now,
         )
         self.assertEqual(fallback["status"], "unavailable")
-        self.assertEqual(fallback["message"], "Recording schedule unavailable.")
+        self.assertEqual(self.shown(fallback), "Recording schedule unavailable.")
 
     def test_active_and_off_window_error_rows_keep_structured_states_and_summary(self):
         off_window = str(uuid.uuid4())
@@ -527,7 +565,7 @@ class RecordingOverviewTests(unittest.TestCase):
         self.assertTrue(rows[self.channel]["scheduled_now"])
         self.assertFalse(rows[off_window]["scheduled_now"])
         self.assertEqual(result["summary"]["error"], 2)
-        self.assertEqual(result["message"],
+        self.assertEqual(self.shown(result),
                          "Synthetic Channel A - — [failed: recorder-stopped]")
 
     def test_compact_failure_labels_are_fixed_and_state_specific(self):

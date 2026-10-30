@@ -25,6 +25,27 @@ def settings(schedule, timezone_name="Europe/Berlin"):
 
 
 class RecordingScheduleOverviewTests(unittest.TestCase):
+    def setUp(self):
+        self._capture_detail_toasts()
+
+    def _capture_detail_toasts(self):
+        self.sent = []
+        for target, value in (
+            ("catchuparr.action_messages._default_sender", lambda: self.sent.append),
+            ("catchuparr.action_messages.FOLLOW_UP_DELAY_SECONDS", 0),
+        ):
+            patcher = patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def shown(self, result):
+        """Return the detail rows a run pushed, or the summary when none were."""
+        if not self.sent:
+            return result["message"]
+        rows = [row for item in self.sent for row in item["message"].split(ROW_SEPARATOR)]
+        self.sent.clear()
+        return join_rows(rows)
+
     def test_continuous_and_multiple_windows_sorted_with_channel_metadata(self):
         result = today_schedule(settings({"a": "continuous", "b": {"daily": [
             {"start": "09:00", "end": "10:00"}, {"start": "13:00", "end": "14:00"}]}}),
@@ -35,7 +56,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.assertEqual([(window["start"], window["end"]) for window in rows[0]["windows"]],
                          [("09:00", "10:00"), ("13:00", "14:00")])
         self.assertEqual(rows[1]["windows"][0]["end"], "24:00")
-        self.assertEqual(result["message"], join_rows((
+        self.assertEqual(self.shown(result), join_rows((
             "All day › Beta", "09:00–10:00, 13:00–14:00 › Alpha",
         )))
 
@@ -47,28 +68,29 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.assertEqual([row["number"] for row in result["channels"]], [2, 10])
         empty = result["channels"][1]
         self.assertEqual(empty["windows"], [])
-        self.assertEqual(result["message"], "All day › Continuous")
+        self.assertEqual(self.shown(result), "All day › Continuous")
         self.assertIsNone(result["recording_paused"])
-        self.assertNotIn("Pause state unknown", result["message"])
+        self.assertNotIn("Pause state unknown", self.shown(result))
         result = today_schedule(settings({"a": {"daily": [{"start": "09:00", "end": "10:00"}]}}),
                                 {}, control_state=type("Control", (), {"paused": True})(),
                                 now=datetime(2026, 10, 19, 7, tzinfo=timezone.utc))
         self.assertTrue(result["recording_paused"])
-        self.assertEqual(result["message"], join_rows((
-            "Recording paused", "09:00–10:00 › Unknown channel",
-        )))
+        self.assertEqual(result["message"],
+                         "Recording paused. Today's schedule: 1 channel in 1 period. Details in 1 toast.")
+        self.assertEqual(self.shown(result), "09:00–10:00 › Unknown channel")
         active = today_schedule(settings({"a": "continuous"}), {},
                                  control_state=type("Control", (), {"paused": False})(),
                                  now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc))
         self.assertIs(active["recording_paused"], False)
         self.assertEqual(active["summary"]["pause_state"], "active")
+        self.sent.clear()
         paused_empty = today_schedule(settings({"a": {"sunday": []}}), {},
                                       control_state=type("Control", (), {"paused": True})(),
                                       now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
         self.assertTrue(paused_empty["recording_paused"])
-        self.assertEqual(paused_empty["message"], join_rows((
-            "Recording paused", "No recordings scheduled today.",
-        )))
+        self.assertEqual(self.shown(paused_empty),
+                         "Recording paused. No recordings scheduled today.")
+        self.assertEqual(self.sent, [])
 
     def test_past_current_and_upcoming_statuses(self):
         result = today_schedule(
@@ -81,7 +103,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             [window["status"] for window in result["channels"][0]["windows"]],
             ["past", "current", "upcoming"],
         )
-        self.assertEqual(result["message"], "09:00–10:00, 11:00–13:00, 14:00–15:00 › Unknown channel")
+        self.assertEqual(self.shown(result), "09:00–10:00, 11:00–13:00, 14:00–15:00 › Unknown channel")
 
     def test_message_omits_free_channels_and_has_no_heading(self):
         result = today_schedule(
@@ -95,24 +117,24 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             {"active": {"name": "Synthetic Channel A"}, "free": {"name": "Free Channel"}},
             now=datetime(2026, 10, 18, 8, tzinfo=timezone.utc),
         )
-        self.assertEqual(result["message"], "09:00–10:00, 13:00–14:00 › Synthetic Channel A")
+        self.assertEqual(self.shown(result), "09:00–10:00, 13:00–14:00 › Synthetic Channel A")
         self.assertEqual(len(result["channels"]), 2)
-        self.assertNotIn("Free Channel", result["message"])
+        self.assertNotIn("Free Channel", self.shown(result))
 
     def test_empty_message_and_schedule_unavailable_are_explicit(self):
         empty = today_schedule(settings({"free": {"sunday": []}}), {},
                                now=datetime(2026, 10, 18, 8, tzinfo=timezone.utc))
-        self.assertEqual(empty["message"], "No recordings scheduled today.")
+        self.assertEqual(self.shown(empty), "No recordings scheduled today.")
         invalid = today_schedule({"channel_uuids": "a", "recording_schedule": {}}, {})
         self.assertEqual(invalid["status"], "schedule_unavailable")
-        self.assertIn("unavailable", invalid["message"].lower())
+        self.assertIn("unavailable", self.shown(invalid).lower())
         malformed = today_schedule({"channel_uuids": "a", "recording_schedule": "invalid"}, {})
         self.assertEqual(malformed["status"], "schedule_unavailable")
 
     def test_invalid_timezone_rejects_continuous_schedule(self):
         invalid = today_schedule(settings({"a": "continuous"}, "Invalid/Zone"), {})
         self.assertEqual(invalid["status"], "schedule_unavailable")
-        self.assertIn("unavailable", invalid["message"].lower())
+        self.assertIn("unavailable", self.shown(invalid).lower())
 
     def test_only_applied_selected_channels_are_listed(self):
         active = settings({"selected": "continuous"})
@@ -153,8 +175,8 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             now=datetime(2026, 10, 19, 8, tzinfo=timezone.utc),
         )
         self.assertEqual(result["channels"][0]["name"], "Unknown channel")
-        self.assertNotIn("example.invalid", result["message"])
-        self.assertNotIn("synthetic", result["message"])
+        self.assertNotIn("example.invalid", self.shown(result))
+        self.assertNotIn("synthetic", self.shown(result))
 
     def test_statuses_overnight_and_week_wrap_are_clipped_to_today(self):
         result = today_schedule(settings({"a": {"sunday": [{"start": "23:00", "end": "01:00"}],
@@ -203,15 +225,19 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             result = Plugin.__new__(Plugin).run("today_schedule", {}, {})
 
         self.assertEqual(
-            result["message"].split(ROW_SEPARATOR),
-            ["Recording paused", "All day › Synthetic Channel A, Synthetic Channel B"],
+            self.shown(result).split(ROW_SEPARATOR),
+            ["All day › Synthetic Channel A, Synthetic Channel B"],
         )
-        self.assertNotIn("\u00a0", result["message"])
-        self.assertNotIn("\n", result["message"])
-        self.assertNotIn("37", result["message"])
-        self.assertNotIn("42", result["message"])
-        self.assertNotIn("99", result["message"])
-        self.assertNotIn("Free Synthetic Channel", result["message"])
+        self.assertEqual(
+            result["message"],
+            "Recording paused. Today's schedule: 2 channels in 1 period. Details in 1 toast.",
+        )
+        self.assertNotIn("\u00a0", self.shown(result))
+        self.assertNotIn("\n", self.shown(result))
+        self.assertNotIn("37", self.shown(result))
+        self.assertNotIn("42", self.shown(result))
+        self.assertNotIn("99", self.shown(result))
+        self.assertNotIn("Free Synthetic Channel", self.shown(result))
         self.assertEqual(
             [(row["channel_uuid"], row["number"], row["name"],
               [(window["start"], window["end"]) for window in row["windows"]])

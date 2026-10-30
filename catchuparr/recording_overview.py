@@ -402,9 +402,18 @@ def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now):
 
 
 def _deliver_rows(visible):
+    problems = sum(
+        not (row.get("state") == "recording" and row.get("recent_media_progress") is True)
+        and row.get("state") != "starting"
+        for row in visible
+    )
+    count = len(visible)
+    summary = f"Current recordings: {count} {'channel' if count == 1 else 'channels'}"
+    summary += f", {problems} with problems." if problems else ", no problems."
     return deliver_action_message(
         (_message_row(row) for row in visible),
         title="Status",
+        summary=summary,
         run_key=f"status-{uuid4().hex[:12]}",
     )
 
