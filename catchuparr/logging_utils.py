@@ -52,6 +52,7 @@ _EVENTS = frozenset({
     "sync_handover_overlap_found",
     "sync_handover_fallback",
     "sync_handover_media_committed",
+    "source_offset_trimmed",
 })
 _ERROR_CATEGORIES = frozenset({
     "configuration_recovery_failed",
@@ -87,7 +88,7 @@ _ERROR_CATEGORIES = frozenset({
 _STATE_KEYS = frozenset({
     "generation", "config_generation", "control_generation", "channel_count",
     "source_policy_count", "queued", "paused", "enabled", "count", "level",
-    "reason", "activation_pending", "outcome_unknown", "recovery_required",
+    "reason", "activation_pending", "outcome_unknown", "recovery_required", "seconds",
 })
 _SAFE_REASONS = frozenset({
     "version", "proxy_api", "cleanup_guard", "xc_hooks", "xc_uninstall", "log_level",
