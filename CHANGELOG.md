@@ -17,6 +17,16 @@ included here to explain the feature history leading to 0.4.0.
   Without a clear match the input is used unchanged. A provider that runs ahead
   cannot be repaired, because the skipped programme was never recorded.
 - Log a fixed `source_offset_trimmed` event with the trimmed seconds.
+- Close the gap left when the new input runs ahead of the old one. A new
+  top-level `handover:` section in the YAML names the M3U sources whose streams
+  are delayed (`delayed_sources`) and how long the old input may keep recording
+  beside the new one (`max_overlap_seconds`, 10 to 120, default 90). When a
+  delayed source hands over to a source that is not listed, the old input keeps
+  recording until the archive reaches the programme at which the new input
+  began; the audio comparison then finds the join, the archive stays continuous
+  and nothing is skipped or repeated. If no join is found within the time, the
+  handover continues as before. Both inputs use a provider connection while
+  they overlap. Without the section nothing changes.
 
 ### Verification and limitations
 
@@ -24,6 +34,9 @@ included here to explain the feature history leading to 0.4.0.
   differently from the archive, plus envelope matching edge cases (silence,
   periodic content, input ahead of the archive). The comparison needs audible,
   varying audio and a ~5 s or longer overlap; real-player acceptance is separate.
+- The extended overlap applies to a delayed source handing over to a viewer's
+  faster source. A return to a faster dedicated source after a borrow does not
+  open a second connection and can still leave a gap.
 
 ## [0.7.7] - Prerelease
 
