@@ -18,6 +18,9 @@ included here to explain the feature history leading to 0.4.0.
   for example because the previous input ended first. Staged segments that
   contain only archived media are discarded. If no overlap can be proven, the
   input is used unchanged and the switch remains a marked discontinuity.
+- Publish the final closed segment of an input that ended on its own before
+  the staged input takes over, and accept keyframes with leading pictures
+  (open GOP) when the splice continues exactly after the archived tail.
 - Enable "Try to synchronize before switching streams" by default for new
   configurations. Existing applied configurations keep their stored value.
 
