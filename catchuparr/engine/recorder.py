@@ -816,9 +816,22 @@ class FFmpegCopyRecorder:
                     useful += committed
                     notify_first_media(committed)
             elif status == "switch_requested":
-                # A new source attempt starts a fresh mux session. Do not flush
-                # any old-input rows after the switch was requested.
+                # A new source attempt starts a fresh mux session.
                 self._mark_next_discontinuity = True
+                if not (next_input is not None and next_input.matched):
+                    # No proven boundary freezes the archive tail, and the next
+                    # input only starts after this attempt returns. Keep the
+                    # final segment this input closed while it was stopped, so
+                    # the gap before the next input is as short as possible.
+                    # It is committed by this attempt, before any successor
+                    # can publish, and is still fenced by the recorder lease.
+                    try:
+                        offset, committed = self._publish_csv_rows(
+                            list_path, offset, require_useful_media=True,
+                        )
+                        useful += committed
+                    except (OSError, ValueError):
+                        pass
             if status == "exited" and useful == 0:
                 status = "no_media"
             result = RecorderAttemptResult(

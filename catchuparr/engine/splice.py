@@ -23,7 +23,7 @@ PROBE_TIMEOUT_SECONDS = 4
 TS_PACKET = 188
 # Hashes of this many consecutive packets must agree so that static or looped
 # content cannot be mistaken for the archive tail.
-MIN_CONTEXT_PACKETS = {"video": 6, "audio": 6}
+MIN_CONTEXT_PACKETS = 6
 MIN_DISTINCT_CONTEXT = 3
 MAX_AUDIO_SKIP_SECONDS = 0.25
 
@@ -50,9 +50,8 @@ class Splice:
     """Where each track of a staged file resumes after the archive tail."""
 
     video_index: int
-    audio_index: int
+    audio_indexes: tuple[int, ...]
     video_pts: float
-    audio_pts: float
     # Seconds between the start of the staged video track and the splice.
     cut_offset: float
     # Every video packet of the staged file is already archived.
@@ -69,10 +68,10 @@ def _deadline_timeout(deadline: float | None) -> float:
 
 
 def probe_tracks(path: Path, deadline: float | None = None) -> dict[str, Track] | None:
-    """Return the single video and audio track of a bounded TS file.
+    """Return the video track and every audio track ("audio0", "audio1", ...).
 
-    Subtitle tracks are ignored. Several video or audio tracks, unknown track
-    types and unreadable timestamps are not supported and return ``None``.
+    Subtitle tracks are ignored. Several video tracks, unknown track types and
+    unreadable timestamps are not supported and return ``None``.
     """
     try:
         path = Path(path)
@@ -89,20 +88,26 @@ def probe_tracks(path: Path, deadline: float | None = None) -> dict[str, Track] 
             check=True, capture_output=True, timeout=_deadline_timeout(deadline),
         )
         document = json.loads(result.stdout)
-        tracks: dict[str, Track] = {}
-        by_index = {}
+        info = {}
+        order = []
+        audio_count = 0
         for stream in document["streams"]:
             kind = stream.get("codec_type")
             if kind == "subtitle":
                 continue
-            if kind not in {"video", "audio"} or kind in by_index.values():
+            if kind == "audio":
+                key = f"audio{audio_count}"
+                audio_count += 1
+            elif kind == "video" and "video" not in info:
+                key = "video"
+            else:
                 return None
-            by_index[stream["index"]] = kind
-            tracks[kind] = (stream["index"], stream["codec_name"], int(str(stream["id"]), 0))
-        packets: dict[str, list[Packet]] = {"video": [], "audio": []}
+            info[stream["index"]] = key
+            order.append((key, stream["codec_name"], int(str(stream["id"]), 0)))
+        packets: dict[str, list[Packet]] = {key: [] for key, _, _ in order}
         for raw in document["packets"]:
-            kind = by_index.get(raw.get("stream_index"))
-            if kind is None:
+            key = info.get(raw.get("stream_index"))
+            if key is None:
                 continue
             digest = raw["data_hash"]
             pts, dts = float(raw["pts_time"]), float(raw["dts_time"])
@@ -111,12 +116,12 @@ def probe_tracks(path: Path, deadline: float | None = None) -> dict[str, Track] 
                     or not math.isfinite(pts) or not math.isfinite(dts)
                     or (pos is not None and (pos < 0 or pos % TS_PACKET))):
                 return None
-            packets[kind].append(Packet(pts, dts, "K" in str(raw.get("flags", "")), pos, digest))
-        if set(tracks) != {"video", "audio"} or not all(packets.values()):
+            packets[key].append(Packet(pts, dts, "K" in str(raw.get("flags", "")), pos, digest))
+        if "video" not in packets or "audio0" not in packets or not all(packets.values()):
             return None
         return {
-            kind: Track(kind, tracks[kind][1], tracks[kind][2], tuple(packets[kind]))
-            for kind in ("video", "audio")
+            key: Track("video" if key == "video" else "audio", codec, pid, tuple(packets[key]))
+            for key, codec, pid in order
         }
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError, TimeoutError):
         return None
@@ -124,7 +129,7 @@ def probe_tracks(path: Path, deadline: float | None = None) -> dict[str, Track] 
 
 def _resume_index(old: Track, new: Track) -> int | None:
     """Index in ``new`` of the first packet after the last packet of ``old``."""
-    context = MIN_CONTEXT_PACKETS[old.kind]
+    context = MIN_CONTEXT_PACKETS
     if len(old.packets) < context or new.codec != old.codec:
         return None
     tail = [packet.digest for packet in old.packets[-context:]]
@@ -143,53 +148,72 @@ def _resume_index(old: Track, new: Track) -> int | None:
 def find_splice(old_path: Path, staged_path: Path, *, deadline: float | None = None) -> Splice | None:
     """Find the resume point of ``staged_path`` after the archived ``old_path``.
 
-    Returns ``None`` unless both tracks resume at an exact, unique packet
-    boundary, the first new picture is a keyframe and at least one new packet
-    remains in each track.
+    Returns ``None`` unless video and the first audio track resume at an exact,
+    unique packet boundary, the first new picture is a keyframe and at least one
+    new packet remains in each of them. Further audio tracks resume at their own
+    unique packet match or, when they carry no distinctive content, at the
+    same instant as the first audio track.
     """
     old = probe_tracks(old_path, deadline)
     new = probe_tracks(staged_path, deadline) if old else None
-    if old is None or new is None:
+    if old is None or new is None or set(old) != set(new):
         return None
-    indexes = {}
-    for kind in ("video", "audio"):
-        index = _resume_index(old[kind], new[kind])
-        if index is None:
-            return None
-        indexes[kind] = index
-    audio_tail = new["audio"].packets[indexes["audio"]:]
-    if (indexes["video"] == len(new["video"].packets)
-            and (not audio_tail or audio_tail[-1].pts - audio_tail[0].pts <= MAX_AUDIO_SKIP_SECONDS)):
-        return Splice(indexes["video"], indexes["audio"], 0.0, 0.0, 0.0, complete=True)
-    if any(indexes[kind] >= len(new[kind].packets) for kind in indexes):
+    audio_keys = sorted(key for key in new if key != "video")
+    if any(old[key].codec != new[key].codec for key in new):
         return None
-    video = new["video"].packets
-    cut = video[indexes["video"]]
+    video_index = _resume_index(old["video"], new["video"])
+    primary_index = _resume_index(old["audio0"], new["audio0"])
+    if primary_index is None:
+        return None
+    video, primary = new["video"].packets, new["audio0"].packets
+    if video_index is None:
+        # The picture tail is not in the new input, for example because its
+        # video starts exactly where the archive ends while its audio starts
+        # earlier. No picture can be repeated, so keep all video from its
+        # first keyframe and trim only the audio overlap.
+        video_index = 0
+    if video_index == len(video):
+        tail = primary[primary_index:]
+        if not tail or tail[-1].pts - tail[0].pts <= MAX_AUDIO_SKIP_SECONDS:
+            return Splice(video_index, (), 0.0, 0.0, complete=True)
+        return None
+    if primary_index >= len(primary):
+        return None
+    cut = video[video_index]
     if not cut.key or cut.pos is None:
         return None
-    # Audio frames share PES packets. Whole PES packets can be cut without
-    # rewriting, so resume at the next PES start: at most one PES of audio is
-    # left out, never repeated.
-    audio = new["audio"].packets
-    resume_pts = audio[indexes["audio"]].pts
-    while indexes["audio"] < len(audio) and audio[indexes["audio"]].pos is None:
-        indexes["audio"] += 1
-    if indexes["audio"] >= len(audio) or audio[indexes["audio"]].pts - resume_pts > MAX_AUDIO_SKIP_SECONDS:
-        return None
+    instant = primary[primary_index].pts
+    indexes = []
+    for key in audio_keys:
+        packets = new[key].packets
+        index = primary_index if key == "audio0" else _resume_index(old[key], new[key])
+        if index is None:
+            index = next((i for i, packet in enumerate(packets) if packet.pts >= instant - 0.001), len(packets))
+        if index >= len(packets):
+            return None
+        # Audio frames share PES packets. Whole PES packets can be cut without
+        # rewriting, so resume at the next PES start: at most one PES of audio
+        # is left out, never repeated.
+        resume_pts = packets[index].pts
+        while index < len(packets) and packets[index].pos is None:
+            index += 1
+        if index >= len(packets) or packets[index].pts - resume_pts > MAX_AUDIO_SKIP_SECONDS:
+            return None
+        indexes.append(index)
     # Pictures that follow the keyframe in decode order but precede it in
     # presentation order (open GOP) reference the archived tail, which this
     # splice continues exactly, so they are kept like any other packet.
     first_pts = min(packet.pts for packet in video)
-    return Splice(
-        indexes["video"], indexes["audio"], cut.pts,
-        audio[indexes["audio"]].pts, cut.pts - first_pts,
-    )
+    return Splice(video_index, tuple(indexes), cut.pts, cut.pts - first_pts)
 
 
 def cut_segment(staged_path: Path, splice: Splice, deadline: float | None = None) -> bytes | None:
     """Return the staged TS bytes from the splice on; media is left untouched."""
     tracks = probe_tracks(staged_path, deadline)
-    if tracks is None:
+    if tracks is None or splice.complete:
+        return None
+    audio_keys = sorted(key for key in tracks if key != "video")
+    if len(audio_keys) != len(splice.audio_indexes):
         return None
     try:
         size = Path(staged_path).stat().st_size
@@ -198,14 +222,12 @@ def cut_segment(staged_path: Path, splice: Splice, deadline: float | None = None
         data = Path(staged_path).read_bytes()
     except OSError:
         return None
-    positions = (tracks["video"].packets[splice.video_index].pos, tracks["audio"].packets[splice.audio_index].pos)
-    if None in positions:
+    starts = [(tracks["video"].pid, tracks["video"].packets[splice.video_index].pos)]
+    starts += [(tracks[key].pid, tracks[key].packets[index].pos) for key, index in zip(audio_keys, splice.audio_indexes)]
+    if any(pos is None for _, pos in starts) or len({pid for pid, _ in starts}) != len(starts):
         return None
-    first_kept = {
-        tracks["video"].pid: positions[0] // TS_PACKET,
-        tracks["audio"].pid: positions[1] // TS_PACKET,
-    }
-    if len(first_kept) != 2 or any(index >= size // TS_PACKET for index in first_kept.values()):
+    first_kept = {pid: pos // TS_PACKET for pid, pos in starts}
+    if any(index >= size // TS_PACKET for index in first_kept.values()):
         return None
     output = bytearray()
     seen = set()

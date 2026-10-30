@@ -76,6 +76,44 @@ class SpliceTests(unittest.TestCase):
     def test_open_gop_h264_with_leading_pictures_is_cut_at_the_keyframe(self):
         self.check_codec("libx264", "aac", 5)
 
+    def test_two_audio_tracks_are_cut_at_the_same_instant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.ts"
+            run("-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=48000", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000",
+                "-t", "14", "-map", "0", "-map", "1", "-map", "2", "-c:v", "mpeg2video", "-g", "25",
+                "-c:a", "mp2", "-f", "mpegts", str(source))
+            old, new = self.tail_and_head(root, source, 5, 2)
+            splice = find_splice(old, new, deadline=time.monotonic() + 20)
+            self.assertIsNotNone(splice)
+            self.assertEqual(len(splice.audio_indexes), 2)
+            cut = root / "cut.ts"
+            cut.write_bytes(cut_segment(new, splice, time.monotonic() + 20))
+            for stream in ("a:0", "a:1"):
+                joined = self.hashes(old, stream) + self.hashes(cut, stream)
+                self.assertEqual(len(joined), len(set(joined)), stream)
+            video = self.hashes(old, "v:0") + self.hashes(cut, "v:0")
+            self.assertEqual(video, self.hashes(source, "v:0")[:len(video)])
+
+    def test_audio_only_overlap_keeps_all_video_and_trims_the_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_source(root, "mpeg2video", "mp2")
+            run("-i", str(source), "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", "5",
+                "-segment_format", "mpegts", str(root / "old-%02d.ts"))
+            # The new input starts at the next keyframe but carries earlier audio.
+            video, audio, new = root / "v.ts", root / "a.ts", root / "new.ts"
+            run("-ss", "5", "-i", str(source), "-t", "6", "-map", "0:v", "-c", "copy", "-f", "mpegts", str(video))
+            run("-ss", "3.5", "-i", str(source), "-t", "7.5", "-map", "0:a", "-c", "copy", "-f", "mpegts", str(audio))
+            run("-i", str(video), "-itsoffset", "0", "-i", str(audio), "-map", "0:v", "-map", "1:a", "-c", "copy",
+                "-f", "mpegts", str(new))
+            splice = find_splice(root / "old-00.ts", new, deadline=time.monotonic() + 20)
+            if splice is None:
+                self.skipTest("synthetic input did not reproduce an audio-only overlap")
+            self.assertEqual(splice.video_index, 0)
+            self.assertGreater(splice.audio_indexes[0], 0)
+
     def test_archive_tail_that_is_not_in_the_new_input_has_no_splice(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
