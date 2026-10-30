@@ -4,6 +4,30 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.4] - Prerelease
+
+### Changed
+
+- Resume a switched or returned recorder exactly after the archived tail. The
+  last audio and video packets of the archive are located in the new input by
+  packet hash, and the new segment is cut on whole transport packets at the
+  following keyframe. Repeated pictures and audio frames at the switch are
+  removed instead of being archived twice. At most one audio PES packet
+  (a fraction of a second) may be omitted, never repeated.
+- Apply the same trim when a staged input is adopted without a prior proof,
+  for example because the previous input ended first. Staged segments that
+  contain only archived media are discarded. If no overlap can be proven, the
+  input is used unchanged and the switch remains a marked discontinuity.
+- Enable "Try to synchronize before switching streams" by default for new
+  configurations. Existing applied configurations keep their stored value.
+
+### Verification and limitations
+
+- Synthetic tests cover MPEG-2/MP2 and H.264 with B-frames/AAC, mid-GOP and
+  missing tails, fully archived rows, and two live readers with different
+  segment boundaries. They are not a claim of acceptance by every real player.
+- A real gap in the archive is not hidden and no media is invented.
+
 ## [0.7.3] - Prerelease
 
 ### Fixed
