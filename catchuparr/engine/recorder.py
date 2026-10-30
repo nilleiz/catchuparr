@@ -26,6 +26,8 @@ LIVE_EDGE_IDLE_TIMEOUT_SECONDS = (
 SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS = 12.0
 STAGED_INPUT_MAX_SECONDS = 30.0
 FINAL_SEGMENT_MIN_SECONDS = 1.0
+MAX_OFFSET_ROWS = 40
+MIN_OFFSET_SECONDS = 1.0
 STAGED_INPUT_MAX_BYTES = 256 * 1024 * 1024
 
 
@@ -239,6 +241,9 @@ class FFmpegCopyRecorder:
         # Archive tail used to trim overlap from a staged input adopted
         # without a proven splice (for example after its predecessor ended).
         self._splice_tail = None
+        self._offset_rows_skipped = 0
+        self._offset_skip_until: float | None = None
+        self._anchor_follows_media = False
 
     def command(self, output_dir: Path) -> list[str]:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -314,20 +319,33 @@ class FFmpegCopyRecorder:
             if self._splice_tail is not None and self._pending_cut is None:
                 tail, self._splice_tail = self._splice_tail, None
                 try:
-                    cut = self._prepare_cut(
+                    cut = None if self._offset_skip_until is not None else self._prepare_cut(
                         tail, None, segment_path, start_s, end_s, time.monotonic() + 10,
                         output_dir=segment_path.parent,
                     )
                 except OSError:
                     cut = None
+                by_audio = False
+                if cut is None:
+                    # Another provider never delivers identical packets and
+                    # may run behind this one; compare the audio instead.
+                    cut = self._prepare_audio_offset_cut(
+                        tail, segment_path, start_s, end_s, segment_path.parent,
+                    )
+                    by_audio = cut is not None
                 if cut is not None and cut[1] is None:
                     # This row repeats only archived media; try the next one.
                     segment_path.unlink(missing_ok=True)
-                    self._splice_tail = tail
+                    self._splice_tail = tail if self._offset_rows_skipped < MAX_OFFSET_ROWS else None
+                    self._offset_rows_skipped += 1
                     self._mark_next_discontinuity = True
                     continue
                 if cut is not None:
                     self._pending_cut = cut
+                    if by_audio:
+                        # Keep the archive timeline continuous with the media
+                        # instead of the (delayed) arrival time of this input.
+                        self._anchor_follows_media = True
                     if self._session_anchor is None:
                         self._session_anchor = tail.end_utc.timestamp() - (start_s + cut[2])
             if self._pending_cut is not None and segment_path.name == self._pending_cut[0]:
@@ -352,7 +370,8 @@ class FFmpegCopyRecorder:
             # wall-clock time so old archive slots are never reused.
             if self._last_end_epoch is not None and (
                 start < self._last_end_epoch - 0.5
-                or abs(end - file_mtime) > max(30, self.segment_seconds * 5)
+                or (not self._anchor_follows_media
+                    and abs(end - file_mtime) > max(30, self.segment_seconds * 5))
             ):
                 self._session_anchor = max(
                     file_mtime - end_s, self._last_end_epoch - start_s
@@ -419,6 +438,46 @@ class FFmpegCopyRecorder:
         if splice.complete:
             return path.name, None, end - start
         payload = cut_segment(path, splice, deadline)
+        if (payload is None or not 0 < splice.cut_offset < end - start
+                or time.monotonic() >= deadline
+                or sum(item.stat().st_size for item in output_dir.iterdir() if item.is_file())
+                + len(payload) > STAGED_INPUT_MAX_BYTES):
+            return None
+        replacement = output_dir / f".cut-{uuid.uuid4().hex}.ts"
+        replacement.write_bytes(payload)
+        return path.name, replacement, splice.cut_offset
+
+    def _prepare_audio_offset_cut(self, tail, path, start, end, output_dir):
+        """Cut away the start of a row that repeats the archive tail by audio.
+
+        The audio comparison runs on the first row that allows it. Both inputs
+        advance in real time, so the repeated part then ends at a fixed point
+        of the new input's own timeline, which later rows reuse.
+        """
+        from ..logging_utils import event
+        from .offset import repeated_seconds_for_input
+        from .splice import cut_segment, splice_at_offset
+
+        deadline = time.monotonic() + 20
+        if self._offset_skip_until is None:
+            try:
+                archived = [item for item in self.store.segments(self.channel_id)
+                            if item.end_utc <= tail.end_utc]
+                repeated = repeated_seconds_for_input(archived, path, ffmpeg=self.ffmpeg, deadline=deadline)
+            except (OSError, ValueError):
+                return None
+            if repeated is None or repeated < MIN_OFFSET_SECONDS:
+                return None
+            self._offset_skip_until = start + repeated
+            event("source_offset_trimmed", seconds=int(round(repeated)))
+        skip_until = self._offset_skip_until
+        if end <= skip_until + 0.02:
+            return path.name, None, end - start
+        self._offset_skip_until = None
+        if start >= skip_until:
+            return None
+        splice = splice_at_offset(path, skip_until - start, deadline=deadline)
+        payload = cut_segment(path, splice, deadline) if splice is not None else None
         if (payload is None or not 0 < splice.cut_offset < end - start
                 or time.monotonic() >= deadline
                 or sum(item.stat().st_size for item in output_dir.iterdir() if item.is_file())
@@ -700,6 +759,9 @@ class FFmpegCopyRecorder:
         process = staged_input.process if staged_input is not None else None
         self._pending_cut = staged_input.cut if staged_input is not None else None
         self._splice_tail = None
+        self._offset_rows_skipped = 0
+        self._offset_skip_until = None
+        self._anchor_follows_media = False
         if staged_input is not None and not staged_input.matched and self.store.segments(self.channel_id):
             tail = self.store.segments(self.channel_id)[-1]
             if time.time() - tail.end_utc.timestamp() < 120 and tail.path.is_file():

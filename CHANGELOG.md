@@ -4,6 +4,27 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.8] - Prerelease
+
+### Fixed
+
+- Remove a repeated stretch of programme when a recorder switches to a
+  different provider whose stream runs behind the archived one. Packet hashes
+  cannot match across providers, so the audio loudness of the new input is
+  compared with the archive tail. A clear, unique match gives the number of
+  seconds the new input already repeats; they are discarded and the next
+  keyframe continues the archive, which stays continuous in programme time.
+  Without a clear match the input is used unchanged. A provider that runs ahead
+  cannot be repaired, because the skipped programme was never recorded.
+- Log a fixed `source_offset_trimmed` event with the trimmed seconds.
+
+### Verification and limitations
+
+- Synthetic tests use audio of a stream delayed by 60 seconds and encoded
+  differently from the archive, plus envelope matching edge cases (silence,
+  periodic content, input ahead of the archive). The comparison needs audible,
+  varying audio and a ~5 s or longer overlap; real-player acceptance is separate.
+
 ## [0.7.7] - Prerelease
 
 ### Fixed
