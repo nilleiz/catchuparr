@@ -102,7 +102,7 @@ Events carry the tail id; an event for another tail id is ignored. Events in
 | `opening`, `joining` | viewer returned (episode `active` again), before the return deadline | `closing` | `close_tail` | `viewer_returned` |
 | `opening`, `joining` | return deadline reached | unchanged | | |
 | `joining` | tail joined, after the return deadline | `tailing` | `cleanup_borrow` | |
-| `opening`, `joining` | join failed, or join deadline | `closing` | `close_tail`, `plain_return` | `join_failed` |
+| `opening`, `joining` | join failed, tail failed, or join deadline | `closing` | `close_tail`, `plain_return` | `join_failed` |
 | `tailing` | borrow cleaned | `tailing` | | |
 | `tailing` | RETURN token, borrow cleaned | `tailing` | `stage_dedicated` | |
 | `tailing` | dedicated staged | `seeking` | | |
@@ -110,11 +110,11 @@ Events carry the tail id; an event for another tail id is ignored. Events in
 | `tailing`, `seeking` | dedicated failed | `closing` | `close_tail` | `dedicated_failed` |
 | `seeking` | seam found (tail publication frozen) | `closing` | `switch_to_dedicated`, `close_tail` | `seam` |
 | `seeking` | tail failed, or seam deadline | `closing` | `fallback_to_dedicated`, `close_tail` | `tail_failed` / `deadline` |
-| any active | stop | `closing` | `close_tail` (+ `close_dedicated_staged` when staged) | `stopped` |
+| any active | stop | `closing` | `close_tail` (+ `close_dedicated_staged` in `seeking`) | `stopped` |
 | `closing`, `cleanup_pending` | tail closed | `closed` | | |
 | `closing` | tail close failed | `cleanup_pending` | | |
 | `cleanup_pending` | tick | `cleanup_pending` | `close_tail` | |
-| `closing`, `cleanup_pending` | tick after cleanup deadline | `cleanup_pending` | `stop_recorder` | |
+| `closing`, `cleanup_pending` | tick after cleanup deadline | `cleanup_pending` | `close_tail`, `stop_recorder` | |
 
 "Active" means `opening`, `joining`, `tailing` or `seeking`. A RETURN token
 before the borrow cleanup was acknowledged, and a join before the return
