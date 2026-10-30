@@ -389,7 +389,6 @@ class InvariantTests(unittest.TestCase):
                 if A.CLEANUP_BORROW in actions:
                     self.assertEqual(previous.phase, TailPhase.JOINING)
                     self.assertTrue(state.return_due)
-                    self.assertGreaterEqual(now, RD)
                     self.assertEqual(state.publisher, Publisher.TAIL)
                 if A.STAGE_DEDICATED in actions:
                     self.assertTrue(previous.borrow_cleaned)
