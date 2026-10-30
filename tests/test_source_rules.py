@@ -116,6 +116,28 @@ class SourceRulesTests(unittest.TestCase):
             schedules[CHANNEL_A],
         )
 
+    def test_handover_section_resolves_delayed_sources_and_bounds_the_wait(self):
+        base = "version: 1\nrules:\n  - channels: {profile: all}\n"
+        result = self.compile(
+            base + "handover:\n  delayed_sources: [Synthetic Source B, Synthetic Source A]\n"
+            "  max_overlap_seconds: 75\n"
+        )
+        self.assertEqual({"delayed_account_ids": ["11", "12"], "max_overlap_seconds": 75}, result.handover)
+        default = self.compile(base + "handover:\n  delayed_sources: [Synthetic Source A]\n")
+        self.assertEqual(90, default.handover["max_overlap_seconds"])
+        self.assertEqual({}, self.compile(base).handover)
+        for bad in (
+            "handover:\n  delayed_sources: [Unknown Source]\n",
+            "handover:\n  delayed_sources: []\n",
+            "handover:\n  delayed_sources: [Synthetic Source A]\n  max_overlap_seconds: 5\n",
+            "handover:\n  delayed_sources: [Synthetic Source A]\n  max_overlap_seconds: 500\n",
+            "handover:\n  delayed_sources: [Synthetic Source A]\n  max_overlap_seconds: true\n",
+            "handover:\n  max_overlap_seconds: 30\n",
+            "handover:\n  delayed_sources: [Synthetic Source A]\n  extra: 1\n",
+        ):
+            with self.assertRaises(SourceRuleError, msg=bad):
+                self.compile(base + bad)
+
     def test_timezone_defaults_use_container_environment_and_explicit_yaml_wins(self):
         with patch.dict(os.environ, {"TZ": "Asia/Tokyo"}):
             inherited = self.compile("version: 1\nrules: []\n")

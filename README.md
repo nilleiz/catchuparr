@@ -248,6 +248,33 @@ it. A failed
 borrow uses the normal fast recovery path. A match is not always available,
 and this option does not promise gapless recordings.
 
+### Providers with a delayed stream
+
+Two M3U sources that carry the same channel can differ in latency by a minute or
+more. Switching between them then repeats part of the programme (the new source
+is behind) or skips it (the new source is ahead). Catchuparr compares the audio
+of the new input with the archive and removes a repeat. To close a gap, name the
+delayed sources in the YAML:
+
+```yaml
+version: 1
+handover:
+  delayed_sources:
+    - Synthetic Delayed Source
+  max_overlap_seconds: 90
+rules:
+  - channels: {profile: all}
+```
+
+When a recording on a listed source hands over to a viewer's source that is not
+listed, the old input keeps recording beside the new one, for at most
+`max_overlap_seconds` (10 to 120, default 90), until the archive reaches the
+programme at which the new input began. The archive is then joined without a gap
+or repeat. Both inputs use a provider connection while they overlap. If no join
+is found in time, the handover continues as before. A return to a faster source
+does not open a second connection and can still leave a gap. The comparison
+needs varying audio and an overlap of about five seconds or more.
+
 The [0.6.1 candidate notes](docs/candidate-0.6.1.md) retain the historical
 settings and migration details. Synthetic tests do not establish acceptance
 by every real player.

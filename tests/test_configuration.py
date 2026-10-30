@@ -788,6 +788,23 @@ class ConfigurationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, key):
                     load_active_configuration(self.active_path)
 
+    def test_handover_settings_are_applied_validated_and_optional(self):
+        plain = apply_configuration(self.settings, self.catalog, self.active_path)
+        self.assertEqual(plain["selected_channel_count"], 2)
+        self.assertNotIn("handover_delayed_account_ids", load_active_configuration(self.active_path))
+        yaml_text = self.settings["filter_config"] + (
+            "handover:\n  delayed_sources: [Synthetic Provider B]\n  max_overlap_seconds: 80\n"
+        )
+        apply_configuration(dict(self.settings, filter_config=yaml_text), self.catalog, self.active_path)
+        active = load_active_configuration(self.active_path)
+        self.assertEqual(["13"], active["handover_delayed_account_ids"])
+        self.assertEqual(80, active["handover_max_overlap_seconds"])
+        snapshot = json.loads(self.active_path.read_text(encoding="utf-8"))
+        snapshot["settings"].pop("handover_max_overlap_seconds")
+        self.active_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            load_active_configuration(self.active_path)
+
     def test_switch_synchronization_is_boolean_and_only_changes_after_apply(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         original = load_active_configuration(self.active_path)

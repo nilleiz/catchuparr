@@ -4,6 +4,52 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.8] - Prerelease
+
+### Fixed
+
+- Remove a repeated stretch of programme when a recorder switches to a
+  different provider whose stream runs behind the archived one. Packet hashes
+  cannot match across providers, so the audio loudness of the new input is
+  compared with the archive tail. A clear, unique match gives the number of
+  seconds the new input already repeats; they are discarded and the next
+  keyframe continues the archive, which stays continuous in programme time.
+  Without a clear match the input is used unchanged. A provider that runs ahead
+  cannot be repaired, because the skipped programme was never recorded.
+- Log a fixed `source_offset_trimmed` event with the trimmed seconds.
+- Close the gap left when the new input runs ahead of the old one. A new
+  top-level `handover:` section in the YAML names the M3U sources whose streams
+  are delayed (`delayed_sources`) and how long the old input may keep recording
+  beside the new one (`max_overlap_seconds`, 10 to 120, default 90). When a
+  delayed source hands over to a source that is not listed, the old input keeps
+  recording until the archive reaches the programme at which the new input
+  began; the audio comparison then finds the join, the archive stays continuous
+  and nothing is skipped or repeated. If no join is found within the time, the
+  handover continues as before. Both inputs use a provider connection while
+  they overlap. Without the section nothing changes.
+
+### Changed
+
+- The green toast of the current-recordings and today's-schedule actions only
+  summarises what follows, for example `Current recordings: 12 channels, 1 with
+  problems. Details in 2 toasts.` or `Today's schedule: 9 channels in 3
+  periods.`; a paused recorder is named first. All rows now appear in the blue
+  `Catchuparr – Status 1/2` and `Catchuparr – Schedule` toasts. Results without
+  rows stay a single green toast. If the push is unavailable, the green toast
+  shows the rows as before and names how many were not shown.
+
+### Verification and limitations
+
+- Synthetic tests use audio of a stream delayed by 60 seconds and encoded
+  differently from the archive, plus envelope matching edge cases (silence,
+  periodic content, input ahead of the archive). The comparison needs audible,
+  varying audio and a ~5 s or longer overlap; real-player acceptance is separate.
+- The extended overlap applies to a delayed source handing over to a viewer's
+  faster source. A return to a faster dedicated source after a borrow does not
+  open a second connection and can still leave a gap.
+- Unit tests cover the summary texts, the detail toasts and the fallback
+  without a push. The toast layout itself is unchanged from 0.7.7.
+
 ## [0.7.7] - Prerelease
 
 ### Fixed

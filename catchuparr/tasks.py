@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import secrets
@@ -120,6 +121,27 @@ def _retry_failure_attach(coordinator, active, control_generation, state_lock, a
         return True
 
 
+def _handover_overlap_seconds(active, prepared, attempt_state) -> float:
+    """Seconds both inputs may run when a delayed source hands over to a faster one.
+
+    Only a configured delayed source leaving for a source that is not delayed
+    needs the long overlap: the new input is then ahead, and the old one must
+    keep recording until it reaches the programme the new input started with.
+    """
+    delayed = active.get("handover_delayed_account_ids")
+    seconds = active.get("handover_max_overlap_seconds")
+    if not delayed or type(seconds) is not int:
+        return 0.0
+    try:
+        old_account = str((attempt_state.get("candidate") or {}).get("account_id") or "")
+        new_account = str(prepared.capability.connection_identity[5])
+    except (AttributeError, IndexError, TypeError):
+        return 0.0
+    if old_account in delayed and new_account and new_account not in delayed:
+        return float(seconds)
+    return 0.0
+
+
 def _request_viewer_switch(switch, active, prepared, make_recorder, attempt_state):
     """Offer one staged reader only for the enabled, current attempt."""
     if switch is None:
@@ -129,6 +151,8 @@ def _request_viewer_switch(switch, active, prepared, make_recorder, attempt_stat
             and not attempt_state.get("return_syncing", False)):
         try:
             target = make_recorder(prepared)
+            with contextlib.suppress(AttributeError, TypeError):
+                target.handover_overlap_seconds = _handover_overlap_seconds(active, prepared, attempt_state)
             attempt_state["syncing"] = True
             offered = switch.offer_synchronized_input(target)
         except Exception:
