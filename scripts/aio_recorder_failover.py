@@ -1112,11 +1112,11 @@ def _safe_supervisor_admission_status(module_name, function_name, frame_locals) 
 
 
 _SUPERVISOR_STOP_REASONS_BY_LINE = {
-    734: "admission_or_lease_renewal",
-    757: "stats_capability_refresh",
-    806: "attempt_renewal",
-    814: "candidate_currentness",
-    818: "exception",
+    758: "admission_or_lease_renewal",
+    781: "stats_capability_refresh",
+    830: "attempt_renewal",
+    838: "candidate_currentness",
+    842: "exception",
 }
 
 _SAFE_SUPERVISOR_EXCEPTION_CLASSES = frozenset({

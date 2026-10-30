@@ -117,6 +117,77 @@ class AudioOffsetTrimTests(unittest.TestCase):
             self.assertGreaterEqual(video[0] - 1.4, 59.9)
             self.assertLessEqual(video[0] - 1.4, 62.0)
 
+    def test_delayed_old_input_keeps_recording_until_the_faster_input_can_be_joined(self):
+        import os
+        import time
+
+        from catchuparr.engine.recorder import RecorderAttemptSwitch
+
+        audio = ("anoisesrc=r=48000:d=70:a=0.3,"
+                 "volume=volume='0.05+mod(abs(sin(floor(t*4)*12.9898)*43758.5453),1)':eval=frame")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.ts"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25", "-f", "lavfi", "-i", audio,
+                "-t", "70", "-c:v", "mpeg2video", "-g", "25", "-c:a", "mp2", "-f", "mpegts", str(source),
+            ], check=True, capture_output=True, timeout=120)
+            old_fifo, new_fifo = root / "old.pipe", root / "new.pipe"
+            os.mkfifo(old_fifo)
+            os.mkfifo(new_fifo)
+            store = ArchiveStore(root / "archive")
+            old = FFmpegCopyRecorder(store, "synthetic", str(old_fifo), root / "work", segment_seconds=6)
+            target = FFmpegCopyRecorder(store, "synthetic", str(new_fifo), root / "work", segment_seconds=6)
+            target.handover_overlap_seconds = 45
+            stop, switch = threading.Event(), RecorderAttemptSwitch()
+            result, feeders = [], []
+
+            def feed(path, seek, *encode):
+                feeders.append(subprocess.Popen([
+                    "ffmpeg", "-v", "error", "-re", "-ss", str(seek), "-i", str(source), "-map", "0",
+                    *encode, "-f", "mpegts", "-y", str(path),
+                ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+            worker = threading.Thread(target=lambda: result.append(
+                old.run_candidate(stop, attempt_switch=switch, poll_interval=0.1)))
+            worker.start()
+            feed(old_fifo, 0, "-c", "copy")
+            try:
+                time.sleep(0.5)
+                self.assertTrue(switch.offer_synchronized_input(target))
+                # The other provider is 14 s ahead and encodes differently.
+                feed(new_fifo, 14, "-c:v", "mpeg2video", "-g", "25", "-b:v", "300k", "-c:a", "mp2", "-b:a", "96k")
+                worker.join(timeout=60)
+                self.assertFalse(worker.is_alive(), "the delayed input never reached the faster input's start")
+                staged = result[0].staged_input
+                self.assertIsNotNone(staged)
+                self.assertTrue(staged.frozen)
+                before = store.segments("synthetic")
+                archived_end = before[-1].end_utc
+                resumed = target.run_candidate(stop, staged_input=staged, poll_interval=0.1)
+                self.assertGreater(resumed.useful_segments, 0)
+                after = store.segments("synthetic")
+                first_new = after[len(before)]
+                self.assertAlmostEqual((first_new.start_utc - archived_end).total_seconds(), 0.0, delta=0.05)
+                archived_seconds = (archived_end - before[0].start_utc).total_seconds()
+                video = self.packets(first_new.path, "v:0")
+                # The new input began 14 s into the programme: the kept picture is
+                # where the archive ended, not earlier and not a gap later.
+                expected = archived_seconds - 14
+                self.assertGreaterEqual(video[0] - 1.4, expected - 0.1)
+                self.assertLessEqual(video[0] - 1.4, expected + 2.0)
+            finally:
+                stop.set()
+                for process in feeders:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                worker.join(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()
