@@ -580,6 +580,60 @@ class HandoverEvidenceTests(unittest.TestCase):
                         process.wait()
                 worker.join(timeout=5)
 
+    def test_unproven_adoption_trims_overlap_with_the_archive_tail(self):
+        class Process:
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def hashes(path):
+            probe = subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_packets",
+                "-show_data_hash", "sha256", "-show_entries", "packet=data_hash", "-of", "json", str(path),
+            ], check=True, capture_output=True, timeout=30)
+            return [packet["data_hash"] for packet in json.loads(probe.stdout)["packets"]]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, stage_root = root / "source.ts", root / "stage"
+            stage_root.mkdir()
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "12",
+                "-c:v", "mpeg2video", "-g", "25", "-c:a", "mp2", "-f", "mpegts", str(source),
+            ], check=True, capture_output=True, timeout=30)
+            old_dir = root / "old"
+            old_dir.mkdir()
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-i", str(source), "-t", "4.95", "-map", "0", "-c", "copy",
+                "-f", "mpegts", str(old_dir / "tail.ts"),
+            ], check=True, capture_output=True, timeout=30)
+            # The new reader starts three seconds before the archive ends.
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-ss", "2", "-i", str(source), "-map", "0", "-c", "copy",
+                "-f", "segment", "-segment_time", "4", "-segment_format", "mpegts",
+                "-segment_list", str(stage_root / "segments.csv"), "-segment_list_type", "csv",
+                str(stage_root / "segment-%06d.ts"),
+            ], check=True, capture_output=True, timeout=30)
+            store = ArchiveStore(root / "archive")
+            started = datetime.now(timezone.utc) - timedelta(seconds=5)
+            tail = store.add_segment("synthetic", old_dir / "tail.ts", started, started + timedelta(seconds=5))
+            target = FFmpegCopyRecorder(store, "synthetic", "http://example.invalid/new", root / "work")
+            staged = StagedRecorderInput(target, stage_root, Process())
+            resumed = target.run_candidate(threading.Event(), staged_input=staged)
+            self.assertGreater(resumed.useful_segments, 0)
+            segments = store.segments("synthetic")
+            self.assertEqual(segments[1].start_utc, tail.end_utc)
+            recorded = [digest for segment in segments for digest in hashes(segment.path)]
+            reference = hashes(source)
+            self.assertEqual(recorded, reference[:len(recorded)], "pictures repeated or lost")
+            self.assertGreater(len(recorded), 125)
+
     def test_staggered_live_readers_splice_without_repeated_or_lost_pictures(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

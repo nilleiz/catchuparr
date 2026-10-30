@@ -55,6 +55,8 @@ class Splice:
     audio_pts: float
     # Seconds between the start of the staged video track and the splice.
     cut_offset: float
+    # Every video packet of the staged file is already archived.
+    complete: bool = False
 
 
 def _deadline_timeout(deadline: float | None) -> float:
@@ -152,9 +154,15 @@ def find_splice(old_path: Path, staged_path: Path, *, deadline: float | None = N
     indexes = {}
     for kind in ("video", "audio"):
         index = _resume_index(old[kind], new[kind])
-        if index is None or index >= len(new[kind].packets):
+        if index is None:
             return None
         indexes[kind] = index
+    audio_tail = new["audio"].packets[indexes["audio"]:]
+    if (indexes["video"] == len(new["video"].packets) and audio_tail
+            and audio_tail[-1].pts - audio_tail[0].pts <= MAX_AUDIO_SKIP_SECONDS):
+        return Splice(indexes["video"], indexes["audio"], 0.0, 0.0, 0.0, complete=True)
+    if any(indexes[kind] >= len(new[kind].packets) for kind in indexes):
+        return None
     video = new["video"].packets
     cut = video[indexes["video"]]
     if not cut.key or cut.pos is None:
