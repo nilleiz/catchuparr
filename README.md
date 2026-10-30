@@ -65,7 +65,7 @@ immediate operational actions.
 | --- | --- |
 | **Channel and source filter (YAML)** | Channel selection, assigned M3U source include/exclude and priority, schedule and timezone. Blank YAML selects no channels. |
 | **Share existing live connections** | Optional global reuse of compatible existing viewer connections on all selected channels. Disabled by default. |
-| **Try to synchronize before switching streams** | Optional, bounded overlap check when switching to a viewer or returning to a dedicated source. Disabled by default. |
+| **Try to synchronize before switching streams** | Optional, bounded overlap check when switching to a viewer or returning to a dedicated source. Enabled by default. |
 | **Live stability delay** | Delay before later switches to a new viewer connection. The first eligible attach is immediate. |
 | **Return delay after last viewer leaves** | Grace before returning to an allowed source. |
 | **Minimum interval between switches** | Cooldown applied to later source switches. |
@@ -232,7 +232,7 @@ authority and recorder failure take the cleanup path without waiting for normal
 viewer cooldowns. A switch marks the new muxer with a segment discontinuity.
 The recorder's channel fence remains in force.
 
-**Try to synchronize before switching streams** is off by default and can be
+**Try to synchronize before switching streams** is on by default and can be
 applied with the other settings. When enabled, a running dedicated recorder may
 briefly stage its already-authorized viewer input and compare complete encoded
 audio/video segments. If a current overlap is proven, the staged reader

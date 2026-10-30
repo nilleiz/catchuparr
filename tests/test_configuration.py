@@ -791,13 +791,13 @@ class ConfigurationTests(unittest.TestCase):
     def test_switch_synchronization_is_boolean_and_only_changes_after_apply(self):
         apply_configuration(self.settings, self.catalog, self.active_path)
         original = load_active_configuration(self.active_path)
-        self.assertIs(original["synchronize_before_switch"], False)
-        enabled = dict(self.settings, synchronize_before_switch=True)
-        validate_configuration(enabled, self.catalog, self.active_path)
-        self.assertIs(load_active_configuration(self.active_path)["synchronize_before_switch"], False)
-        apply_configuration(enabled, self.catalog, self.active_path)
+        self.assertIs(original["synchronize_before_switch"], True)
+        disabled = dict(self.settings, synchronize_before_switch=False)
+        validate_configuration(disabled, self.catalog, self.active_path)
+        self.assertIs(load_active_configuration(self.active_path)["synchronize_before_switch"], True)
+        apply_configuration(disabled, self.catalog, self.active_path)
         active = load_active_configuration(self.active_path)
-        self.assertIs(active["synchronize_before_switch"], True)
+        self.assertIs(active["synchronize_before_switch"], False)
         self.assertNotEqual(
             configuration.active_configuration_generation(original),
             configuration.active_configuration_generation(active),

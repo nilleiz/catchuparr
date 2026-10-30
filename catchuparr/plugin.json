@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.7.3",
+  "version": "0.7.4-rc.1",
   "description": "Local rolling catch-up archive, start-over and optional live connection sharing for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -23,7 +23,7 @@
       "id": "synchronize_before_switch",
       "label": "Try to synchronize before switching streams",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "help_text": "Try to match encoded audio and video before switching to a viewer. On return, first finish viewer cleanup, then try to match the new source to the archive tail. Without a safe overlap after about 12 seconds, use the normal switch. This does not guarantee a gapless recording. Apply this setting before use."
     },
     {
