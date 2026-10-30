@@ -445,9 +445,10 @@ def probe():
     require(all({"channel_uuid", "number", "name", "state", "mode", "reason", "source"}
                 <= set(row) for row in current_result["channels"]),
             "Current recordings action omitted expected channel state fields")
-    require("Current recordings" not in current_result.get("message", "")
-            and "Problems:" not in current_result.get("message", "")
-            and "Last confirmed progress" not in current_result.get("message", ""),
+    current_message = current_result.get("message", "")
+    require(current_message.startswith("Current recordings:")
+            and "Problems:" not in current_message
+            and "Last confirmed progress" not in current_message,
             "Current recordings action returned the expanded diagnostic message")
     require(isinstance(schedule_result, dict) and isinstance(schedule_result.get("channels"), list)
             and isinstance(schedule_result.get("summary"), dict),
@@ -455,9 +456,10 @@ def probe():
     require(all({"channel_uuid", "number", "name", "windows"} <= set(row)
                 and isinstance(row["windows"], list) for row in schedule_result["channels"]),
             "Today's schedule action omitted selected channels or window lists")
-    require("Today's recording schedule" not in schedule_result.get("message", "")
-            and "Pause state unknown" not in schedule_result.get("message", "")
-            and "No recording windows planned" not in schedule_result.get("message", ""),
+    schedule_message = schedule_result.get("message", "")
+    require("Today's recording schedule" not in schedule_message
+            and "Pause state unknown" not in schedule_message
+            and "No recording windows planned" not in schedule_message,
             "Today's schedule action returned the expanded schedule message")
     require(active_path.read_bytes() == active_before and control_path.read_bytes() == control_before
             and set(active_path.parent.iterdir()) == directory_before,
