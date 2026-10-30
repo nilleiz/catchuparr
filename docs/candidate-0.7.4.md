@@ -14,8 +14,8 @@ provable overlap the input is used unchanged as a marked discontinuity.
 
 Audio frames share PES packets and cannot be split without rewriting them, so
 audio resumes at the next PES start. A fraction of a second of audio may be
-omitted; none is repeated. Only one video and one audio track are supported;
-other layouts keep the previous behaviour.
+omitted; none is repeated. One video track and one or more audio tracks are supported; other layouts keep
+the previous behaviour.
 
 "Try to synchronize before switching streams" is now enabled by default for new
 configurations. Existing applied configurations keep their stored value.
