@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from .action_messages import format_action_message
+from .action_messages import deliver_action_message, split_group_row
 from .schedule import schedule_from_snapshot
 
 
@@ -120,14 +121,18 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             })
         rows.append(row)
     rows.sort(key=_channel_sort_key)
-    lines = []
+    # Channels sharing identical windows form one "period › channels" row.
+    groups = {}
     for row in rows:
         if row["windows"]:
-            label = _safe_display(row.get("name")) or "Unknown channel"
-            windows_text = ", ".join(
-                f"{window['start']}–{window['end']}" for window in row["windows"]
-            )
-            lines.append(f"{label}: {windows_text}")
+            key = tuple((window["start"], window["end"]) for window in row["windows"])
+            groups.setdefault(key, []).append(_safe_display(row.get("name")) or "Unknown channel")
+    lines = []
+    for key in sorted(groups, key=lambda windows: (windows != (("00:00", "24:00"),), windows)):
+        period = "All day" if key == (("00:00", "24:00"),) else ", ".join(
+            f"{start}–{end}" for start, end in key
+        )
+        lines.extend(split_group_row(period, groups[key]))
     if not lines:
         lines.append("No recordings scheduled today.")
     if paused is True:
@@ -136,7 +141,9 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
     window_count = sum(len(row["windows"]) for row in rows)
     return {
         "status": "ok",
-        "message": format_action_message(lines),
+        "message": deliver_action_message(
+            lines, title="Schedule", run_key=f"schedule-{uuid4().hex[:12]}",
+        ),
         "channels": rows,
         "summary": {
             "channel_count": len(rows),
