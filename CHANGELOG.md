@@ -4,6 +4,31 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.7] - Prerelease
+
+### Fixed
+
+- Show each row of the current-recordings and today's-schedule action toasts
+  on its own line. Rows are separated by a hanging run of ideographic spaces
+  instead of estimated non-breaking-space padding, so the layout no longer
+  depends on the toast font or width.
+- Keep every toast within Dispatcharr's 200px notification height. Rows that do
+  not fit are pushed as numbered admin-only follow-up toasts
+  (`Catchuparr – Status 2/3`). They are marked as dismissed, so they do not add
+  unread entries to the notification center. If the push is unavailable, the
+  first toast names how many rows were not shown.
+- Today's schedule groups channels with identical windows into one
+  `period › channels` row, with all-day recordings first.
+
+### Verification and limitations
+
+- Unit tests cover line estimates, pagination, group splitting and follow-up
+  delivery. Synthetic rows were rendered in Chromium and Firefox at
+  Dispatcharr's toast dimensions: every page stayed within seven lines without
+  horizontal overflow. WebKit was not tested.
+- Follow-up toasts use Dispatcharr's blue system-notification style and close
+  after ten seconds. The first toast keeps the action's green style.
+
 ## [0.7.6] - Prerelease
 
 ### Fixed

@@ -1,4 +1,3 @@
-import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -6,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from catchuparr.action_messages import format_action_message
+from catchuparr.action_messages import ROW_SEPARATOR, join_rows
 from catchuparr.configuration import SourceCatalog, apply_configuration, load_applied_state_readonly
 from catchuparr.plugin import Plugin
 from catchuparr.recording_schedule_overview import today_schedule
@@ -36,8 +35,8 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.assertEqual([(window["start"], window["end"]) for window in rows[0]["windows"]],
                          [("09:00", "10:00"), ("13:00", "14:00")])
         self.assertEqual(rows[1]["windows"][0]["end"], "24:00")
-        self.assertEqual(result["message"], format_action_message((
-            "Alpha: 09:00–10:00, 13:00–14:00", "Beta: 00:00–24:00",
+        self.assertEqual(result["message"], join_rows((
+            "All day › Beta", "09:00–10:00, 13:00–14:00 › Alpha",
         )))
 
     def test_empty_day_and_paused_state_visible(self):
@@ -48,15 +47,15 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.assertEqual([row["number"] for row in result["channels"]], [2, 10])
         empty = result["channels"][1]
         self.assertEqual(empty["windows"], [])
-        self.assertEqual(result["message"], "Continuous: 00:00–24:00")
+        self.assertEqual(result["message"], "All day › Continuous")
         self.assertIsNone(result["recording_paused"])
         self.assertNotIn("Pause state unknown", result["message"])
         result = today_schedule(settings({"a": {"daily": [{"start": "09:00", "end": "10:00"}]}}),
                                 {}, control_state=type("Control", (), {"paused": True})(),
                                 now=datetime(2026, 10, 19, 7, tzinfo=timezone.utc))
         self.assertTrue(result["recording_paused"])
-        self.assertEqual(result["message"], format_action_message((
-            "Recording paused", "Unknown channel: 09:00–10:00",
+        self.assertEqual(result["message"], join_rows((
+            "Recording paused", "09:00–10:00 › Unknown channel",
         )))
         active = today_schedule(settings({"a": "continuous"}), {},
                                  control_state=type("Control", (), {"paused": False})(),
@@ -67,7 +66,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                                       control_state=type("Control", (), {"paused": True})(),
                                       now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
         self.assertTrue(paused_empty["recording_paused"])
-        self.assertEqual(paused_empty["message"], format_action_message((
+        self.assertEqual(paused_empty["message"], join_rows((
             "Recording paused", "No recordings scheduled today.",
         )))
 
@@ -82,7 +81,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             [window["status"] for window in result["channels"][0]["windows"]],
             ["past", "current", "upcoming"],
         )
-        self.assertEqual(result["message"], "Unknown channel: 09:00–10:00, 11:00–13:00, 14:00–15:00")
+        self.assertEqual(result["message"], "09:00–10:00, 11:00–13:00, 14:00–15:00 › Unknown channel")
 
     def test_message_omits_free_channels_and_has_no_heading(self):
         result = today_schedule(
@@ -96,7 +95,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             {"active": {"name": "Synthetic Channel A"}, "free": {"name": "Free Channel"}},
             now=datetime(2026, 10, 18, 8, tzinfo=timezone.utc),
         )
-        self.assertEqual(result["message"], "Synthetic Channel A: 09:00–10:00, 13:00–14:00")
+        self.assertEqual(result["message"], "09:00–10:00, 13:00–14:00 › Synthetic Channel A")
         self.assertEqual(len(result["channels"]), 2)
         self.assertNotIn("Free Channel", result["message"])
 
@@ -203,20 +202,11 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                    return_value=channels):
             result = Plugin.__new__(Plugin).run("today_schedule", {}, {})
 
-        expected = format_action_message((
-            "Recording paused",
-            "Synthetic Channel A: 00:00–24:00",
-            "Synthetic Channel B: 00:00–24:00",
-        ))
-        self.assertEqual(result["message"], expected)
         self.assertEqual(
-            re.split(r" \u00a0+ ", result["message"]),
-            ["Recording paused", "Synthetic Channel A: 00:00–24:00",
-             "Synthetic Channel B: 00:00–24:00"],
+            result["message"].split(ROW_SEPARATOR),
+            ["Recording paused", "All day › Synthetic Channel A, Synthetic Channel B"],
         )
-        self.assertEqual(result["message"].count("Recording paused"), 1)
-        self.assertGreater(result["message"].count("\u00a0"), 0)
-        self.assertLess(result["message"].count("\u00a0"), 158)
+        self.assertNotIn("\u00a0", result["message"])
         self.assertNotIn("\n", result["message"])
         self.assertNotIn("37", result["message"])
         self.assertNotIn("42", result["message"])

@@ -1,5 +1,4 @@
 import copy
-import re
 import sqlite3
 import sys
 import tempfile
@@ -12,10 +11,13 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from catchuparr.action_messages import (
-    NBSP_WIDTH_PX,
-    TARGET_WIDTH_PX,
-    _last_visual_line_width,
-    format_action_message,
+    MAX_LINES_PER_TOAST,
+    ROW_SEPARATOR,
+    deliver_action_message,
+    join_rows,
+    paginate_rows,
+    split_group_row,
+    wrapped_line_count,
 )
 from catchuparr.configuration import active_configuration_generation
 from catchuparr.plugin import Plugin
@@ -40,61 +42,87 @@ class OverviewRedis:
 
 
 class ActionMessageFormattingTests(unittest.TestCase):
-    @staticmethod
-    def padding_before_next_row(message):
-        return message.split("NextRow", 1)[0].count("\u00a0")
+    def test_rows_are_joined_by_a_hanging_ideographic_space_run(self):
+        self.assertEqual(join_rows(()), "")
+        self.assertEqual(join_rows(("OnlyRow",)), "OnlyRow")
+        message = join_rows(("A", "B"))
+        self.assertEqual(message, "A" + "\u3000" * 40 + "B")
+        self.assertNotIn("\u00a0", message)
+        self.assertNotIn("\n", message)
 
-    def test_padding_varies_with_last_visual_line_width(self):
-        short = format_action_message(("A", "NextRow"))
-        long = format_action_message(("W" * 21, "NextRow"))
-        short_padding = self.padding_before_next_row(short)
-        long_padding = self.padding_before_next_row(long)
-        self.assertGreater(short_padding, long_padding)
-        self.assertEqual(long_padding, 0)
-        self.assertLessEqual(short_padding, int(TARGET_WIDTH_PX / NBSP_WIDTH_PX))
-
-    def test_wrapped_long_row_pads_from_its_last_visual_line(self):
-        row = "Synthetic Channel: " + ", ".join(
+    def test_line_count_grows_with_wrapping_and_wide_characters(self):
+        self.assertEqual(wrapped_line_count("Synthetic Channel A - Source [ok]"), 1)
+        long_row = "Synthetic Channel: " + ", ".join(
             f"{hour:02}:00–{hour + 1:02}:00" for hour in range(9, 17)
         )
-        message = format_action_message((row, "NextRow"))
-        padding = self.padding_before_next_row(message)
-        self.assertGreater(_last_visual_line_width(row), 0)
-        self.assertLess(_last_visual_line_width(row), TARGET_WIDTH_PX)
-        self.assertGreater(padding, 0)
-        short_padding = self.padding_before_next_row(format_action_message(("A", "NextRow")))
-        self.assertLess(padding, short_padding)
-        self.assertGreater(len(row.split(", ")), 1)
+        self.assertGreater(wrapped_line_count(long_row), 1)
+        self.assertGreater(wrapped_line_count("漢" * 40), wrapped_line_count("a" * 40))
+        self.assertGreater(wrapped_line_count("W" * 60), 1)
+        self.assertEqual(wrapped_line_count("Cafe\u0301"), wrapped_line_count("Cafe"))
 
-    def test_east_asian_fallback_uses_wider_estimate(self):
-        ascii_padding = self.padding_before_next_row(format_action_message(("A", "NextRow")))
-        east_asian_padding = self.padding_before_next_row(format_action_message(("漢", "NextRow")))
-        self.assertLess(east_asian_padding, ascii_padding)
+    def test_pages_respect_line_budget_and_never_split_rows(self):
+        rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
+        pages = paginate_rows(rows)
+        self.assertGreater(len(pages), 1)
+        self.assertEqual([row for page in pages for row in page], rows)
+        for page in pages:
+            self.assertLessEqual(sum(map(wrapped_line_count, page)), MAX_LINES_PER_TOAST)
+        oversized = "Synthetic " * 200
+        self.assertEqual(paginate_rows(["A", oversized, "B"]), [["A"], [oversized], ["B"]])
 
-    def test_long_cjk_and_mixed_rows_wrap_at_character_breaks(self):
-        for row in ("漢" * 25 + " - Tail", "Latin 漢" * 20 + " end"):
-            with self.subTest(row=row[:20]):
-                width = _last_visual_line_width(row)
-                message = format_action_message((row, "NextRow"))
-                padding = self.padding_before_next_row(message)
-                self.assertLessEqual(width, TARGET_WIDTH_PX)
-                self.assertGreater(width, 0)
-                self.assertLessEqual(
-                    width + (padding + 1) * NBSP_WIDTH_PX,
-                    TARGET_WIDTH_PX,
-                )
+    def test_large_group_is_split_with_repeated_period(self):
+        names = [f"Synthetic Channel {index}" for index in range(60)]
+        rows = split_group_row("09:00–10:00", names)
+        self.assertGreater(len(rows), 1)
+        for row in rows:
+            self.assertTrue(row.startswith("09:00–10:00 › "))
+            self.assertLessEqual(wrapped_line_count(row), MAX_LINES_PER_TOAST)
+        self.assertEqual(
+            [name for row in rows for name in row.split(" › ", 1)[1].split(", ")], names,
+        )
 
-    def test_combining_mark_has_zero_extra_estimated_width(self):
-        plain = self.padding_before_next_row(format_action_message(("Cafe", "NextRow")))
-        combined = self.padding_before_next_row(format_action_message(("Cafe\u0301", "NextRow")))
-        self.assertEqual(combined, plain)
+    def test_single_page_sends_nothing(self):
+        sent = []
+        message = deliver_action_message(("A", "B"), title="T", run_key="k",
+                                         sender=sent.append, delay_seconds=0)
+        self.assertEqual(message, join_rows(("A", "B")))
+        self.assertEqual(sent, [])
 
-    def test_single_empty_and_full_width_rows_do_not_get_large_padding(self):
-        self.assertEqual(format_action_message(()), "")
-        self.assertEqual(format_action_message(("OnlyRow",)), "OnlyRow")
-        full = format_action_message(("W" * 21, "NextRow"))
-        self.assertNotIn("\u00a0", full)
-        self.assertNotIn("\n", full)
+    def test_further_pages_are_pushed_as_numbered_admin_toasts(self):
+        rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
+        pages = paginate_rows(rows)
+        sent = []
+        message = deliver_action_message(rows, title="Status", run_key="run",
+                                         sender=sent.append, delay_seconds=0)
+        total = len(pages)
+        self.assertEqual(message.split(ROW_SEPARATOR)[0], f"1/{total} · {rows[0]}")
+        self.assertEqual(len(sent), total - 1)
+        for number, (notification, page) in enumerate(zip(sent, pages[1:]), start=2):
+            self.assertEqual(notification["title"], f"Catchuparr – Status {number}/{total}")
+            self.assertEqual(notification["message"], join_rows(page))
+            self.assertEqual(notification["notification_key"], f"catchuparr-run-{number}")
+            self.assertEqual(notification["priority"], "high")
+            self.assertIs(notification["admin_only"], True)
+            self.assertIs(notification["is_dismissed"], True)
+
+    def test_unavailable_push_names_missing_rows(self):
+        rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
+
+        def failing(_notification):
+            raise RuntimeError("unavailable")
+
+        message = deliver_action_message(rows, title="T", run_key="k",
+                                         sender=failing, delay_seconds=0)
+        shown = message.split(ROW_SEPARATOR)
+        self.assertRegex(shown[-1], r"^\+\d+ more not shown$")
+        self.assertEqual(len(shown) - 1 + int(shown[-1].split()[0]), len(rows))
+        self.assertLessEqual(sum(map(wrapped_line_count, shown)), MAX_LINES_PER_TOAST)
+
+    def test_missing_host_push_falls_back_to_note(self):
+        rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
+        with patch.dict(sys.modules, {"core.utils": ModuleType("core.utils")}):
+            message = deliver_action_message(rows, title="T", run_key="k", delay_seconds=0)
+        self.assertIn("more not shown", message)
 
 
 class RecordingOverviewTests(unittest.TestCase):
@@ -372,21 +400,14 @@ class RecordingOverviewTests(unittest.TestCase):
                    side_effect=lambda channel_id, *_args: sources[channel_id]):
             result = Plugin.__new__(Plugin).run("current_recordings", {}, {})
 
-        expected = format_action_message((
-            "Synthetic Channel A - M3UActual [starting]",
-            "Synthetic Channel B - Alternate [starting]",
-        ))
         self.assertEqual([row["state"] for row in result["channels"]], ["starting", "starting"])
-        self.assertEqual(result["message"], expected)
         self.assertEqual(
-            re.split(r" \u00a0+ ", result["message"]),
+            result["message"].split(ROW_SEPARATOR),
             ["Synthetic Channel A - M3UActual [starting]",
              "Synthetic Channel B - Alternate [starting]"],
         )
+        self.assertNotIn("\u00a0", result["message"])
         self.assertNotIn("\n", result["message"])
-        padding = result["message"].split("Synthetic Channel B", 1)[0].count("\u00a0")
-        self.assertGreater(padding, 0)
-        self.assertLess(padding, 200)
         self.assertNotIn("731", result["message"])
         self.assertNotIn("842", result["message"])
         self.assertNotIn("Distinct Stream Full Name", result["message"])
