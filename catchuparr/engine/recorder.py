@@ -25,6 +25,7 @@ LIVE_EDGE_IDLE_TIMEOUT_SECONDS = (
 )
 SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS = 12.0
 STAGED_INPUT_MAX_SECONDS = 30.0
+FINAL_SEGMENT_MIN_SECONDS = 1.0
 STAGED_INPUT_MAX_BYTES = 256 * 1024 * 1024
 
 
@@ -280,6 +281,7 @@ class FFmpegCopyRecorder:
         *,
         require_useful_media: bool | None = None,
         attempt_switch: RecorderAttemptSwitch | None = None,
+        min_duration: float = 0.0,
     ) -> tuple[int, int]:
         if not list_path.exists():
             return offset, 0
@@ -301,6 +303,11 @@ class FFmpegCopyRecorder:
                 self._mark_next_discontinuity = True
                 continue
             segment_path = Path(name)
+            if end_s - start_s < min_duration:
+                # A stub left by stopping the muxer may lack a track entirely.
+                (segment_path if segment_path.is_absolute() else list_path.parent / segment_path).unlink(missing_ok=True)
+                self._mark_next_discontinuity = True
+                continue
             if not segment_path.is_absolute():
                 segment_path = list_path.parent / segment_path
             replaced_source = None
@@ -462,6 +469,7 @@ class FFmpegCopyRecorder:
             while not stop_event.is_set() and not switch.is_set():
                 offset, committed = self._publish_csv_rows(
                     list_path, offset, require_useful_media=True, attempt_switch=switch,
+                    min_duration=FINAL_SEGMENT_MIN_SECONDS if current_process.poll() is not None else 0.0,
                 )
                 if committed:
                     committed_total += committed
@@ -530,6 +538,7 @@ class FFmpegCopyRecorder:
                         # shrinks the gap before the staged input.
                         offset, committed = self._publish_csv_rows(
                             list_path, offset, require_useful_media=True, attempt_switch=switch,
+                            min_duration=FINAL_SEGMENT_MIN_SECONDS,
                         )
                         if committed:
                             committed_total += committed
@@ -827,7 +836,7 @@ class FFmpegCopyRecorder:
                     # can publish, and is still fenced by the recorder lease.
                     try:
                         offset, committed = self._publish_csv_rows(
-                            list_path, offset, require_useful_media=True,
+                            list_path, offset, require_useful_media=True, min_duration=FINAL_SEGMENT_MIN_SECONDS,
                         )
                         useful += committed
                     except (OSError, ValueError):

@@ -4,6 +4,19 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.5] - Prerelease
+
+### Fixed
+
+- Do not publish a stub segment shorter than one second when an input is
+  stopped or ends on its own before the next input takes over. Such a stub can
+  lack a track and would add an audio-less segment to the archive. Segments of
+  one second or more continue to be kept.
+
+### Verification and limitations
+
+- A focused regression covers the stub case. Real-player acceptance is separate.
+
 ## [0.7.4] - Prerelease
 
 ### Changed
