@@ -4,6 +4,19 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.6] - Prerelease
+
+### Fixed
+
+- Apply the one-second minimum to the final segment that closes when a recorder
+  input ends or is stopped normally, not only before a handover. Such a stub
+  could lack a track and was still archived at the end of a borrow.
+
+### Verification and limitations
+
+- A focused regression covers the ended-input case. Real-player acceptance is
+  separate.
+
 ## [0.7.5] - Prerelease
 
 ### Fixed
