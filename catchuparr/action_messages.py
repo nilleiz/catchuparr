@@ -1,17 +1,33 @@
-"""Format compact action rows with static, calibrated visual width estimates."""
+"""Format action rows for Dispatcharr's plain-text notification toasts.
+
+Dispatcharr renders an action's ``message`` as a single text node with normal
+white-space handling, inside a 350px Mantine notification capped at 200px
+height. Newlines collapse and overflow is clipped, so rows are separated by a
+run of ideographic spaces: the run is wider than the toast and hangs at the end
+of a line, which starts every row on its own line at any toast width. Rows that
+would not fit one toast are delivered as numbered follow-up toasts.
+"""
 
 from __future__ import annotations
 
-import math
+import logging
+import threading
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
+from datetime import datetime, timezone
 
-# Canvas measurements for 17px Lato at the 350px action-message width.
-# Estimates are static and do not inspect the runtime font or viewport.
-TARGET_WIDTH_PX = 350.0
-NBSP_WIDTH_PX = 4.35205
+logger = logging.getLogger(__name__)
+
+ROW_SEPARATOR = "\u3000" * 40
+# Conservative estimates for the 14px description text of a 350px toast.
+TEXT_WIDTH_PX = 230.0
+MAX_LINES_PER_TOAST = 7
+FOLLOW_UP_DELAY_SECONDS = 0.8
+_FONT_SCALE = 14.0 / 17.0
+_PAGE_PREFIX_ALLOWANCE = "00/00 · "
 FALLBACK_LATIN_WIDTH_PX = 8.5
 EAST_ASIAN_WIDTH_PX = 17.0
+# Canvas measurements for 17px Lato, scaled to the toast font at lookup.
 _CALIBRATED_WIDTHS = {
     ' ': 4.35205,
     '!': 4.57306,
@@ -143,24 +159,22 @@ _CALIBRATED_WIDTHS = {
 
 def _character_width(character: str) -> float:
     width = _CALIBRATED_WIDTHS.get(character)
-    if width is not None:
-        return width
-    if unicodedata.combining(character):
-        return 0.0
-    if unicodedata.east_asian_width(character) in {"W", "F"}:
-        return EAST_ASIAN_WIDTH_PX
-    return FALLBACK_LATIN_WIDTH_PX
+    if width is None:
+        if unicodedata.combining(character):
+            return 0.0
+        if unicodedata.east_asian_width(character) in {"W", "F"}:
+            width = EAST_ASIAN_WIDTH_PX
+        else:
+            width = FALLBACK_LATIN_WIDTH_PX
+    return width * _FONT_SCALE
 
 
-def _text_width(text: str) -> float:
-    return sum(_character_width(character) for character in text)
-
-
-def _last_visual_line_width(text: str) -> float:
-    """Estimate the last visual line, including CJK break opportunities."""
+def wrapped_line_count(text: str, width: float = TEXT_WIDTH_PX) -> int:
+    """Estimate visual lines, including CJK break opportunities."""
+    lines = 1
     line_width = 0.0
-    words = text.split()
-    for word_index, word in enumerate(words):
+    space = _character_width(" ")
+    for word in text.split():
         units = []
         for character in word:
             if unicodedata.east_asian_width(character) in {"W", "F"}:
@@ -171,25 +185,139 @@ def _last_visual_line_width(text: str) -> float:
                 units.append(("\0", _character_width(character)))
         for index, (kind, unit_width) in enumerate(units):
             if index == 0 and line_width:
-                line_width += _CALIBRATED_WIDTHS[" "]
-                if line_width + unit_width > TARGET_WIDTH_PX:
+                line_width += space
+                if line_width + unit_width > width:
+                    lines += 1
                     line_width = 0.0
             break_before = kind != "\0" or (index > 0 and units[index - 1][0] != "\0")
-            if break_before and line_width and line_width + unit_width > TARGET_WIDTH_PX:
+            if break_before and line_width and line_width + unit_width > width:
+                lines += 1
                 line_width = unit_width
             else:
                 line_width += unit_width
-    return line_width
+            while line_width > width:
+                # Assume an unbreakable run longer than a line wraps anywhere.
+                lines += 1
+                line_width -= width
+    return lines
 
 
-def format_action_message(rows: Iterable[str]) -> str:
-    """Join visible rows with width-bounded NBSP padding between them."""
-    lines = [str(row) for row in rows]
-    if not lines:
+def join_rows(rows: Iterable[str]) -> str:
+    """Join rows so each starts on its own visual line in the toast."""
+    return ROW_SEPARATOR.join(str(row) for row in rows)
+
+
+def split_group_row(prefix: str, names: Sequence[str],
+                    max_lines: int = MAX_LINES_PER_TOAST) -> list[str]:
+    """Render ``prefix › a, b, …`` as rows that each fit one toast."""
+    rows: list[str] = []
+    current: list[str] = []
+    for name in names:
+        candidate = current + [name]
+        if current and wrapped_line_count(f"{prefix} › {', '.join(candidate)}") > max_lines:
+            rows.append(f"{prefix} › {', '.join(current)}")
+            candidate = [name]
+        current = candidate
+    if current or not rows:
+        rows.append(f"{prefix} › {', '.join(current)}")
+    return rows
+
+
+def paginate_rows(rows: Iterable[str], max_lines: int = MAX_LINES_PER_TOAST) -> list[list[str]]:
+    """Split rows into toast pages without splitting a row.
+
+    The first row of the first page is measured with room for its ``n/N``
+    prefix. A row taller than a page gets a page of its own.
+    """
+    pages: list[list[str]] = []
+    page: list[str] = []
+    used = 0
+    for row in (str(row) for row in rows):
+        measured = _PAGE_PREFIX_ALLOWANCE + row if not pages and not page else row
+        lines = wrapped_line_count(measured)
+        if page and used + lines > max_lines:
+            pages.append(page)
+            page, used = [], 0
+        page.append(row)
+        used += lines
+    if page:
+        pages.append(page)
+    return pages
+
+
+def _send_follow_ups(notifications: list[dict], sender: Callable[[dict], None]) -> None:
+    for notification in notifications:
+        sender(notification)
+
+
+def _send_follow_ups_later(notifications: list[dict], sender: Callable[[dict], None]) -> None:
+    try:
+        _send_follow_ups(notifications, sender)
+    except Exception:
+        logger.warning("Unable to push follow-up Catchuparr action toasts", exc_info=True)
+
+
+def _default_sender() -> Callable[[dict], None]:
+    from core.utils import send_websocket_notification
+
+    return send_websocket_notification
+
+
+def deliver_action_message(
+    rows: Iterable[str],
+    *,
+    title: str,
+    run_key: str,
+    sender: Callable[[dict], None] | None = None,
+    delay_seconds: float = FOLLOW_UP_DELAY_SECONDS,
+) -> str:
+    """Return the first toast's message and push any further pages.
+
+    Follow-up pages use Dispatcharr's admin-only system notification push. They
+    are marked dismissed so they show only as toasts, never as unread entries.
+    If the push is unavailable, the first page names how many rows are missing.
+    """
+    pages = paginate_rows(rows)
+    if not pages:
         return ""
-    parts = [lines[0]]
-    for previous, current in zip(lines, lines[1:]):
-        remaining_width = TARGET_WIDTH_PX - _last_visual_line_width(previous)
-        padding_count = max(0, math.floor(remaining_width / NBSP_WIDTH_PX) - 1)
-        parts.extend((" " + "\u00a0" * padding_count + " ", current))
-    return "".join(parts)
+    if len(pages) == 1:
+        return join_rows(pages[0])
+    total = len(pages)
+    created_at = datetime.now(timezone.utc).isoformat()
+    notifications = [
+        {
+            "notification_key": f"catchuparr-{run_key}-{number}",
+            "notification_type": "info",
+            "priority": "high",
+            "admin_only": True,
+            "is_active": True,
+            "is_dismissed": True,
+            "action_data": {},
+            "created_at": created_at,
+            "title": f"Catchuparr – {title} {number}/{total}",
+            "message": join_rows(page),
+        }
+        for number, page in enumerate(pages[1:], start=2)
+    ]
+    try:
+        send = sender or _default_sender()
+        if delay_seconds > 0:
+            # Let the action response toast appear before its follow-ups.
+            timer = threading.Timer(delay_seconds, _send_follow_ups_later, (notifications, send))
+            timer.daemon = True
+            timer.start()
+        else:
+            _send_follow_ups(notifications, send)
+    except Exception:
+        logger.debug("Unable to push follow-up action toasts", exc_info=True)
+        first = list(pages[0])
+        missing = sum(len(page) for page in pages[1:])
+        while True:
+            note = f"+{missing} more not shown"
+            if len(first) == 1 or sum(map(wrapped_line_count, first + [note])) <= MAX_LINES_PER_TOAST:
+                return join_rows(first + [note])
+            missing += 1
+            first.pop()
+    first = list(pages[0])
+    first[0] = f"1/{total} · {first[0]}"
+    return join_rows(first)
