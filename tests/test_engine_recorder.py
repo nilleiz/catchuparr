@@ -391,6 +391,40 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(2, len(segments))
         self.assertTrue(segments[1].discontinuity)
 
+    def test_final_stub_segment_is_not_published_when_an_input_ends(self):
+        class EndedProcess:
+            def __init__(self, command, **_kwargs):
+                directory = Path(command[-1]).parent
+                rows = []
+                for index, (start, end) in enumerate(((0, 6), (6, 6.2))):
+                    name = f"segment-{index:06d}.ts"
+                    (directory / name).write_bytes(
+                        RecorderTests._ts_packet(256, start=True) + RecorderTests._ts_packet(256)
+                    )
+                    rows.append(f"{name},{start},{end}")
+                Path(command[command.index("-segment_list") + 1]).write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        recorder = FFmpegCopyRecorder(
+            self.store, "ch1", "http://dispatcharr/catchuparr/recorder/ch1",
+            self.root / "stub-work", fencing_token=11, require_media_progress=True,
+        )
+        with patch("catchuparr.engine.recorder.subprocess.Popen", EndedProcess):
+            result = recorder.run_candidate(threading.Event())
+        self.assertEqual(1, result.useful_segments)
+        self.assertEqual([6.0], [round(item.duration, 1) for item in self.store.segments("ch1")])
+
     def test_attempt_switch_counts_segment_committed_immediately_before_request(self):
         switch = RecorderAttemptSwitch()
         stop_event = threading.Event()
