@@ -176,12 +176,10 @@ def find_splice(old_path: Path, staged_path: Path, *, deadline: float | None = N
         indexes["audio"] += 1
     if indexes["audio"] >= len(audio) or audio[indexes["audio"]].pts - resume_pts > MAX_AUDIO_SKIP_SECONDS:
         return None
-    first_pts = min(packet.pts for packet in video)
     # Pictures that follow the keyframe in decode order but precede it in
-    # presentation order depend on dropped frames.
-    leading = [p for p in video[indexes["video"] + 1:indexes["video"] + 4] if p.pts < cut.pts]
-    if leading:
-        return None
+    # presentation order (open GOP) reference the archived tail, which this
+    # splice continues exactly, so they are kept like any other packet.
+    first_pts = min(packet.pts for packet in video)
     return Splice(
         indexes["video"], indexes["audio"], cut.pts,
         audio[indexes["audio"]].pts, cut.pts - first_pts,
