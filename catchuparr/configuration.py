@@ -1604,7 +1604,7 @@ def _applicable_settings(settings: dict) -> dict[str, Any]:
     native_output_catchup = settings.get("native_output_catchup", False)
     if type(native_output_catchup) is not bool:
         raise ValueError("native_output_catchup must be boolean")
-    synchronize_before_switch = settings.get("synchronize_before_switch", False)
+    synchronize_before_switch = settings.get("synchronize_before_switch", True)
     if type(synchronize_before_switch) is not bool:
         raise ValueError("synchronize_before_switch must be boolean")
     applicable: dict[str, Any] = {

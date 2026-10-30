@@ -380,14 +380,16 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual("switch_requested", switched.status)
         self.assertEqual(["terminate", "wait"], events)
         self.assertFalse(stop_event.is_set())
-        self.assertEqual([], self.store.segments("ch1"))
+        # The segment closed while the stopped input shut down is kept; it is
+        # committed before the successor can start publishing.
+        self.assertEqual(1, len(self.store.segments("ch1")))
 
         with patch("catchuparr.engine.recorder.subprocess.Popen", NextSourceProcess):
             next_source = recorder.run_candidate(stop_event)
         self.assertEqual("exited", next_source.status)
         segments = self.store.segments("ch1")
-        self.assertEqual(1, len(segments))
-        self.assertTrue(segments[0].discontinuity)
+        self.assertEqual(2, len(segments))
+        self.assertTrue(segments[1].discontinuity)
 
     def test_attempt_switch_counts_segment_committed_immediately_before_request(self):
         switch = RecorderAttemptSwitch()

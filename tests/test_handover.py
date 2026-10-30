@@ -329,6 +329,44 @@ class HandoverEvidenceTests(unittest.TestCase):
             self.assertEqual(outcome.attempt_switch_id, switch.attempt_id)
             self.assertEqual(len(store.segments("synthetic")), 1)
 
+    def test_outgoing_input_that_ended_still_publishes_its_final_closed_segment(self):
+        class Process:
+            def __init__(self, ended):
+                self.ended = ended
+
+            def poll(self):
+                return 0 if self.ended else None
+
+            def terminate(self):
+                self.ended = True
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage, old_dir = root / "stage", root / "old"
+            stage.mkdir()
+            old_dir.mkdir()
+            (stage / "segments.csv").write_text("", encoding="utf-8")
+            (old_dir / "segment-000000.ts").write_bytes(b"\x47" + b"\x1f\xff\x10" + b"\x00" * 184
+                                                         + (b"\x47\x01\x00\x30" + b"\x00" * 184) * 2)
+            (old_dir / "segments.csv").write_text("segment-000000.ts,0,2\n", encoding="utf-8")
+            store = ArchiveStore(root / "archive")
+            old = FFmpegCopyRecorder(store, "synthetic", "http://example.invalid/old", root / "work")
+            target = FFmpegCopyRecorder(store, "synthetic", "http://example.invalid/new", root / "work")
+            staged = StagedRecorderInput(target, stage, Process(False))
+            switch = RecorderAttemptSwitch()
+            with patch.object(target, "_start_staged_input", return_value=staged), \
+                    patch("catchuparr.engine.recorder.has_useful_transport_stream", return_value=True):
+                _, _, count = old._try_synchronized_handover(
+                    target, Process(True), old_dir / "segments.csv", 0, threading.Event(), switch, lambda _: None,
+                )
+            self.assertEqual(count, 1)
+            self.assertEqual(len(store.segments("synthetic")), 1)
+            self.assertTrue(switch.is_set())
+            staged.close()
+
     def test_stale_or_missing_proof_uses_existing_staged_input_for_fallback(self):
         class Process:
             ended = False
@@ -571,6 +609,134 @@ class HandoverEvidenceTests(unittest.TestCase):
             finally:
                 stop.set()
                 for process in feeder_processes:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                worker.join(timeout=5)
+
+    def test_unproven_adoption_trims_overlap_with_the_archive_tail(self):
+        class Process:
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def hashes(path):
+            probe = subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_packets",
+                "-show_data_hash", "sha256", "-show_entries", "packet=data_hash", "-of", "json", str(path),
+            ], check=True, capture_output=True, timeout=30)
+            return [packet["data_hash"] for packet in json.loads(probe.stdout)["packets"]]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, stage_root = root / "source.ts", root / "stage"
+            stage_root.mkdir()
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "12",
+                "-c:v", "mpeg2video", "-g", "25", "-c:a", "mp2", "-f", "mpegts", str(source),
+            ], check=True, capture_output=True, timeout=30)
+            old_dir = root / "old"
+            old_dir.mkdir()
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-i", str(source), "-t", "4.95", "-map", "0", "-c", "copy",
+                "-f", "mpegts", str(old_dir / "tail.ts"),
+            ], check=True, capture_output=True, timeout=30)
+            # The new reader starts three seconds before the archive ends.
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-ss", "2", "-i", str(source), "-map", "0", "-c", "copy",
+                "-f", "segment", "-segment_time", "4", "-segment_format", "mpegts",
+                "-segment_list", str(stage_root / "segments.csv"), "-segment_list_type", "csv",
+                str(stage_root / "segment-%06d.ts"),
+            ], check=True, capture_output=True, timeout=30)
+            store = ArchiveStore(root / "archive")
+            started = datetime.now(timezone.utc) - timedelta(seconds=5)
+            tail = store.add_segment("synthetic", old_dir / "tail.ts", started, started + timedelta(seconds=5))
+            target = FFmpegCopyRecorder(store, "synthetic", "http://example.invalid/new", root / "work")
+            staged = StagedRecorderInput(target, stage_root, Process())
+            resumed = target.run_candidate(threading.Event(), staged_input=staged)
+            self.assertGreater(resumed.useful_segments, 0)
+            segments = store.segments("synthetic")
+            self.assertEqual(segments[1].start_utc, tail.end_utc)
+            recorded = [digest for segment in segments for digest in hashes(segment.path)]
+            reference = hashes(source)
+            self.assertEqual(recorded, reference[:len(recorded)], "pictures repeated or lost")
+            self.assertGreater(len(recorded), 125)
+
+    def test_staggered_live_readers_splice_without_repeated_or_lost_pictures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.ts"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                "testsrc2=size=64x64:rate=25", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=48000", "-t", "14",
+                "-c:v", "mpeg2video", "-g", "25", "-c:a", "mp2", "-f", "mpegts", str(source),
+            ], check=True, capture_output=True, timeout=30)
+            old_fifo, new_fifo = root / "old.pipe", root / "new.pipe"
+            os.mkfifo(old_fifo)
+            os.mkfifo(new_fifo)
+            store = ArchiveStore(root / "archive")
+            old = FFmpegCopyRecorder(store, "synthetic", str(old_fifo), root / "work", segment_seconds=4)
+            target = FFmpegCopyRecorder(store, "synthetic", str(new_fifo), root / "work", segment_seconds=4)
+            stop, switch = threading.Event(), RecorderAttemptSwitch()
+            result, feeders = [], []
+
+            def feed(path, seek):
+                feeders.append(subprocess.Popen([
+                    "ffmpeg", "-v", "error", "-re", "-ss", str(seek), "-i", str(source), "-map", "0",
+                    "-c", "copy", "-f", "mpegts", "-y", str(path),
+                ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+            def hashes(path, stream):
+                probe = subprocess.run([
+                    "ffprobe", "-v", "error", "-select_streams", stream, "-show_packets",
+                    "-show_data_hash", "sha256", "-show_entries", "packet=data_hash", "-of", "json", str(path),
+                ], check=True, capture_output=True, timeout=30)
+                return [packet["data_hash"] for packet in json.loads(probe.stdout)["packets"]]
+
+            worker = threading.Thread(target=lambda: result.append(
+                old.run_candidate(stop, attempt_switch=switch, poll_interval=0.1)))
+            worker.start()
+            feed(old_fifo, 0)
+            try:
+                time.sleep(0.5)
+                self.assertTrue(switch.offer_synchronized_input(target))
+                # The second reader joins later and its segment boundaries differ.
+                feed(new_fifo, 2)
+                worker.join(timeout=20)
+                self.assertFalse(worker.is_alive())
+                staged = result[0].staged_input
+                self.assertIsNotNone(staged)
+                self.assertTrue(staged.matched)
+                self.assertIsNotNone(staged.cut)
+                before = store.segments("synthetic")
+                resumed = target.run_candidate(stop, staged_input=staged, poll_interval=0.1)
+                self.assertGreater(resumed.useful_segments, 0)
+                after = store.segments("synthetic")
+                self.assertEqual(after[len(before)].start_utc, before[-1].end_utc)
+                recorded = [digest for segment in after for digest in hashes(segment.path, "v:0")]
+                reference = hashes(source, "v:0")
+                self.assertEqual(recorded, reference[:len(recorded)], "pictures repeated or lost")
+                audio = [digest for segment in after for digest in hashes(segment.path, "a:0")]
+                self.assertEqual(len(audio), len(set(audio)), "audio frames repeated")
+                joined = subprocess.run([
+                    "ffmpeg", "-v", "error", "-xerror", "-i", "concat:" + "|".join(str(s.path) for s in after),
+                    "-f", "null", "-",
+                ], capture_output=True, timeout=30)
+                self.assertEqual(joined.returncode, 0, joined.stderr)
+            finally:
+                stop.set()
+                for process in feeders:
                     if process.poll() is None:
                         process.terminate()
                     try:

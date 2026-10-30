@@ -65,7 +65,7 @@ immediate operational actions.
 | --- | --- |
 | **Channel and source filter (YAML)** | Channel selection, assigned M3U source include/exclude and priority, schedule and timezone. Blank YAML selects no channels. |
 | **Share existing live connections** | Optional global reuse of compatible existing viewer connections on all selected channels. Disabled by default. |
-| **Try to synchronize before switching streams** | Optional, bounded overlap check when switching to a viewer or returning to a dedicated source. Disabled by default. |
+| **Try to synchronize before switching streams** | Optional, bounded overlap check when switching to a viewer or returning to a dedicated source. Enabled by default. |
 | **Live stability delay** | Delay before later switches to a new viewer connection. The first eligible attach is immediate. |
 | **Return delay after last viewer leaves** | Grace before returning to an allowed source. |
 | **Minimum interval between switches** | Cooldown applied to later source switches. |
@@ -232,16 +232,19 @@ authority and recorder failure take the cleanup path without waiting for normal
 viewer cooldowns. A switch marks the new muxer with a segment discontinuity.
 The recorder's channel fence remains in force.
 
-**Try to synchronize before switching streams** is off by default and can be
+**Try to synchronize before switching streams** is on by default and can be
 applied with the other settings. When enabled, a running dedicated recorder may
-briefly stage its already-authorized viewer input and compare complete encoded
-audio/video segments. If a current overlap is proven, the staged reader
-continues from that boundary without reopening it. Subtitle tracks may differ
+briefly stage its already-authorized viewer input and compare encoded
+audio/video packets with the archived tail. If the tail is found, the staged
+reader continues at the next keyframe after it, cut on whole transport packets
+so that no picture is archived twice, without reopening the input. Subtitle tracks may differ
 between the sources and are not covered by the audio/video proof. On return,
 the borrowed client is cleaned up first, then the new dedicated reader is
 compared with the archived tail; no simultaneous provider reader is opened for
 this comparison.
-Without a match, the same reader continues with its captured media. A failed
+Without a match, the same reader continues with its captured media; an overlap
+with the archive is trimmed whenever the archive tail can still be found in
+it. A failed
 borrow uses the normal fast recovery path. A match is not always available,
 and this option does not promise gapless recordings.
 
