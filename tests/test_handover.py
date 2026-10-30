@@ -367,6 +367,44 @@ class HandoverEvidenceTests(unittest.TestCase):
             self.assertTrue(switch.is_set())
             staged.close()
 
+    def test_outgoing_input_stub_segment_is_not_published(self):
+        class Process:
+            def __init__(self, ended):
+                self.ended = ended
+
+            def poll(self):
+                return 0 if self.ended else None
+
+            def terminate(self):
+                self.ended = True
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage, old_dir = root / "stage", root / "old"
+            stage.mkdir()
+            old_dir.mkdir()
+            (stage / "segments.csv").write_text("", encoding="utf-8")
+            (old_dir / "segment-000000.ts").write_bytes(b"\x47" + b"\x1f\xff\x10" + b"\x00" * 184
+                                                         + (b"\x47\x01\x00\x30" + b"\x00" * 184) * 2)
+            (old_dir / "segments.csv").write_text("segment-000000.ts,0,0.2\n", encoding="utf-8")
+            store = ArchiveStore(root / "archive")
+            old = FFmpegCopyRecorder(store, "synthetic", "http://example.invalid/old", root / "work")
+            target = FFmpegCopyRecorder(store, "synthetic", "http://example.invalid/new", root / "work")
+            staged = StagedRecorderInput(target, stage, Process(False))
+            switch = RecorderAttemptSwitch()
+            with patch.object(target, "_start_staged_input", return_value=staged), \
+                    patch("catchuparr.engine.recorder.has_useful_transport_stream", return_value=True):
+                _, _, count = old._try_synchronized_handover(
+                    target, Process(True), old_dir / "segments.csv", 0, threading.Event(), switch, lambda _: None,
+                )
+            self.assertEqual(count, 0)
+            self.assertEqual(store.segments("synthetic"), [])
+            self.assertTrue(switch.is_set())
+            staged.close()
+
     def test_stale_or_missing_proof_uses_existing_staged_input_for_fallback(self):
         class Process:
             ended = False
