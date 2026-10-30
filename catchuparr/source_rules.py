@@ -58,6 +58,7 @@ class FilterCompilation:
     timezone: str
     channel_schedules: dict[str, RecordingSchedule] = field(default_factory=dict)
     channel_origins: dict[str, dict[str, Any]] = field(default_factory=dict)
+    handover: dict[str, Any] = field(default_factory=dict)
 
 
 class _RestrictedSafeLoader(yaml.SafeLoader):
@@ -494,10 +495,44 @@ def _load_document(text: str) -> tuple[dict[str, Any] | None, tuple[int, ...]]:
         document,
         line=1,
         field="filter_config",
-        allowed={"version", "profile", "rules", "timezone", "schedule"},
+        allowed={"version", "profile", "rules", "timezone", "schedule", "handover"},
         required={"version", "rules"},
     )
     return document, rule_lines
+
+
+MAX_HANDOVER_OVERLAP_SECONDS = 120
+MIN_HANDOVER_OVERLAP_SECONDS = 10
+DEFAULT_HANDOVER_OVERLAP_SECONDS = 90
+
+
+def _resolve_handover(
+    value: Any,
+    *,
+    account_names: dict[str, str],
+    account_ids: set[str],
+    ambiguous_account_names: set[str],
+) -> dict[str, Any]:
+    """Resolve the optional list of delayed M3U accounts and the overlap budget."""
+    if value is None:
+        return {}
+    section = _mapping(
+        value, line=1, field="handover",
+        allowed={"delayed_sources", "max_overlap_seconds"}, required={"delayed_sources"},
+    )
+    names = _string_list(section["delayed_sources"], line=1, field="handover.delayed_sources")
+    seconds = section.get("max_overlap_seconds", DEFAULT_HANDOVER_OVERLAP_SECONDS)
+    if (isinstance(seconds, bool) or not isinstance(seconds, int)
+            or not MIN_HANDOVER_OVERLAP_SECONDS <= seconds <= MAX_HANDOVER_OVERLAP_SECONDS):
+        raise SourceRuleError(
+            "line 1, field handover.max_overlap_seconds: expected an integer from "
+            f"{MIN_HANDOVER_OVERLAP_SECONDS} to {MAX_HANDOVER_OVERLAP_SECONDS}"
+        )
+    delayed = sorted({
+        _account_id(name, "handover.delayed_sources", 1, account_names, account_ids, ambiguous_account_names)
+        for name in names
+    }, key=int)
+    return {"delayed_account_ids": delayed, "max_overlap_seconds": seconds}
 
 
 def compile_filter_config(
@@ -552,6 +587,10 @@ def compile_filter_config(
         )
 
     account_names, account_ids, ambiguous_account_names = _account_index(accounts)
+    handover = _resolve_handover(
+        document.get("handover"), account_names=account_names, account_ids=account_ids,
+        ambiguous_account_names=ambiguous_account_names,
+    )
     all_rule = None
     profile_rules: list[dict[str, Any]] = []
     direct_rules: list[dict[str, Any]] = []
@@ -807,6 +846,7 @@ def compile_filter_config(
         timezone=timezone_name,
         channel_schedules=channel_schedules,
         channel_origins=channel_origins,
+        handover=handover,
     )
 
 

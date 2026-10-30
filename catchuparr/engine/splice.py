@@ -207,6 +207,35 @@ def find_splice(old_path: Path, staged_path: Path, *, deadline: float | None = N
     return Splice(video_index, tuple(indexes), cut.pts, cut.pts - first_pts)
 
 
+def splice_at_offset(staged_path: Path, offset_seconds: float, *, deadline: float | None = None) -> Splice | None:
+    """Resume at the first keyframe at least ``offset_seconds`` into the file.
+
+    Used when the leading part of the input is known to repeat the archive but
+    no packet match exists. Audio resumes at the first PES start at or after
+    that keyframe, so no picture or audio frame of the skipped part is kept.
+    """
+    tracks = probe_tracks(staged_path, deadline)
+    if tracks is None or not offset_seconds > 0:
+        return None
+    video = tracks["video"].packets
+    target = min(packet.pts for packet in video) + offset_seconds
+    video_index = next(
+        (i for i, packet in enumerate(video) if packet.key and packet.pos is not None and packet.pts >= target - 0.001),
+        None,
+    )
+    if video_index is None:
+        return None
+    cut = video[video_index]
+    indexes = []
+    for key in sorted(name for name in tracks if name != "video"):
+        packets = tracks[key].packets
+        index = next((i for i, packet in enumerate(packets) if packet.pos is not None and packet.pts >= cut.pts - 0.001), None)
+        if index is None:
+            return None
+        indexes.append(index)
+    return Splice(video_index, tuple(indexes), cut.pts, cut.pts - min(packet.pts for packet in video))
+
+
 def cut_segment(staged_path: Path, splice: Splice, deadline: float | None = None) -> bytes | None:
     """Return the staged TS bytes from the splice on; media is left untouched."""
     tracks = probe_tracks(staged_path, deadline)

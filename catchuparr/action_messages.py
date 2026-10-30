@@ -267,21 +267,21 @@ def deliver_action_message(
     rows: Iterable[str],
     *,
     title: str,
+    summary: str,
     run_key: str,
     sender: Callable[[dict], None] | None = None,
-    delay_seconds: float = FOLLOW_UP_DELAY_SECONDS,
+    delay_seconds: float | None = None,
 ) -> str:
-    """Return the first toast's message and push any further pages.
+    """Return a short summary for the action toast and push the rows.
 
-    Follow-up pages use Dispatcharr's admin-only system notification push. They
-    are marked dismissed so they show only as toasts, never as unread entries.
-    If the push is unavailable, the first page names how many rows are missing.
+    Every page of rows is pushed as an admin-only Dispatcharr system
+    notification, marked dismissed so it shows only as a toast and never as an
+    unread entry. If the push is unavailable, the summary toast carries as many
+    rows as fit and names how many are missing.
     """
     pages = paginate_rows(rows)
     if not pages:
-        return ""
-    if len(pages) == 1:
-        return join_rows(pages[0])
+        return summary
     total = len(pages)
     created_at = datetime.now(timezone.utc).isoformat()
     notifications = [
@@ -294,30 +294,34 @@ def deliver_action_message(
             "is_dismissed": True,
             "action_data": {},
             "created_at": created_at,
-            "title": f"Catchuparr – {title} {number}/{total}",
+            "title": f"Catchuparr – {title}" + (f" {number}/{total}" if total > 1 else ""),
             "message": join_rows(page),
         }
-        for number, page in enumerate(pages[1:], start=2)
+        for number, page in enumerate(pages, start=1)
     ]
+    if delay_seconds is None:
+        delay_seconds = FOLLOW_UP_DELAY_SECONDS
     try:
         send = sender or _default_sender()
         if delay_seconds > 0:
-            # Let the action response toast appear before its follow-ups.
+            # Let the summary toast appear before the detail toasts.
             timer = threading.Timer(delay_seconds, _send_follow_ups_later, (notifications, send))
             timer.daemon = True
             timer.start()
         else:
             _send_follow_ups(notifications, send)
     except Exception:
-        logger.debug("Unable to push follow-up action toasts", exc_info=True)
-        first = list(pages[0])
-        missing = sum(len(page) for page in pages[1:])
-        while True:
-            note = f"+{missing} more not shown"
-            if len(first) == 1 or sum(map(wrapped_line_count, first + [note])) <= MAX_LINES_PER_TOAST:
-                return join_rows(first + [note])
+        logger.debug("Unable to push detail action toasts", exc_info=True)
+        shown = [summary] + [row for page in pages for row in page]
+        missing = 0
+        while sum(map(wrapped_line_count, shown)) > MAX_LINES_PER_TOAST and len(shown) > 2:
+            shown.pop()
             missing += 1
-            first.pop()
-    first = list(pages[0])
-    first[0] = f"1/{total} · {first[0]}"
-    return join_rows(first)
+        if missing:
+            while (sum(map(wrapped_line_count, shown + [f"+{missing} more not shown"]))
+                   > MAX_LINES_PER_TOAST and len(shown) > 2):
+                shown.pop()
+                missing += 1
+            shown.append(f"+{missing} more not shown")
+        return join_rows(shown)
+    return f"{summary} Details in {total} {'toast' if total == 1 else 'toasts'}."

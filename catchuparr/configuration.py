@@ -301,6 +301,9 @@ def compile_draft(
     parsed_settings["recording_enabled"] = recording_enabled
     parsed_settings["log_level"] = log_level
     parsed_settings.update(sharing_global)
+    if compiled.handover:
+        parsed_settings["handover_delayed_account_ids"] = list(compiled.handover["delayed_account_ids"])
+        parsed_settings["handover_max_overlap_seconds"] = compiled.handover["max_overlap_seconds"]
     return {
         "settings": parsed_settings,
         "channel_uuids": list(compiled.channel_uuids),
@@ -2019,7 +2022,8 @@ def _validate_active_document(data: dict[str, Any]) -> None:
                 "recording_enabled", "log_level", "public_base_url",
                 "show_archive_playback_in_stats", "hide_recorders_in_stats",
                 "native_output_catchup", "native_output_key_id",
-                "synchronize_before_switch",
+                "synchronize_before_switch", "handover_delayed_account_ids",
+                "handover_max_overlap_seconds",
             }
         )
     if version >= 7:
@@ -2143,6 +2147,16 @@ def _validate_active_document(data: dict[str, Any]) -> None:
             and type(settings["synchronize_before_switch"]) is not bool
         ):
             raise ValueError("Active Catchuparr synchronize_before_switch is invalid")
+        delayed = settings.get("handover_delayed_account_ids")
+        overlap = settings.get("handover_max_overlap_seconds")
+        if (delayed is None) != (overlap is None):
+            raise ValueError("Active Catchuparr handover settings are incomplete")
+        if delayed is not None and (
+            not isinstance(delayed, list) or not delayed
+            or any(not isinstance(item, str) or not item.isdigit() for item in delayed)
+            or isinstance(overlap, bool) or not isinstance(overlap, int) or not 1 <= overlap <= 600
+        ):
+            raise ValueError("Active Catchuparr handover settings are invalid")
         key_id = settings.get("native_output_key_id")
         if key_id is not None and not native_key_id_valid(key_id):
             raise ValueError("Active Catchuparr native output key ID is invalid")
