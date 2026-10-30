@@ -818,9 +818,11 @@ class FFmpegCopyRecorder:
                 # A proven staged boundary must be checked before final flush.
                 rows, _ = _staged_csv_rows(output_dir, offset) if expected_start is not None else ([], offset)
                 if expected_start is None or (rows and abs(rows[0][1] - expected_start) <= 0.025):
+                    # Stopping the muxer closes a final, often tiny segment that
+                    # can lack a track; keep it only if it is long enough.
                     offset, committed = self._publish_csv_rows(
                         list_path, offset, require_useful_media=True,
-                        attempt_switch=attempt_switch,
+                        attempt_switch=attempt_switch, min_duration=FINAL_SEGMENT_MIN_SECONDS,
                     )
                     useful += committed
                     notify_first_media(committed)
