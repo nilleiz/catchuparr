@@ -32,7 +32,7 @@ class SpliceTests(unittest.TestCase):
         return source
 
     def tail_and_head(self, root, source, tail_seconds, head_start):
-        old, new = root / "old.ts", root / "new.ts"
+        new = root / "new.ts"
         # Like the recorder, cut the archived tail at a keyframe boundary.
         run("-i", str(source), "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", str(tail_seconds),
             "-segment_format", "mpegts", str(root / "old-%02d.ts"))
