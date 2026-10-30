@@ -235,6 +235,9 @@ class FFmpegCopyRecorder:
         self._current_attempt_segment_id: str | None = None
         self._last_commit_monotonic: float | None = None
         self._pending_cut: tuple[str, Path, float] | None = None
+        # Archive tail used to trim overlap from a staged input adopted
+        # without a proven splice (for example after its predecessor ended).
+        self._splice_tail = None
 
     def command(self, output_dir: Path) -> list[str]:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -301,6 +304,25 @@ class FFmpegCopyRecorder:
             if not segment_path.is_absolute():
                 segment_path = list_path.parent / segment_path
             replaced_source = None
+            if self._splice_tail is not None and self._pending_cut is None:
+                tail, self._splice_tail = self._splice_tail, None
+                try:
+                    cut = self._prepare_cut(
+                        tail, None, segment_path, start_s, end_s, time.monotonic() + 10,
+                        output_dir=segment_path.parent,
+                    )
+                except OSError:
+                    cut = None
+                if cut is not None and cut[1] is None:
+                    # This row repeats only archived media; try the next one.
+                    segment_path.unlink(missing_ok=True)
+                    self._splice_tail = tail
+                    self._mark_next_discontinuity = True
+                    continue
+                if cut is not None:
+                    self._pending_cut = cut
+                    if self._session_anchor is None:
+                        self._session_anchor = tail.end_utc.timestamp() - (start_s + cut[2])
             if self._pending_cut is not None and segment_path.name == self._pending_cut[0]:
                 replaced_source, segment_path, removed = segment_path, self._pending_cut[1], self._pending_cut[2]
                 start_s += removed
@@ -375,20 +397,27 @@ class FFmpegCopyRecorder:
         return StagedRecorderInput(self, output_dir, process)
 
     @staticmethod
-    def _prepare_cut(latest, staged, path, start, end, deadline):
-        """Cut a staged row so it resumes exactly after the archive tail."""
+    def _prepare_cut(latest, staged, path, start, end, deadline, *, output_dir=None):
+        """Cut a staged row so it resumes exactly after the archive tail.
+
+        Returns ``(name, replacement, seconds_removed)``; ``replacement`` is
+        ``None`` when the whole row is already archived.
+        """
         from .splice import cut_segment, find_splice
 
+        output_dir = output_dir or staged.output_dir
         splice = find_splice(latest.path, path, deadline=deadline)
         if splice is None:
             return None
+        if splice.complete:
+            return path.name, None, end - start
         payload = cut_segment(path, splice, deadline)
         if (payload is None or not 0 < splice.cut_offset < end - start
                 or time.monotonic() >= deadline
-                or sum(item.stat().st_size for item in staged.output_dir.iterdir() if item.is_file())
+                or sum(item.stat().st_size for item in output_dir.iterdir() if item.is_file())
                 + len(payload) > STAGED_INPUT_MAX_BYTES):
             return None
-        replacement = staged.output_dir / f".cut-{uuid.uuid4().hex}.ts"
+        replacement = output_dir / f".cut-{uuid.uuid4().hex}.ts"
         replacement.write_bytes(payload)
         return path.name, replacement, splice.cut_offset
 
@@ -650,6 +679,11 @@ class FFmpegCopyRecorder:
             self._mark_next_discontinuity = True
         process = staged_input.process if staged_input is not None else None
         self._pending_cut = staged_input.cut if staged_input is not None else None
+        self._splice_tail = None
+        if staged_input is not None and not staged_input.matched and self.store.segments(self.channel_id):
+            tail = self.store.segments(self.channel_id)[-1]
+            if time.time() - tail.end_utc.timestamp() < 120 and tail.path.is_file():
+                self._splice_tail = tail
         if staged_input is not None:
             staged_input.consumed = True
         next_input = None
