@@ -25,7 +25,7 @@ def encoders():
 class SpliceTests(unittest.TestCase):
     def make_source(self, root, video, audio, seconds=14):
         source = root / "source.ts"
-        extra = ["-bf", "2"] if video == "libx264" else []
+        extra = ["-bf", "2", "-x264-params", "open-gop=1:keyint=25:min-keyint=25:scenecut=0"] if video == "libx264" else []
         run("-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25", "-f", "lavfi", "-i",
             "sine=frequency=440:sample_rate=48000", "-t", str(seconds), "-c:v", video, "-g", "25", *extra,
             "-c:a", audio, "-f", "mpegts", str(source))
@@ -73,7 +73,7 @@ class SpliceTests(unittest.TestCase):
         self.check_codec("mpeg2video", "mp2", 5)
 
     @unittest.skipUnless("libx264" in encoders() and " aac " in encoders(), "requires H.264 and AAC encoders")
-    def test_h264_with_b_frames_is_cut_at_the_keyframe(self):
+    def test_open_gop_h264_with_leading_pictures_is_cut_at_the_keyframe(self):
         self.check_codec("libx264", "aac", 5)
 
     def test_archive_tail_that_is_not_in_the_new_input_has_no_splice(self):

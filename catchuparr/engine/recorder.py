@@ -523,6 +523,17 @@ class FFmpegCopyRecorder:
                                 return staged, offset, committed_total
                 if (current_process.poll() is not None or staged.process.poll() is not None
                         or time.monotonic() >= deadline):
+                    if current_process.poll() is not None:
+                        # The outgoing input ended on its own, so its final
+                        # closed segment is still this attempt's to publish.
+                        # The switch is not requested yet; keeping that media
+                        # shrinks the gap before the staged input.
+                        offset, committed = self._publish_csv_rows(
+                            list_path, offset, require_useful_media=True, attempt_switch=switch,
+                        )
+                        if committed:
+                            committed_total += committed
+                            notify(committed)
                     # The attempted comparison timed out or an input stopped.
                     # Retain this exact one-use reader for the normal handover.
                     staged.offset = self._fallback_offset(rows, complete_offset)
