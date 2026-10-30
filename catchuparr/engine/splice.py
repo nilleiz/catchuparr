@@ -158,8 +158,8 @@ def find_splice(old_path: Path, staged_path: Path, *, deadline: float | None = N
             return None
         indexes[kind] = index
     audio_tail = new["audio"].packets[indexes["audio"]:]
-    if (indexes["video"] == len(new["video"].packets) and audio_tail
-            and audio_tail[-1].pts - audio_tail[0].pts <= MAX_AUDIO_SKIP_SECONDS):
+    if (indexes["video"] == len(new["video"].packets)
+            and (not audio_tail or audio_tail[-1].pts - audio_tail[0].pts <= MAX_AUDIO_SKIP_SECONDS)):
         return Splice(indexes["video"], indexes["audio"], 0.0, 0.0, 0.0, complete=True)
     if any(indexes[kind] >= len(new[kind].packets) for kind in indexes):
         return None
