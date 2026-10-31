@@ -282,7 +282,10 @@ viewer reader is released, until the dedicated source has joined it by audio.
 The viewer's provider connection then stays open for at most
 `max_overlap_seconds` plus about a minute after the return. This needs
 **Synchronize before switch**. Any failure returns exactly as before; a viewer
-who starts watching during this time is borrowed once the return completes.
+who starts watching during this time is borrowed once the return completes. The
+private reader needs at least 8 seconds of viewer-return grace to open before
+the return; with a shorter `last_viewer_return_seconds` (and minimum switch
+interval) the return runs as before, without it.
 
 The [0.6.1 candidate notes](docs/candidate-0.6.1.md) retain the historical
 settings and migration details. Synthetic tests do not establish acceptance
