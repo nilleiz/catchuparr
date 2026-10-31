@@ -53,6 +53,10 @@ _EVENTS = frozenset({
     "sync_handover_fallback",
     "sync_handover_media_committed",
     "source_offset_trimmed",
+    "return_tail_opened",
+    "return_tail_joined",
+    "return_tail_closed",
+    "sharing_tail_cleanup_pending",
 })
 _ERROR_CATEGORIES = frozenset({
     "configuration_recovery_failed",
@@ -83,6 +87,7 @@ _ERROR_CATEGORIES = frozenset({
     "sharing_return_cleanup_pending",
     "sharing_return_media_unconfirmed",
     "sharing_return_binding_stale",
+    "sharing_tail_cleanup_pending",
     "diagnostic_category_invalid",
 })
 _STATE_KEYS = frozenset({
@@ -98,7 +103,7 @@ _SAFE_ERROR_CALLSITES = frozenset({
     "startup_recovery", "startup_admission", "return_recovery",
     "recorder_supervisor", "borrowed_worker", "borrowed_cleanup",
     "dedicated_worker", "attempt_reconciliation", "schedule_validation",
-    "control_state_read", "reconcile_cleanup",
+    "control_state_read", "reconcile_cleanup", "return_tail",
 })
 _SAFE_EXCEPTION_CLASSES = frozenset({
     "AttributeError", "ConnectionError", "IntegrityError", "KeyError",

@@ -271,9 +271,18 @@ listed, the old input keeps recording beside the new one, for at most
 `max_overlap_seconds` (10 to 120, default 90), until the archive reaches the
 programme at which the new input began. The archive is then joined without a gap
 or repeat. Both inputs use a provider connection while they overlap. If no join
-is found in time, the handover continues as before. A return to a faster source
-does not open a second connection and can still leave a gap. The comparison
-needs varying audio and an overlap of about five seconds or more.
+is found in time, the handover continues as before. The comparison needs
+varying audio and an overlap of about five seconds or more.
+
+The same section covers the way back. When a borrowed viewer stream on a listed
+source returns to a dedicated source that is not listed, a private reader opens
+on the viewer's channel shortly before the return. It continues the archive at
+an exact packet boundary and keeps recording the delayed stream after the
+viewer reader is released, until the dedicated source has joined it by audio.
+The viewer's provider connection then stays open for at most
+`max_overlap_seconds` plus about a minute after the return. This needs
+**Synchronize before switch**. Any failure returns exactly as before; a viewer
+who starts watching during this time is borrowed once the return completes.
 
 The [0.6.1 candidate notes](docs/candidate-0.6.1.md) retain the historical
 settings and migration details. Synthetic tests do not establish acceptance
