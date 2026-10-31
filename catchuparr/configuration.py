@@ -1040,16 +1040,31 @@ def rehydrate_current_sharing_authority(
     control: Any,
     path: Path | None = None,
 ) -> bool:
+    """Return True only when every enabled channel has current authority."""
+    stale = rehydrate_sharing_authority_channels(active, control, path)
+    return stale is not None and not stale
+
+
+def rehydrate_sharing_authority_channels(
+    active: dict[str, Any] | None,
+    control: Any,
+    path: Path | None = None,
+) -> set[str] | None:
     """Restore missing Redis projections from exact committed startup state.
 
     This deliberately republishes only the current authority hashes. It never
-    drains pending events or replays prior episode snapshots, and it refuses to
-    publish unless every enabled channel has a complete durable head matching
-    the applied configuration, control state, and live source catalog.
+    drains pending events or replays prior episode snapshots, and a channel is
+    republished only from a complete durable head matching the applied
+    configuration, control state, and its live source catalog.
+
+    Returns the enabled channels that still lack current authority, for
+    example because their sources changed after the last Apply; each is
+    stale on its own and does not block the others. ``None`` means no channel
+    can be trusted, because Redis is unavailable or an activation is pending.
     """
     enabled = sorted(_enabled_sharing_channels(active))
     if not enabled or control is None or getattr(control, "paused", False):
-        return True
+        return set()
     try:
         from core.utils import RedisClient
 
@@ -1059,7 +1074,7 @@ def rehydrate_current_sharing_authority(
 
         redis = RedisClient.get_client()
         if redis is None:
-            return False
+            return None
         config_generation = active_configuration_generation(active)
         missing = []
         for channel in enabled:
@@ -1070,23 +1085,23 @@ def rehydrate_current_sharing_authority(
             ) is None:
                 missing.append(channel)
         if not missing:
-            return True
+            return set()
 
         active_path = Path(path) if path is not None else active_settings_path()
         outbox_path = active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME)
         if not outbox_path.is_file():
-            return False
+            return set(missing)
         outbox = _sharing_authority_outbox(active_path)
         # An incomplete transition must be resolved by its existing recovery
         # path before startup can admit new recorder attempts.
         if outbox.pending():
-            return False
+            return None
         heads = {
             head.channel_uuid: head
             for head in outbox.committed_authority_heads()
         }
-        targets = []
-        for channel in enabled:
+        stale = set()
+        for channel in missing:
             catalog_generation = _sharing_catalog_generation(channel)
             target = SharingAuthorityTarget(
                 channel, config_generation, control.generation, catalog_generation,
@@ -1097,27 +1112,19 @@ def rehydrate_current_sharing_authority(
                 or head.configuration_generation != target.configuration_generation
                 or head.control_generation != target.control_generation
                 or head.catalog_generation != target.catalog_generation
+                or not _rehydrate_sharing_authority_head(
+                    redis, head, publish_current_authority, reject_newer=True,
+                )
+                or current_sharing_authority_context(
+                    redis, channel,
+                    config_generation=config_generation,
+                    control_generation=control.generation,
+                ) is None
             ):
-                return False
-            targets.append((channel, head))
-
-        for channel, head in targets:
-            if channel not in missing:
-                continue
-            if not _rehydrate_sharing_authority_head(
-                redis, head, publish_current_authority, reject_newer=True,
-            ):
-                return False
-        return all(
-            current_sharing_authority_context(
-                redis, channel,
-                config_generation=config_generation,
-                control_generation=control.generation,
-            ) is not None
-            for channel in enabled
-        )
+                stale.add(channel)
+        return stale
     except Exception:
-        return False
+        return None
 
 
 def _read_file_bytes(path: Path) -> bytes | None:

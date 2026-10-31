@@ -263,6 +263,10 @@ return 1
 """
 
 
+class PriorSharingOperationPending(RuntimeError):
+    """An ended recorder's sharing attempt is not yet reaped by its native source."""
+
+
 class RecorderAttemptAdmissionUncertain(RuntimeError):
     """An issue write may have committed; exact attempt identity is retained."""
 
@@ -1074,7 +1078,7 @@ def issue_recorder_attempt(
             redis_client, channel_uuid=str(channel_uuid),
             current_lease_value=str(lease_value), current_lease_fence=int(fence),
         ):
-            raise RuntimeError("previous sharing operation still requires exact cleanup")
+            raise PriorSharingOperationPending("previous sharing operation still requires exact cleanup")
         raw_sequence = redis_client.get(operation_sequence_key)
         if raw_sequence is None:
             sequence = 0

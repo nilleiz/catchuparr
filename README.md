@@ -287,6 +287,11 @@ private reader needs at least 8 seconds of viewer-return grace to open before
 the return; with a shorter `last_viewer_return_seconds` (and minimum switch
 interval) the return runs as before, without it.
 
+Borrowing a viewer stream that runs behind the dedicated source first repeats
+programme the archive already holds; those seconds are discarded. If the viewer
+leaves within that time, the programme between the borrow and the return is not
+recorded.
+
 The [0.6.1 candidate notes](docs/candidate-0.6.1.md) retain the historical
 settings and migration details. Synthetic tests do not establish acceptance
 by every real player.
@@ -398,6 +403,10 @@ can be replaced with ordinary spaces in the destination text.
 - **Sharing stays idle:** confirm it is enabled for a selected channel and that
   an ordinary viewer is using a healthy, compatible assigned stream. Sharing
   never starts a source outside the allowed set.
+- **`sharing_authority_stale` in the log:** a channel's assigned streams,
+  accounts or profiles changed after the last Apply. The channel keeps
+  recording from a dedicated source without sharing; Apply restores sharing.
+  Reordering streams alone does not cause this.
 - **Token links fail:** check the applied public URL, user ID, active user,
   channel permission, catch-up permission, stream limits and reverse-proxy path.
 - **History is missing:** verify local recording coverage, retention, selected

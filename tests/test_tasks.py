@@ -702,7 +702,7 @@ class RecorderTaskTests(unittest.TestCase):
 
         def recover_authority(_active, _control):
             events.append("authority_recovery")
-            return recovery_allowed[0]
+            return set() if recovery_allowed[0] else None
 
         celery = _fake_module("celery", shared_task=task_decorator)
         apps = _fake_module("apps")
@@ -744,7 +744,7 @@ class RecorderTaskTests(unittest.TestCase):
                     return_value=(active, control),
                 ),
                 patch(
-                    "catchuparr.configuration.rehydrate_current_sharing_authority",
+                    "catchuparr.configuration.rehydrate_sharing_authority_channels",
                     side_effect=recover_authority,
                 ),
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
@@ -830,8 +830,8 @@ class RecorderTaskTests(unittest.TestCase):
                     return_value=(active, SimpleNamespace(paused=False, generation=7)),
                 ),
                 patch(
-                    "catchuparr.configuration.rehydrate_current_sharing_authority",
-                    return_value=True,
+                    "catchuparr.configuration.rehydrate_sharing_authority_channels",
+                    return_value=set(),
                 ),
                 patch("catchuparr.engine.store.ArchiveStore", FakeStore),
                 patch("catchuparr.sharing_runtime.retry_durable_open_cleanups", side_effect=cleanup),
@@ -1166,6 +1166,10 @@ class RecorderTaskTests(unittest.TestCase):
                 startup_patches = ExitStack()
                 startup_patches.enter_context(patch(
                     "catchuparr.sharing_episode.BorrowEpisodeLedger", return_value=object(),
+                ))
+                startup_patches.enter_context(patch(
+                    "catchuparr.recorder_proxy.current_sharing_authority_context",
+                    return_value={"authority_revision": 2, "catalog_generation": "catalog"},
                 ))
                 startup_patches.enter_context(patch(
                     "catchuparr.sharing_recovery.recover_superseded_borrow",
