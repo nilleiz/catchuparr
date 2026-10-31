@@ -90,6 +90,32 @@ class ReadingTests(unittest.TestCase):
             self.make([20], chunks=()).require_reading(timeout=5, sleep=lambda _seconds: None)
 
 
+class ActivityTests(unittest.TestCase):
+    def test_touch_refreshes_only_an_existing_client_hash(self):
+        calls = []
+
+        class Redis:
+            def __init__(self, exists):
+                self.exists = exists
+
+            def eval(self, script, numkeys, key, value):
+                calls.append((numkeys, key, value))
+                return 1 if self.exists else 0
+
+        tail = probe.ReturnTailProbe(Redis(True), None, CHANNEL, clock=lambda: 42.0)
+        self.assertTrue(tail.touch())
+        self.assertEqual(calls[-1], (1, f"live:channel:{CHANNEL}:clients:{tail.client_id}", "42.0"))
+        self.assertIn("EXISTS", probe._TOUCH_EXISTING_CLIENT_LUA)
+        self.assertFalse(probe.ReturnTailProbe(Redis(False), None, CHANNEL).touch())
+
+    def test_activity_reporter_stops_when_the_client_is_gone(self):
+        tail = probe.ReturnTailProbe(None, None, CHANNEL)
+        with patch.object(probe, "ACTIVITY_INTERVAL_SECONDS", 0.01), \
+                patch.object(tail, "touch", side_effect=[True, True, False]) as touch:
+            tail._report_activity()
+        self.assertEqual(touch.call_count, 3)
+
+
 class CloseTests(unittest.TestCase):
     def test_close_removes_client_stops_owned_manager_and_marker_once(self):
         calls = []

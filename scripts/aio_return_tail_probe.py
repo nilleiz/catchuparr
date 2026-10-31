@@ -19,10 +19,20 @@ imported only inside the AIO.
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 
 TAIL_USER_AGENT = "Catchuparr return tail probe"
+ACTIVITY_INTERVAL_SECONDS = 1.0
+# Refresh only an existing client hash; never recreate a removed client.
+_TOUCH_EXISTING_CLIENT_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('HSET', KEYS[1], 'last_active', ARGV[1])
+  return 1
+end
+return 0
+"""
 
 
 def _text(value) -> str | None:
@@ -81,6 +91,21 @@ class ReturnTailProbe:
         self.start_head = None
         self.marked = False
         self.registered = False
+        self._stop_activity = threading.Event()
+        self._activity = None
+
+    def touch(self) -> bool:
+        """Report reader activity as a reading client does, so it is no ghost."""
+        key = f"live:channel:{self.channel_uuid}:clients:{self.client_id}"
+        return self.redis_text.eval(_TOUCH_EXISTING_CLIENT_LUA, 1, key, str(self.clock())) == 1
+
+    def _report_activity(self) -> None:
+        while not self._stop_activity.wait(ACTIVITY_INTERVAL_SECONDS):
+            try:
+                if not self.touch():
+                    return
+            except Exception:
+                return
 
     def _client_present(self) -> bool:
         channel, client = self.channel_uuid, self.client_id
@@ -124,6 +149,9 @@ class ReturnTailProbe:
                  "Tail probe client is not classified private")
         _require(authority_snapshot(self.redis_text, self.channel_uuid) == before,
                  "Registering the tail client changed the sharing authority or operation")
+        _require(self.touch(), "Tail probe could not report client activity")
+        self._activity = threading.Thread(target=self._report_activity, daemon=True)
+        self._activity.start()
         self.buffer = make_task_local_input_buffer(StreamBuffer, self.channel_uuid, self.redis_binary)
         self.start_head = buffer_head(self.redis_binary, self.buffer)
 
@@ -152,6 +180,10 @@ class ReturnTailProbe:
         """Remove the exact client and marker; never stop the native channel."""
         from catchuparr.stats import recorder_client_removed
 
+        self._stop_activity.set()
+        if self._activity is not None:
+            self._activity.join(5)
+            self._activity = None
         if not (self.registered or self.marked):
             return True
         if self.registered and self.manager is not None:
