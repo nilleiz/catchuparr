@@ -5685,7 +5685,10 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         # borrowed client's cleanup.
         from aio_return_tail_probe import ReturnTailProbe
 
-        tail_probe = ReturnTailProbe(redis_client, RedisClient.get_buffer(), worker_id)
+        tail_probe = ReturnTailProbe(
+            redis_client, RedisClient.get_buffer(), worker_id,
+            sharing_episode_ledger.read(worker_id),
+        )
         tail_probe.start()
         _require(
             _redis_text(redis_client.hget(sharing_episode_key, "phase")) == "wait_return"
