@@ -82,6 +82,7 @@ def run():
         docker("cp", str(ROOT / "scripts/aio_sharing_registration_crash.py"),
                f"{name}:/tmp/aio_sharing_registration_crash.py")
         docker("cp", str(ROOT / "scripts/aio_recorder_failover.py"), f"{name}:/tmp/aio_recorder_failover.py")
+        docker("cp", str(ROOT / "scripts/aio_return_tail_probe.py"), f"{name}:/tmp/aio_return_tail_probe.py")
         docker("exec", name, "chown", "-R", "1000:1000", "/data/plugins")
         docker("cp", str(ROOT / "tests"), f"{name}:/tmp/tests")
         docker("exec", "--workdir", "/tmp", "-e", "PYTHONPATH=/data/plugins:/tmp",

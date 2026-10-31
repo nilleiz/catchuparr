@@ -70,6 +70,7 @@ jobs:
           import json
           import os
           import re
+          import sys
           from pathlib import Path
 
           if os.environ["EVENT_NAME"] == "workflow_dispatch":
@@ -137,7 +138,11 @@ jobs:
               os.environ["EVENT_NAME"] == "workflow_dispatch"
               and os.environ["INPUT_PRERELEASE"] == "true"
           )
-          Path("dist/RELEASE_NOTES.md").write_text(changelog)
+          sys.path.insert(0, "scripts")
+          from release_notes import release_notes
+
+          # Only this version's section; the full history stays in CHANGELOG.md.
+          Path("dist/RELEASE_NOTES.md").write_text(release_notes(changelog, version))
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
               output.write(f"version={version}\n")
               output.write(f"prerelease={'true' if prerelease else 'false'}\n")

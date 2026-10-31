@@ -4,6 +4,32 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.9] - Prerelease
+
+### Fixed
+
+- Close the gap when a borrowed viewer stream on a delayed source returns to a
+  faster dedicated source. With the `handover:` section, a private reader opens
+  on the viewer's channel up to 20 seconds before the return deadline. After
+  the deadline it continues the archive at an exact packet boundary, keeps
+  recording the delayed stream after the borrowed reader's cleanup, and the
+  dedicated source joins it by audio as in 0.7.8. The archive stays continuous
+  and nothing is repeated. The private reader holds the viewer's provider
+  connection for at most `max_overlap_seconds` plus 60 seconds after the return
+  deadline; if no join is found in time, the return continues as before.
+  Requires **Synchronize before switch**. If the private reader cannot open or
+  join, the return runs as before; only the borrowed input's final partial
+  segment (at most one segment) is then not kept.
+- A recorder start removes a private reader that a stopped recorder process
+  left behind.
+- Log fixed `return_tail_opened`, `return_tail_joined` and
+  `return_tail_closed` events and a `sharing_tail_cleanup_pending` error.
+
+### Changed
+
+- GitHub release notes contain only the released version's section of
+  `CHANGELOG.md` instead of the whole file.
+
 ## [0.7.8] - Prerelease
 
 ### Fixed
