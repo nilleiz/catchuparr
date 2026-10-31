@@ -1,20 +1,19 @@
-"""Native evidence for the return tail reader's two Dispatcharr assumptions.
+"""Native evidence for the return tail reader inside a real borrow return.
 
 The media probe calls this inside its borrow-return scenario. While the borrow
-waits for its return, a second task-local client registers on the viewer
-channel with the running recorder's private Stats marker. The probe then
-requires that:
+waits for its return, the production :class:`NativeTailReader` opens on the
+viewer channel and a consumer reads it as the piped FFmpeg input would. The
+probe then requires that:
 
-1. the extra client is classified private, so the borrow still returns at its
-   native deadline and the extra client blocks neither the return nor the
-   classification of other clients;
-2. registering it changes neither the sharing authority nor the operation
+1. the tail client is classified private, so the borrow still returns at its
+   native deadline;
+2. opening it changes neither the sharing authority nor the operation
    pointer, so the dedicated attempt's RETURN acknowledgement stays valid;
 3. after the borrowed client's exact cleanup, the native channel stays up for
-   the extra client and its buffer keeps advancing with readable chunks.
+   the tail alone, which keeps reading new chunks and reporting activity.
 
-It does not test the tail planner or archive splicing. Dispatcharr modules are
-imported only inside the AIO.
+It does not test archive splicing, which the synthetic engine tests cover.
+Dispatcharr modules are imported only inside the AIO.
 """
 
 from __future__ import annotations
@@ -23,16 +22,7 @@ import threading
 import time
 import uuid
 
-TAIL_USER_AGENT = "Catchuparr return tail probe"
-ACTIVITY_INTERVAL_SECONDS = 1.0
-# Refresh only an existing client hash; never recreate a removed client.
-_TOUCH_EXISTING_CLIENT_LUA = """
-if redis.call('EXISTS', KEYS[1]) == 1 then
-  redis.call('HSET', KEYS[1], 'last_active', ARGV[1])
-  return 1
-end
-return 0
-"""
+TAIL_PROBE_SECONDS = 180.0
 
 
 def _text(value) -> str | None:
@@ -70,95 +60,73 @@ def authority_snapshot(redis_text, channel_uuid: str) -> tuple:
     )
 
 
-def buffer_head(redis_binary, buffer) -> int:
-    raw = redis_binary.get(buffer.buffer_index_key)
-    _require(raw is not None, "Native buffer index is unavailable to the tail probe")
-    return int(_text(raw))
-
-
 class ReturnTailProbe:
-    """One private extra client on the borrowed channel, closed exactly once."""
+    """The production tail reader on the borrowed channel, consumed in a thread."""
 
-    def __init__(self, redis_text, redis_binary, channel_uuid: str, *, clock=time.time):
+    def __init__(self, redis_text, redis_binary, channel_uuid: str, episode, *, clock=time.time):
         self.redis_text = redis_text
         self.redis_binary = redis_binary
         self.channel_uuid = channel_uuid
+        self.episode = episode
         self.clock = clock
-        self.client_id = f"catchuparr-client-{uuid.uuid4().hex}"
-        self.manager = None
-        self.owned_manager = False
-        self.buffer = None
-        self.start_head = None
-        self.marked = False
-        self.registered = False
-        self._stop_activity = threading.Event()
-        self._activity = None
-
-    def touch(self) -> bool:
-        """Report reader activity as a reading client does, so it is no ghost."""
-        key = f"live:channel:{self.channel_uuid}:clients:{self.client_id}"
-        return self.redis_text.eval(_TOUCH_EXISTING_CLIENT_LUA, 1, key, str(self.clock())) == 1
-
-    def _report_activity(self) -> None:
-        while not self._stop_activity.wait(ACTIVITY_INTERVAL_SECONDS):
-            try:
-                if not self.touch():
-                    return
-            except Exception:
-                return
+        self.reader = None
+        self.consumer = None
+        self.stop = threading.Event()
+        self.bytes_read = 0
+        self.consumer_error = None
 
     def _client_present(self) -> bool:
-        channel, client = self.channel_uuid, self.client_id
+        if self.reader is None:
+            return False
+        channel, client = self.channel_uuid, self.reader.client_id
         return bool(
             self.redis_text.sismember(f"live:channel:{channel}:clients", client)
             and self.redis_text.exists(f"live:channel:{channel}:clients:{client}")
         )
+
+    def _consume(self) -> None:
+        try:
+            for chunk in self.reader.iter_chunks(self.stop):
+                self.bytes_read += len(chunk)
+                self.reader.record_activity()
+        except Exception as exc:  # The probe reports only the class.
+            self.consumer_error = type(exc).__name__
 
     def start(self) -> None:
         from apps.proxy.live_proxy.client_manager import ClientManager
         from apps.proxy.live_proxy.input.buffer import StreamBuffer
 
         from catchuparr.adapters.sharing_native import _private_client
-        from catchuparr.adapters.sharing_reader import make_task_local_input_buffer
-        from catchuparr.sharing_episode import select_task_local_client_manager
-        from catchuparr.stats import recorder_client_registered
+        from catchuparr.sharing_tail import NativeTailReader
 
         before = authority_snapshot(self.redis_text, self.channel_uuid)
-        digest = recorder_stats_digest(self.redis_text, self.channel_uuid)
-        # Mark before registering, so no observation can count the client as a viewer.
-        self.marked = recorder_client_registered(
-            self.channel_uuid, self.client_id, digest, self.channel_uuid,
+        lease = _text(self.redis_text.get(f"catchuparr:recorder:{self.channel_uuid}"))
+        self.reader = NativeTailReader(
+            redis_text=self.redis_text, redis_binary=self.redis_binary,
+            channel_uuid=self.channel_uuid, identity=tuple(self.episode.identity),
+            configuration_generation=self.episode.configuration_generation,
+            control_generation=self.episode.control_generation,
+            recorder_fence=self.episode.recorder_fence, lease_value=lease,
+            stats_digest=recorder_stats_digest(self.redis_text, self.channel_uuid),
+            hard_deadline=self.clock() + TAIL_PROBE_SECONDS,
+            generation_is_current=lambda: not self.stop.is_set(),
+            tail_id=uuid.uuid4().hex,
         )
-        _require(self.marked, "Tail probe could not write its private recorder marker")
-        self.manager, self.owned_manager = select_task_local_client_manager(
-            None, ClientManager, channel_uuid=self.channel_uuid,
-            redis_client=self.redis_text, worker_id=f"catchuparr-reader-{uuid.uuid4().hex}",
-        )
-        result = self.manager.add_client(
-            self.client_id, "127.0.0.1", TAIL_USER_AGENT,
-            user=None, output_format="mpegts", output_profile_id=None,
-        )
-        self.registered = True
-        _require(type(result) is int and result >= 1 and self._client_present(),
-                 "Tail probe client was not registered natively")
-        # A marker refresh between marking and registering drops markers of
-        # absent clients; mark again now that the client is present.
-        _require(recorder_client_registered(self.channel_uuid, self.client_id, digest, self.channel_uuid),
-                 "Tail probe could not refresh its private recorder marker")
-        _require(_private_client(self.redis_text, self.channel_uuid, self.client_id) is True,
-                 "Tail probe client is not classified private")
+        self.reader.open(ClientManager, StreamBuffer)
+        _require(self._client_present(), "Tail client was not registered natively")
+        _require(_private_client(self.redis_text, self.channel_uuid, self.reader.client_id) is True,
+                 "Tail client is not classified private")
         _require(authority_snapshot(self.redis_text, self.channel_uuid) == before,
-                 "Registering the tail client changed the sharing authority or operation")
-        _require(self.touch(), "Tail probe could not report client activity")
-        self._activity = threading.Thread(target=self._report_activity, daemon=True)
-        self._activity.start()
-        self.buffer = make_task_local_input_buffer(StreamBuffer, self.channel_uuid, self.redis_binary)
-        self.start_head = buffer_head(self.redis_binary, self.buffer)
+                 "Opening the tail reader changed the sharing authority or operation")
+        self.consumer = threading.Thread(target=self._consume, daemon=True)
+        self.consumer.start()
 
     def require_alive(self, label: str) -> None:
         """The native channel still serves the tail after the borrow left."""
         from apps.proxy.live_proxy.redis_keys import RedisKeys
 
+        _require(self.consumer_error is None and self.consumer is not None and self.consumer.is_alive(),
+                 f"Tail reader stopped {label}: {self.consumer_error or 'ended'}")
         _require(self._client_present(), f"Tail client disappeared {label}")
         _require(self.redis_text.get(RedisKeys.channel_owner(self.channel_uuid)) is not None,
                  f"Native channel owner released with the tail client present {label}")
@@ -166,33 +134,25 @@ class ReturnTailProbe:
                  f"Native channel is stopping with the tail client present {label}")
 
     def require_reading(self, *, timeout: float = 15.0, sleep=time.sleep) -> None:
-        """New chunks appear after the borrow's cleanup and are readable."""
+        """New chunks keep arriving after the borrow's cleanup."""
         deadline = self.clock() + timeout
-        head = buffer_head(self.redis_binary, self.buffer)
-        while head <= self.start_head + 1:
-            _require(self.clock() < deadline, "Native buffer stopped advancing for the tail client")
+        start = self.bytes_read
+        while self.bytes_read <= start:
+            _require(self.consumer_error is None, f"Tail reader failed: {self.consumer_error}")
+            _require(self.clock() < deadline, "Tail reader received no chunk after the return")
             sleep(0.2)
-            head = buffer_head(self.redis_binary, self.buffer)
-        chunks, _next = self.buffer.get_optimized_client_data(head - 1)
-        _require(bool(chunks), "Tail client could not read a chunk written after the return")
 
     def close(self) -> bool:
-        """Remove the exact client and marker; never stop the native channel."""
-        from catchuparr.stats import recorder_client_removed
-
-        self._stop_activity.set()
-        if self._activity is not None:
-            self._activity.join(5)
-            self._activity = None
-        if not (self.registered or self.marked):
+        """Stop the consumer and remove the exact client; never stop the channel."""
+        self.stop.set()
+        if self.consumer is not None:
+            self.consumer.join(10)
+            self.consumer = None
+        if self.reader is None:
             return True
-        if self.registered and self.manager is not None:
-            self.manager.remove_client(self.client_id)
-            self.registered = False
-        if self.owned_manager and self.manager is not None:
-            self.manager.stop()
-            self.owned_manager = False
-        if self.marked:
-            recorder_client_removed(self.channel_uuid, self.client_id)
-            self.marked = False
-        return not self._client_present()
+        closed = self.reader.close()
+        present = self._client_present()
+        if closed and not present:
+            self.reader = None
+            return True
+        return False

@@ -253,6 +253,10 @@ class FFmpegCopyRecorder:
         # Extra seconds a staged input may run beside the old one to find the
         # exact join point; 0 keeps the short default comparison window.
         self.handover_overlap_seconds = 0.0
+        # Shortest final segment kept when this input ends on its own. A
+        # successor staged on the same source raises it so the archive ends
+        # at a segment boundary the successor can be spliced to exactly.
+        self.final_segment_min_seconds = FINAL_SEGMENT_MIN_SECONDS
 
     def command(self, output_dir: Path) -> list[str]:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -274,6 +278,12 @@ class FFmpegCopyRecorder:
             "-segment_list_type", "csv", str(output_dir / "segment-%06d.ts"),
         ])
         return command
+
+    def _popen(self, output_dir: Path):
+        return subprocess.Popen(
+            self.command(output_dir), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
     @staticmethod
     def _validate_input_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -422,10 +432,7 @@ class FFmpegCopyRecorder:
         output_dir = self.work_root / f"{self.channel_id}-{uuid.uuid4().hex}"
         output_dir.mkdir()
         try:
-            process = subprocess.Popen(
-                self.command(output_dir), stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            process = self._popen(output_dir)
         except BaseException:
             shutil.rmtree(output_dir, ignore_errors=True)
             raise
@@ -688,7 +695,6 @@ class FFmpegCopyRecorder:
         no matching overlap, its recorded media is retained for normal return.
         """
         from ..logging_utils import event
-        from .handover import matching_completed_segments
 
         if (not isinstance(previous_segment_id, str) or not previous_segment_id
                 or stop_event.is_set() or switch.is_set()):
@@ -696,16 +702,47 @@ class FFmpegCopyRecorder:
         previous = self.store.segments(self.channel_id)
         if not previous or previous[-1].id != previous_segment_id:
             return None
-        latest = previous[-1]
         try:
             staged = self._start_staged_input()
         except Exception:
             event("sync_handover_fallback")
             return None
-        deadline = time.monotonic() + SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS
+        return self._join_archive_tail(
+            staged, previous[-1], stop_event, switch,
+            time.monotonic() + SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS,
+        )
+
+    def join_staged_after_archive_tail(
+        self, staged, previous_segment_id, stop_event, *,
+        timeout: float = SYNCHRONIZED_HANDOVER_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Prove that an input staged before its predecessor ended continues it.
+
+        The staged input reads the same source, so its packets repeat the
+        archive tail exactly. It is matched only at an exact packet splice;
+        otherwise the caller closes it and returns as before.
+        """
+        if (not isinstance(staged, StagedRecorderInput) or staged.recorder is not self
+                or staged.consumed or not isinstance(previous_segment_id, str)):
+            return False
+        previous = self.store.segments(self.channel_id)
+        if not previous or previous[-1].id != previous_segment_id:
+            return False
+        self._join_archive_tail(staged, previous[-1], stop_event, None, time.monotonic() + timeout)
+        return staged.matched and not staged.consumed
+
+    def _join_archive_tail(self, staged, latest, stop_event, switch, deadline):
+        from ..logging_utils import event
+        from .handover import matching_completed_segments
+
+        previous_segment_id = latest.id
+
+        def interrupted():
+            return stop_event.is_set() or (switch is not None and switch.is_set())
+
         tested = set()
         try:
-            while not stop_event.is_set() and not switch.is_set():
+            while not interrupted():
                 rows, _ = _staged_csv_rows(staged.output_dir)
                 if not staged.within_limits():
                     event("sync_handover_fallback")
@@ -725,8 +762,7 @@ class FFmpegCopyRecorder:
                             continue
                     current = self.store.segments(self.channel_id)
                     if (current and current[-1].id == previous_segment_id
-                            and not stop_event.is_set() and not switch.is_set()
-                            and staged.process.poll() is None):
+                            and not interrupted() and staged.process.poll() is None):
                         if cut is None:
                             staged.offset = row_offset
                             staged.anchor = latest.end_utc.timestamp() - end
@@ -743,7 +779,7 @@ class FFmpegCopyRecorder:
                 if staged.process.poll() is not None or time.monotonic() >= deadline:
                     break
                 stop_event.wait(0.2)
-            if stop_event.is_set() or switch.is_set():
+            if interrupted():
                 staged.close()
                 return staged
             event("sync_handover_fallback")
@@ -860,12 +896,7 @@ class FFmpegCopyRecorder:
 
         try:
             if process is None:
-                process = subprocess.Popen(
-                    self.command(output_dir),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                process = self._popen(output_dir)
             while process.poll() is None and not stop_event.is_set():
                 if attempt_switch is not None and attempt_switch.is_set():
                     status = "switch_requested"
@@ -941,7 +972,7 @@ class FFmpegCopyRecorder:
                     # can lack a track; keep it only if it is long enough.
                     offset, committed = self._publish_csv_rows(
                         list_path, offset, require_useful_media=True,
-                        attempt_switch=attempt_switch, min_duration=FINAL_SEGMENT_MIN_SECONDS,
+                        attempt_switch=attempt_switch, min_duration=self.final_segment_min_seconds,
                     )
                     useful += committed
                     notify_first_media(committed)
@@ -998,7 +1029,7 @@ class FFmpegCopyRecorder:
             self._mark_next_discontinuity = True
         process = None
         try:
-            process = subprocess.Popen(self.command(output_dir), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            process = self._popen(output_dir)
             while process.poll() is None and not stop_event.wait(0.5):
                 offset, committed = self._publish_csv_rows(list_path, offset)
                 count += committed
@@ -1035,6 +1066,79 @@ class FFmpegCopyRecorder:
             if stop_event.wait(backoff):
                 break
             backoff = min(max_backoff, backoff * 2)
+
+
+class _ProcessStop:
+    """Stop signal for a chunk source that also ends when its FFmpeg process exits."""
+
+    def __init__(self, process) -> None:
+        self.process = process
+        self.event = threading.Event()
+
+    def is_set(self) -> bool:
+        return self.event.is_set() or self.process.poll() is not None
+
+    def set(self) -> None:
+        self.event.set()
+
+    def wait(self, timeout: float) -> bool:
+        if not self.is_set():
+            self.event.wait(timeout)
+        return self.is_set()
+
+
+class PipedFFmpegRecorder(FFmpegCopyRecorder):
+    """Record MPEG-TS chunks that this process writes to FFmpeg's stdin.
+
+    ``source`` provides ``iter_chunks(stop)`` and ``record_activity()``. It
+    feeds exactly one FFmpeg process; its owner closes it after that process
+    ended. A failing source closes stdin, so FFmpeg ends like a closed input.
+    """
+
+    def __init__(self, store: ArchiveStore, channel_id: str, source, work_root: Path, **kwargs):
+        super().__init__(store, channel_id, "pipe:0", work_root, **kwargs)
+        if not callable(getattr(source, "iter_chunks", None)) or not callable(
+            getattr(source, "record_activity", None)
+        ):
+            raise ValueError("source must provide iter_chunks and record_activity")
+        self.source = source
+        self.feeder: threading.Thread | None = None
+        self._spawned = False
+
+    def command(self, output_dir: Path) -> list[str]:
+        command = super().command(output_dir)
+        command.remove("-nostdin")
+        index = command.index("-i")
+        command[index:index] = ["-f", "mpegts"]
+        return command
+
+    def _popen(self, output_dir: Path):
+        if self._spawned:
+            raise RuntimeError("a piped input feeds only one FFmpeg process")
+        self._spawned = True
+        process = subprocess.Popen(
+            self.command(output_dir), stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        stop = _ProcessStop(process)
+
+        def feed() -> None:
+            try:
+                for chunk in self.source.iter_chunks(stop):
+                    process.stdin.write(chunk)
+                    process.stdin.flush()
+                    self.source.record_activity()
+            except Exception:
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+
+        self.feeder = threading.Thread(target=feed, name=f"catchuparr-tail-{self.channel_id}", daemon=True)
+        self.feeder.start()
+        return process
 
 
 def has_useful_transport_stream(path: Path) -> bool:

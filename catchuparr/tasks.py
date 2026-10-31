@@ -8,6 +8,7 @@ import logging
 import secrets
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from threading import Event as _WakeEvent
 
@@ -140,6 +141,98 @@ def _handover_overlap_seconds(active, prepared, attempt_state) -> float:
     if old_account in delayed and new_account and new_account not in delayed:
         return float(seconds)
     return 0.0
+
+
+RETURN_TAIL_POLL_SECONDS = 0.5
+
+
+def _start_return_tail_watch(
+    redis, channel_uuid, prepared, borrow_recorder, store, config, fence, lease,
+    stats_digest, active, stop_event, dedicated_candidate,
+):
+    """Watch the borrow's return grace and open a private tail reader in time.
+
+    Returns ``(None, None, None)`` unless a delayed viewer source may return
+    to a faster dedicated one. The tail itself decides by the pure planner.
+    """
+    delayed = active.get("handover_delayed_account_ids")
+    if (active.get("synchronize_before_switch") is not True or not delayed
+            or type(active.get("handover_max_overlap_seconds")) is not int
+            or not stats_digest or not hasattr(prepared, "capability")):
+        return None, None, None
+    from .adapters.sharing_native import episode_projection_key
+    from .engine.recorder import PipedFFmpegRecorder
+    from .logging_utils import error
+    from .sharing_return_tail import ReturnRequest
+    from .sharing_tail import NativeTailReader, ReturnTail
+
+    capability = prepared.capability
+    identity = tuple(capability.connection_identity)
+    episode_key = episode_projection_key(str(channel_uuid))
+    tail_id = uuid.uuid4().hex
+
+    def projection(field):
+        value = redis.hget(episode_key, field)
+        return value.decode("utf-8") if isinstance(value, bytes) else value
+
+    def request_factory(now):
+        try:
+            return_deadline = float(projection("return_deadline") or "inf")
+        except (TypeError, ValueError):
+            return_deadline = float("inf")
+        candidate = dedicated_candidate() or {}
+        return ReturnRequest(
+            channel_uuid=str(channel_uuid), tail_id=tail_id, recorder_fence=fence, now=now,
+            return_deadline=return_deadline, borrowed_account_id=str(identity[5]),
+            dedicated_account_id=str(candidate.get("account_id") or ""),
+            delayed_account_ids=frozenset(str(item) for item in delayed),
+            max_overlap_seconds=active.get("handover_max_overlap_seconds"),
+            synchronize_before_switch=True,
+        )
+
+    def make_reader(state):
+        from apps.proxy.live_proxy.client_manager import ClientManager
+        from apps.proxy.live_proxy.input.buffer import StreamBuffer
+        from core.utils import RedisClient
+
+        reader = NativeTailReader(
+            redis_text=redis, redis_binary=RedisClient.get_buffer(),
+            channel_uuid=str(channel_uuid), identity=identity,
+            configuration_generation=capability.configuration_generation,
+            control_generation=capability.control_generation,
+            recorder_fence=capability.recorder_fence, lease_value=str(lease._value),
+            stats_digest=stats_digest, hard_deadline=state.hard_deadline,
+            # Admission and configuration changes stop the recorder; the
+            # native proof itself checks the lease on every read.
+            generation_is_current=lambda: not stop_event.is_set(),
+            tail_id=state.tail_id,
+        )
+        reader.open(ClientManager, StreamBuffer)
+        return reader
+
+    def make_recorder(reader):
+        return PipedFFmpegRecorder(
+            store, channel_uuid, reader, config.archive_root / "work",
+            fencing_token=fence, require_media_progress=True,
+        )
+
+    return_tail = ReturnTail(
+        request_factory=request_factory, make_reader=make_reader,
+        make_recorder=make_recorder, stop_event=stop_event,
+        on_error=lambda category: error(category, callsite="return_tail"),
+    )
+    borrow_done = threading.Event()
+
+    def watch():
+        while not borrow_done.wait(RETURN_TAIL_POLL_SECONDS):
+            try:
+                return_tail.poll(borrow_recorder, episode_phase=projection("phase"))
+            except Exception as exc:
+                error("sharing_tail_cleanup_pending", exc, callsite="return_tail")
+
+    watcher = threading.Thread(target=watch, name="catchuparr-return-tail-watch", daemon=True)
+    watcher.start()
+    return return_tail, borrow_done, watcher
 
 
 def _request_viewer_switch(switch, active, prepared, make_recorder, attempt_state):
@@ -539,6 +632,7 @@ def record_channel(
         "cleaning_up": False,
         "syncing": False, "prepared_input": None,
         "return_syncing": False, "return_sync_marker": None,
+        "return_tail": None,
     }
 
     def publish_dedicated_diagnostic(
@@ -653,6 +747,11 @@ def record_channel(
                 error("sharing_recovery_failed", exc, callsite="startup_recovery")
             if cleanup_pending:
                 error("sharing_cleanup_pending", callsite="startup_recovery")
+                return {"status": "sharing_cleanup_pending"}
+            from .sharing_tail import recover_stale_tail
+
+            if not recover_stale_tail(redis, str(channel_uuid)):
+                error("sharing_tail_cleanup_pending", callsite="startup_recovery")
                 return {"status": "sharing_cleanup_pending"}
 
             from .sharing_recovery import recover_superseded_borrow
@@ -961,6 +1060,11 @@ def record_channel(
                     )
                     return True
 
+                return_tail, borrow_done, tail_watcher = _start_return_tail_watch(
+                    redis, channel_uuid, prepared, recorder, store, config, fence, lease,
+                    stats_capability_digest, current_state["active"], stop_event,
+                    lambda: candidates[candidate_index] if candidate_index < len(candidates) else None,
+                )
                 try:
                     borrow_result = recorder.run_candidate(
                         stop_event, startup_timeout=DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
@@ -994,6 +1098,21 @@ def record_channel(
                         and active.get("synchronize_before_switch") is True)
                     else None
                 )
+                if return_tail is not None:
+                    borrow_done.set()
+                    tail_watcher.join(5)
+                    if return_tail.join(borrow_outcome, return_sync_marker):
+                        # The tail records the delayed stream from here on;
+                        # the dedicated source joins it by audio instead.
+                        return_tail.start(
+                            startup_timeout=DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
+                            media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
+                        )
+                        return_sync_marker = None
+                        with attempt_state_lock:
+                            attempt_state["return_tail"] = return_tail
+                    else:
+                        return_tail.close()
                 # run_candidate has reaped FFmpeg, so exact reader cleanup may
                 # now be retried. Never switch inputs while its native client
                 # or episode projection can still be live.
@@ -1027,6 +1146,9 @@ def record_channel(
                                 with attempt_state_lock:
                                     attempt_state["return_prepared"] = prepared
                                     attempt_state["return_sync_marker"] = return_sync_marker
+                                    running_tail = attempt_state["return_tail"]
+                                if running_tail is not None:
+                                    running_tail.borrow_cleaned()
                             if borrow_outcome == "failure" and not stop_event.is_set():
                                 # Re-observe immediately after the exact cleanup;
                                 # normal viewer departures keep their settings.
@@ -1195,7 +1317,19 @@ def record_channel(
                             try:
                                 staged_return = None
                                 tried_return_sync = False
-                                if (return_token is not None and return_sync_marker is not None
+                                with attempt_state_lock:
+                                    return_tail = attempt_state["return_tail"]
+                                    attempt_state["return_tail"] = None
+                                if return_tail is not None:
+                                    tried_return_sync = True
+                                    with attempt_state_lock:
+                                        attempt_state["return_syncing"] = True
+                                    try:
+                                        staged_return = return_tail.hand_over(recorder, attempt_switch)
+                                    finally:
+                                        with attempt_state_lock:
+                                            attempt_state["return_syncing"] = False
+                                elif (return_token is not None and return_sync_marker is not None
                                         and attempt_switch is not None
                                         and current_state["active"].get("synchronize_before_switch") is True):
                                     tried_return_sync = True
@@ -1209,7 +1343,8 @@ def record_channel(
                                         with attempt_state_lock:
                                             attempt_state["return_syncing"] = False
                                 if (tried_return_sync and staged_return is None
-                                        and (stop_event.is_set() or attempt_switch.is_set())):
+                                        and (stop_event.is_set()
+                                             or (attempt_switch is not None and attempt_switch.is_set()))):
                                     status = "stopped" if stop_event.is_set() else "switch_requested"
                                     result = RecorderAttemptResult(
                                         status, 0, None,
@@ -1367,8 +1502,15 @@ def record_channel(
             with attempt_state_lock:
                 pending_prepared = attempt_state["borrow"]
                 pending_input = attempt_state["prepared_input"]
+                pending_tail = attempt_state["return_tail"]
                 attempt_state["borrow"] = None
                 attempt_state["prepared_input"] = None
+                attempt_state["return_tail"] = None
+            if pending_tail is not None:
+                try:
+                    pending_tail.close()
+                except Exception as exc:
+                    error("sharing_tail_cleanup_pending", exc, callsite="return_tail")
             if pending_input is not None:
                 try:
                     pending_input.close()

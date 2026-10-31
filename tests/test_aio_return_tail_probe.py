@@ -1,7 +1,6 @@
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from scripts import aio_return_tail_probe as probe
 
@@ -66,72 +65,68 @@ class AuthoritySnapshotTests(unittest.TestCase):
 
 
 class ReadingTests(unittest.TestCase):
-    def make(self, heads, chunks=(b"\x47" * 188,)):
-        heads = iter(heads)
-        buffer = SimpleNamespace(
-            buffer_index_key="index",
-            get_optimized_client_data=lambda index: (list(chunks), index + 1),
-        )
-        redis_binary = SimpleNamespace(get=lambda _key: str(next(heads)).encode())
-        clock = iter(range(0, 1000))
-        tail = probe.ReturnTailProbe(None, redis_binary, CHANNEL, clock=lambda: next(clock))
-        tail.buffer, tail.start_head = buffer, 10
-        return tail
+    def test_new_chunks_after_the_return_pass(self):
+        tail = probe.ReturnTailProbe(None, None, CHANNEL, None, clock=iter(range(1000)).__next__)
+        tail.bytes_read = 100
 
-    def test_advancing_buffer_with_a_readable_chunk_passes(self):
-        self.make([10, 11, 12]).require_reading(timeout=50, sleep=lambda _seconds: None)
+        def arrive(_seconds):
+            tail.bytes_read += 188
 
-    def test_stalled_buffer_fails(self):
+        tail.require_reading(timeout=50, sleep=arrive)
+
+    def test_no_new_chunk_fails(self):
+        tail = probe.ReturnTailProbe(None, None, CHANNEL, None, clock=iter(range(1000)).__next__)
         with self.assertRaises(RuntimeError):
-            self.make([10] * 100).require_reading(timeout=5, sleep=lambda _seconds: None)
+            tail.require_reading(timeout=5, sleep=lambda _seconds: None)
 
-    def test_unreadable_chunk_fails(self):
+    def test_consumer_error_fails_immediately(self):
+        tail = probe.ReturnTailProbe(None, None, CHANNEL, None, clock=iter(range(1000)).__next__)
+        tail.consumer_error = "BorrowBindingLost"
         with self.assertRaises(RuntimeError):
-            self.make([20], chunks=()).require_reading(timeout=5, sleep=lambda _seconds: None)
+            tail.require_reading(timeout=50, sleep=lambda _seconds: None)
 
+    def test_consumer_reports_activity_per_chunk(self):
+        reader = SimpleNamespace(activity=0)
+        reader.iter_chunks = lambda stop: iter([b"a" * 188, b"b" * 376])
 
-class ActivityTests(unittest.TestCase):
-    def test_touch_refreshes_only_an_existing_client_hash(self):
-        calls = []
+        def record():
+            reader.activity += 1
 
-        class Redis:
-            def __init__(self, exists):
-                self.exists = exists
-
-            def eval(self, script, numkeys, key, value):
-                calls.append((numkeys, key, value))
-                return 1 if self.exists else 0
-
-        tail = probe.ReturnTailProbe(Redis(True), None, CHANNEL, clock=lambda: 42.0)
-        self.assertTrue(tail.touch())
-        self.assertEqual(calls[-1], (1, f"live:channel:{CHANNEL}:clients:{tail.client_id}", "42.0"))
-        self.assertIn("EXISTS", probe._TOUCH_EXISTING_CLIENT_LUA)
-        self.assertFalse(probe.ReturnTailProbe(Redis(False), None, CHANNEL).touch())
-
-    def test_activity_reporter_stops_when_the_client_is_gone(self):
-        tail = probe.ReturnTailProbe(None, None, CHANNEL)
-        with patch.object(probe, "ACTIVITY_INTERVAL_SECONDS", 0.01), \
-                patch.object(tail, "touch", side_effect=[True, True, False]) as touch:
-            tail._report_activity()
-        self.assertEqual(touch.call_count, 3)
+        reader.record_activity = record
+        tail = probe.ReturnTailProbe(None, None, CHANNEL, None)
+        tail.reader = reader
+        tail._consume()
+        self.assertEqual((tail.bytes_read, reader.activity, tail.consumer_error), (564, 2, None))
 
 
 class CloseTests(unittest.TestCase):
-    def test_close_removes_client_stops_owned_manager_and_marker_once(self):
-        calls = []
+    def test_close_stops_the_consumer_and_removes_the_exact_client(self):
         redis = _FakeRedis()
-        tail = probe.ReturnTailProbe(redis, None, CHANNEL)
-        tail.manager = SimpleNamespace(remove_client=lambda client: calls.append(("remove", client)),
-                                       stop=lambda: calls.append(("stop",)))
-        tail.owned_manager = tail.registered = tail.marked = True
-        with patch("catchuparr.stats.recorder_client_removed",
-                   side_effect=lambda channel, client: calls.append(("marker", client))):
-            self.assertTrue(tail.close())
-            self.assertTrue(tail.close())
-        self.assertEqual(calls, [("remove", tail.client_id), ("stop",), ("marker", tail.client_id)])
+        reader = SimpleNamespace(client_id="catchuparr-client-1", closes=0)
+
+        def close():
+            reader.closes += 1
+            return True
+
+        reader.close = close
+        tail = probe.ReturnTailProbe(redis, None, CHANNEL, None)
+        tail.reader = reader
+        self.assertTrue(tail.close())
+        self.assertTrue(tail.stop.is_set())
+        self.assertEqual(reader.closes, 1)
+        self.assertTrue(tail.close())
+        self.assertEqual(reader.closes, 1)
+
+    def test_close_reports_a_client_that_remains(self):
+        client = "catchuparr-client-1"
+        redis = _FakeRedis(values={f"live:channel:{CHANNEL}:clients:{client}": "x"},
+                           sets={f"live:channel:{CHANNEL}:clients": {client}})
+        tail = probe.ReturnTailProbe(redis, None, CHANNEL, None)
+        tail.reader = SimpleNamespace(client_id=client, close=lambda: True)
+        self.assertFalse(tail.close())
 
     def test_never_started_probe_closes_cleanly(self):
-        self.assertTrue(probe.ReturnTailProbe(_FakeRedis(), None, CHANNEL).close())
+        self.assertTrue(probe.ReturnTailProbe(_FakeRedis(), None, CHANNEL, None).close())
 
 
 class WiringTests(unittest.TestCase):
