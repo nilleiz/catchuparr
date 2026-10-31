@@ -25,6 +25,11 @@ included here to explain the feature history leading to 0.4.0.
 - Log fixed `return_tail_opened`, `return_tail_joined` and
   `return_tail_closed` events and a `sharing_tail_cleanup_pending` error.
 
+### Changed
+
+- GitHub release notes contain only the released version's section of
+  `CHANGELOG.md` instead of the whole file.
+
 ## [0.7.8] - Prerelease
 
 ### Fixed
