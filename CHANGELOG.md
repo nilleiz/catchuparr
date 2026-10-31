@@ -4,6 +4,36 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.10] - Prerelease
+
+### Fixed
+
+- Recorders start again after a recorder worker ended without stopping its
+  FFmpeg inputs, for example after a crash. Such inputs kept their provider
+  connections and private source readers open, so the previous sharing
+  attempt could never be closed and no recorder of the affected channels could
+  start until Dispatcharr was restarted. A recorder now stops these leftover
+  inputs of its own channel as soon as it holds the channel's lease, removes
+  their unpublished staging directories, and waits up to 90 seconds for the
+  previous attempt to close instead of failing; a fixed
+  `recorder_orphans_reaped` event reports the count.
+- Reordering a channel's streams in Dispatcharr no longer stops recording. The
+  sharing authority binds which sources are assigned and usable, not their
+  order. A real source change (a stream, account or profile added, removed,
+  enabled or disabled) after the last Apply now affects only that channel: it
+  records from a dedicated source without borrowing a viewer connection until
+  the next Apply, and a fixed `sharing_authority_stale` error names the cause.
+  Previously such a change stopped recording on every channel.
+- A viewer who returns during the viewer-return grace and leaves again later
+  gets a new private return reader, so this return is gap-free as well.
+
+### Known limitations
+
+- When a recorder borrows a viewer stream that runs behind its dedicated
+  source, the borrowed stream first repeats programme the archive already
+  holds; those seconds are discarded. If the viewer leaves within that time,
+  the programme between the borrow and the return is not recorded.
+
 ## [0.7.9] - Prerelease
 
 ### Fixed

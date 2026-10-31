@@ -79,11 +79,13 @@ class _FakeTail:
         self._record("close")
 
 
-class ReturnTailWiringTests(unittest.TestCase):
-    def run_record_channel(self, *, tail=None, recover_tail=True, outcome_return=True):
+class _RecordChannelHarness:
+    def run_record_channel(self, *, tail=None, recover_tail=True, outcome_return=True,
+                           authority=True, issue_errors=(), wait_seconds=90.0):
         """Borrow, return at the deadline, then one dedicated attempt that stops."""
         calls, recorder_runs, prepare_calls, acknowledged = [], [], [], []
-        holder = {}
+        holder = {"issued": [], "reaped": []}
+        pending_issue_errors = list(issue_errors)
         stop_box = {"event": _StopEvent()}
         with tempfile.TemporaryDirectory() as temp:
             archive_root = Path(temp) / "archive"
@@ -168,6 +170,16 @@ class ReturnTailWiringTests(unittest.TestCase):
                     prepare_calls.append(marker)
                     return None
 
+            def issue(_redis, _lease, **kwargs):
+                holder["issued"].append(kwargs.get("sharing_authority"))
+                if pending_issue_errors:
+                    raise pending_issue_errors.pop(0)
+                return Attempt(kwargs["candidate"])
+
+            def reap(work_root, channel):
+                holder["reaped"].append((Path(work_root).name, channel))
+                return 0
+
             def start_watch(*args):
                 holder["args"] = args
                 if tail is None:
@@ -181,6 +193,9 @@ class ReturnTailWiringTests(unittest.TestCase):
                     enter = stack.enter_context
                     enter(patch.object(tasks, "_start_return_tail_watch", side_effect=start_watch))
                     enter(patch.object(tasks, "RECORDER_CLEANUP_RETRY_SECONDS", 0.0))
+                    enter(patch.object(tasks, "PRIOR_SHARING_OPERATION_WAIT_SECONDS", wait_seconds))
+                    enter(patch.object(tasks, "PRIOR_SHARING_OPERATION_RETRY_SECONDS", 0.0))
+                    enter(patch("catchuparr.engine.recorder.reap_orphaned_inputs", side_effect=reap))
                     enter(patch("catchuparr.sharing_tail.recover_stale_tail", return_value=recover_tail))
                     enter(patch("catchuparr.runtime.load_config", return_value=config))
                     enter(patch("catchuparr.configuration.reset_legacy_configuration", return_value=False))
@@ -193,9 +208,9 @@ class ReturnTailWiringTests(unittest.TestCase):
                     enter(patch("catchuparr.recorder_proxy.ranked_source_candidates",
                                 return_value=[{"id": "44", "account_id": "fast"}]))
                     enter(patch("catchuparr.recorder_proxy.current_sharing_authority_context",
-                                return_value={"authority_revision": 2, "catalog_generation": "catalog"}))
-                    enter(patch("catchuparr.recorder_proxy.issue_recorder_attempt",
-                                side_effect=lambda _r, _l, **kwargs: Attempt(kwargs["candidate"])))
+                                return_value={"authority_revision": 2, "catalog_generation": "catalog"}
+                                if authority else None))
+                    enter(patch("catchuparr.recorder_proxy.issue_recorder_attempt", side_effect=issue))
                     enter(patch("catchuparr.recorder_proxy.stop_recorder_attempt", return_value=True))
                     enter(patch("catchuparr.tasks._issue_recorder_capability", return_value=(None, None, None)))
                     enter(patch("catchuparr.sharing_runtime.RecorderBorrowCoordinator", Coordinator))
@@ -217,6 +232,8 @@ class ReturnTailWiringTests(unittest.TestCase):
                     result = tasks.record_channel("channel-1", expected_generation, 6)
         return result, calls, recorder_runs, prepare_calls, acknowledged, holder
 
+
+class ReturnTailWiringTests(_RecordChannelHarness, unittest.TestCase):
     def test_joined_tail_hands_the_dedicated_input_over_instead_of_a_packet_return(self):
         calls = []
         closed = []
@@ -278,6 +295,41 @@ class ReturnTailWiringTests(unittest.TestCase):
         result, _events, runs, _prepares, _ack, _holder = self.run_record_channel(recover_tail=False)
         self.assertEqual({"status": "sharing_cleanup_pending"}, result)
         self.assertEqual([], runs)
+
+
+class RecorderStartRecoveryTests(_RecordChannelHarness, unittest.TestCase):
+    """Startup recovery shared by every recorder run, exercised through the same harness."""
+
+    def test_orphaned_inputs_are_reaped_after_the_lease_is_held(self):
+        _result, _events, _runs, _prepares, _ack, holder = self.run_record_channel()
+        self.assertEqual([("work", "channel-1")], holder["reaped"])
+
+    def test_prior_sharing_operation_is_awaited_until_it_closes(self):
+        from catchuparr.recorder_proxy import PriorSharingOperationPending
+
+        result, _events, runs, _prepares, acknowledged, holder = self.run_record_channel(
+            issue_errors=[PriorSharingOperationPending("synthetic"), PriorSharingOperationPending("synthetic")],
+        )
+        self.assertEqual({"status": "stopped"}, result)
+        self.assertEqual(3, len(holder["issued"]))
+        self.assertEqual("dedicated", runs[-1][0])
+        self.assertEqual(1, len(acknowledged))
+
+    def test_prior_sharing_operation_that_stays_open_ends_the_run_in_order(self):
+        from catchuparr.recorder_proxy import PriorSharingOperationPending
+
+        result, _events, runs, _prepares, _ack, _holder = self.run_record_channel(
+            issue_errors=[PriorSharingOperationPending("synthetic")], wait_seconds=0.0,
+        )
+        self.assertEqual({"status": "sharing_cleanup_pending"}, result)
+        self.assertNotIn("dedicated", [kind for kind, _staged in runs])
+
+    def test_stale_sharing_authority_records_from_a_dedicated_source(self):
+        result, events, runs, _prepares, _ack, holder = self.run_record_channel(authority=False)
+        self.assertEqual({"status": "stopped"}, result)
+        self.assertEqual([None], holder["issued"])
+        self.assertEqual([("dedicated", None)], runs)
+        self.assertNotIn(("return_after_cleanup", "return"), events)
 
 
 class ReturnTailWatchGateTests(unittest.TestCase):

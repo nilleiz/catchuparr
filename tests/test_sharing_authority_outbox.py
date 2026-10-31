@@ -542,6 +542,58 @@ class SharingAuthorityOutboxTests(unittest.TestCase):
         published.assert_not_called()
         self.assertFalse(self.redis.hgetall(key))
 
+    def test_startup_rehydration_isolates_a_channel_whose_sources_changed(self):
+        from catchuparr.configuration import (
+            SHARING_AUTHORITY_OUTBOX_NAME,
+            rehydrate_sharing_authority_channels,
+        )
+
+        changed = SharingAuthorityTarget(
+            "channel-changed-synthetic", self.target.configuration_generation,
+            self.target.control_generation, "catalog-before-synthetic",
+        )
+        active_path = Path(self.temp.name) / "active-isolated-synthetic.json"
+        outbox = SharingAuthorityOutbox(
+            active_path.with_name(SHARING_AUTHORITY_OUTBOX_NAME),
+            clock=lambda: self.now[0],
+        )
+        events = outbox.stage("activation-isolated-synthetic", (self.target, changed))
+        self.assertTrue(outbox.commit_activation(events[0].activation_id))
+        outbox.drain(
+            self.redis,
+            read_prior=lambda *_args: SharingAuthorityPriorObservation("absent"),
+            publish=self.publish,
+            invalidate=lambda *_args: True,
+        )
+        for target in (self.target, changed):
+            self.redis.hashes.pop(f"catchuparr:sharing:current:{target.channel_uuid}")
+        catalogs = {self.target.channel_uuid: self.target.catalog_generation,
+                    changed.channel_uuid: "catalog-after-synthetic"}
+
+        def publish_current(redis, channel_uuid, **kwargs):
+            return self.publish(redis, types.SimpleNamespace(channel_uuid=channel_uuid, **kwargs))
+
+        core = types.ModuleType("core")
+        core.__path__ = []
+        core_utils = types.ModuleType("core.utils")
+        core_utils.RedisClient = types.SimpleNamespace(get_client=lambda: self.redis)
+        active = {"connection_sharing": {
+            self.target.channel_uuid: {"enabled": True}, changed.channel_uuid: {"enabled": True},
+        }}
+        control = types.SimpleNamespace(paused=False, generation=self.target.control_generation)
+        with (
+            patch.dict(sys.modules, {"core": core, "core.utils": core_utils}),
+            patch("catchuparr.configuration.active_configuration_generation",
+                  return_value=self.target.configuration_generation),
+            patch("catchuparr.configuration._sharing_catalog_generation", side_effect=catalogs.__getitem__),
+            patch("catchuparr.adapters.sharing_native.publish_current_authority", side_effect=publish_current),
+        ):
+            stale = rehydrate_sharing_authority_channels(active, control, active_path)
+
+        self.assertEqual({changed.channel_uuid}, stale)
+        self.assertTrue(self.redis.hgetall(f"catchuparr:sharing:current:{self.target.channel_uuid}"))
+        self.assertFalse(self.redis.hgetall(f"catchuparr:sharing:current:{changed.channel_uuid}"))
+
     def test_startup_rehydration_does_not_run_while_outbox_transition_is_pending(self):
         from catchuparr.configuration import (
             SHARING_AUTHORITY_OUTBOX_NAME,

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -1139,6 +1141,100 @@ class PipedFFmpegRecorder(FFmpegCopyRecorder):
         self.feeder = threading.Thread(target=feed, name=f"catchuparr-tail-{self.channel_id}", daemon=True)
         self.feeder.start()
         return process
+
+
+ORPHAN_TERMINATE_GRACE_SECONDS = 5.0
+STALE_WORK_DIRECTORY_SECONDS = 60.0
+
+
+def _process_parent(proc_root: Path, pid: int) -> int | None:
+    try:
+        stat = (proc_root / str(pid) / "stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _input_processes(proc_root: Path, prefix: str) -> dict[int, set[Path]]:
+    """FFmpeg processes writing into work directories that start with ``prefix``."""
+    found: dict[int, set[Path]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if not argv or not Path(argv[0].decode("utf-8", "replace")).name.startswith("ffmpeg"):
+            continue
+        directories = set()
+        for raw in argv[1:]:
+            value = raw.decode("utf-8", "replace")
+            if value.startswith(prefix):
+                directories.add(Path(value).parent)
+        if directories:
+            found[int(entry.name)] = directories
+    return found
+
+
+def reap_orphaned_inputs(
+    work_root: Path, channel_id: str, *, proc_root: Path = Path("/proc"),
+    own_pid: int | None = None, kill: Callable[[int, int], None] = os.kill,
+    sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+    grace_seconds: float = ORPHAN_TERMINATE_GRACE_SECONDS,
+) -> int:
+    """Stop FFmpeg inputs that an ended recorder of this channel left running.
+
+    The caller holds the channel's recorder lease, so an FFmpeg process that
+    writes into this channel's work directories and is not a child of the
+    calling process belongs to a recorder that lost its lease, for example a
+    worker that crashed. Such a process keeps its provider connection and its
+    private source reader open and blocks their exact cleanup. Its staging
+    directory and older unused staging directories are removed afterwards;
+    their media was never published. Returns the number of stopped processes.
+    """
+    work_root = Path(work_root)
+    own_pid = os.getpid() if own_pid is None else own_pid
+    prefix = str(work_root / f"{channel_id}-")
+    orphans = {
+        pid: directories
+        for pid, directories in _input_processes(proc_root, prefix).items()
+        if pid != own_pid and _process_parent(proc_root, pid) != own_pid
+    }
+    for pid in orphans:
+        try:
+            kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = clock() + grace_seconds
+    while any((proc_root / str(pid)).exists() for pid in orphans) and clock() < deadline:
+        sleep(0.1)
+    for pid in orphans:
+        if (proc_root / str(pid)).exists():
+            try:
+                kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    in_use = set().union(set(), *_input_processes(proc_root, prefix).values())
+    now = time.time()
+    try:
+        candidates = [path for path in work_root.glob(f"{channel_id}-*") if path.is_dir()]
+    except OSError:
+        candidates = []
+    for directory in candidates:
+        if directory in in_use:
+            continue
+        try:
+            stale = now - directory.stat().st_mtime >= STALE_WORK_DIRECTORY_SECONDS
+        except OSError:
+            continue
+        if stale or any(directory in directories for directories in orphans.values()):
+            shutil.rmtree(directory, ignore_errors=True)
+    return len(orphans)
 
 
 def has_useful_transport_stream(path: Path) -> bool:
