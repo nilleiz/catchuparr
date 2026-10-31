@@ -1,6 +1,6 @@
 # Return overlap: returning from a delayed viewer stream without a gap
 
-Status: specification, not implemented. Target: 0.7.9.
+Status: implemented in 0.7.9.
 
 ## Problem
 
@@ -176,31 +176,36 @@ client id, `opened_at`, the return, join and hard deadlines, `closing_at` and
 the outcome. It
 never holds a URL, token or capability. Restoring requires the same channel.
 
-## Integration (after the planner is accepted)
+## Implementation
 
-- Ledger: a tail record next to the borrow episode ledger, written before the
-  reader opens (`opening`), so a crash leaves a closable record.
-- Native classification: the tail client carries the running recorder's
-  private Stats marker, which `sharing_native._private_client` and both Lua
-  checks already accept independently of the closed borrow episode. Its
-  reader refreshes `last_active` at least once per second. The native borrow check and viewer observation
-  ignore it; a viewer arriving after the return deadline waits for the
-  bounded tail to end.
-- Trigger: the runtime asks the planner while the episode is `wait_return`;
-  the tail opens as staged input of the borrowed recorder and joins with the
-  archive-tail splice of `prepare_synchronized_return`. Its staging limit must
-  cover the lead time plus the join.
-- Join: borrow → tail uses the existing staged-input splice
-  (`matching_completed_segments` / `_prepare_cut`).
-- Seam: tail → dedicated reuses the audio path of `_try_synchronized_handover`
-  with the dedicated input as staged input (`max_seconds` already covers
-  `handover_overlap_seconds`).
-- Authority: the tail must not hold the sharing operation pointer, so
-  `issue_recorder_attempt` still admits the dedicated attempt. Verify in the
-  native CI that the authority revision bump at borrow cleanup does not
-  invalidate the tail's reader proof.
-- `scripts/aio_recorder_failover.py` pins line numbers in `tasks.py`; update
-  them with every change above them.
+- Planner: `catchuparr/sharing_return_tail.py` (pure).
+- Runtime: `catchuparr/sharing_tail.py`. `NativeTailReader` registers a
+  task-local client inside the recorder process with
+  `BorrowedClientRegistration`, marks it with the running recorder's private
+  Stats marker before it is registered, and reads the native buffer with
+  `ReadOnlyTsBufferReader`. Each read is proven by a read-only Lua check of the
+  borrowed connection's owner, metadata, worker heartbeat, recorder lease and
+  stopping marker until the hard deadline; `NativeClientActivityGuard`
+  refreshes `last_active` after every chunk written to FFmpeg.
+- Input: `PipedFFmpegRecorder` feeds those chunks to FFmpeg's stdin; a failing
+  reader closes stdin, so FFmpeg ends like a closed input.
+- Join: while the tail is staged, the borrowed input discards its final partial
+  segment (`final_segment_min_seconds`), so the archive ends at a segment
+  boundary; `join_staged_after_archive_tail` then continues it at the exact
+  packet splice of `prepare_synchronized_return`.
+- Seam: `ReturnTail.hand_over` offers the dedicated recorder to the running
+  tail through `RecorderAttemptSwitch`; `_try_synchronized_handover` finds the
+  audio seam as in 0.7.8 and returns the frozen dedicated input, which then
+  publishes and acknowledges the RETURN.
+- Recovery: a Redis record `catchuparr:sharing:tail:<channel>` with the exact
+  client fields and a TTL is written after registration. A recorder start
+  removes such a client exactly before any sharing work; a tail is never
+  resumed. Redis replaces the SQLite ledger of the first draft because the
+  native client itself only exists in Redis.
+- Wiring: `tasks._start_return_tail_watch` polls the episode projection every
+  0.5 s during the borrow; the dedicated attempt calls `hand_over` instead of
+  `prepare_synchronized_return`. Line pins in `scripts/aio_recorder_failover.py`
+  follow `tasks.py`.
 
 Native evidence (synthetic AIO, Dispatcharr 0.33.0,
 `scripts/aio_return_tail_probe.py` inside the media probe's borrow return):
