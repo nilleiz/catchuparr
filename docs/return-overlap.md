@@ -180,9 +180,10 @@ never holds a URL, token or capability. Restoring requires the same channel.
 
 - Ledger: a tail record next to the borrow episode ledger, written before the
   reader opens (`opening`), so a crash leaves a closable record.
-- Native classification: `sharing_native._private_client` must classify the
-  tail client as private through its own ledger key; it is no longer bound to
-  the closed borrow episode. The native borrow check and viewer observation
+- Native classification: the tail client carries the running recorder's
+  private Stats marker, which `sharing_native._private_client` and both Lua
+  checks already accept independently of the closed borrow episode. Its
+  reader refreshes `last_active` at least once per second. The native borrow check and viewer observation
   ignore it; a viewer arriving after the return deadline waits for the
   bounded tail to end.
 - Trigger: the runtime asks the planner while the episode is `wait_return`;
@@ -201,10 +202,26 @@ never holds a URL, token or capability. Restoring requires the same channel.
 - `scripts/aio_recorder_failover.py` pins line numbers in `tasks.py`; update
   them with every change above them.
 
-Open questions to settle in the native CI (Dispatcharr 0.32 and 0.33): whether
-the native channel stays up for the tail after the borrowed client leaves, and
-whether a private client opened while the borrow is active survives the
-borrow's cleanup unchanged.
+Native evidence (synthetic AIO, Dispatcharr 0.33.0,
+`scripts/aio_return_tail_probe.py` inside the media probe's borrow return):
+
+- A second task-local client marked with the running recorder's private Stats
+  marker (`catchuparr:stats:recorder-client:*`, bound to the recorder lease, not
+  to the borrow episode) is classified private by the Python and Lua checks:
+  the borrow stays in `wait_return` and returns at its native deadline.
+- Registering it changes neither the sharing authority nor the operation
+  pointer, and the RETURN is acknowledged while it is present.
+- After the borrowed client's exact cleanup the native channel stays up for
+  it alone, and its buffer keeps advancing with readable chunks.
+- Dispatcharr removes a client that reports no activity as a ghost after
+  about 50 s, and then stops the channel. The tail reader must therefore
+  refresh `last_active` of its existing client hash at least once per second,
+  as the borrowed reader does. The tail classification can reuse the
+  recorder marker; no Lua change is needed for it.
+
+Not yet covered: Dispatcharr 0.32, a tail alone for the full
+`max_overlap_seconds`, and the packet join and audio seam on real archive
+segments.
 
 ## Rejected alternatives
 
