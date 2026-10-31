@@ -306,6 +306,44 @@ class ReturnTailControllerTests(unittest.TestCase):
         self.assertEqual(reader.closes, 1)
         self.assertEqual(borrow.final_segment_min_seconds, FINAL_SEGMENT_MIN_SECONDS)
 
+    def test_a_later_grace_of_the_same_borrow_opens_a_new_tail(self):
+        readers = []
+
+        def make_reader(state):
+            readers.append((_FakeReader(), state.tail_id))
+            return readers[-1][0]
+
+        tail, clock, _reader, _recorder, _errors, _stop = self.make(now=1015.0, deadline=1030.0)
+        tail.make_reader = make_reader
+        tail.make_recorder = lambda _reader: _FakeTailRecorder()
+        borrow = SimpleNamespace(final_segment_min_seconds=FINAL_SEGMENT_MIN_SECONDS)
+        tail.poll(borrow, episode_phase="wait_return")
+        clock["now"] = 1018.0
+        tail.poll(borrow, episode_phase="active")
+        self.assertEqual(tail.state.outcome, "viewer_returned")
+        tail.poll(borrow, episode_phase="active")
+        self.assertEqual(len(readers), 1)
+        clock["now"] = 1100.0
+        tail.request_factory = (lambda base: (lambda now: ReturnRequest(**{
+            **base.__dict__, "now": now, "return_deadline": 1110.0})))(tail.request_factory(0.0))
+        tail.poll(borrow, episode_phase="wait_return")
+        self.assertEqual(tail.state.phase, TailPhase.JOINING)
+        self.assertEqual([tail_id for _r, tail_id in readers], ["tail-1", "tail-1-1"])
+        self.assertEqual(readers[0][0].closes, 1)
+        self.assertEqual(borrow.final_segment_min_seconds, math.inf)
+
+    def test_a_closed_tail_is_not_reopened_for_other_outcomes(self):
+        tail, clock, reader, recorder, _errors, _stop = self.make(
+            now=1015.0, deadline=1030.0, recorder=_FakeTailRecorder(joined=False),
+        )
+        borrow = SimpleNamespace(final_segment_min_seconds=1.0)
+        tail.poll(borrow, episode_phase="wait_return")
+        clock["now"] = 1031.0
+        tail.join("return", "segment-7")
+        tail.poll(borrow, episode_phase="wait_return")
+        self.assertEqual(tail.state.outcome, "join_failed")
+        self.assertEqual(reader.closes, 1)
+
     def test_join_after_the_deadline_hands_publication_to_the_tail(self):
         tail, clock, _reader, recorder, _errors, _stop = self.make(now=1015.0, deadline=1030.0)
         borrow = SimpleNamespace(final_segment_min_seconds=FINAL_SEGMENT_MIN_SECONDS)
