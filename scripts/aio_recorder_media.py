@@ -4452,6 +4452,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
     live_reader = None
     live_session = None
     churn_session = None
+    tail_probe = None
     native_server = None
     native_diagnostic = None
     native_diagnostic_report = None
@@ -5679,6 +5680,18 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
         )
         _require(time.time() < return_deadline,
                  "The synthetic viewer left after the tested switch deadline")
+        # Return tail evidence: a private extra reader registered during the
+        # viewer-return grace must neither delay the return nor fall with the
+        # borrowed client's cleanup.
+        from aio_return_tail_probe import ReturnTailProbe
+
+        tail_probe = ReturnTailProbe(redis_client, RedisClient.get_buffer(), worker_id)
+        tail_probe.start()
+        _require(
+            _redis_text(redis_client.hget(sharing_episode_key, "phase")) == "wait_return"
+            and time.time() < return_deadline,
+            "The private tail client ended the viewer-return grace",
+        )
         first_b_boundary = {}
 
         def verify_first_b_effect(source_name, request_number, started_at):
@@ -5720,6 +5733,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 _redis_text(redis_client.hget(sharing_episode_key, "phase")) == "closed",
                 "Borrowed episode cleanup was not acknowledged before the first B provider request",
             )
+            tail_probe.require_alive("at the first B provider request")
             return True
 
         source_server.install_request_start_callback(verify_first_b_effect)
@@ -5755,6 +5769,25 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             cooperative_sleep=gevent_sleep,
         )
         _require(bool(returned_segments), "Recorder did not return to allowed source B")
+        tail_probe.require_alive("after the return")
+        tail_probe.require_reading(sleep=gevent_sleep)
+        from catchuparr.sharing_persistence import SharingIntentLedger
+
+        tail_ack_until = time.monotonic() + 30
+        while True:
+            tail_ack_state = SharingIntentLedger(
+                archive_root / ".catchuparr-sharing.sqlite3",
+            ).read(worker_id)
+            if (tail_ack_state is not None
+                    and tail_ack_state.state.phase.value == "dedicated"
+                    and tail_ack_state.state.pending_action is None):
+                break
+            _require(time.monotonic() < tail_ack_until,
+                     "RETURN was not acknowledged while the private tail client was present")
+            gevent_sleep(0.2)
+        _require(tail_probe.close(), "The private tail client could not be removed exactly")
+        tail_probe = None
+        print("AIO native channel kept a private tail client through the borrow return")
         from aio_recorder_diagnostics_probe import probe_live_dedicated_diagnostic
 
         dedicated_diagnostic_cleanup = probe_live_dedicated_diagnostic(redis_client, worker_id)
@@ -7988,6 +8021,13 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 churn_session = None
             except Exception:
                 cleanup_errors.append("native-churn-response")
+        if tail_probe is not None:
+            try:
+                if not tail_probe.close():
+                    cleanup_errors.append("native-tail-client")
+                tail_probe = None
+            except Exception:
+                cleanup_errors.append("native-tail-client")
         try:
             from catchuparr.adapters.recorder_proxy import stop_managed_workers
 
