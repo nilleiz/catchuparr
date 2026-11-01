@@ -135,6 +135,80 @@ class ReapOrphanedInputsTests(unittest.TestCase):
                 process.wait()
 
 
+class _OperationRedis:
+    """Records Lua calls for one prior sharing operation of a crashed recorder."""
+
+    def __init__(self, *, status="active", worker_state="released", fence="5", begin=1, close=1):
+        self.channel = CHANNEL
+        self.operation_id = "op-synthetic"
+        self.worker_id = "catchuparr-r" + "0" * 40
+        self.digest = "a" * 64
+        self.values = {f"catchuparr:sharing:attempt:{CHANNEL}:current": f"{self.operation_id}:1"}
+        self.hashes = {
+            f"catchuparr:sharing:attempt:{CHANNEL}:operation:{self.operation_id}": {
+                "operation_id": self.operation_id, "operation_revision": "1", "recorder_fence": fence,
+                "worker_id": self.worker_id, "capability_digest": self.digest,
+                "status": status, "open_count": "0",
+            },
+            f"catchuparr:recorder-proxy:worker:{self.worker_id}": {
+                "sharing_operation_id": self.operation_id, "sharing_operation_revision": "1",
+                "worker_id": self.worker_id, "capability_digest": self.digest, "state": worker_state,
+            },
+        }
+        self.results = {"begin": begin, "close": close}
+        self.calls = []
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
+    def eval(self, script, numkeys, *args):
+        from catchuparr import recorder_proxy
+
+        name = ("begin" if script == recorder_proxy._BEGIN_SHARING_OPERATION_CLOSE_LUA
+                else "close" if script == recorder_proxy._CLOSE_SHARING_OPERATION_LUA else "other")
+        self.calls.append((name, args[:numkeys]))
+        return self.results.get(name, 0)
+
+
+class PriorSharingOperationRecoveryTests(unittest.TestCase):
+    def reconcile(self, redis, fence=9):
+        from catchuparr.recorder_proxy import reconcile_prior_sharing_operation
+
+        return reconcile_prior_sharing_operation(
+            redis, channel_uuid=CHANNEL, current_lease_value=f"{fence}:owner", current_lease_fence=fence,
+        )
+
+    def test_unrevoked_attempt_of_a_crashed_recorder_is_revoked_then_closed(self):
+        redis = _OperationRedis()
+        self.assertTrue(self.reconcile(redis))
+        self.assertEqual(["begin", "close"], [name for name, _keys in redis.calls])
+        begin_keys = redis.calls[0][1]
+        self.assertEqual(f"catchuparr:recorder-proxy:capability:{redis.digest}", begin_keys[2])
+
+    def test_attempt_already_closing_is_only_closed(self):
+        redis = _OperationRedis(status="closing")
+        self.assertTrue(self.reconcile(redis))
+        self.assertEqual(["close"], [name for name, _keys in redis.calls])
+
+    def test_live_source_or_newer_attempt_is_never_revoked(self):
+        cases = {
+            "source still open": _OperationRedis(worker_state="active"),
+            "same fence": _OperationRedis(fence="9"),
+        }
+        for name, redis in cases.items():
+            with self.subTest(name):
+                self.assertFalse(self.reconcile(redis))
+                self.assertEqual([], redis.calls)
+
+    def test_failed_revocation_keeps_the_attempt_blocked(self):
+        redis = _OperationRedis(begin=0)
+        self.assertFalse(self.reconcile(redis))
+        self.assertEqual(["begin"], [name for name, _keys in redis.calls])
+
+
 class _Query(list):
     def select_related(self, *_args):
         return self
