@@ -14,9 +14,10 @@ included here to explain the feature history leading to 0.4.0.
   attempt could never be closed and no recorder of the affected channels could
   start until Dispatcharr was restarted. A recorder now stops these leftover
   inputs of its own channel as soon as it holds the channel's lease, removes
-  their unpublished staging directories, and waits up to 90 seconds for the
-  previous attempt to close instead of failing; a fixed
-  `recorder_orphans_reaped` event reports the count.
+  their unpublished staging directories, completes the revocation the ended
+  recorder never made, and waits up to 90 seconds for the previous attempt to
+  close instead of failing; a fixed `recorder_orphans_reaped` event reports
+  the count.
 - Reordering a channel's streams in Dispatcharr no longer stops recording. The
   sharing authority binds which sources are assigned and usable, not their
   order. A real source change (a stream, account or profile added, removed,
