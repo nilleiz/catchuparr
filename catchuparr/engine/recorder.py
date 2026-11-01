@@ -31,6 +31,9 @@ FINAL_SEGMENT_MIN_SECONDS = 1.0
 MAX_OFFSET_ROWS = 40
 MIN_OFFSET_SECONDS = 1.0
 STAGED_INPUT_MAX_BYTES = 256 * 1024 * 1024
+# A Dispatcharr worker that froze keeps the HTTP connection open without data;
+# FFmpeg then ends on its own instead of waiting for the media-idle timeout.
+INPUT_READ_TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -268,6 +271,8 @@ class FFmpegCopyRecorder:
         if self.input_headers:
             header_block = "".join(f"{name}: {value}\r\n" for name, value in self.input_headers.items())
             command.extend(["-headers", header_block])
+        if self.proxy_url.startswith(("http://", "https://")):
+            command.extend(["-rw_timeout", str(INPUT_READ_TIMEOUT_SECONDS * 1_000_000)])
         command.extend([
             "-i", self.proxy_url,
             # Vu+/DVB transport streams may contain private data PIDs that

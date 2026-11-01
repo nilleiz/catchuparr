@@ -556,6 +556,7 @@ class RecorderTaskTests(unittest.TestCase):
                         patch("catchuparr.engine.store.ArchiveStore", return_value=object()),
                         patch.object(recorder_module, "FFmpegCopyRecorder", FakeRecorder),
                         patch("catchuparr.tasks.threading.Event", FastEvent),
+                        patch.object(tasks, "RESTART_STAGGER_STEP_SECONDS", 0.0),
                     ):
                         task_thread = threading.Thread(
                             target=lambda: result_holder.append(
@@ -752,7 +753,7 @@ class RecorderTaskTests(unittest.TestCase):
                 result = tasks.reconcile_recorders()
                 self.assertEqual(["authority_recovery", "queue"], events)
                 self.assertEqual(
-                    [{"args": ["channel-1", expected_generation, 7], "queue": "dvr"}],
+                    [{"args": ["channel-1", expected_generation, 7], "queue": "dvr", "countdown": 0.0}],
                     queued,
                 )
                 recovery_allowed[0] = False
