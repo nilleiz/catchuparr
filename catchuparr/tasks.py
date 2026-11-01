@@ -144,6 +144,8 @@ def _handover_overlap_seconds(active, prepared, attempt_state) -> float:
 
 
 RETURN_TAIL_POLL_SECONDS = 0.5
+PRIOR_SHARING_OPERATION_WAIT_SECONDS = 90.0
+PRIOR_SHARING_OPERATION_RETRY_SECONDS = 2.0
 
 
 def _start_return_tail_watch(
@@ -413,7 +415,7 @@ def reconcile_recorders():
 
     from .configuration import (
         load_applied_state,
-        rehydrate_current_sharing_authority,
+        rehydrate_sharing_authority_channels,
         reset_legacy_configuration,
     )
     from .engine.store import ArchiveStore
@@ -436,11 +438,18 @@ def reconcile_recorders():
     apply_log_level(active.get("log_level", "INFO") if active else "INFO")
     config = load_config(active_snapshot=active) if active is not None else None
     if config is not None and active is not None and control is not None:
-        if not rehydrate_current_sharing_authority(active, control):
+        stale_authority = rehydrate_sharing_authority_channels(active, control)
+        if stale_authority is None:
             from .logging_utils import error
 
             error("sharing_recovery_failed", callsite="startup_recovery")
             return {"queued": 0, "cleanup_pending": 0}
+        if stale_authority:
+            from .logging_utils import error
+
+            # Each such channel records without borrowing until the next Apply;
+            # the other channels are unaffected.
+            error("sharing_authority_stale", callsite="reconcile_cleanup")
     cleanup_pending = set()
     if config is not None and active is not None:
         generation = configuration_generation(active)
@@ -583,6 +592,7 @@ def record_channel(
     from .engine.store import ArchiveStore
     from .logging_utils import error, event
     from .recorder_proxy import (
+        PriorSharingOperationPending,
         RecorderAttemptAdmissionUncertain,
         candidate_is_current,
         current_sharing_authority_context,
@@ -615,6 +625,17 @@ def record_channel(
     fence = lease.acquire()
     if fence is None:
         return {"status": "already_running"}
+    try:
+        from .engine.recorder import reap_orphaned_inputs
+
+        # A recorder that lost its lease without reaping FFmpeg (for example a
+        # crashed worker) leaves inputs that hold provider connections and
+        # block the exact cleanup of its private sources.
+        reaped = reap_orphaned_inputs(config.archive_root / "work", str(channel_uuid))
+        if reaped:
+            event("recorder_orphans_reaped", count=reaped)
+    except Exception as exc:
+        error("recorder_cleanup_pending", exc, callsite="startup_recovery")
     stats_capability_key = None
     stats_capability_digest = None
     stop_event = None
@@ -700,8 +721,11 @@ def record_channel(
         sharing = active.get("connection_sharing")
         sharing_setting = sharing.get(channel_uuid) if isinstance(sharing, dict) else None
         sharing_enabled = isinstance(sharing_setting, dict) and sharing_setting.get("enabled") is True
+        # Source ranking follows the applied setting even while a stale
+        # sharing authority makes this run record without borrowing.
+        all_sources = sharing_enabled
         candidates = ranked_source_candidates(
-            channel_uuid, active, all_sources=sharing_enabled,
+            channel_uuid, active, all_sources=all_sources,
         )
         # Sharing-enabled channels use the all-assigned-source ordering even
         # when the user did not add a source filter. The legacy channel route
@@ -788,6 +812,18 @@ def record_channel(
                 return {"status": "sharing_recovery_stale"}
             active = recovered_admission["active"]
 
+        if sharing_enabled and current_sharing_authority_context(
+            redis, str(channel_uuid), config_generation=expected_generation,
+            control_generation=expected_control_generation,
+        ) is None:
+            # The channel's sources changed after the last Apply, so its applied
+            # sharing authority no longer matches them. Record from a dedicated
+            # source without borrowing until the next Apply restores sharing.
+            error("sharing_authority_stale", callsite="startup_admission")
+            sharing_enabled = False
+            if candidates is not None and not candidates:
+                return {"status": "no_permitted_sources"}
+        if sharing_enabled:
             sharing_coordinator = RecorderBorrowCoordinator(
                 redis,
                 config.archive_root,
@@ -1183,6 +1219,7 @@ def record_channel(
 
             candidate_index = 0
             candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
+            prior_operation_since = None
             while True:
                 while candidate_index < len(candidates):
                     if run_prepared_borrow():
@@ -1247,6 +1284,18 @@ def record_channel(
                             internal_base_url=proxy_base_url,
                             sharing_authority=sharing_authority,
                         )
+                    except PriorSharingOperationPending:
+                        # The previous attempt closes once its native source saw
+                        # the reaped input leave; wait for it under this lease.
+                        if prior_operation_since is None:
+                            prior_operation_since = time.monotonic()
+                        if (time.monotonic() - prior_operation_since
+                                >= PRIOR_SHARING_OPERATION_WAIT_SECONDS):
+                            error("sharing_attempt_cleanup_pending", callsite="attempt_reconciliation")
+                            return {"status": "sharing_cleanup_pending"}
+                        if stop_event.wait(PRIOR_SHARING_OPERATION_RETRY_SECONDS):
+                            break
+                        continue
                     except RecorderAttemptAdmissionUncertain as exc:
                         uncertain = exc.attempt
                         digest = uncertain.capability_key.removeprefix(
@@ -1476,7 +1525,7 @@ def record_channel(
                     return {"status": "lease_lost"}
                 try:
                     refreshed_candidates = ranked_source_candidates(
-                        channel_uuid, retry_admission["active"], all_sources=sharing_enabled,
+                        channel_uuid, retry_admission["active"], all_sources=all_sources,
                     )
                 except Exception as exc:
                     error("recorder_retry_candidates_failed", exc, callsite="candidate_retry")

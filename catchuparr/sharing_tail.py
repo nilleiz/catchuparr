@@ -12,6 +12,7 @@ import math
 import threading
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Callable
 
 from .sharing_return_tail import (
@@ -286,6 +287,7 @@ class ReturnTail:
         self.switch = None
         self.thread: threading.Thread | None = None
         self.result = None
+        self._generation = 0
         self._lock = threading.RLock()
 
     # -- planner glue -----------------------------------------------------
@@ -314,10 +316,19 @@ class ReturnTail:
         from .logging_utils import event
 
         with self._lock:
+            if (self.state is not None and self.state.phase is TailPhase.CLOSED
+                    and self.state.outcome == "viewer_returned" and episode_phase == "wait_return"):
+                # The viewer came back before the return; the next grace of the
+                # same borrow plans a new tail under a new tail id.
+                self.state = self.reader = self.recorder = self.staged = None
+                self._generation += 1
             if self.state is None:
                 if episode_phase != "wait_return" or self.stop_event.is_set():
                     return
-                decision = plan_return(self.request_factory(self.clock()))
+                request = self.request_factory(self.clock())
+                if self._generation:
+                    request = replace(request, tail_id=f"{request.tail_id}-{self._generation}")
+                decision = plan_return(request)
                 if TailAction.OPEN_TAIL not in decision.actions:
                     if decision.state.outcome != "not_yet":
                         self.state = decision.state

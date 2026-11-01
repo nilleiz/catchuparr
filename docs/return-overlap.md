@@ -119,7 +119,7 @@ Events carry the tail id; an event for another tail id is ignored. Events in
 "Active" means `opening`, `joining`, `tailing` or `seeking`. A RETURN token
 before the borrow cleanup was acknowledged, and a join before the return
 deadline, are ignored. After `viewer_returned` the borrow simply continues; a
-later `wait_return` may plan a new tail with a new tail id. A viewer arriving
+later `wait_return` of the same borrow plans a new tail with a new tail id. A viewer arriving
 after the return deadline does not interrupt the tail (see below). `fallback_to_dedicated`
 is the existing unsynchronized return; `plain_return` is today's return path
 for a borrow that still publishes.

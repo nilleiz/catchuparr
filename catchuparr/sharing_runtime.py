@@ -2067,13 +2067,15 @@ def _native_source_catalog(channel_uuid: str) -> tuple[tuple[NativeAssignedSourc
             ))
     if not rows:
         raise BorrowEpisodeRejected("no fully described M3U source assignments remain")
-    canonical = [
+    # The digest binds which sources are assigned and usable, not the order a
+    # viewer tries them in. Reordering streams must not invalidate authority.
+    canonical = sorted(
         [row.channel_uuid, row.stream_id, row.account_id, row.m3u_profile_id,
          row.input_profile_id, row.assigned, row.account_active, row.profile_active,
          row.media_compatible, row.supported_worker_kind, row.redirect_channel,
          row.vod_or_preview]
         for row in rows
-    ]
+    )
     digest = hashlib.sha256(
         json.dumps(canonical, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     ).hexdigest()
