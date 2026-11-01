@@ -4,6 +4,20 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.12] - Prerelease
+
+### Fixed
+
+- After an Apply, a recorder reopens the source it was recording from. Every
+  Apply issues a new sharing authority, which supersedes the operation of each
+  running recording; the recorder treated that like a failed source and moved
+  on to the next, lower-ranked source. Such a source could refuse the
+  connection and leave a gap of about half a minute until the recorder came
+  back to its first source.
+- These reopens are spread out like the restarts of 0.7.11: each channel
+  keeps its running recording for its own stagger delay of up to 16 seconds,
+  so an Apply no longer reopens every channel at the same moment.
+
 ## [0.7.11] - Prerelease
 
 ### Fixed

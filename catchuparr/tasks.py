@@ -159,6 +159,14 @@ def _restart_stagger_seconds(channel_uuid) -> float:
     return (slot % RESTART_STAGGER_SLOTS) * RESTART_STAGGER_STEP_SECONDS
 
 
+def _superseded_switch_due(state, attempt, channel_uuid, *, now=None) -> bool:
+    """True once a superseded attempt's per-channel stagger delay has passed."""
+    now = time.monotonic() if now is None else now
+    if state.get("attempt") is not attempt:
+        state.update(attempt=attempt, since=now)
+    return now - state["since"] >= _restart_stagger_seconds(channel_uuid)
+
+
 def _stagger_restart(channel_uuid, lease, stop_event, keep_alive=lambda: True, *, clock=time.monotonic):
     """Keep a stale recorder alive for its stagger delay, renewing its lease."""
     deadline = clock() + _restart_stagger_seconds(channel_uuid)
@@ -899,6 +907,7 @@ def record_channel(
             )
 
         def supervise():
+            superseded = {"attempt": None, "since": 0.0}
             signature = None
             next_full_check = time.monotonic() + RECORDER_SUPERVISION_INTERVAL_SECONDS
             interval = (SHARING_WATCH_INTERVAL_SECONDS if sharing_coordinator is not None
@@ -994,7 +1003,12 @@ def record_channel(
                         # stop the task because teardown revoked its bearer.
                         if current_attempt is not None and current_switch is not None:
                             if current_attempt.operation_needs_switch(redis):
-                                current_switch.request()
+                                # Every Apply supersedes all running operations at
+                                # once; reopen each channel's source in its own turn.
+                                if _superseded_switch_due(superseded, current_attempt, channel_uuid):
+                                    current_switch.request(superseded=True)
+                                elif not current_attempt.renew(redis):
+                                    current_switch.request()
                             elif not current_attempt.renew(redis):
                                 current_switch.request()
                         elif current_attempt is not None and not current_attempt.renew(redis):
@@ -1557,6 +1571,13 @@ def record_channel(
                         # an allowlisted source after that reader closes at grace.
                         candidate_index = 0
                         candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
+                        continue
+                    if (result is not None and result.status == "switch_requested"
+                            and result.useful_segments > 0
+                            and attempt_switch is not None and attempt_switch.superseded):
+                        # A newer sharing authority (every Apply) replaced this
+                        # working attempt's operation. Reopen the same source
+                        # instead of falling back to a lower-ranked one.
                         continue
                     candidate_index += 1
                 if sharing_coordinator is None or stop_event.is_set():
