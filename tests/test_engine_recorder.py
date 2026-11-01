@@ -47,6 +47,18 @@ class RecorderTests(unittest.TestCase):
         local = FFmpegCopyRecorder(self.store, "ch1", str(self.root / "input.ts"), self.root / "work")
         self.assertNotIn("-rw_timeout", local.command(self.root / "output"))
 
+    def test_switch_records_only_the_first_reason(self):
+        from catchuparr.engine.recorder import RecorderAttemptSwitch
+
+        superseded = RecorderAttemptSwitch()
+        superseded.request(superseded=True)
+        superseded.request()
+        self.assertTrue(superseded.superseded)
+        plain = RecorderAttemptSwitch()
+        plain.request()
+        plain.request(superseded=True)
+        self.assertFalse(plain.superseded)
+
     def test_internal_capability_is_sent_as_header_not_url(self):
         recorder = FFmpegCopyRecorder(
             self.store,
