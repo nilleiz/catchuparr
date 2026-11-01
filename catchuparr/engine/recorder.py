@@ -60,9 +60,14 @@ class RecorderAttemptSwitch:
         self._wake = threading.Event()
         self._offered = None
         self.attempt_id = uuid.uuid4().hex
+        # True when the switch only replaces a working attempt whose sharing
+        # operation a newer authority superseded; its source stays the same.
+        self.superseded = False
 
-    def request(self) -> None:
+    def request(self, *, superseded: bool = False) -> None:
         with self._lock:
+            if not self._requested.is_set():
+                self.superseded = superseded
             self._requested.set()
             self._wake.set()
 

@@ -159,6 +159,25 @@ def _restart_stagger_seconds(channel_uuid) -> float:
     return (slot % RESTART_STAGGER_SLOTS) * RESTART_STAGGER_STEP_SECONDS
 
 
+def _superseded_switch_due(state, attempt, channel_uuid, *, now=None) -> bool:
+    """True once a superseded attempt's per-channel stagger delay has passed."""
+    now = time.monotonic() if now is None else now
+    if state.get("attempt") is not attempt:
+        state.update(attempt=attempt, since=now)
+    return now - state["since"] >= _restart_stagger_seconds(channel_uuid)
+
+
+def _restart_follows(status, channel_uuid) -> bool:
+    """True when a stale recorder is replaced by one under the new applied state.
+
+    Only such a restart is staggered; a recorder that the new state closes,
+    pauses or disables stops at once.
+    """
+    return status in RESTART_STATUSES and _supervisor_recorder_admission_state(
+        channel_uuid, None, None, current=True,
+    )["status"] == "ready"
+
+
 def _stagger_restart(channel_uuid, lease, stop_event, keep_alive=lambda: True, *, clock=time.monotonic):
     """Keep a stale recorder alive for its stagger delay, renewing its lease."""
     deadline = clock() + _restart_stagger_seconds(channel_uuid)
@@ -899,6 +918,7 @@ def record_channel(
             )
 
         def supervise():
+            superseded = {"attempt": None, "since": 0.0}
             signature = None
             next_full_check = time.monotonic() + RECORDER_SUPERVISION_INTERVAL_SECONDS
             interval = (SHARING_WATCH_INTERVAL_SECONDS if sharing_coordinator is not None
@@ -919,7 +939,7 @@ def record_channel(
                     if (
                         current_admission["status"] != "ready" or not lease.renew()
                     ):
-                        if current_admission["status"] in RESTART_STATUSES:
+                        if _restart_follows(current_admission["status"], channel_uuid):
                             _stagger_restart(
                                 channel_uuid, lease, stop_event,
                                 lambda: stats_capability_key is None or bool(redis.expire(
@@ -994,7 +1014,12 @@ def record_channel(
                         # stop the task because teardown revoked its bearer.
                         if current_attempt is not None and current_switch is not None:
                             if current_attempt.operation_needs_switch(redis):
-                                current_switch.request()
+                                # Every Apply supersedes all running operations at
+                                # once; reopen each channel's source in its own turn.
+                                if _superseded_switch_due(superseded, current_attempt, channel_uuid):
+                                    current_switch.request(superseded=True)
+                                elif not current_attempt.renew(redis):
+                                    current_switch.request()
                             elif not current_attempt.renew(redis):
                                 current_switch.request()
                         elif current_attempt is not None and not current_attempt.renew(redis):
@@ -1558,6 +1583,13 @@ def record_channel(
                         candidate_index = 0
                         candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
                         continue
+                    if (result is not None and result.status == "switch_requested"
+                            and result.useful_segments > 0
+                            and attempt_switch is not None and attempt_switch.superseded):
+                        # A newer sharing authority (every Apply) replaced this
+                        # working attempt's operation. Reopen the same source
+                        # instead of falling back to a lower-ranked one.
+                        continue
                     candidate_index += 1
                 if sharing_coordinator is None or stop_event.is_set():
                     break
@@ -1652,7 +1684,7 @@ def _active_schedule(active, channel_uuid):
 
 
 def _supervisor_recorder_admission_state(
-    channel_uuid, expected_generation, expected_control_generation,
+    channel_uuid, expected_generation, expected_control_generation, *, current=False,
 ):
     """Run periodic ORM-backed admission away from Dispatcharr's gevent loop."""
     try:
@@ -1662,6 +1694,7 @@ def _supervisor_recorder_admission_state(
         # the normal synchronous behavior.
         return _recorder_admission_state(
             channel_uuid, expected_generation, expected_control_generation,
+            current=current,
         )
 
     def check_admission():
@@ -1674,6 +1707,7 @@ def _supervisor_recorder_admission_state(
         try:
             return _recorder_admission_state(
                 channel_uuid, expected_generation, expected_control_generation,
+                current=current,
             )
         finally:
             if close_old_connections is not None:
@@ -1682,7 +1716,9 @@ def _supervisor_recorder_admission_state(
     return get_hub().threadpool.apply(check_admission)
 
 
-def _recorder_admission_state(channel_uuid, expected_generation, expected_control_generation):
+def _recorder_admission_state(channel_uuid, expected_generation, expected_control_generation,
+                              *, current=False):
+    """Admission of this channel's recorder; ``current`` admits any applied generation."""
     from .configuration import load_applied_state
     from .logging_utils import apply_log_level, error, event
     from .recorder_control import RecorderControlError
@@ -1697,7 +1733,7 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
         return {"status": "control_unavailable"}
     if control.paused:
         return {"status": "recording_paused"}
-    if control.generation != expected_control_generation:
+    if not current and control.generation != expected_control_generation:
         event("recorder_stale_job")
         return {"status": "stale_control"}
     if active is None:
@@ -1708,7 +1744,7 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
     if config is None or channel_uuid not in config.channel_uuids:
         event("recorder_disabled")
         return {"status": "disabled"}
-    if configuration_generation(active) != expected_generation:
+    if not current and configuration_generation(active) != expected_generation:
         event("recorder_stale_job")
         return {"status": "stale_configuration"}
     active_channels = set(str(active.get("channel_uuids") or "").splitlines())
