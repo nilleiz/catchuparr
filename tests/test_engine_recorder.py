@@ -37,6 +37,16 @@ class RecorderTests(unittest.TestCase):
         self.assertNotIn("-vf", args)
         self.assertNotIn("-af", args)
 
+    def test_http_input_ends_when_it_stays_silent(self):
+        from catchuparr.engine.recorder import INPUT_READ_TIMEOUT_SECONDS
+
+        args = self.recorder.command(self.root / "output")
+        timeout_index = args.index("-rw_timeout")
+        self.assertLess(timeout_index, args.index("-i"))
+        self.assertEqual(str(INPUT_READ_TIMEOUT_SECONDS * 1_000_000), args[timeout_index + 1])
+        local = FFmpegCopyRecorder(self.store, "ch1", str(self.root / "input.ts"), self.root / "work")
+        self.assertNotIn("-rw_timeout", local.command(self.root / "output"))
+
     def test_internal_capability_is_sent_as_header_not_url(self):
         recorder = FFmpegCopyRecorder(
             self.store,

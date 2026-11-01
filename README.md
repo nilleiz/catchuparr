@@ -407,6 +407,11 @@ can be replaced with ordinary spaces in the destination text.
   accounts or profiles changed after the last Apply. The channel keeps
   recording from a dedicated source without sharing; Apply restores sharing.
   Reordering streams alone does not cause this.
+- **A channel shows more provider connections than viewers and recorders:** a
+  Dispatcharr web worker may have stopped responding while it still holds
+  upstream connections. Its heartbeat key `live:worker:<host>:<pid>:heartbeat`
+  is then missing in Redis. Restarting that worker (or Dispatcharr) releases
+  the connections; Catchuparr recorders recover on their own.
 - **Token links fail:** check the applied public URL, user ID, active user,
   channel permission, catch-up permission, stream limits and reverse-proxy path.
 - **History is missing:** verify local recording coverage, retention, selected
