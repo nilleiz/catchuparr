@@ -57,6 +57,8 @@ _EVENTS = frozenset({
     "return_tail_joined",
     "return_tail_closed",
     "sharing_tail_cleanup_pending",
+    "recorder_orphans_reaped",
+    "sharing_authority_stale",
 })
 _ERROR_CATEGORIES = frozenset({
     "configuration_recovery_failed",
@@ -88,6 +90,7 @@ _ERROR_CATEGORIES = frozenset({
     "sharing_return_media_unconfirmed",
     "sharing_return_binding_stale",
     "sharing_tail_cleanup_pending",
+    "sharing_authority_stale",
     "diagnostic_category_invalid",
 })
 _STATE_KEYS = frozenset({

@@ -263,6 +263,10 @@ return 1
 """
 
 
+class PriorSharingOperationPending(RuntimeError):
+    """An ended recorder's sharing attempt is not yet reaped by its native source."""
+
+
 class RecorderAttemptAdmissionUncertain(RuntimeError):
     """An issue write may have committed; exact attempt identity is retained."""
 
@@ -499,6 +503,15 @@ def reconcile_prior_sharing_operation(
         if (worker.get("state") not in {"released", "failed"}
                 or operation.get("status") not in {"active", "closing"}):
             return False
+        # A previous recorder that ended, for example by a crash, before it
+        # revoked its attempt leaves it active. Its lease is older and its
+        # source released, so the revocation it would have made is completed.
+        if operation.get("status") == "active" and not begin_sharing_operation_close_exact(
+            redis_client, channel_uuid=channel_uuid, operation_id=operation_id,
+            operation_revision=revision, worker_id=str(worker_id),
+            capability_digest=str(digest),
+        ):
+            return False
         if not _reconcile_operation_open_slots(
             redis_client, channel_uuid, operation_id, revision,
         ):
@@ -510,6 +523,27 @@ def reconcile_prior_sharing_operation(
         )
     except Exception:
         return False
+
+
+def begin_sharing_operation_close_exact(
+    redis_client, *, channel_uuid: str, operation_id: str,
+    operation_revision: int, worker_id: str, capability_digest: str,
+) -> bool:
+    """Tombstone one exact attempt by its stored digest, without its bearer token."""
+    if (not isinstance(capability_digest, str) or len(capability_digest) != 64
+            or any(char not in "0123456789abcdef" for char in capability_digest)):
+        return False
+    try:
+        result = redis_client.eval(
+            _BEGIN_SHARING_OPERATION_CLOSE_LUA, 3,
+            _sharing_operation_current_key(channel_uuid),
+            _sharing_operation_key(channel_uuid, operation_id),
+            CAPABILITY_PREFIX + capability_digest,
+            operation_id, str(operation_revision), worker_id, capability_digest,
+        )
+    except Exception:
+        return False
+    return type(result) is int and result == 1
 
 
 def close_sharing_operation_after_reap_exact(
@@ -1074,7 +1108,7 @@ def issue_recorder_attempt(
             redis_client, channel_uuid=str(channel_uuid),
             current_lease_value=str(lease_value), current_lease_fence=int(fence),
         ):
-            raise RuntimeError("previous sharing operation still requires exact cleanup")
+            raise PriorSharingOperationPending("previous sharing operation still requires exact cleanup")
         raw_sequence = redis_client.get(operation_sequence_key)
         if raw_sequence is None:
             sequence = 0
