@@ -4,6 +4,25 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.11] - Prerelease
+
+### Fixed
+
+- An Apply no longer restarts every running recorder in the same moment. A
+  recorder whose configuration became stale keeps recording for a stable
+  per-channel delay of up to 16 seconds before it stops, and reconciliation
+  starts new recorders 3 seconds apart. Stopping and opening many native
+  channels on the same Dispatcharr workers at once had frozen a worker, which
+  then kept provider connections open that belonged to no channel. Pause,
+  disabled recording and a closing schedule still stop recorders at once.
+- A recorder whose borrowed viewer reader vanished together with the
+  Dispatcharr worker serving it no longer waits forever for that reader's
+  cleanup. Once the reader's client and projection are proven absent, the
+  recorder closes its own borrow episode under the same tombstone as startup
+  recovery and returns to a dedicated source.
+- FFmpeg ends an HTTP input that delivers no data for 60 seconds, so a frozen
+  Dispatcharr worker cannot hold a recorder input open indefinitely.
+
 ## [0.7.10] - Prerelease
 
 ### Fixed

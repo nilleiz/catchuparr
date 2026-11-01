@@ -157,3 +157,72 @@ class SupersededBorrowRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AbandonedOwnBorrowTests(unittest.TestCase):
+    """The recorder's own borrow whose Dispatcharr worker died with its reader."""
+
+    OWN_LEASE = "11:old-owner"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.ledger = BorrowEpisodeLedger(Path(self.temp.name) / "sharing.sqlite3")
+        token = SharingIntentToken(
+            channel_uuid=CHANNEL, revision=1, intent_epoch=1,
+            action=SharingAction.ATTACH_BORROW,
+            configuration_generation="synthetic-config", control_generation=8,
+            recorder_fence=11, target_identity=IDENTITY, target_admitted=True, not_before=100,
+        )
+        opening = self.ledger.begin_open(
+            token, lease_digest=sha256(self.OWN_LEASE.encode()).hexdigest(),
+            identity=IDENTITY, client_id=CLIENT, expected_version=None,
+        )
+        self.episode = self.ledger.activate(
+            opening.episode_id, expected_version=opening.version, client_id=CLIENT,
+            connected_at="100", ordinary_viewer_ids=("synthetic-viewer",),
+        )
+        self.redis = NativeState()
+        self.redis.lease = self.OWN_LEASE
+        self.context = {"catalog_generation": "synthetic-catalog", "authority_revision": 3}
+
+    def close(self, **kwargs):
+        from catchuparr.sharing_recovery import close_abandoned_own_borrow
+
+        args = dict(episode_id=self.episode.episode_id, client_id=CLIENT,
+                    configuration_generation="synthetic-config", control_generation=8,
+                    recorder_fence=11, lease_value=self.OWN_LEASE,
+                    current_authority=lambda: self.context)
+        args.update(kwargs)
+        return close_abandoned_own_borrow(self.ledger, self.redis, CHANNEL, **args)
+
+    def test_vanished_reader_closes_the_own_episode_once(self):
+        self.assertTrue(self.close())
+        closed = self.ledger.read(CHANNEL)
+        self.assertEqual((self.episode.episode_id, "closed"), (closed.episode_id, closed.phase))
+        self.assertEqual(1, len(self.redis.eval_calls))
+        self.assertTrue(self.close())
+        self.assertEqual(1, len(self.redis.eval_calls))
+
+    def test_a_live_reader_is_never_closed(self):
+        for field in ("projection", "client"):
+            with self.subTest(field=field):
+                setattr(self.redis, field, True)
+                self.assertFalse(self.close())
+                self.assertEqual(self.episode, self.ledger.read(CHANNEL))
+                setattr(self.redis, field, False)
+        self.assertEqual([], self.redis.eval_calls)
+
+    def test_another_episode_lease_or_authority_is_never_closed(self):
+        for args in ({"episode_id": "other-episode"}, {"client_id": "catchuparr-client-other"},
+                     {"recorder_fence": 12, "lease_value": "12:synthetic-current-owner"},
+                     {"configuration_generation": "changed-config"}, {"control_generation": 9},
+                     {"current_authority": lambda: None}):
+            with self.subTest(args=args):
+                self.assertFalse(self.close(**args))
+                self.assertEqual(self.episode, self.ledger.read(CHANNEL))
+
+    def test_lost_lease_is_never_closed(self):
+        self.redis.lease = "12:synthetic-current-owner"
+        self.assertFalse(self.close())
+        self.assertEqual(self.episode, self.ledger.read(CHANNEL))
