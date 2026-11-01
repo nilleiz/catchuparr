@@ -409,6 +409,45 @@ class RecorderTaskTests(unittest.TestCase):
         self.assertEqual(Path("/tmp/synthetic-snapshot-a"), state["config"].archive_root)
         self.assertEqual([active_a], read_snapshots)
 
+    def test_current_admission_ignores_stale_generations_but_not_the_new_state(self):
+        import uuid
+
+        from catchuparr.runtime import parse_settings
+
+        channel = str(uuid.uuid4())
+        open_active = {**_active_configuration(channel), "archive_root": "/tmp/synthetic-current"}
+        closed_active = {
+            **open_active,
+            "recording_schedule": {
+                "timezone": "UTC",
+                "channels": {channel: {"mode": "weekly", "intervals": []}},
+            },
+        }
+        cases = (
+            ("open", open_active, False, "ready"),
+            ("closed", closed_active, False, "outside_schedule"),
+            ("paused", open_active, True, "recording_paused"),
+        )
+        with _isolated_plugin_modules({
+            "celery": _fake_module("celery", shared_task=lambda *, name: lambda fn: fn),
+        }):
+            tasks = importlib.import_module("catchuparr.tasks")
+            for name, active, paused, expected in cases:
+                with self.subTest(name), patch(
+                    "catchuparr.configuration.load_applied_state",
+                    return_value=(active, SimpleNamespace(paused=paused, generation=10)),
+                ), patch(
+                    "catchuparr.runtime.load_config",
+                    side_effect=lambda active_snapshot=None: parse_settings(active_snapshot),
+                ):
+                    # The recorder was admitted under an older generation.
+                    self.assertIn(tasks._recorder_admission_state(
+                        channel, "older-generation", 9,
+                    )["status"], {"stale_control", "stale_configuration", "recording_paused"})
+                    self.assertEqual(expected, tasks._recorder_admission_state(
+                        channel, None, None, current=True,
+                    )["status"])
+
     def test_supervisor_admission_runs_in_native_pool_and_closes_thread_db_state(self):
         caller_thread = threading.get_ident()
         admission_threads = []
@@ -456,7 +495,7 @@ class RecorderTaskTests(unittest.TestCase):
         with _isolated_plugin_modules(fake_modules):
             tasks = importlib.import_module("catchuparr.tasks")
 
-            def admission(*_args):
+            def admission(*_args, **_kwargs):
                 admission_threads.append(threading.get_ident())
                 return result
 

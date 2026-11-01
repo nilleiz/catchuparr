@@ -401,6 +401,27 @@ class StaggeredRestartTests(unittest.TestCase):
             self.assertTrue(tasks._superseded_switch_due({"attempt": None, "since": 0.0}, first,
                                                          "channel-1", now=5.0))
 
+    def test_only_a_restart_under_the_new_state_is_staggered(self):
+        tasks = self.tasks()
+        for status, current, expected in (
+            ("stale_configuration", "ready", True),
+            ("stale_control", "ready", True),
+            ("stale_configuration", "outside_schedule", False),
+            ("stale_configuration", "disabled", False),
+            ("stale_control", "recording_paused", False),
+            ("outside_schedule", "ready", False),
+            ("lease_lost", "ready", False),
+        ):
+            with self.subTest(status=status, current=current), patch.object(
+                tasks, "_supervisor_recorder_admission_state",
+                return_value={"status": current},
+            ) as admission:
+                self.assertIs(expected, tasks._restart_follows(status, "channel-1"))
+                if status in tasks.RESTART_STATUSES:
+                    admission.assert_called_once_with("channel-1", None, None, current=True)
+                else:
+                    admission.assert_not_called()
+
     def test_stale_recorder_keeps_its_lease_until_its_turn(self):
         tasks = self.tasks()
         clock = {"now": 0.0}
