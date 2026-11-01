@@ -332,6 +332,64 @@ class RecorderStartRecoveryTests(_RecordChannelHarness, unittest.TestCase):
         self.assertNotIn(("return_after_cleanup", "return"), events)
 
 
+class StaggeredRestartTests(unittest.TestCase):
+    def tasks(self):
+        stack = ExitStack()
+        stack.enter_context(_isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())))
+        self.addCleanup(stack.close)
+        return importlib.import_module("catchuparr.tasks")
+
+    def test_each_channel_has_a_stable_delay_within_the_spread(self):
+        tasks = self.tasks()
+        channels = [f"00000000-0000-0000-0000-{index:012d}" for index in range(40)]
+        delays = [tasks._restart_stagger_seconds(channel) for channel in channels]
+        self.assertEqual(delays, [tasks._restart_stagger_seconds(channel) for channel in channels])
+        maximum = (tasks.RESTART_STAGGER_SLOTS - 1) * tasks.RESTART_STAGGER_STEP_SECONDS
+        self.assertTrue(all(0.0 <= delay <= maximum for delay in delays))
+        self.assertGreater(len(set(delays)), 1, "channels must not all stop together")
+
+    def test_stale_recorder_keeps_its_lease_until_its_turn(self):
+        tasks = self.tasks()
+        clock = {"now": 0.0}
+        renewals, keep_alives = [], []
+
+        class Stop:
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                clock["now"] += seconds
+                return False
+
+        lease = SimpleNamespace(renew=lambda: renewals.append(clock["now"]) or True)
+        with patch.object(tasks, "_restart_stagger_seconds", return_value=5.0):
+            tasks._stagger_restart("channel-1", lease, Stop(), lambda: keep_alives.append(1) or True,
+                                   clock=lambda: clock["now"])
+        self.assertEqual(5.0, clock["now"])
+        self.assertEqual(5, len(renewals))
+        self.assertEqual(5, len(keep_alives))
+
+    def test_stagger_ends_early_on_stop_or_lost_lease(self):
+        tasks = self.tasks()
+        for name, stop_after, renew in (("stop", 2, True), ("lease lost", None, False)):
+            with self.subTest(name):
+                clock = {"now": 0.0, "waits": 0}
+
+                class Stop:
+                    def is_set(self):
+                        return stop_after is not None and clock["waits"] >= stop_after
+
+                    def wait(self, seconds):
+                        clock["waits"] += 1
+                        clock["now"] += seconds
+                        return self.is_set()
+
+                lease = SimpleNamespace(renew=lambda: renew)
+                with patch.object(tasks, "_restart_stagger_seconds", return_value=16.0):
+                    tasks._stagger_restart("channel-1", lease, Stop(), clock=lambda: clock["now"])
+                self.assertLess(clock["now"], 16.0)
+
+
 class ReturnTailWatchGateTests(unittest.TestCase):
     def test_watch_starts_only_for_a_configured_delayed_return(self):
         with _isolated_plugin_modules(_recording_task_fake_modules(FakeRedis())):

@@ -100,6 +100,7 @@ class PipedRecorderTests(unittest.TestCase):
         index = command.index("-i")
         self.assertEqual(command[index - 2:index + 2], ["-f", "mpegts", "-i", "pipe:0"])
         self.assertNotIn("-headers", command)
+        self.assertNotIn("-rw_timeout", command)
 
     def test_source_must_provide_chunks_and_activity(self):
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):

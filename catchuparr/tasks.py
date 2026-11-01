@@ -144,6 +144,33 @@ def _handover_overlap_seconds(active, prepared, attempt_state) -> float:
 
 
 RETURN_TAIL_POLL_SECONDS = 0.5
+# An Apply makes every running recorder stale at once. Restarting them all in
+# the same moment stops and opens many native channels on the same Dispatcharr
+# workers together, which has frozen a worker. Spread both sides out.
+RESTART_STATUSES = frozenset({"stale_configuration", "stale_control"})
+RESTART_STAGGER_SLOTS = 5
+RESTART_STAGGER_STEP_SECONDS = 4.0
+START_STAGGER_SECONDS = 3.0
+
+
+def _restart_stagger_seconds(channel_uuid) -> float:
+    """A stable per-channel delay so stale recorders do not all stop together."""
+    slot = int(hashlib.sha256(str(channel_uuid).encode("utf-8")).hexdigest()[:8], 16)
+    return (slot % RESTART_STAGGER_SLOTS) * RESTART_STAGGER_STEP_SECONDS
+
+
+def _stagger_restart(channel_uuid, lease, stop_event, keep_alive=lambda: True, *, clock=time.monotonic):
+    """Keep a stale recorder alive for its stagger delay, renewing its lease."""
+    deadline = clock() + _restart_stagger_seconds(channel_uuid)
+    while not stop_event.is_set():
+        remaining = deadline - clock()
+        if remaining <= 0 or stop_event.wait(min(1.0, remaining)):
+            return
+        try:
+            if not lease.renew() or not keep_alive():
+                return
+        except Exception:
+            return
 PRIOR_SHARING_OPERATION_WAIT_SECONDS = 90.0
 PRIOR_SHARING_OPERATION_RETRY_SECONDS = 2.0
 
@@ -506,9 +533,11 @@ def reconcile_recorders():
                     dispatch_key = f"catchuparr:dispatch:{channel}"
                     if redis.exists(lease_key):
                         continue
-                    if redis.set(dispatch_key, "1", nx=True, ex=60):
+                    countdown = queued * START_STAGGER_SECONDS
+                    if redis.set(dispatch_key, "1", nx=True, ex=int(60 + countdown)):
                         record_channel.apply_async(
-                            args=[channel, generation, control.generation], queue="dvr"
+                            args=[channel, generation, control.generation], queue="dvr",
+                            countdown=countdown,
                         )
                         queued += 1
     if config is not None:
@@ -890,6 +919,13 @@ def record_channel(
                     if (
                         current_admission["status"] != "ready" or not lease.renew()
                     ):
+                        if current_admission["status"] in RESTART_STATUSES:
+                            _stagger_restart(
+                                channel_uuid, lease, stop_event,
+                                lambda: stats_capability_key is None or bool(redis.expire(
+                                    stats_capability_key, RECORDER_CAPABILITY_TTL_SECONDS,
+                                )),
+                            )
                         stop_event.set()
                         return
                     # Finish a media-confirmed RETURN before observing new
@@ -1034,6 +1070,31 @@ def record_channel(
                         episode_ledger, redis, now=time.time(),
                         stale_after=0, episode_id=prepared.episode_id,
                         channel_uuid=str(channel_uuid),
+                    )
+                    if borrow_cleanup_acknowledged(redis, episode_ledger, prepared):
+                        return True
+                    from .sharing_recovery import close_abandoned_own_borrow
+
+                    def cleanup_authority():
+                        admission = _recorder_admission_state(
+                            channel_uuid, expected_generation, expected_control_generation,
+                        )
+                        if admission["status"] != "ready":
+                            return None
+                        return current_sharing_authority_context(
+                            redis, str(channel_uuid), config_generation=expected_generation,
+                            control_generation=expected_control_generation,
+                        )
+
+                    # The borrowed route closes its episode; when the Dispatcharr
+                    # worker serving it died or froze, nobody else does.
+                    close_abandoned_own_borrow(
+                        episode_ledger, redis, str(channel_uuid),
+                        episode_id=prepared.episode_id, client_id=prepared.client_id,
+                        configuration_generation=expected_generation,
+                        control_generation=expected_control_generation,
+                        recorder_fence=fence, lease_value=str(lease._value),
+                        current_authority=cleanup_authority,
                     )
                     return borrow_cleanup_acknowledged(redis, episode_ledger, prepared)
                 except Exception:
