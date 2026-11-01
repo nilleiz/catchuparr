@@ -81,10 +81,12 @@ class _FakeTail:
 
 class _RecordChannelHarness:
     def run_record_channel(self, *, tail=None, recover_tail=True, outcome_return=True,
-                           authority=True, issue_errors=(), wait_seconds=90.0):
+                           authority=True, issue_errors=(), wait_seconds=90.0,
+                           candidates=None, dedicated_plan=None):
         """Borrow, return at the deadline, then one dedicated attempt that stops."""
         calls, recorder_runs, prepare_calls, acknowledged = [], [], [], []
-        holder = {"issued": [], "reaped": []}
+        holder = {"issued": [], "reaped": [], "issued_candidates": []}
+        plan = list(dedicated_plan or [])
         pending_issue_errors = list(issue_errors)
         stop_box = {"event": _StopEvent()}
         with tempfile.TemporaryDirectory() as temp:
@@ -162,6 +164,8 @@ class _RecordChannelHarness:
                     recorder_runs.append((self.kind, kwargs.get("staged_input")))
                     if self.kind == "borrow":
                         return SimpleNamespace(status="exited", useful_segments=1, return_code=0)
+                    if plan:
+                        return plan.pop(0)(stop_event, kwargs)
                     kwargs["on_first_media"](time.time())
                     stop_event.set()
                     return SimpleNamespace(status="stopped", useful_segments=1, return_code=-15)
@@ -172,6 +176,7 @@ class _RecordChannelHarness:
 
             def issue(_redis, _lease, **kwargs):
                 holder["issued"].append(kwargs.get("sharing_authority"))
+                holder["issued_candidates"].append(kwargs["candidate"]["id"])
                 if pending_issue_errors:
                     raise pending_issue_errors.pop(0)
                 return Attempt(kwargs["candidate"])
@@ -206,7 +211,7 @@ class _RecordChannelHarness:
                         "control": SimpleNamespace(generation=6),
                     }))
                     enter(patch("catchuparr.recorder_proxy.ranked_source_candidates",
-                                return_value=[{"id": "44", "account_id": "fast"}]))
+                                return_value=candidates or [{"id": "44", "account_id": "fast"}]))
                     enter(patch("catchuparr.recorder_proxy.current_sharing_authority_context",
                                 return_value={"authority_revision": 2, "catalog_generation": "catalog"}
                                 if authority else None))
@@ -332,6 +337,40 @@ class RecorderStartRecoveryTests(_RecordChannelHarness, unittest.TestCase):
         self.assertNotIn(("return_after_cleanup", "return"), events)
 
 
+class SupersededAttemptTests(_RecordChannelHarness, unittest.TestCase):
+    CANDIDATES = [{"id": "44", "account_id": "fast"}, {"id": "45", "account_id": "fallback"}]
+
+    @staticmethod
+    def superseded(stop_event, kwargs):
+        kwargs["on_first_media"](time.time())
+        kwargs["attempt_switch"].request(superseded=True)
+        return SimpleNamespace(status="switch_requested", useful_segments=3, return_code=None)
+
+    @staticmethod
+    def failed_switch(stop_event, kwargs):
+        kwargs["attempt_switch"].request()
+        return SimpleNamespace(status="switch_requested", useful_segments=3, return_code=None)
+
+    @staticmethod
+    def stops(stop_event, kwargs):
+        stop_event.set()
+        return SimpleNamespace(status="stopped", useful_segments=1, return_code=-15)
+
+    def test_a_superseded_working_attempt_reopens_the_same_source(self):
+        result, _events, _runs, _prepares, _ack, holder = self.run_record_channel(
+            candidates=self.CANDIDATES, dedicated_plan=[self.superseded, self.stops],
+        )
+        self.assertEqual({"status": "stopped"}, result)
+        self.assertEqual(["44", "44"], holder["issued_candidates"])
+
+    def test_other_switches_still_fall_back_to_the_next_source(self):
+        result, _events, _runs, _prepares, _ack, holder = self.run_record_channel(
+            candidates=self.CANDIDATES, dedicated_plan=[self.failed_switch, self.stops],
+        )
+        self.assertEqual({"status": "stopped"}, result)
+        self.assertEqual(["44", "45"], holder["issued_candidates"])
+
+
 class StaggeredRestartTests(unittest.TestCase):
     def tasks(self):
         stack = ExitStack()
@@ -347,6 +386,41 @@ class StaggeredRestartTests(unittest.TestCase):
         maximum = (tasks.RESTART_STAGGER_SLOTS - 1) * tasks.RESTART_STAGGER_STEP_SECONDS
         self.assertTrue(all(0.0 <= delay <= maximum for delay in delays))
         self.assertGreater(len(set(delays)), 1, "channels must not all stop together")
+
+    def test_superseded_attempt_switches_in_its_own_turn(self):
+        tasks = self.tasks()
+        state = {"attempt": None, "since": 0.0}
+        first, second = object(), object()
+        with patch.object(tasks, "_restart_stagger_seconds", return_value=8.0):
+            self.assertFalse(tasks._superseded_switch_due(state, first, "channel-1", now=100.0))
+            self.assertFalse(tasks._superseded_switch_due(state, first, "channel-1", now=107.9))
+            self.assertTrue(tasks._superseded_switch_due(state, first, "channel-1", now=108.0))
+            # A new attempt starts its own delay.
+            self.assertFalse(tasks._superseded_switch_due(state, second, "channel-1", now=110.0))
+        with patch.object(tasks, "_restart_stagger_seconds", return_value=0.0):
+            self.assertTrue(tasks._superseded_switch_due({"attempt": None, "since": 0.0}, first,
+                                                         "channel-1", now=5.0))
+
+    def test_only_a_restart_under_the_new_state_is_staggered(self):
+        tasks = self.tasks()
+        for status, current, expected in (
+            ("stale_configuration", "ready", True),
+            ("stale_control", "ready", True),
+            ("stale_configuration", "outside_schedule", False),
+            ("stale_configuration", "disabled", False),
+            ("stale_control", "recording_paused", False),
+            ("outside_schedule", "ready", False),
+            ("lease_lost", "ready", False),
+        ):
+            with self.subTest(status=status, current=current), patch.object(
+                tasks, "_supervisor_recorder_admission_state",
+                return_value={"status": current},
+            ) as admission:
+                self.assertIs(expected, tasks._restart_follows(status, "channel-1"))
+                if status in tasks.RESTART_STATUSES:
+                    admission.assert_called_once_with("channel-1", None, None, current=True)
+                else:
+                    admission.assert_not_called()
 
     def test_stale_recorder_keeps_its_lease_until_its_turn(self):
         tasks = self.tasks()
