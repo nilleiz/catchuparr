@@ -23,6 +23,7 @@ from .epg_rules import (
     compile_padding,
     freeze_running,
     plan_windows,
+    preview_matches,
     window_active,
 )
 
@@ -123,6 +124,67 @@ def next_show_start(active: Mapping[str, Any], channel: str, now: float) -> floa
         return None
     starts = [w.start for w in load_windows(windows_path(active)).get(channel, ()) if w.start > now]
     return min(starts) if starts else None
+
+
+def load_programmes(active: Mapping[str, Any], now: float) -> dict[str, list[Programme] | None]:
+    """EPG programmes around ``now`` for every covered channel, from one query.
+
+    A channel without EPG gets an empty list; ``None`` for all channels means
+    the EPG could not be read, so callers keep what they had.
+    """
+    from datetime import timedelta
+
+    from apps.channels.managers import with_effective_values
+    from apps.channels.models import Channel
+    from apps.epg.models import ProgramData
+
+    from .logging_utils import error
+
+    covered = covered_channels(active)
+    programmes: dict[str, list[Programme] | None] = {channel: [] for channel in covered}
+    try:
+        channels = with_effective_values(
+            Channel.objects.filter(uuid__in=sorted(covered)), select_related_fks=True,
+        ).select_related("epg_data__epg_source", "override__epg_data__epg_source")
+        channels_by_epg: dict[int, list[str]] = {}
+        for channel in channels:
+            epg_data = channel.effective_epg_data_obj
+            if epg_data is not None:
+                channels_by_epg.setdefault(epg_data.id, []).append(str(channel.uuid))
+        moment = datetime.fromtimestamp(now, timezone.utc)
+        rows = ProgramData.objects.filter(
+            epg_id__in=list(channels_by_epg),
+            end_time__gt=moment - timedelta(seconds=PLAN_PAST_SECONDS),
+            start_time__lt=moment + timedelta(seconds=PLAN_AHEAD_SECONDS),
+        ).order_by("start_time")
+        for row in rows.iterator(chunk_size=1000):
+            programme = Programme(
+                row.start_time.timestamp(), row.end_time.timestamp(), row.title or "",
+                getattr(row, "sub_title", "") or "", row.description or "",
+            )
+            for channel_uuid in channels_by_epg.get(row.epg_id, ()):
+                programmes[channel_uuid].append(programme)
+    except Exception as exc:
+        error("show_windows_epg_failed", exc, callsite="show_windows_epg")
+        return {channel: None for channel in programmes}
+    return programmes
+
+
+def preview_show_matches(active: Mapping[str, Any], programmes_by_channel: Mapping[str, list[Programme] | None],
+                         now: float, *, limit: int = 20) -> dict[str, Any]:
+    """Upcoming matches per channel for the validation preview."""
+    names = {entry["index"]: entry["name"] for entry in active.get("show_rules") or ()}
+    channels: dict[str, list[dict]] = {}
+    unreadable = False
+    for channel, rules in channel_rules(active).items():
+        programmes = programmes_by_channel.get(channel, [])
+        if programmes is None:
+            unreadable = True
+            continue
+        matches = preview_matches(programmes, rules, now=now, limit=limit)
+        if matches:
+            channels[channel] = [{**m, "rules": [names[i] for i in m["rules"]]} for m in matches]
+    return {"channels": channels, "epg_unavailable": unreadable}
 
 
 def plan_all(active: Mapping[str, Any], programmes_by_channel: Mapping[str, list[Programme] | None],
