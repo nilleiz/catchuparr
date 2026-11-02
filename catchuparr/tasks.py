@@ -469,7 +469,7 @@ def reconcile_recorders():
     from .recorder_control import RecorderControlError
     from .recorder_proxy import configuration_generation
     from .runtime import load_config, require_supported_version
-    from .schedule import ScheduleError, schedule_from_snapshot, schedule_is_active
+    from .schedule import ScheduleError, schedule_from_snapshot
 
     require_supported_version()
     reset_legacy_configuration()
@@ -544,7 +544,7 @@ def reconcile_recorders():
                         continue
                     try:
                         schedule = schedule_from_snapshot(channel_schedules[channel])
-                        if not schedule_is_active(schedule, timezone_name, now):
+                        if not _window_open(active, channel, schedule, timezone_name, now, redis):
                             continue
                     except (KeyError, ScheduleError, ValueError):
                         continue
@@ -1724,7 +1724,7 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
     from .recorder_control import RecorderControlError
     from .recorder_proxy import configuration_generation
     from .runtime import load_config
-    from .schedule import ScheduleError, schedule_is_active
+    from .schedule import ScheduleError
 
     try:
         active, control = load_applied_state()
@@ -1756,7 +1756,75 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
     except (ScheduleError, ValueError) as exc:
         error("schedule_install_failed", exc, callsite="schedule_validation")
         return {"status": "invalid_schedule"}
-    if not schedule_is_active(schedule, timezone_name, datetime.now(timezone.utc)):
+    if not _window_open(active, channel_uuid, schedule, timezone_name, datetime.now(timezone.utc)):
         event("recorder_schedule_closed")
         return {"status": "outside_schedule"}
     return {"status": "ready", "config": config, "active": active, "control": control}
+
+
+def _window_open(active, channel_uuid, schedule, timezone_name, now, redis=None):
+    """Weekly schedule or an open shows window admits the channel's recorder."""
+    from .schedule import schedule_is_active
+
+    if schedule_is_active(schedule, timezone_name, now):
+        return True
+    if not active.get("show_rules"):
+        return False
+    from .show_windows import show_window_open
+
+    return show_window_open(active, channel_uuid, now.timestamp(), redis)
+
+
+@shared_task(name="catchuparr.plan_show_windows")
+def plan_show_windows():
+    """Match the EPG against the shows rules and store each channel's windows."""
+    from apps.channels.managers import with_effective_values
+    from apps.channels.models import Channel
+    from core.utils import RedisClient
+
+    from .configuration import load_active_configuration, reset_legacy_configuration
+    from .epg_rules import Programme
+    from .logging_utils import apply_log_level, event
+    from .runtime import require_supported_version
+    from .show_windows import (
+        PLAN_AHEAD_SECONDS,
+        PLAN_PAST_SECONDS,
+        channel_rules,
+        plan_channel,
+        rules_hash,
+    )
+
+    require_supported_version()
+    reset_legacy_configuration()
+    active = load_active_configuration()
+    if active is None or not active.get("show_rules"):
+        return {"channels": 0}
+    apply_log_level(active.get("log_level", "INFO"))
+    rules = channel_rules(active)
+    digest = rules_hash(active["show_rules"])
+    redis = RedisClient.get_client()
+    now = datetime.now(timezone.utc)
+    channels = with_effective_values(
+        Channel.objects.filter(uuid__in=list(rules)), select_related_fks=True,
+    ).select_related("epg_data__epg_source", "override__epg_data__epg_source")
+    planned = 0
+    for channel in channels:
+        channel_uuid = str(channel.uuid)
+        epg_data = channel.effective_epg_data_obj
+        programmes = []
+        if epg_data is not None:
+            rows = epg_data.programs.filter(
+                end_time__gt=now - timedelta(seconds=PLAN_PAST_SECONDS),
+                start_time__lt=now + timedelta(seconds=PLAN_AHEAD_SECONDS),
+            ).order_by("start_time")
+            programmes = [
+                Programme(
+                    row.start_time.timestamp(), row.end_time.timestamp(), row.title or "",
+                    getattr(row, "sub_title", "") or "", row.description or "",
+                )
+                for row in rows.iterator(chunk_size=500)
+            ]
+        windows = plan_channel(redis, channel_uuid, digest, rules[channel_uuid], programmes, now.timestamp())
+        planned += 1
+        event("show_windows_planned", logging.DEBUG, windows=len(windows))
+    return {"channels": planned}

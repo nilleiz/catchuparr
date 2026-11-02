@@ -23,6 +23,8 @@ RECONCILE_TASK = "catchuparr.reconcile"
 RECONCILE_SCHEDULE = "catchuparr-recorder-reconcile"
 SNAPSHOT_TASK = "catchuparr.snapshot_epg"
 SNAPSHOT_SCHEDULE = "catchuparr-epg-snapshot"
+SHOW_WINDOWS_TASK = "catchuparr.plan_show_windows"
+SHOW_WINDOWS_SCHEDULE = "catchuparr-show-windows"
 
 
 @dataclass(frozen=True)
@@ -392,10 +394,20 @@ def _ensure_schedule() -> None:
     snapshot_interval, _ = IntervalSchedule.objects.get_or_create(
         every=300, period=IntervalSchedule.SECONDS
     )
+    minute_interval, _ = IntervalSchedule.objects.get_or_create(
+        every=60, period=IntervalSchedule.SECONDS
+    )
     PeriodicTask.objects.update_or_create(
         name=SNAPSHOT_SCHEDULE,
         defaults={
             "task": SNAPSHOT_TASK, "interval": snapshot_interval,
+            "queue": "dvr", "enabled": True,
+        },
+    )
+    PeriodicTask.objects.update_or_create(
+        name=SHOW_WINDOWS_SCHEDULE,
+        defaults={
+            "task": SHOW_WINDOWS_TASK, "interval": minute_interval,
             "queue": "dvr", "enabled": True,
         },
     )
@@ -423,7 +435,7 @@ def shutdown() -> None:
         from django_celery_beat.models import PeriodicTask
 
         PeriodicTask.objects.filter(
-            name__in=(RECONCILE_SCHEDULE, SNAPSHOT_SCHEDULE)
+            name__in=(RECONCILE_SCHEDULE, SNAPSHOT_SCHEDULE, SHOW_WINDOWS_SCHEDULE)
         ).update(enabled=False)
     except Exception:
         error("scheduler_disable_failed")
@@ -438,8 +450,9 @@ def shutdown() -> None:
 def reconcile() -> None:
     require_supported_version()
     _ensure_schedule()
-    from .tasks import reconcile_recorders, snapshot_epg
+    from .tasks import plan_show_windows, reconcile_recorders, snapshot_epg
 
+    plan_show_windows.apply_async(queue="dvr")
     reconcile_recorders.apply_async(queue="dvr")
     snapshot_epg.apply_async(queue="dvr")
 
