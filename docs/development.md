@@ -1,5 +1,41 @@
 # Development and deployment
 
+## Change workflow
+
+Every change reaches `main` the same way:
+
+1. **Branch and develop.** Work on `develop/<version>-<topic>` cut from `main`.
+   Write focused `unittest` tests with the behavior change, run only the tests
+   of the touched modules and `ruff check .` locally (install the `ruff`
+   version pinned in `ci.yml` into a throwaway virtual environment), and commit
+   in small steps.
+2. **Full suite in GitHub CI.** Do not run the whole suite locally. Run
+   `gh workflow run ci.yml --ref <branch> -f skip_native=true` for routine
+   unit, lint and package validation; it cannot provide release evidence.
+   Merge `main` into the branch when it moved.
+3. **Native AIO acceptance once per milestone.** The AIO integration job runs
+   on the PR once the change is feature complete, not after every step. Reuse
+   its result for the identical tree; a changed tree needs a new run.
+4. **Verify the update in the isolated Dev stack.** Start from a fresh Dispatcharr
+   backup ZIP of the production system and its applied Catchuparr snapshot, so
+   the new version updates a realistic state. Confirm `dev_egress.py check`
+   passes before starting Dev, run Apply and plugin actions as the service user
+   (not root), exercise the change against real EPG and sources, restart the
+   container, and compare the applied configuration before and after. Restore
+   the Dev settings afterwards. Keep every private detail out of the repository.
+5. **Pull request.** Open a PR to `main` with the problem, changes, verification
+   and user impact in generic terms. Its CI, including the native AIO job, must
+   succeed for the exact tree that is merged.
+6. **Merge and release.** Merge only after green CI and completed Dev
+   verification, with a merge commit. Then run the `Build and publish release`
+   workflow from `main` with the version from `CHANGELOG.md` and the
+   pre-release flag, and verify the assets and `SHA256SUMS`. Merging and
+   publishing need the user's explicit go-ahead.
+
+Content of commits, PRs, documentation and release notes follows the privacy
+rules in `.agents/instructions/AGENTS.md`: synthetic channels and programmes,
+placeholder addresses, no personal setup.
+
 ## Local checks
 
 Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q catchuparr scripts tests`, and `ruff check .`. Build the importable archive with `python3 scripts/build_plugin.py`.
