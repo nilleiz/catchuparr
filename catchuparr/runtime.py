@@ -216,7 +216,17 @@ def apply_committed_log_level(settings: dict | None = None) -> str:
 def validate_configuration(settings: dict) -> dict:
     from .configuration import validate_configuration as validate
 
-    return validate(settings)
+    return validate(settings, show_preview=_show_preview)
+
+
+def _show_preview(active: dict) -> dict:
+    """Upcoming matches of the draft's shows rules; the validation never fails on the EPG."""
+    import time
+
+    from .show_windows import load_programmes, preview_show_matches
+
+    now = time.time()
+    return preview_show_matches(active, load_programmes(active, now), now)
 
 
 def apply_configuration(settings: dict | None = None) -> dict:

@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -341,10 +342,11 @@ def compile_draft(
 def validate_configuration(
     settings: dict, catalog: SourceCatalog | None = None,
     active_path: Path | None = None,
+    show_preview: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     previous_active = load_active_configuration(active_path or active_settings_path())
     active, _, previews = compile_draft(settings, catalog, previous_active)
-    return {
+    result = {
         "valid": True,
         "channels": previews,
         "selected_channel_count": len(active["channel_uuids"]),
@@ -356,6 +358,9 @@ def validate_configuration(
             else f"{len(active['channel_uuids'])} channel(s) selected."
         ),
     }
+    if show_preview is not None and active["show_rules"]:
+        result["show_matches"] = show_preview(active)
+    return result
 
 
 def apply_configuration(

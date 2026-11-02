@@ -1773,22 +1773,12 @@ def _window_open(active, channel_uuid, schedule, timezone_name, now):
 @shared_task(name="catchuparr.plan_show_windows")
 def plan_show_windows():
     """Match the EPG against the shows rules and store each channel's windows."""
-    from apps.channels.managers import with_effective_values
-    from apps.channels.models import Channel
     from core.utils import RedisClient
 
     from .configuration import load_active_configuration, reset_legacy_configuration
-    from .epg_rules import Programme
-    from .logging_utils import apply_log_level, error, event
+    from .logging_utils import apply_log_level, event
     from .runtime import require_supported_version
-    from .show_windows import (
-        PLAN_AHEAD_SECONDS,
-        PLAN_LOCK_KEY,
-        PLAN_LOCK_SECONDS,
-        PLAN_PAST_SECONDS,
-        covered_channels,
-        plan_all,
-    )
+    from .show_windows import PLAN_LOCK_KEY, PLAN_LOCK_SECONDS, load_programmes, plan_all
 
     require_supported_version()
     reset_legacy_configuration()
@@ -1804,37 +1794,7 @@ def plan_show_windows():
         return {"status": "busy"}
     try:
         now = datetime.now(timezone.utc)
-        channels = with_effective_values(
-            Channel.objects.filter(uuid__in=sorted(covered_channels(active))), select_related_fks=True,
-        ).select_related("epg_data__epg_source", "override__epg_data__epg_source")
-        epg_by_channel = {}
-        for channel in channels:
-            epg_data = channel.effective_epg_data_obj
-            if epg_data is not None:
-                epg_by_channel[str(channel.uuid)] = epg_data.id
-        programmes: dict[str, list[Programme] | None] = {channel: [] for channel in covered_channels(active)}
-        try:
-            channels_by_epg: dict[int, list[str]] = {}
-            for channel_uuid, epg_id in epg_by_channel.items():
-                channels_by_epg.setdefault(epg_id, []).append(channel_uuid)
-            from apps.epg.models import ProgramData
-
-            rows = ProgramData.objects.filter(
-                epg_id__in=list(channels_by_epg),
-                end_time__gt=now - timedelta(seconds=PLAN_PAST_SECONDS),
-                start_time__lt=now + timedelta(seconds=PLAN_AHEAD_SECONDS),
-            ).order_by("start_time")
-            for row in rows.iterator(chunk_size=1000):
-                programme = Programme(
-                    row.start_time.timestamp(), row.end_time.timestamp(), row.title or "",
-                    getattr(row, "sub_title", "") or "", row.description or "",
-                )
-                for channel_uuid in channels_by_epg.get(row.epg_id, ()):
-                    programmes[channel_uuid].append(programme)
-        except Exception as exc:
-            # Keep every channel's previous windows rather than closing them.
-            error("show_windows_failed", exc, callsite="show_windows_epg")
-            programmes = {channel: None for channel in programmes}
+        programmes = load_programmes(active, now.timestamp())
         windows = plan_all(active, programmes, now.timestamp())
         event("show_windows_planned", logging.DEBUG, channel_count=len(windows),
               windows=sum(len(items) for items in windows.values()))

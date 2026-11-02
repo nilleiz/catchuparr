@@ -119,3 +119,42 @@ class ShowWindowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreviewTests(unittest.TestCase):
+    def active(self, *entries):
+        return {"archive_root": "/unused", "show_rules": list(entries),
+                "recording_schedule": {"timezone": "UTC", "channels": {}}}
+
+    def test_preview_lists_upcoming_matches_with_rule_names(self):
+        from catchuparr.show_windows import preview_show_matches
+
+        active = self.active(show_entry())
+        programmes = {CHANNEL: [
+            Programme(0, 600, "Show old"), Programme(1000, 1600, "Other"),
+            Programme(2000, 2600, "Show two"), Programme(3000, 3600, "Show three"),
+        ]}
+        result = preview_show_matches(active, programmes, now=700, limit=1)
+        self.assertEqual(
+            [{"title": "Show two", "sub_title": "", "start": 2000, "end": 2600, "rules": ["Synthetic"]}],
+            result["channels"][CHANNEL],
+        )
+        self.assertFalse(result["epg_unavailable"])
+
+    def test_preview_flags_an_unreadable_epg(self):
+        from catchuparr.show_windows import preview_show_matches
+
+        result = preview_show_matches(self.active(show_entry()), {CHANNEL: None}, now=0)
+        self.assertEqual({"channels": {}, "epg_unavailable": True}, result)
+
+    def test_validation_attaches_matches_only_for_shows_rules(self):
+        from catchuparr import configuration
+
+        active = {"channel_uuids": [], "source_policies": {}, "warnings": [], "show_rules": [show_entry()]}
+        with patch.object(configuration, "load_active_configuration", return_value=None), \
+                patch.object(configuration, "compile_draft", return_value=(active, None, [])):
+            result = configuration.validate_configuration({}, show_preview=lambda a: {"seen": True})
+            self.assertEqual({"seen": True}, result["show_matches"])
+            active["show_rules"] = []
+            self.assertNotIn("show_matches", configuration.validate_configuration(
+                {}, show_preview=lambda a: {"seen": True}))

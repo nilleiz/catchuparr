@@ -242,6 +242,29 @@ def plan_windows(programmes: Iterable[Programme], rules: Sequence[ShowRule]) -> 
     return merge_windows(windows)
 
 
+def preview_matches(programmes: Iterable[Programme], rules: Sequence[ShowRule], *, now: float,
+                    limit: int = 20) -> list[dict]:
+    """Upcoming or running programmes any rule matches, soonest first, for the preview."""
+    found = []
+    for programme in sorted(programmes, key=lambda p: (p.start, p.end)):
+        if programme.end <= now or not programme.end > programme.start:
+            continue
+        texts = programme_texts(programme)
+        hits = [
+            rule.index for rule in rules
+            if (rule.start_allowed is None or rule.start_allowed(programme.start))
+            and rule.matches(programme, texts)
+        ]
+        if hits:
+            found.append({
+                "title": programme.title, "sub_title": programme.sub_title,
+                "start": programme.start, "end": programme.end, "rules": hits,
+            })
+            if len(found) >= limit:
+                break
+    return found
+
+
 def freeze_running(previous: Iterable[Window], planned: Iterable[Window], now: float) -> list[Window]:
     """Keep a running window's start and never shorten its end.
 
