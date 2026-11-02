@@ -4,6 +4,18 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.7.13] - Prerelease
+
+### Fixed
+
+- Native catch-up played to the end of the guide entry and then stopped with
+  a 404; seeking ten seconds forward made it play on. The playlist for a
+  catch-up link without its own duration or end was closed at the end of the
+  programme, so the client had to ask again exactly at the boundary. Such a
+  playlist now continues past the programme end through the archive, over any
+  number of guide entries, up to the newest recorded media. Only a range that
+  the client bounds itself with a real `duration` or `utcend` stays closed.
+
 ## [0.7.12] - Prerelease
 
 ### Fixed
