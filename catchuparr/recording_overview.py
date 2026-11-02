@@ -80,7 +80,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         channel = metadata.get(channel_uuid, {})
         diagnostic = diagnostics.get(channel_uuid)
         scheduled, schedule_error = _scheduled_now(
-            schedule_channels, timezone_name, channel_uuid, instant,
+            schedule_channels, timezone_name, channel_uuid, instant, settings,
         )
         evidence = None
         if diagnostic and diagnostic.get("phase") != "error":
@@ -130,6 +130,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
             "reason": reason,
             "source": source,
             "scheduled_now": scheduled if not schedule_error else None,
+            "show": _current_show(settings, channel_uuid, instant),
         }
         if diagnostic and diagnostic.get("phase") == "error":
             channel_row["error_code"] = diagnostic.get("error_code")
@@ -357,7 +358,9 @@ def _message_row(row):
     attached = row.get("state") == "recording" and row.get("recent_media_progress") is True \
         and row.get("mode") == "borrowed"
     suffix = ", attached" if attached else ""
-    return f"{name} - {m3u_first_word or '—'} [{status}{suffix}]"
+    show = row.get("show")
+    label = f" · Show: {_safe_display(show.get('title'))}" if isinstance(show, dict) and show.get("title") else ""
+    return f"{name} - {m3u_first_word or '—'} [{status}{suffix}]{label}"
 
 
 _COMPACT_ERROR_LABELS = {
@@ -385,20 +388,33 @@ def _compact_error_label(error_code):
     return _COMPACT_ERROR_LABELS.get(error_code, "unknown")
 
 
-def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now):
+def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now, active=None):
     if not isinstance(schedule_channels, dict) or not isinstance(timezone_name, str):
         return False, True
     try:
-        from .schedule import schedule_from_snapshot, schedule_is_active
+        from .schedule import schedule_from_snapshot
+        from .show_windows import recording_window_open
 
         snapshot = schedule_channels[channel_uuid]
         parsed = schedule_from_snapshot(snapshot)
         # schedule_is_active returns early for continuous schedules, so validate
         # the IANA timezone independently before evaluating every schedule mode.
         ZoneInfo(timezone_name)
-        return schedule_is_active(parsed, timezone_name, now), False
+        return recording_window_open(active or {}, channel_uuid, parsed, timezone_name, now), False
     except Exception:
         return False, True
+
+
+def _current_show(active, channel_uuid, now):
+    """The programme an open show window records for, or None."""
+    if not active or not active.get("show_rules"):
+        return None
+    try:
+        from .show_windows import current_show
+
+        return current_show(active, channel_uuid, now.timestamp())
+    except Exception:
+        return None
 
 
 def _deliver_rows(visible):
@@ -451,7 +467,9 @@ def _unknown_all(settings, channel_ids, control_state, reason, *, now=None):
         except (ValueError, TypeError, KeyError):
             schedule_unknown = True
     for row in rows:
-        scheduled, schedule_error = _scheduled_now(schedule_channels, timezone_name, row["channel_uuid"], now)
+        scheduled, schedule_error = _scheduled_now(
+            schedule_channels, timezone_name, row["channel_uuid"], now, settings,
+        )
         row["scheduled_now"] = scheduled if not schedule_error else None
         if schedule_error:
             row["reason"] = "schedule_unavailable"

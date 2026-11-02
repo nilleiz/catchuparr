@@ -25,10 +25,12 @@ def network_state() -> dict:
     return json.loads(command("docker", "network", "inspect", NETWORK).stdout)[0]
 
 
-def rules(target: str | None, port: int) -> list[list[str]]:
+def rules(target: str | None, port: int, extra: tuple[tuple[str, int], ...] = ()) -> list[list[str]]:
+    """Deny-all chain with the approved source endpoint and explicitly approved extra endpoints."""
     result = [["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"]]
-    if target is not None:
-        result.append(["-d", f"{target}/32", "-p", "tcp", "--dport", str(port), "-j", "RETURN"])
+    allowed = ([(target, port)] if target is not None else []) + list(extra)
+    for address, allowed_port in allowed:
+        result.append(["-d", f"{address}/32", "-p", "tcp", "--dport", str(allowed_port), "-j", "RETURN"])
     result.append(["-j", "REJECT"])
     return result
 
@@ -85,9 +87,9 @@ def installed_rules() -> list[list[str]] | None:
     return chain_rules(CHAIN)
 
 
-def matches_rules(target: str | None, port: int) -> bool:
+def matches_rules(target: str | None, port: int, extra: tuple[tuple[str, int], ...] = ()) -> bool:
     installed = installed_rules()
-    expected = [_canonical_rule(rule) for rule in rules(target, port)]
+    expected = [_canonical_rule(rule) for rule in rules(target, port, extra)]
     return installed == expected
 
 
@@ -129,14 +131,14 @@ def ensure_jump_first(subnet: str) -> None:
         raise RuntimeError("Failed to place Dev egress restriction first in DOCKER-USER")
 
 
-def apply(subnet: str, target: str | None, port: int) -> None:
+def apply(subnet: str, target: str | None, port: int, extra: tuple[tuple[str, int], ...] = ()) -> None:
     assert_network(subnet)
     existing = installed_rules()
-    if existing is not None and not matches_rules(target, port):
+    if existing is not None and not matches_rules(target, port, extra):
         raise RuntimeError("Existing Dev egress chain differs; stop runtime and remove it first")
     if existing is None:
         command("iptables", "-w", "-N", CHAIN)
-        for rule in rules(target, port):
+        for rule in rules(target, port, extra):
             command("iptables", "-w", "-A", CHAIN, *rule)
     ensure_jump_first(subnet)
 
@@ -167,6 +169,10 @@ def main() -> None:
     parser.add_argument("--subnet", required=True)
     parser.add_argument("--source-ip")
     parser.add_argument("--source-port", type=int, default=8001)
+    parser.add_argument(
+        "--allow", action="append", default=[], metavar="IP:PORT",
+        help="additional TCP endpoint the user explicitly approved; repeatable",
+    )
     args = parser.parse_args()
     subnet = str(ipaddress.ip_network(args.subnet, strict=True))
     if not isinstance(ipaddress.ip_network(subnet), ipaddress.IPv4Network):
@@ -176,13 +182,24 @@ def main() -> None:
         parser.error("--source-port must be a TCP port")
     if target is None and args.source_port != 8001:
         parser.error("--source-port requires --source-ip")
+    extra = []
+    for item in args.allow:
+        address, _, allowed_port = item.rpartition(":")
+        try:
+            endpoint = (str(ipaddress.IPv4Address(address)), int(allowed_port))
+        except ValueError:
+            parser.error("--allow expects a numeric IPv4:PORT")
+        if not 1 <= endpoint[1] <= 65535:
+            parser.error("--allow port must be a TCP port")
+        extra.append(endpoint)
+    options = {"extra": tuple(extra)} if extra else {}
     if args.action == "apply":
-        apply(subnet, target, args.source_port)
+        apply(subnet, target, args.source_port, **options)
     elif args.action == "remove":
         remove(subnet)
     else:
         assert_network(subnet)
-        if not matches_rules(target, args.source_port) or not jump_is_first(subnet):
+        if not matches_rules(target, args.source_port, **options) or not jump_is_first(subnet):
             raise RuntimeError("Dev egress restriction is not installed as expected")
 
 

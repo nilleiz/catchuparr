@@ -778,7 +778,8 @@ class RecorderBorrowCoordinator:
 
             from .configuration import _sharing_catalog_generation
             from .recorder_proxy import configuration_generation
-            from .schedule import schedule_from_snapshot, schedule_is_active
+            from .schedule import schedule_from_snapshot
+            from .show_windows import recording_window_open
 
             current = self.intent_ledger.read(self.channel_uuid)
             if (current is None or current.intent != token
@@ -808,8 +809,9 @@ class RecorderBorrowCoordinator:
                     or not isinstance(timezone_name, str)):
                 return None
             schedule = schedule_from_snapshot(schedule_config[self.channel_uuid])
-            if not schedule_is_active(
-                    schedule, timezone_name, datetime.fromtimestamp(now, timezone.utc)):
+            if not recording_window_open(
+                    active, self.channel_uuid, schedule, timezone_name,
+                    datetime.fromtimestamp(now, timezone.utc)):
                 return None
             if (not self._recovery_is_current(
                     self.channel_uuid, current.revision, self.configuration_generation,
