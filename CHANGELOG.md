@@ -4,6 +4,18 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.8.1] - Prerelease
+
+### Fixed
+
+- A viewer must stay on a channel for the configured live stability window
+  before the recorder borrows its connection, also for the first borrow after
+  a restart. Before, a viewer who zapped through a channel for under a second
+  made the recorder give up its own connection and attach to a native channel
+  that nobody watched any more, where it stayed for the minimum switch
+  interval. A recorder without a working source of its own (paused, failed or
+  without an available dedicated source) still attaches at once.
+
 ## [0.8.0] - Prerelease
 
 ### Added

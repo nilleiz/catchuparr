@@ -381,6 +381,7 @@ def observe_native_connection(
 
         clients_key = f"live:channel:{channel_uuid}:clients"
         ordinary: list[str] = []
+        connected: list[float] = []
         for raw_client_id in redis.smembers(clients_key):
             client_id = _text(raw_client_id)
             private = _private_client(redis, channel_uuid, client_id)
@@ -396,6 +397,12 @@ def observe_native_connection(
                 and not redis.exists(f"live:channel:{channel_uuid}:client:{client_id}:stop")
             ):
                 ordinary.append(client_id)
+                try:
+                    since = float(fields["connected_at"])
+                except ValueError:
+                    since = None
+                if since is not None and math.isfinite(since) and since > 0:
+                    connected.append(since)
         ordinary_ids = tuple(sorted(set(ordinary)))
         target = BorrowTarget(
             channel_uuid=channel_uuid,
@@ -420,6 +427,7 @@ def observe_native_connection(
             ),
             redirect_worker=source.redirect_channel,
             vod_or_preview_worker=source.vod_or_preview,
+            live_since=min(connected) if connected else None,
         )
         return NativeSharingObservation(
             target=target,

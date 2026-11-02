@@ -7,7 +7,7 @@ mutate Dispatcharr, Redis, native clients, buffers, or provider connections.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Mapping
 
@@ -74,8 +74,18 @@ class BorrowTarget:
     account_allowed_by_recording_policy: bool = True
     redirect_worker: bool = False
     vod_or_preview_worker: bool = False
+    # When the longest-watching ordinary viewer connected. The stability window
+    # runs from here, so a viewer already watching when the recorder starts is
+    # borrowed at once while a zapping viewer is not. Not part of any identity.
+    live_since: float | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
+        if self.live_since is not None and (
+            isinstance(self.live_since, bool)
+            or not isinstance(self.live_since, (int, float))
+            or not math.isfinite(self.live_since)
+        ):
+            raise ValueError("live_since must be a finite timestamp")
         for name in (
             "channel_uuid", "worker_uuid", "owner_lock_value", "metadata_owner",
             "stream_id", "account_id", "m3u_profile_id", "input_profile_id",
@@ -340,6 +350,19 @@ def restore_state(
     )
 
 
+def _stability_seconds(state: SharingState, observation: SharingObservation) -> float:
+    """How long a viewer must stay live before the recorder borrows it.
+
+    The window always applies, also before the first switch, so a zapping viewer
+    never triggers a borrow. Only when the recorder has no working source of its
+    own (paused, failed, or its dedicated source is unavailable) does it attach
+    at once, because waiting would only lengthen the recording gap.
+    """
+    if state.phase in {SharingPhase.PAUSED, SharingPhase.FAILED} or not observation.dedicated_source_available:
+        return 0
+    return observation.settings.live_stability_seconds
+
+
 def observe(state: SharingState | None, observation: SharingObservation) -> SharingDecision:
     """Coalesce one observation into one deadline or one fenced transition intent."""
     current = state or initial_state(observation)
@@ -580,7 +603,7 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
     same_candidate = current.candidate_identity == identity
     since = current.candidate_since if same_candidate else None
     if since is None:
-        since = now
+        since = now if target.live_since is None else min(now, float(target.live_since))
     candidate_state = replace(
         current,
         candidate_identity=identity,
@@ -591,7 +614,7 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
     )
     deadline = _later_deadline(
         since,
-        (0 if current.last_switch_at is None else observation.settings.live_stability_seconds),
+        _stability_seconds(current, observation),
         current.last_switch_at,
         observation.settings.min_switch_interval_seconds,
     )
@@ -605,8 +628,8 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
         candidate_state,
         SharingAction.ATTACH_BORROW,
         SharingPhase.WAIT_LIVE,
-        ("initial eligible viewer connection attaches immediately"
-         if current.last_switch_at is None
+        ("recorder has no working source; attach without the stability window"
+         if _stability_seconds(current, observation) == 0
          else "eligible existing live connection is stable"),
     )
 
@@ -832,8 +855,7 @@ def _completion_deadline(
             return None
         return _later_deadline(
             state.candidate_since,
-            (0 if state.last_switch_at is None
-             else observation.settings.live_stability_seconds),
+            _stability_seconds(state, observation),
             state.last_switch_at,
             observation.settings.min_switch_interval_seconds,
         )
