@@ -15,6 +15,13 @@ included here to explain the feature history leading to 0.4.0.
   playlist now continues past the programme end through the archive, over any
   number of guide entries, up to the newest recorded media. Only a range that
   the client bounds itself with a real `duration` or `utcend` stays closed.
+- A request a few seconds before the end of a guide entry was answered with
+  404 ("no archived segments in requested range") although the archive
+  covered it: a segment that reached past the requested end was dropped, and
+  the segment spanning the boundary was the only one left. A segment that
+  starts inside the range is now kept. The production log shows these
+  refusals at `utc` values 3 and 4 seconds before a guide boundary, while the
+  same request 60 seconds later succeeded.
 
 ## [0.7.12] - Prerelease
 
