@@ -246,3 +246,21 @@ class ShowListTests(unittest.TestCase):
         self.assertEqual("Shows", pushed["title"])
         self.assertEqual(1, len(pushed["rows"]))
         self.assertIn("Show A › Ch", pushed["rows"][0])
+
+    def test_validation_toast_lists_only_the_next_matches_per_channel(self):
+        from catchuparr import runtime
+
+        pushed = {}
+
+        def fake(rows, **kwargs):
+            pushed["rows"] = list(rows)
+            return kwargs["summary"]
+
+        items = [{"title": f"Show {n}", "start": n * 1000, "end": n * 1000 + 900, "rules": ["x"]} for n in range(8)]
+        result = {"message": "1 channel(s) selected.", "channels": [{"channel_uuid": CHANNEL, "channel_name": "Ch"}]}
+        matches = {"channels": {CHANNEL: items}, "epg_unavailable": True, "timezone": "UTC"}
+        with patch("catchuparr.action_messages.deliver_action_message", fake):
+            summary = runtime.deliver_show_matches(result, matches)
+        self.assertEqual(5, len(pushed["rows"]))
+        self.assertIn("8 upcoming shows match (the next 5 per channel are listed)", summary)
+        self.assertTrue(summary.endswith("could not be read for some channels."))
