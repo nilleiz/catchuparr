@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# The full probe runs its native teardown gates serially. Thirteen waits each
+# The full suite runs its native teardown gates serially. Thirteen waits each
 # include the configured disconnect/cleanup phases, a 90-second stopping-marker
 # allowance, and monitor margin (at least 1,235 seconds total), before its
 # bounded media and recorder-failover phases.
@@ -31,6 +31,11 @@ def run():
         "--configuration-only",
         action="store_true",
         help="Run source-rule unit tests and the provider-free Django configuration probe, then stop.",
+    )
+    parser.add_argument(
+        "--suite", choices=("core", "full"), default="full",
+        help="core: compatibility, routes, overviews, source configuration and show rules (about a minute); "
+             "full: additionally the recorder media and failover phases (release evidence).",
     )
     args = parser.parse_args()
     name = f"catchuparr-ci-{time.time_ns()}"
@@ -116,7 +121,8 @@ def run():
         if args.configuration_only:
             return
         with (ROOT / "scripts/aio_integration_probe.py").open("rb") as script:
-            docker("exec", "-i", name, "/dispatcharrpy/bin/python", "-c",
+            docker("exec", "-i", "-e", f"CATCHUPARR_AIO_SUITE={args.suite}",
+                   name, "/dispatcharrpy/bin/python", "-c",
                    "import os,sys; from pathlib import Path; "
                    "os.environ['DJANGO_SECRET_KEY']=Path('/data/jwt').read_text().strip(); "
                    # Simulate only Dispatcharr's recognized stream-worker process role.

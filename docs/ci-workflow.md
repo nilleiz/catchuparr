@@ -7,7 +7,17 @@ changelog, or workflow YAML files. Unknown files and unavailable diff metadata
 run the full probe. Manual workflow dispatch runs it by default. The workflow
 offers an explicit `skip_native` input for a manually requested package/unit
 validation run; its default is false, and the skip does not produce release
-acceptance evidence. The AIO job has a
+acceptance evidence.
+
+The AIO probe has two suites. A pull request runs the **core** suite in the step
+"Core checks in actual Dispatcharr AIO": compatibility, archive routes, the
+overview actions, source configuration with nested `m3u` filters, and show rules
+(validation preview, Apply, planning from the real EPG tables, recorder
+admission, today's schedule and current show). It takes about a minute and is
+not release evidence. The **full** suite adds the recorder media and failover
+phases (about 13 minutes) in the step "Synthetic playback in actual Dispatcharr
+AIO". It runs when the pull request carries the label `full-aio` (adding the
+label starts a new run) or on a manual dispatch without `skip_native`. The AIO job has a
 40-minute outer timeout for its 30-minute probe budget plus bounded setup and
 cleanup time; the probe's own deadline and assertions remain its runtime limit.
 Pull-request runs use concurrency cancellation so obsolete revisions do not
