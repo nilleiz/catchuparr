@@ -163,7 +163,10 @@ class NativeArchiveParityTests(unittest.TestCase):
         self.request.GET["lutc"] = str(int(self.now))
         response = self.call_archive()
         self.assertEqual(200, response.status_code)
-        self.assertEqual(self.requested_end + 60, self.service.playlist.call_args.args[3])
+        # The guide end of one programme must not close the playlist: playback
+        # continues into the following archive without a new request.
+        self.assertTrue(self.service.playlist.call_args.kwargs["continuous"])
+        self.assertEqual(self.start + 86400, self.service.playlist.call_args.args[3])
 
     def test_missing_duration_and_malformed_duration_are_distinguished(self):
         self.request.GET.pop("duration")
@@ -274,3 +277,39 @@ class NativeArchiveParityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundarySegmentTests(unittest.TestCase):
+    def test_request_just_before_a_programme_end_keeps_the_spanning_segment(self):
+        import tempfile
+        from datetime import timedelta
+        from pathlib import Path
+
+        from catchuparr.engine.store import ArchiveStore
+        from catchuparr.http import ArchiveHTTPService
+
+        base = 1_800_000_000
+        boundary = base + 6
+        with tempfile.TemporaryDirectory() as temp:
+            store = ArchiveStore(Path(temp))
+            for offset in (0, 6):
+                stamp = datetime.fromtimestamp(base + offset, timezone.utc)
+                path = Path(temp) / f"s{offset}.ts"
+                path.write_bytes(b"\x47" + bytes([offset]) * 187)
+                store.add_segment("ch", path, stamp, stamp + timedelta(seconds=6))
+            service = ArchiveHTTPService(
+                store, SimpleNamespace(lookup=lambda token: "7"),
+                authorize_user_channel=lambda *_: True, catchup_enabled=lambda *_: True,
+            )
+            # The only segment in range, [base, base+6), ends after the
+            # requested end (a programme boundary 1 second after the request).
+            end = base + 3
+            candidates = store.segments("ch", base + 2, end)
+            manifest = service._manifest_segments(
+                "ch", "[]", candidates, playback_end=end,
+            )
+            self.assertEqual(1, len(manifest))
+            # A segment that starts at or after the end stays out.
+            later = store.segments("ch", base + 2, boundary + 3)
+            manifest = service._manifest_segments("ch", "[]", later, playback_end=end)
+            self.assertEqual(1, len(manifest))
