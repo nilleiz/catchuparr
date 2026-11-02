@@ -4,6 +4,28 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.8.0] - Prerelease
+
+### Added
+
+- Show rules: a `shows:` rule records every EPG programme whose title,
+  sub-title or description matches, plus optional padding, on the channels it
+  covers. Text operators `equals`, `starts_with`, `ends_with`, `contains`,
+  `wildcard` and `regex` combine with `any`, `all` and `not`; programme length
+  can be bounded. A rule can nest `m3u` source filters and restrict matches
+  with a `schedule`. See `docs/shows.md`.
+- A planner computes the recording windows of all show rules every minute and
+  stores them next to the archive. Overlapping or touching windows, also across
+  rules, are recorded without interruption; a running window is never shortened
+  by an EPG refresh, and a stopped planner or an unreadable EPG only keeps
+  planned windows from being cut off.
+- Validation lists the next matching programmes per channel with the rule that
+  matched them.
+
+### Fixed
+
+- Today's recording schedule includes the planned show windows of the day.
+
 ## [0.7.13] - Prerelease
 
 ### Fixed
