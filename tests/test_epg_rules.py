@@ -54,6 +54,15 @@ class MatchTests(unittest.TestCase):
         self.assertFalse(matches({**spec, "case_sensitive": True}, title="strasse"))
         self.assertTrue(matches({"title": {"equals": "ＡＢ"}}, title="ab"))
 
+    def test_regex_ignores_case_without_casefolding_letters(self):
+        self.assertTrue(matches({"title": {"regex": "Straße"}}, title="straße live"))
+        self.assertTrue(matches({"title": {"regex": "^ab c$"}}, title="AB   c"))
+        self.assertFalse(matches({"title": {"regex": "^ab"}, "case_sensitive": True}, title="AB"))
+
+    def test_long_descriptions_are_searched_beyond_the_first_characters(self):
+        text = "x " * 400 + "report"
+        self.assertTrue(matches({"description": {"contains": "report"}}, title="", description=text))
+
     def test_fields_combine_and_length_limits(self):
         spec = {"title": {"contains": "doc"}, "description": {"contains": "nature"}, "min_minutes": 20}
         self.assertTrue(matches(spec, title="Doc", description="About nature"))
@@ -115,6 +124,9 @@ class WindowTests(unittest.TestCase):
         self.assertEqual([Window(100, 1200, (0,))], freeze_running(previous, [Window(300, 1200, (0,))], 500))
         self.assertEqual([Window(100, 1000, (0,))], freeze_running(previous, [Window(200, 800, (0,))], 500))
         self.assertEqual([], freeze_running(previous, [], 1000))
+        # Admission opens a window early; it is protected from then on.
+        self.assertEqual([Window(100, 1000, (0,))], freeze_running(previous, [], 80))
+        self.assertEqual([], freeze_running(previous, [], 50))
         self.assertEqual([Window(2000, 3000, (0,))], freeze_running([], [Window(2000, 3000, (0,))], 500))
 
     def test_activity_lookahead_and_next_start(self):

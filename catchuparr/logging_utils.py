@@ -63,6 +63,7 @@ _EVENTS = frozenset({
 })
 _ERROR_CATEGORIES = frozenset({
     "configuration_recovery_failed",
+    "show_windows_failed",
     "route_install_failed",
     "schedule_install_failed",
     "xc_install_failed",
@@ -103,6 +104,7 @@ _SAFE_REASONS = frozenset({
     "version", "proxy_api", "cleanup_guard", "xc_hooks", "xc_uninstall", "log_level",
 })
 _SAFE_ERROR_CALLSITES = frozenset({
+    "show_windows_epg",
     "native_observation", "opening_projection", "opening_cleanup", "return_completion",
     "startup_recovery", "startup_admission", "return_recovery",
     "recorder_supervisor", "borrowed_worker", "borrowed_cleanup",

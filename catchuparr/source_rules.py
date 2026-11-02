@@ -589,7 +589,10 @@ def _compile_show_rule(
         profile_ids.update(found_profiles)
         return selected
 
-    selected = select("include") if "include" in scope else set(eligible_ids)
+    # Without an explicit scope only channels with an EPG can ever match.
+    selected = select("include") if "include" in scope else {
+        row["uuid"] for row in eligible_rows if row.get("has_epg", True)
+    }
     if "exclude" in scope:
         selected -= select("exclude")
     if not selected:
@@ -840,25 +843,7 @@ def compile_filter_config(
         else:
             effective_policy = inherited_policy
         if effective_policy is not None:
-            if (
-                effective_policy.priorities
-                and effective_policy.include_account_ids is None
-                and not effective_policy.exclude_account_ids
-                and origin["source_filter"] is None
-            ):
-                raise SourceRuleError("field priority: requires include or exclude")
-            for account_id, _score in effective_policy.priorities:
-                if (
-                    effective_policy.include_account_ids is not None
-                    and account_id not in effective_policy.include_account_ids
-                ):
-                    raise SourceRuleError(
-                        "field priority: account is excluded by include filter"
-                    )
-                if account_id in effective_policy.exclude_account_ids:
-                    raise SourceRuleError(
-                        "field priority: account is excluded by source filter"
-                    )
+            _check_priorities(effective_policy, has_filter=origin["source_filter"] is not None)
         channel_schedule = (
             CONTINUOUS_SCHEDULE
             if len(inherited_days) == 7 and all(
@@ -874,7 +859,7 @@ def compile_filter_config(
         )
 
     show_policies = _show_only_channels(
-        show_entries, selected_ids, account_ids=account_ids,
+        show_entries, selected_ids, account_ids=account_ids, warnings=warnings,
     )
     for channel_uuid, (policy, origin_rule) in show_policies.items():
         effective[channel_uuid] = (
@@ -956,7 +941,22 @@ def compile_filter_config(
     )
 
 
-def _show_only_channels(show_entries, selected_ids, *, account_ids):
+def _check_priorities(policy: SourcePolicy, *, has_filter: bool) -> None:
+    if (
+        policy.priorities
+        and policy.include_account_ids is None
+        and not policy.exclude_account_ids
+        and not has_filter
+    ):
+        raise SourceRuleError("field priority: requires include or exclude")
+    for account_id, _score in policy.priorities:
+        if policy.include_account_ids is not None and account_id not in policy.include_account_ids:
+            raise SourceRuleError("field priority: account is excluded by include filter")
+        if account_id in policy.exclude_account_ids:
+            raise SourceRuleError("field priority: account is excluded by source filter")
+
+
+def _show_only_channels(show_entries, selected_ids, *, account_ids, warnings):
     """Channels reached only by shows rules and the source policy they share.
 
     A channel that also has a channels rule keeps that rule's source policy.
@@ -967,9 +967,14 @@ def _show_only_channels(show_entries, selected_ids, *, account_ids):
         compiled = entry["compiled"]
         policy = _effective_filter(entry["patch"], None, line=compiled["line"], known_account_ids=account_ids)
         origin = f"rule {compiled['index']}"
-        if (policy is not None and policy.priorities and policy.include_account_ids is None
-                and not policy.exclude_account_ids):
-            raise SourceRuleError(f"line {compiled['line']}, rule {compiled['index']}: field priority: requires include or exclude")
+        if policy is not None:
+            _rule_call(compiled["index"], _check_priorities, policy, has_filter=False)
+        shared = selected_ids.intersection(compiled["channel_uuids"])
+        if policy is not None and shared:
+            warnings.append(
+                f"rule {compiled['index']}: m3u filter does not apply to {len(shared)} channel(s) "
+                "with a channels rule; that rule's sources are used"
+            )
         for channel_uuid in compiled["channel_uuids"]:
             if channel_uuid in selected_ids:
                 continue
