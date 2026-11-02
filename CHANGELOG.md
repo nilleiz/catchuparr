@@ -20,7 +20,8 @@ included here to explain the feature history leading to 0.4.0.
   by an EPG refresh, and a stopped planner or an unreadable EPG only keeps
   planned windows from being cut off.
 - Validation lists the next matching programmes per channel with the rule that
-  matched them.
+  matched them. Today's schedule lists the planned shows of the day, and the
+  current-recordings rows name the show a running window records for.
 
 ### Fixed
 

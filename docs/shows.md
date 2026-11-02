@@ -44,10 +44,17 @@ rules:
   source filter; the shows windows only add recording time. A `m3u` filter on
   the shows rule does not apply to such a channel and is reported as a warning.
 - Several shows rules on the same channel must use identical `m3u` filters.
-- The validation preview (`show_matches`) lists the next matching programmes
-  per channel (20 at most) with the rule that matched, and reports when the EPG
-  could not be read. Today's schedule lists the planned show windows of the day
-  next to the weekly windows.
+- Which shows are planned:
+  - **Validate** pushes the next matching programmes per channel (five per
+    channel in the toast, twenty in the `show_matches` result) with the
+    programme title and time, and says when the EPG could not be read.
+  - **Today's schedule** lists the planned shows of the day (`Show · 17:00–17:15
+    Synthetic Programme › Synthetic Channel`) next to the weekly windows, and `shows` in each
+    channel row carries title, rule and time.
+  - **Current recordings** names the programme a running show window records for
+    (`Synthetic Channel - Source [ok] · Show: Synthetic Programme`); the row's `show` field holds title,
+    rule, times and `phase` (`upcoming` while the padding before it runs,
+    `airing`, `ended` during the padding after it).
 - The planner runs every minute and stores the windows in
   `.catchuparr-show-windows.json` in the archive directory. Each window carries
   its own end, so a stopped planner or a Redis restart only keeps already
