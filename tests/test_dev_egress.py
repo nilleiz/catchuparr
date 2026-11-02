@@ -26,6 +26,38 @@ class EgressRulesTests(unittest.TestCase):
             ],
         )
 
+    def test_extra_endpoints_follow_the_vu_endpoint_before_reject(self):
+        self.assertEqual(
+            dev_egress.rules("192.0.2.20", 8001, (("192.0.2.30", 5012),)),
+            [
+                ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"],
+                ["-d", "192.0.2.20/32", "-p", "tcp", "--dport", "8001", "-j", "RETURN"],
+                ["-d", "192.0.2.30/32", "-p", "tcp", "--dport", "5012", "-j", "RETURN"],
+                ["-j", "REJECT"],
+            ],
+        )
+
+    def test_cli_passes_approved_extra_endpoints(self):
+        with (
+            patch.object(sys, "argv", [
+                "dev_egress.py", "apply", "--subnet", "192.0.2.0/24", "--vu-ip", "192.0.2.20",
+                "--allow", "192.0.2.30:5012",
+            ]),
+            patch.object(dev_egress, "apply") as apply,
+        ):
+            dev_egress.main()
+        apply.assert_called_once_with("192.0.2.0/24", "192.0.2.20", 8001, extra=(("192.0.2.30", 5012),))
+
+    def test_cli_rejects_a_hostname_endpoint(self):
+        with (
+            patch.object(sys, "argv", [
+                "dev_egress.py", "apply", "--subnet", "192.0.2.0/24", "--allow", "example.org:80",
+            ]),
+            patch.object(dev_egress, "apply"),
+            self.assertRaises(SystemExit),
+        ):
+            dev_egress.main()
+
     def test_check_requires_the_exact_rule_sequence(self):
         canonical = [
             ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"],

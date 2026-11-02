@@ -22,6 +22,7 @@ _EVENTS = frozenset({
     "control_resumed",
     "recorder_disabled",
     "recorder_schedule_closed",
+    "show_windows_planned",
     "recorder_stale_job",
     "recorder_worker_stopped",
     "recorder_cleanup_pending",
@@ -62,6 +63,7 @@ _EVENTS = frozenset({
 })
 _ERROR_CATEGORIES = frozenset({
     "configuration_recovery_failed",
+    "show_windows_failed",
     "route_install_failed",
     "schedule_install_failed",
     "xc_install_failed",
@@ -96,12 +98,13 @@ _ERROR_CATEGORIES = frozenset({
 _STATE_KEYS = frozenset({
     "generation", "config_generation", "control_generation", "channel_count",
     "source_policy_count", "queued", "paused", "enabled", "count", "level",
-    "reason", "activation_pending", "outcome_unknown", "recovery_required", "seconds",
+    "reason", "activation_pending", "outcome_unknown", "recovery_required", "seconds", "windows",
 })
 _SAFE_REASONS = frozenset({
     "version", "proxy_api", "cleanup_guard", "xc_hooks", "xc_uninstall", "log_level",
 })
 _SAFE_ERROR_CALLSITES = frozenset({
+    "show_windows_epg",
     "native_observation", "opening_projection", "opening_cleanup", "return_completion",
     "startup_recovery", "startup_admission", "return_recovery",
     "recorder_supervisor", "borrowed_worker", "borrowed_cleanup",
