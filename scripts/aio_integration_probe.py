@@ -1088,6 +1088,11 @@ def probe():
         phase("source_configuration", "started")
         probe_source_configuration(channel, root)
         phase("source_configuration", "complete")
+        if os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core":
+            # The recorder media and failover phases take most of the run time and
+            # are the release evidence of the full suite only.
+            print(f"AIO core checks passed: Dispatcharr {__version__}")
+            return
         sys.path.insert(0, "/tmp")
         from aio_recorder_media import probe_actual_recorder_media
 
