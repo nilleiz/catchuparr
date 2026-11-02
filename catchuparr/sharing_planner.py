@@ -340,6 +340,19 @@ def restore_state(
     )
 
 
+def _stability_seconds(state: SharingState, observation: SharingObservation) -> float:
+    """How long a viewer must stay live before the recorder borrows it.
+
+    The window always applies, also before the first switch, so a zapping viewer
+    never triggers a borrow. Only when the recorder has no working source of its
+    own (paused, failed, or its dedicated source is unavailable) does it attach
+    at once, because waiting would only lengthen the recording gap.
+    """
+    if state.phase in {SharingPhase.PAUSED, SharingPhase.FAILED} or not observation.dedicated_source_available:
+        return 0
+    return observation.settings.live_stability_seconds
+
+
 def observe(state: SharingState | None, observation: SharingObservation) -> SharingDecision:
     """Coalesce one observation into one deadline or one fenced transition intent."""
     current = state or initial_state(observation)
@@ -591,7 +604,7 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
     )
     deadline = _later_deadline(
         since,
-        (0 if current.last_switch_at is None else observation.settings.live_stability_seconds),
+        _stability_seconds(current, observation),
         current.last_switch_at,
         observation.settings.min_switch_interval_seconds,
     )
@@ -605,8 +618,8 @@ def observe(state: SharingState | None, observation: SharingObservation) -> Shar
         candidate_state,
         SharingAction.ATTACH_BORROW,
         SharingPhase.WAIT_LIVE,
-        ("initial eligible viewer connection attaches immediately"
-         if current.last_switch_at is None
+        ("recorder has no working source; attach without the stability window"
+         if _stability_seconds(current, observation) == 0
          else "eligible existing live connection is stable"),
     )
 
@@ -832,8 +845,7 @@ def _completion_deadline(
             return None
         return _later_deadline(
             state.candidate_since,
-            (0 if state.last_switch_at is None
-             else observation.settings.live_stability_seconds),
+            _stability_seconds(state, observation),
             state.last_switch_at,
             observation.settings.min_switch_interval_seconds,
         )

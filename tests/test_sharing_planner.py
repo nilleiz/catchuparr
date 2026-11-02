@@ -173,22 +173,52 @@ class SharingPlannerTests(unittest.TestCase):
                 admitted_return_deadline=200.0,
             )
 
-    def test_initial_attach_uses_eligible_viewer_without_waiting_for_stability(self):
-        initial = observation(100, candidate=target(allowed=False))
-        decision = observe(None, initial)
+    def test_initial_attach_waits_for_the_stability_window(self):
+        waiting = observe(None, observation(100, candidate=target(allowed=False)))
+        self.assertEqual(SharingAction.WAIT, waiting.action)
+        self.assertEqual(105, waiting.deadline)
+        still = observe(waiting.state, observation(104, candidate=target(allowed=False)))
+        self.assertEqual(SharingAction.WAIT, still.action)
+        decision = observe(still.state, observation(105, candidate=target(allowed=False)))
         self.assertEqual(SharingAction.ATTACH_BORROW, decision.action)
         self.assertIsNone(decision.deadline)
-        self.assertIn("immediately", decision.reason)
-        duplicate = observe(decision.state, observation(100, candidate=target(allowed=False)))
+        self.assertIn("stable", decision.reason)
+        duplicate = observe(decision.state, observation(105, candidate=target(allowed=False)))
         self.assertEqual(SharingAction.NOOP, duplicate.action)
         self.assertEqual(decision.state.pending_action, duplicate.state.pending_action)
 
         borrowed = resolve_transition(
-            decision.state, SharingAction.ATTACH_BORROW, succeeded=True, now=100
+            decision.state, SharingAction.ATTACH_BORROW, succeeded=True, now=105
         )
         self.assertEqual(SharingPhase.BORROWED, borrowed.phase)
         self.assertEqual(target(allowed=False).connection_identity, borrowed.borrowed_identity)
-        self.assertEqual(100, borrowed.last_switch_at)
+        self.assertEqual(105, borrowed.last_switch_at)
+
+    def test_a_zapping_viewer_never_triggers_a_borrow(self):
+        settings = SharingSettings(True, live_stability_seconds=15)
+        seen = observe(None, observation(100, candidate=target(), settings=settings))
+        self.assertEqual(SharingAction.WAIT, seen.action)
+        gone = observe(seen.state, observation(101, candidate=target(clients=()), settings=settings))
+        self.assertNotEqual(SharingAction.ATTACH_BORROW, gone.action)
+        later = observe(gone.state, observation(116, candidate=target(clients=()), settings=settings))
+        self.assertNotEqual(SharingAction.ATTACH_BORROW, later.action)
+        back = observe(later.state, observation(120, candidate=target(), settings=settings))
+        self.assertEqual(SharingAction.WAIT, back.action)
+        self.assertEqual(135, back.deadline)
+
+    def test_without_a_working_own_source_the_recorder_attaches_at_once(self):
+        settings = SharingSettings(True, live_stability_seconds=15)
+        unavailable = observe(None, observation(
+            100, candidate=target(), settings=settings, dedicated_source_available=False,
+        ))
+        self.assertEqual(SharingAction.ATTACH_BORROW, unavailable.action)
+        self.assertIn("no working source", unavailable.reason)
+        paused = observe(None, observation(100, settings=settings, dedicated_source_available=False))
+        self.assertEqual(SharingPhase.PAUSED, paused.state.phase)
+        resumed = observe(paused.state, observation(
+            101, candidate=target(), settings=settings, dedicated_source_available=False,
+        ))
+        self.assertEqual(SharingAction.ATTACH_BORROW, resumed.action)
 
     def test_target_identity_change_restarts_live_stability(self):
         current = replace(
@@ -438,6 +468,8 @@ class SharingPlannerTests(unittest.TestCase):
         )
         self.assertEqual(SharingAction.NOOP, current.action)
         current = observe(stale.state, observation(105, candidate=target()))
+        self.assertEqual(SharingAction.WAIT, current.action)
+        current = observe(current.state, observation(110, candidate=target()))
         self.assertEqual(SharingAction.ATTACH_BORROW, current.action)
 
     def test_configuration_or_control_generation_change_restarts_live_stability(self):
@@ -467,7 +499,8 @@ class SharingPlannerTests(unittest.TestCase):
         self.assertEqual(SharingPhase.DEDICATED, decision.state.phase)
 
     def test_restart_preserves_valid_cooldowns_but_never_a_borrowed_binding(self):
-        pending = observe(None, observation(100, candidate=target()))
+        fast = SharingSettings(True, live_stability_seconds=0)
+        pending = observe(None, observation(100, candidate=target(), settings=fast))
         restored = restore_state(
             pending.state.to_snapshot(),
             channel_uuid=CHANNEL,
@@ -478,11 +511,10 @@ class SharingPlannerTests(unittest.TestCase):
         )
         self.assertEqual(SharingPhase.DEDICATED, restored.phase)
         self.assertIsNone(restored.borrowed_identity)
-        resumed = observe(restored, observation(104, candidate=target(), fence=12))
+        resumed = observe(restored, observation(104, candidate=target(), fence=12, settings=fast))
         self.assertEqual(SharingAction.ATTACH_BORROW, resumed.action)
         self.assertIsNone(resumed.deadline)
 
-        fast = SharingSettings(True, live_stability_seconds=0)
         attach = observe(None, observation(200, candidate=target(), settings=fast))
         borrowed = resolve_transition(attach.state, attach.action, succeeded=True, now=200)
         snapshot = borrowed.to_snapshot()
@@ -738,7 +770,7 @@ class SharingPlannerTests(unittest.TestCase):
         self.assertEqual(SharingPhase.PAUSED, paused_complete.phase)
 
     def test_attach_and_return_recheck_deadlines_at_completion_and_on_clock_rollback(self):
-        settings = SharingSettings(True, 5, 30, 60)
+        settings = SharingSettings(True, 0, 30, 60)
         attach = observe(None, observation(100, candidate=target(), settings=settings))
         self.assertEqual(SharingAction.ATTACH_BORROW, attach.action)
         self.assertIsNone(attach.deadline)

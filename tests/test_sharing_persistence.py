@@ -56,21 +56,25 @@ def target():
 
 
 def pending_attach():
-    start = observe(
-        None,
-        SharingObservation(
+    def at(now, candidate):
+        return SharingObservation(
             channel_uuid=CHANNEL,
-            now=100,
+            now=now,
             configuration_generation="config-a",
             control_generation=3,
             recorder_fence=11,
             lease_is_current=True,
             settings=SharingSettings(True, 5, 30, 60),
-            target=None,
-        ),
-    )
+            target=candidate,
+        )
+
+    start = observe(None, at(90, None))
+    # The viewer appears five seconds earlier, so the stability window ends
+    # exactly when the attach is requested at 100.
+    seen = observe(start.state, at(95, target()))
+    assert seen.action is SharingAction.WAIT
     ready = observe(
-        start.state,
+        seen.state,
         SharingObservation(
             channel_uuid=CHANNEL,
             now=100,

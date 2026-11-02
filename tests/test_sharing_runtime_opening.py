@@ -58,11 +58,18 @@ def target():
 
 def attach_state():
     first = observe(None, SharingObservation(
-        channel_uuid=CHANNEL, now=100, configuration_generation="config-synthetic",
+        channel_uuid=CHANNEL, now=90, configuration_generation="config-synthetic",
         control_generation=2, recorder_fence=7, lease_is_current=True,
         settings=SharingSettings(True, 5, 30, 60), target=None,
     ))
-    ready = observe(first.state, SharingObservation(
+    # The viewer appears five seconds earlier, so the stability window ends
+    # exactly when the attach is requested at 100.
+    seen = observe(first.state, SharingObservation(
+        channel_uuid=CHANNEL, now=95, configuration_generation="config-synthetic",
+        control_generation=2, recorder_fence=7, lease_is_current=True,
+        settings=SharingSettings(True, 5, 30, 60), target=target(),
+    ))
+    ready = observe(seen.state, SharingObservation(
         channel_uuid=CHANNEL, now=100, configuration_generation="config-synthetic",
         control_generation=2, recorder_fence=7, lease_is_current=True,
         settings=SharingSettings(True, 5, 30, 60), target=target(),
