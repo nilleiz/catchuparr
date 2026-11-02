@@ -135,7 +135,8 @@ rollback.
 ## AIO in pull request CI
 
 Every pull request that changes plugin code runs the **core** AIO suite
-(compatibility, routes, overviews, source configuration). The step is named
+(compatibility, routes, overviews, source configuration, show rules against the
+real EPG tables). The step is named
 "Core checks in actual Dispatcharr AIO" and is **not** release evidence. The full
 suite runs when the pull request carries the label `full-aio` (adding the label
 starts a new run) or on a manual dispatch without `skip_native`. Only the step
@@ -175,7 +176,7 @@ production is not updated. Preserve Dev bind addresses, volumes and egress rules
 For a rebuild instead of an in-place upgrade, use the backup ZIP/API restoration
 procedure below. Run `python3 scripts/run_aio_integration.py --image <pinned-image>`
 once for the pinned Dispatcharr version (`--suite core` stops after the source
-configuration, about a minute; the default `full` suite adds the recorder media
+configuration and show-rule checks, about a minute; the default `full` suite adds the recorder media
 and failover phases, about 13 minutes). Each invocation creates a uniquely
 named, networkless container with its own anonymous `/data` volume and no fixed
 host ports. Capture the run's

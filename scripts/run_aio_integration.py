@@ -34,7 +34,7 @@ def run():
     )
     parser.add_argument(
         "--suite", choices=("core", "full"), default="full",
-        help="core: compatibility, routes, overviews and source configuration (about a minute); "
+        help="core: compatibility, routes, overviews, source configuration and show rules (about a minute); "
              "full: additionally the recorder media and failover phases (release evidence).",
     )
     args = parser.parse_args()

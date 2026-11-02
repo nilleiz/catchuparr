@@ -2527,7 +2527,7 @@ def probe_actual_recorder_media(root: Path) -> None:
                 f"profile: {profile_name}\n"
                 "rules:\n"
                 "  - channels: {profile: all}\n"
-                "    include: [Synthetic media source B]\n"
+                "    m3u: {include: [Synthetic media source B]}\n"
             ),
             "archive_root": str(root),
             "retention_hours": 1,
@@ -4207,7 +4207,7 @@ def _probe_running_recorder_controls(
             + f"    - {{start: \"{start_clock}\", end: \"{end_clock}\"}}\n"
             + "rules:\n"
             + "  - channels: {profile: all}\n"
-            + "    include: [Synthetic archive isolation B]\n"
+            + "    m3u: {include: [Synthetic archive isolation B]}\n"
         ),
     )
     persist_draft(timed_settings)
@@ -4565,7 +4565,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                 f"profile: {profile_name}\n"
                 "rules:\n"
                 "  - channels: {profile: all}\n"
-                "    exclude: []\n"
+                "    m3u: {exclude: []}\n"
             ),
             "archive_root": str(archive_root),
             "retention_hours": 1,
@@ -4862,7 +4862,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
                     f"profile: {profile_name}\n"
                     "rules:\n"
                     "  - channels: {profile: all}\n"
-                    "    include: [Synthetic archive isolation B]\n"
+                    "    m3u: {include: [Synthetic archive isolation B]}\n"
                 ),
             ),
             hide_recorders=True,
@@ -6343,7 +6343,7 @@ def probe_actual_live_archive_isolation(root: Path) -> None:
             f"profile: {profile_name}\n"
             "rules:\n"
             "  - channels: {profile: all}\n"
-            f'    exclude: ["{account_a.name}", "{account_b.name}"]\n'
+            f'    m3u: {{exclude: ["{account_a.name}", "{account_b.name}"]}}\n'
         )
         no_source_plugin = PluginConfig.objects.get(key="catchuparr")
         no_source_plugin.settings = dict(no_source_settings)

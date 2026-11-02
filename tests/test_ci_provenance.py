@@ -522,6 +522,13 @@ class CIChangeClassificationTest(unittest.TestCase):
         self.assertNotIn("--suite core", evidence_block)
         self.assertIn("contains(github.event.pull_request.labels.*.name, 'full-aio')", evidence_block)
 
+    def test_core_suite_ends_after_the_show_rule_phase(self):
+        probe = (Path(__file__).resolve().parents[1] / "scripts/aio_integration_probe.py").read_text()
+        self.assertLess(probe.index('phase("show_rules", "complete")'),
+                        probe.index('os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core"'))
+        self.assertLess(probe.index('os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core"'),
+                        probe.index('phase("recorder_media", "started")'))
+
     def test_changed_paths_uses_nul_delimited_git_diff(self):
         sha = "a" * 40
         fake = type("Result", (), {"stdout": b"README.md\0docs/ci-workflow.md\0"})()

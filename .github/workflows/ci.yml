@@ -47,7 +47,7 @@ jobs:
           --head-sha "$PR_HEAD_SHA"
           --output "$GITHUB_OUTPUT"
       # Pull requests run the core checks (compatibility, routes, overviews, source
-      # configuration; about a minute). The recorder media and failover phases take
+      # configuration, show rules; about a minute). The recorder media and failover phases take
       # about 13 minutes and are the release evidence: the label `full-aio` on the
       # pull request, or a manual dispatch, runs them. Only the step below that
       # carries the release-evidence name can satisfy scripts/ci_provenance.py.
