@@ -588,3 +588,15 @@ class RecordingOverviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShowLabelTests(unittest.TestCase):
+    def test_recorder_row_names_the_show_it_records_for(self):
+        from catchuparr.recording_overview import _current_show, _message_row
+
+        row = {"name": "Channel", "state": "recording", "recent_media_progress": True, "mode": "dedicated",
+               "source": None, "show": {"title": "Synthetic Programme"}}
+        self.assertEqual("Channel - — [ok] · Show: Synthetic Programme", _message_row(row))
+        self.assertEqual("Channel - — [ok]", _message_row({**row, "show": None}))
+        self.assertIsNone(_current_show({}, "x", None))
+        self.assertIsNone(_current_show({"show_rules": [{"index": 1}]}, "x", object()))

@@ -23,6 +23,9 @@ RECONCILE_TASK = "catchuparr.reconcile"
 RECONCILE_SCHEDULE = "catchuparr-recorder-reconcile"
 SNAPSHOT_TASK = "catchuparr.snapshot_epg"
 SNAPSHOT_SCHEDULE = "catchuparr-epg-snapshot"
+SHOW_WINDOWS_TASK = "catchuparr.plan_show_windows"
+SHOW_WINDOWS_SCHEDULE = "catchuparr-show-windows"
+SHOW_TOAST_PER_CHANNEL = 5
 
 
 @dataclass(frozen=True)
@@ -214,7 +217,44 @@ def apply_committed_log_level(settings: dict | None = None) -> str:
 def validate_configuration(settings: dict) -> dict:
     from .configuration import validate_configuration as validate
 
-    return validate(settings)
+    result = validate(settings, show_preview=_show_preview)
+    matches = result.get("show_matches")
+    if matches:
+        result["message"] = deliver_show_matches(result, matches)
+    return result
+
+
+def deliver_show_matches(result: dict, matches: dict) -> str:
+    """Push the upcoming show matches as a toast and return the summary line."""
+    import time
+    from uuid import uuid4
+
+    from .action_messages import deliver_action_message
+    from .show_windows import format_show_rows
+
+    names = {row["channel_uuid"]: row["channel_name"] for row in result["channels"]}
+    entries = [
+        (names.get(channel, "Unknown channel"), item["start"], item["end"], item["title"])
+        for channel, items in matches["channels"].items() for item in items[:SHOW_TOAST_PER_CHANNEL]
+    ]
+    count = sum(len(items) for items in matches["channels"].values())
+    summary = f"{result['message']} {count} upcoming show{'' if count == 1 else 's'} match"
+    summary += f" (the next {SHOW_TOAST_PER_CHANNEL} per channel are listed)" if count > len(entries) else ""
+    summary += "; the EPG could not be read for some channels." if matches["epg_unavailable"] else "."
+    if not entries:
+        return summary
+    rows = format_show_rows(entries, matches["timezone"], time.time())
+    return deliver_action_message(rows, title="Shows", summary=summary, run_key=f"shows-{uuid4().hex[:12]}")
+
+
+def _show_preview(active: dict) -> dict:
+    """Upcoming matches of the draft's shows rules; the validation never fails on the EPG."""
+    import time
+
+    from .show_windows import load_programmes, preview_show_matches
+
+    now = time.time()
+    return preview_show_matches(active, load_programmes(active, now), now)
 
 
 def apply_configuration(settings: dict | None = None) -> dict:
@@ -392,10 +432,20 @@ def _ensure_schedule() -> None:
     snapshot_interval, _ = IntervalSchedule.objects.get_or_create(
         every=300, period=IntervalSchedule.SECONDS
     )
+    minute_interval, _ = IntervalSchedule.objects.get_or_create(
+        every=60, period=IntervalSchedule.SECONDS
+    )
     PeriodicTask.objects.update_or_create(
         name=SNAPSHOT_SCHEDULE,
         defaults={
             "task": SNAPSHOT_TASK, "interval": snapshot_interval,
+            "queue": "dvr", "enabled": True,
+        },
+    )
+    PeriodicTask.objects.update_or_create(
+        name=SHOW_WINDOWS_SCHEDULE,
+        defaults={
+            "task": SHOW_WINDOWS_TASK, "interval": minute_interval,
             "queue": "dvr", "enabled": True,
         },
     )
@@ -423,7 +473,7 @@ def shutdown() -> None:
         from django_celery_beat.models import PeriodicTask
 
         PeriodicTask.objects.filter(
-            name__in=(RECONCILE_SCHEDULE, SNAPSHOT_SCHEDULE)
+            name__in=(RECONCILE_SCHEDULE, SNAPSHOT_SCHEDULE, SHOW_WINDOWS_SCHEDULE)
         ).update(enabled=False)
     except Exception:
         error("scheduler_disable_failed")
@@ -438,8 +488,9 @@ def shutdown() -> None:
 def reconcile() -> None:
     require_supported_version()
     _ensure_schedule()
-    from .tasks import reconcile_recorders, snapshot_epg
+    from .tasks import plan_show_windows, reconcile_recorders, snapshot_epg
 
+    plan_show_windows.apply_async(queue="dvr")
     reconcile_recorders.apply_async(queue="dvr")
     snapshot_epg.apply_async(queue="dvr")
 
@@ -447,7 +498,8 @@ def reconcile() -> None:
 def status(settings: dict, *, control_state=None) -> dict:
     from .engine.store import ArchiveStore
     from .recorder_control import RecorderControlError
-    from .schedule import ScheduleError, schedule_from_snapshot, schedule_is_active
+    from .schedule import ScheduleError, schedule_from_snapshot
+    from .show_windows import recording_window_open
 
     config = parse_settings(settings)
     store = ArchiveStore(config.archive_root)
@@ -522,8 +574,8 @@ def status(settings: dict, *, control_state=None) -> dict:
         if isinstance(schedules, dict) and isinstance(timezone_name, str):
             try:
                 schedule = schedule_from_snapshot(schedules[channel])
-                channel_status["recording_scheduled"] = schedule_is_active(
-                    schedule, timezone_name, now
+                channel_status["recording_scheduled"] = recording_window_open(
+                    settings, channel, schedule, timezone_name, now
                 )
             except (KeyError, ScheduleError, ValueError):
                 channel_status["recording_scheduled"] = None
