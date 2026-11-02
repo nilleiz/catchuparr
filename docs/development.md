@@ -132,6 +132,18 @@ restore point while preserving the current archive directory, recordings and
 archive database. Do not restore or replace archive data as part of an ordinary
 rollback.
 
+## AIO in pull request CI
+
+Every pull request that changes plugin code runs the **core** AIO suite
+(compatibility, routes, overviews, source configuration, show rules against the
+real EPG tables). The step is named
+"Core checks in actual Dispatcharr AIO" and is **not** release evidence. The full
+suite runs when the pull request carries the label `full-aio` (adding the label
+starts a new run) or on a manual dispatch without `skip_native`. Only the step
+"Synthetic playback in actual Dispatcharr AIO" satisfies `scripts/ci_provenance.py`,
+so label the pull request `full-aio` once it is feature complete and before the
+release is dispatched; the release then reuses that run and does not repeat it.
+
 ## Upgrading the isolated AIO to 0.33.0
 
 Use `ghcr.io/dispatcharr/dispatcharr@sha256:96bc548978c68e684677da7895692eeeefb7f0b2edfa38311dac2b702c61d236`
@@ -163,7 +175,9 @@ production is not updated. Preserve Dev bind addresses, volumes and egress rules
 
 For a rebuild instead of an in-place upgrade, use the backup ZIP/API restoration
 procedure below. Run `python3 scripts/run_aio_integration.py --image <pinned-image>`
-once for the pinned Dispatcharr version. Each invocation creates a uniquely
+once for the pinned Dispatcharr version (`--suite core` stops after the source
+configuration and show-rule checks, about a minute; the default `full` suite adds the recorder media
+and failover phases, about 13 minutes). Each invocation creates a uniquely
 named, networkless container with its own anonymous `/data` volume and no fixed
 host ports. Capture the run's
 output in a separate private log outside the repository. The runner refuses

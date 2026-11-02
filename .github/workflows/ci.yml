@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       skip_native:
@@ -45,9 +46,23 @@ jobs:
           --base-sha "$PR_BASE_SHA"
           --head-sha "$PR_HEAD_SHA"
           --output "$GITHUB_OUTPUT"
+      # Pull requests run the core checks (compatibility, routes, overviews, source
+      # configuration, show rules; about a minute). The recorder media and failover phases take
+      # about 13 minutes and are the release evidence: the label `full-aio` on the
+      # pull request, or a manual dispatch, runs them. Only the step below that
+      # carries the release-evidence name can satisfy scripts/ci_provenance.py.
+      - name: Core checks in actual Dispatcharr AIO
+        if: >-
+          steps.classify.outputs.full == 'true'
+          && github.event_name == 'pull_request'
+          && !contains(github.event.pull_request.labels.*.name, 'full-aio')
+        run: python scripts/run_aio_integration.py --suite core --image ${{ matrix.image }}
       - name: Synthetic playback in actual Dispatcharr AIO
-        if: steps.classify.outputs.full == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.skip_native)
-        run: python scripts/run_aio_integration.py --image ${{ matrix.image }}
+        if: >-
+          steps.classify.outputs.full == 'true'
+          && !(github.event_name == 'workflow_dispatch' && inputs.skip_native)
+          && (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'full-aio'))
+        run: python scripts/run_aio_integration.py --suite full --image ${{ matrix.image }}
       - name: Record explicit manual native AIO skip
         if: github.event_name == 'workflow_dispatch' && inputs.skip_native
         run: echo "::notice title=Native AIO explicitly skipped::This manually requested run is package/unit validation only and cannot satisfy release acceptance."

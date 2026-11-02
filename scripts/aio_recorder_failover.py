@@ -1989,11 +1989,12 @@ def probe_recorder_failover(root: Path) -> None:
                 f"profile: {profile_name}\n"
                 "rules:\n"
                 "  - channels: {profile: all}\n"
-                "    exclude: []\n"
-                "    priority:\n"
-                '      "Synthetic failover A": 300\n'
-                '      "Synthetic failover B": 200\n'
-                '      "Synthetic failover D": 100\n'
+                "    m3u:\n"
+                "      exclude: []\n"
+                "      priority:\n"
+                '        "Synthetic failover A": 300\n'
+                '        "Synthetic failover B": 200\n'
+                '        "Synthetic failover D": 100\n'
             ),
             "archive_root": str(archive_root),
             "retention_hours": 1,
