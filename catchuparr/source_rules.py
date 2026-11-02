@@ -12,6 +12,7 @@ from yaml.constructor import ConstructorError
 from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
 
+from .epg_rules import ShowRuleError, compile_match, compile_padding
 from .schedule import (
     CONTINUOUS_SCHEDULE,
     RecordingSchedule,
@@ -59,6 +60,8 @@ class FilterCompilation:
     channel_schedules: dict[str, RecordingSchedule] = field(default_factory=dict)
     channel_origins: dict[str, dict[str, Any]] = field(default_factory=dict)
     handover: dict[str, Any] = field(default_factory=dict)
+    show_rules: tuple[dict[str, Any], ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 class _RestrictedSafeLoader(yaml.SafeLoader):
@@ -535,6 +538,77 @@ def _resolve_handover(
     return {"delayed_account_ids": delayed, "max_overlap_seconds": seconds}
 
 
+_FLAT_FILTER_KEYS = ("include", "exclude", "priority")
+
+
+def _flatten_m3u(rule: dict[str, Any], *, line: int, field: str) -> tuple[dict[str, Any], bool]:
+    """Merge a nested ``m3u`` provider filter into the flat keys; report flat use."""
+    flat_used = any(key in rule for key in _FLAT_FILTER_KEYS)
+    if "m3u" not in rule:
+        return rule, flat_used
+    if flat_used:
+        raise SourceRuleError(f"line {line}, field {field}.m3u: cannot be combined with include, exclude or priority")
+    nested = _mapping(rule["m3u"], line=line, field=f"{field}.m3u", allowed=set(_FLAT_FILTER_KEYS))
+    return {**{key: value for key, value in rule.items() if key != "m3u"}, **nested}, False
+
+
+def _compile_show_rule(
+    rule: dict[str, Any],
+    *,
+    number: int,
+    line: int,
+    channel_rows: list[dict[str, Any]],
+    eligible_ids: set[str],
+    profiles_by_name: dict[str, dict[str, Any]],
+    schedule_days,
+) -> tuple[dict[str, Any], set[str]]:
+    field = f"rules[{number - 1}].shows"
+    show = _mapping(rule["shows"], line=line, field=field, allowed={"name", "match", "channels", "padding"},
+                    required={"match"})
+    name = show.get("name", f"rule {number}")
+    if not isinstance(name, str) or not name:
+        raise SourceRuleError(f"line {line}, field {field}.name: expected text")
+    if "schedule_mode" in rule:
+        raise SourceRuleError(f"line {line}, field schedule_mode: not supported for shows")
+    try:
+        compile_match(show["match"], field=f"{field}.match")
+        before, after = compile_padding(show.get("padding"), field=f"{field}.padding")
+    except ShowRuleError as exc:
+        raise SourceRuleError(f"line {line}, {exc}") from None
+    scope = _mapping(show.get("channels", {}), line=line, field=f"{field}.channels", allowed={"include", "exclude"})
+    profile_ids: set[str] = set()
+    eligible_rows = [row for row in channel_rows if row["uuid"] in eligible_ids]
+
+    def select(kind: str) -> set[str]:
+        selector = _mapping(scope[kind], line=line, field=f"{field}.channels.{kind}",
+                            allowed={"numbers", "names", "groups", "profile"})
+        selected, found_profiles, _ = _resolve_channel_selector(
+            selector, line=line, channel_rows=eligible_rows, eligible_channel_ids=eligible_ids,
+            profiles_by_name=profiles_by_name,
+        )
+        profile_ids.update(found_profiles)
+        return selected
+
+    selected = select("include") if "include" in scope else set(eligible_ids)
+    if "exclude" in scope:
+        selected -= select("exclude")
+    if not selected:
+        raise SourceRuleError(f"line {line}, field {field}.channels: no channels remain after exclude")
+    schedule = None
+    if schedule_days is not None:
+        schedule = normalize_expanded_schedule_days(schedule_days).to_snapshot()
+    compiled = {
+        "index": number,
+        "name": name,
+        "channel_uuids": sorted(selected),
+        "match": show["match"],
+        "padding": {"before": before / 60, "after": after / 60},
+        "schedule": schedule,
+        "line": line,
+    }
+    return compiled, profile_ids
+
+
 def compile_filter_config(
     text: str,
     channels: Iterable[Mapping[str, Any]],
@@ -592,6 +666,8 @@ def compile_filter_config(
         ambiguous_account_names=ambiguous_account_names,
     )
     all_rule = None
+    warnings: list[str] = []
+    show_entries: list[dict[str, Any]] = []
     profile_rules: list[dict[str, Any]] = []
     direct_rules: list[dict[str, Any]] = []
     occupied_direct: set[str] = set()
@@ -602,9 +678,13 @@ def compile_filter_config(
             raw_rule,
             line=line,
             field=f"rules[{index - 1}]",
-            allowed={"channels", "include", "exclude", "priority", "schedule", "schedule_mode"},
-            required={"channels"},
+            allowed={"channels", "shows", "m3u", "include", "exclude", "priority", "schedule", "schedule_mode"},
         )
+        if ("channels" in rule) == ("shows" in rule):
+            raise SourceRuleError(f"line {line}, rule {index}: specify exactly one of channels or shows")
+        rule, flat_filter = _rule_call(index, _flatten_m3u, rule, line=line, field=f"rules[{index - 1}]")
+        if flat_filter:
+            warnings.append(f"rule {index}: flat include/exclude/priority is deprecated, use m3u")
         schedule_mode = rule.get("schedule_mode", "replace")
         if not isinstance(schedule_mode, str) or schedule_mode not in {"replace", "override_days"}:
             raise SourceRuleError(
@@ -623,6 +703,19 @@ def compile_filter_config(
             )
         except ScheduleError as exc:
             raise SourceRuleError(f"rule {index}: {exc}") from None
+        if "shows" in rule:
+            compiled_show, show_profile_ids = _rule_call(
+                index, _compile_show_rule, rule, number=index, line=line, channel_rows=channel_rows,
+                eligible_ids=eligible_ids, profiles_by_name=profiles_by_name,
+                schedule_days=rule_schedule_days,
+            )
+            referenced_profile_ids.update(show_profile_ids)
+            patch = _rule_call(
+                index, _resolve_filter, rule, line=line, account_names=account_names,
+                account_ids=account_ids, ambiguous_account_names=ambiguous_account_names,
+            )
+            show_entries.append({"compiled": compiled_show, "patch": patch})
+            continue
         selector = _rule_call(index, _mapping,
             rule["channels"],
             line=line,
@@ -780,6 +873,17 @@ def compile_filter_config(
              "schedule_days": schedule_origins},
         )
 
+    show_policies = _show_only_channels(
+        show_entries, selected_ids, account_ids=account_ids,
+    )
+    for channel_uuid, (policy, origin_rule) in show_policies.items():
+        effective[channel_uuid] = (
+            policy, RecordingSchedule("weekly", ()),
+            {"source_filter": origin_rule if policy is not None else "inherited default",
+             "priority": origin_rule if policy is not None and policy.priorities else "inherited default",
+             "schedule_days": {day: f"shows {origin_rule}" for day in days}},
+        )
+    selected_ids |= set(show_policies)
     source_policies: dict[str, SourcePolicy] = {}
     channel_schedules: dict[str, RecordingSchedule] = {}
     preview_by_uuid: dict[str, dict[str, Any]] = {}
@@ -847,7 +951,35 @@ def compile_filter_config(
         channel_schedules=channel_schedules,
         channel_origins=channel_origins,
         handover=handover,
+        show_rules=tuple(entry["compiled"] for entry in show_entries),
+        warnings=tuple(warnings),
     )
+
+
+def _show_only_channels(show_entries, selected_ids, *, account_ids):
+    """Channels reached only by shows rules and the source policy they share.
+
+    A channel that also has a channels rule keeps that rule's source policy.
+    Shows rules covering the same channel must agree on theirs.
+    """
+    result: dict[str, tuple[SourcePolicy | None, str]] = {}
+    for entry in show_entries:
+        compiled = entry["compiled"]
+        policy = _effective_filter(entry["patch"], None, line=compiled["line"], known_account_ids=account_ids)
+        origin = f"rule {compiled['index']}"
+        if (policy is not None and policy.priorities and policy.include_account_ids is None
+                and not policy.exclude_account_ids):
+            raise SourceRuleError(f"line {compiled['line']}, rule {compiled['index']}: field priority: requires include or exclude")
+        for channel_uuid in compiled["channel_uuids"]:
+            if channel_uuid in selected_ids:
+                continue
+            if channel_uuid in result and result[channel_uuid][0] != policy:
+                raise SourceRuleError(
+                    f"line {compiled['line']}, rule {compiled['index']}: "
+                    "shows rules covering the same channel need identical source filters"
+                )
+            result.setdefault(channel_uuid, (policy, origin))
+    return result
 
 
 def _requires_override(policy: SourcePolicy) -> bool:

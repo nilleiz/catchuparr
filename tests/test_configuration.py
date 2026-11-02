@@ -106,6 +106,54 @@ class ConfigurationTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def test_show_rules_persist_only_when_used_and_keep_the_generation_stable(self):
+        apply_configuration(self.settings, self.catalog, self.active_path)
+        plain = load_active_configuration(self.active_path)
+        self.assertNotIn("show_rules", plain)
+        self.assertNotIn("show_rules", json.loads(self.active_path.read_text(encoding="utf-8")))
+
+        shows = dict(self.settings, filter_config=(
+            "version: 1\nprofile: Synthetic Profile All\nrules:\n"
+            "  - shows:\n      name: Synthetic show\n      match: {title: {starts_with: Synthetic}}\n"
+            "      channels: {include: {names: [Synthetic Channel A]}}\n"
+            "      padding: {before: 1, after: 5}\n"
+        ))
+        preview = validate_configuration(shows, self.catalog)
+        self.assertEqual(1, preview["show_rule_count"])
+        self.assertEqual([], preview["warnings"])
+        apply_configuration(shows, self.catalog, self.active_path)
+        active = load_active_configuration(self.active_path)
+        self.assertEqual(CHANNEL_A, active["channel_uuids"])
+        self.assertEqual("Synthetic show", active["show_rules"][0]["name"])
+        self.assertEqual({"before": 1.0, "after": 5.0}, active["show_rules"][0]["padding"])
+        self.assertNotEqual(
+            configuration.active_configuration_generation(plain),
+            configuration.active_configuration_generation(active),
+        )
+
+    def test_invalid_persisted_show_rules_are_rejected(self):
+        shows = dict(self.settings, filter_config=(
+            "version: 1\nrules:\n  - shows:\n      match: {title: {contains: x}}\n"
+        ))
+        apply_configuration(shows, self.catalog, self.active_path)
+        saved = json.loads(self.active_path.read_text(encoding="utf-8"))
+        for mutate in (
+            lambda rule: rule.update(channel_uuids=["00000000-0000-0000-0000-0000000000ff"]),
+            lambda rule: rule.update(match={"title": {"regex": "("}}),
+            lambda rule: rule.update(padding={"before": 999, "after": 0}),
+            lambda rule: rule.update(unexpected=1),
+        ):
+            broken = json.loads(json.dumps(saved))
+            mutate(broken["show_rules"][0])
+            self.active_path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_active_configuration(self.active_path)
+        broken = json.loads(json.dumps(saved))
+        broken["show_rules"] = []
+        self.active_path.write_text(json.dumps(broken), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            load_active_configuration(self.active_path)
+
     def test_real_compiler_persists_only_stable_ids_and_safe_preview(self):
         result = validate_configuration(self.settings, self.catalog)
         applied = apply_configuration(self.settings, self.catalog, self.active_path)

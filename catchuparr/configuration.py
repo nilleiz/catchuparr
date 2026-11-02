@@ -320,6 +320,8 @@ def compile_draft(
         "connection_sharing": connection_sharing,
         "recording_enabled": recording_enabled,
         "log_level": log_level,
+        "show_rules": [dict(rule) for rule in compiled.show_rules],
+        "warnings": list(compiled.warnings),
     }, catalog, previews
 
 
@@ -334,6 +336,8 @@ def validate_configuration(
         "channels": previews,
         "selected_channel_count": len(active["channel_uuids"]),
         "source_policy_count": len(active["source_policies"]),
+        "show_rule_count": len(active["show_rules"]),
+        "warnings": active["warnings"],
         "message": (
             "No channels are selected." if not active["channel_uuids"]
             else f"{len(active['channel_uuids'])} channel(s) selected."
@@ -422,6 +426,10 @@ def _apply_configuration_locked(
         "recording_schedule": active["recording_schedule"],
         "configuration_origins": active["configuration_origins"],
     }
+    if active["show_rules"]:
+        # Only present when used, so snapshots and generations of installs
+        # without show rules stay byte-identical.
+        document["show_rules"] = active["show_rules"]
     _prevalidate_archive_root(document["settings"]["archive_root"])
     try:
         previous_active = _load_active_configuration_locked(path)
@@ -1871,7 +1879,9 @@ def _active_configuration_view(data: dict[str, Any]) -> dict[str, Any]:
             channel: dict(CONNECTION_SHARING_DEFAULTS)
             for channel in data["channel_uuids"]
         }
+    show_rules = {"show_rules": data["show_rules"]} if data.get("show_rules") else {}
     return {
+        **show_rules,
         **data["settings"],
         "channel_uuids": "\n".join(channel_ids),
         "channel_profile_ids": list(data["channel_profile_ids"]),
@@ -2012,6 +2022,8 @@ def _validate_active_document(data: dict[str, Any]) -> None:
         expected_fields.add("configuration_origins")
     if version == 6:
         expected_fields.add("connection_sharing")
+    if version >= 7 and "show_rules" in data:
+        expected_fields.add("show_rules")
     if set(data) != expected_fields:
         raise ValueError("Active Catchuparr configuration fields are invalid")
     settings = data["settings"]
@@ -2191,6 +2203,8 @@ def _validate_active_document(data: dict[str, Any]) -> None:
     channels = set(normalized_channels)
     if version >= 3:
         _validate_recording_schedule(data.get("recording_schedule"), normalized_channels)
+    if "show_rules" in data:
+        _validate_show_rules(data["show_rules"], channels)
     policies = data["source_policies"]
     for raw_channel, policy in policies.items():
         try:
@@ -2258,6 +2272,33 @@ def _validate_recording_schedule(value: Any, channel_uuids: list[str]) -> None:
             schedule_from_snapshot(snapshot)
         except ScheduleError:
             raise ValueError("Active Catchuparr channel schedule is invalid") from None
+
+
+def _validate_show_rules(value: Any, channels: set[str]) -> None:
+    from .epg_rules import ShowRuleError, compile_match, compile_padding
+    from .schedule import ScheduleError, schedule_from_snapshot
+
+    fields = {"index", "name", "channel_uuids", "match", "padding", "schedule", "line"}
+    if not isinstance(value, list) or not value:
+        raise ValueError("Active Catchuparr show rules are invalid")
+    for rule in value:
+        if not isinstance(rule, dict) or set(rule) != fields:
+            raise ValueError("Active Catchuparr show rule fields are invalid")
+        members = rule["channel_uuids"]
+        if (type(rule["index"]) is not int or not isinstance(rule["name"], str)
+                or not isinstance(members, list) or not members
+                or not all(isinstance(member, str) and member in channels for member in members)):
+            raise ValueError("Active Catchuparr show rule is invalid")
+        padding = rule["padding"]
+        try:
+            if not isinstance(padding, dict) or set(padding) != {"before", "after"}:
+                raise ValueError
+            compile_match(rule["match"])
+            compile_padding({key: int(padding[key]) for key in padding})
+            if rule["schedule"] is not None:
+                schedule_from_snapshot(rule["schedule"])
+        except (ShowRuleError, ScheduleError, TypeError, ValueError, KeyError):
+            raise ValueError("Active Catchuparr show rule is invalid") from None
 
 
 def _validate_account_id_list(values, field_name: str) -> list[str]:
