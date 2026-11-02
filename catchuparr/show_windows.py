@@ -57,11 +57,9 @@ def channel_rules(active: Mapping[str, Any]) -> dict[str, list[ShowRule]]:
         restriction = None
         if entry["schedule"] is not None:
             schedule = schedule_from_snapshot(entry["schedule"])
-            restriction = (
-                lambda start, schedule=schedule: schedule_is_active(
-                    schedule, timezone_name, datetime.fromtimestamp(start, timezone.utc)
-                )
-            )
+            def restriction(start, schedule=schedule):
+                return schedule_is_active(schedule, timezone_name, datetime.fromtimestamp(start, timezone.utc))
+
         rule = ShowRule(entry["index"], compile_match(entry["match"]), before, after, restriction)
         for channel in entry["channel_uuids"]:
             result.setdefault(channel, []).append(rule)
