@@ -857,7 +857,7 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
     programme_end_epoch, next_programme_end_epoch = _archive_epg_bounds(
         channel, start_epoch, store
     )
-    from .catchup_request import archive_request_end
+    from .catchup_request import archive_request_end, has_explicit_end
 
     try:
         requested_end_epoch = archive_request_end(
@@ -871,7 +871,10 @@ def _native_archive_response(request, route_channel: str | None, segment_id: str
     if (start_epoch > now_epoch
             or requested_end_epoch < now_epoch - config.retention_hours * 3600):
         return _no_cache(HttpResponse("No archived programme", status=404))
-    continuous = playback == "continuous"
+    # A guide-bounded request must not stop at the programme end: the client
+    # would ask again at the boundary and could be refused. Only a range the
+    # client bounded itself stays closed.
+    continuous = playback == "continuous" or not has_explicit_end(request.GET)
     end_epoch = (start_epoch + MAX_ARCHIVE_PLAYBACK_SECONDS
                  if continuous else requested_end_epoch)
     if request.method == "HEAD":

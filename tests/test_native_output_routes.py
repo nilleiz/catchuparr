@@ -163,7 +163,10 @@ class NativeArchiveParityTests(unittest.TestCase):
         self.request.GET["lutc"] = str(int(self.now))
         response = self.call_archive()
         self.assertEqual(200, response.status_code)
-        self.assertEqual(self.requested_end + 60, self.service.playlist.call_args.args[3])
+        # The guide end of one programme must not close the playlist: playback
+        # continues into the following archive without a new request.
+        self.assertTrue(self.service.playlist.call_args.kwargs["continuous"])
+        self.assertEqual(self.start + 86400, self.service.playlist.call_args.args[3])
 
     def test_missing_duration_and_malformed_duration_are_distinguished(self):
         self.request.GET.pop("duration")
