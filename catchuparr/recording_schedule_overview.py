@@ -107,6 +107,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
                 cursor += timedelta(minutes=1)
             if opened is not None:
                 windows.append((opened, day_end))
+        windows = _with_show_windows(settings, channel_id, windows, day_start, day_end, zone)
         for start, end in windows:
             if end.astimezone(timezone.utc) <= local_now.astimezone(timezone.utc):
                 status = "past"
@@ -158,6 +159,33 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
         "timezone": timezone_name,
         "recording_paused": paused,
     }
+
+
+def _with_show_windows(settings, channel_id, windows, day_start, day_end, zone):
+    """Add today's planned shows windows to the weekly ones; both admit the recorder."""
+    if not settings.get("show_rules"):
+        return windows
+    try:
+        from .show_windows import covered_channels, load_windows, windows_path
+
+        if channel_id not in covered_channels(settings):
+            return windows
+        stored = load_windows(windows_path(settings)).get(channel_id, ())
+    except Exception:
+        return windows
+    spans = [(start, end) for start, end in windows]
+    for window in stored:
+        start = max(datetime.fromtimestamp(window.start, timezone.utc).astimezone(zone), day_start)
+        end = min(datetime.fromtimestamp(window.end, timezone.utc).astimezone(zone), day_end)
+        if start < end:
+            spans.append((start, end))
+    merged = []
+    for start, end in sorted(spans, key=lambda span: (span[0], span[1])):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _error(status, message):
