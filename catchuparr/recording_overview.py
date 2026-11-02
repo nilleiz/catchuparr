@@ -80,7 +80,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
         channel = metadata.get(channel_uuid, {})
         diagnostic = diagnostics.get(channel_uuid)
         scheduled, schedule_error = _scheduled_now(
-            schedule_channels, timezone_name, channel_uuid, instant,
+            schedule_channels, timezone_name, channel_uuid, instant, settings,
         )
         evidence = None
         if diagnostic and diagnostic.get("phase") != "error":
@@ -385,18 +385,19 @@ def _compact_error_label(error_code):
     return _COMPACT_ERROR_LABELS.get(error_code, "unknown")
 
 
-def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now):
+def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now, active=None):
     if not isinstance(schedule_channels, dict) or not isinstance(timezone_name, str):
         return False, True
     try:
-        from .schedule import schedule_from_snapshot, schedule_is_active
+        from .schedule import schedule_from_snapshot
+        from .show_windows import recording_window_open
 
         snapshot = schedule_channels[channel_uuid]
         parsed = schedule_from_snapshot(snapshot)
         # schedule_is_active returns early for continuous schedules, so validate
         # the IANA timezone independently before evaluating every schedule mode.
         ZoneInfo(timezone_name)
-        return schedule_is_active(parsed, timezone_name, now), False
+        return recording_window_open(active or {}, channel_uuid, parsed, timezone_name, now), False
     except Exception:
         return False, True
 

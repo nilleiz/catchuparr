@@ -544,7 +544,7 @@ def reconcile_recorders():
                         continue
                     try:
                         schedule = schedule_from_snapshot(channel_schedules[channel])
-                        if not _window_open(active, channel, schedule, timezone_name, now, redis):
+                        if not _window_open(active, channel, schedule, timezone_name, now):
                             continue
                     except (KeyError, ScheduleError, ValueError):
                         continue
@@ -1762,17 +1762,12 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
     return {"status": "ready", "config": config, "active": active, "control": control}
 
 
-def _window_open(active, channel_uuid, schedule, timezone_name, now, redis=None):
+
+def _window_open(active, channel_uuid, schedule, timezone_name, now):
     """Weekly schedule or an open shows window admits the channel's recorder."""
-    from .schedule import schedule_is_active
+    from .show_windows import recording_window_open
 
-    if schedule_is_active(schedule, timezone_name, now):
-        return True
-    if not active.get("show_rules"):
-        return False
-    from .show_windows import show_window_open
-
-    return show_window_open(active, channel_uuid, now.timestamp(), redis)
+    return recording_window_open(active, channel_uuid, schedule, timezone_name, now)
 
 
 @shared_task(name="catchuparr.plan_show_windows")
@@ -1784,14 +1779,15 @@ def plan_show_windows():
 
     from .configuration import load_active_configuration, reset_legacy_configuration
     from .epg_rules import Programme
-    from .logging_utils import apply_log_level, event
+    from .logging_utils import apply_log_level, error, event
     from .runtime import require_supported_version
     from .show_windows import (
         PLAN_AHEAD_SECONDS,
+        PLAN_LOCK_KEY,
+        PLAN_LOCK_SECONDS,
         PLAN_PAST_SECONDS,
-        channel_rules,
-        plan_channel,
-        rules_hash,
+        covered_channels,
+        plan_all,
     )
 
     require_supported_version()
@@ -1800,31 +1796,49 @@ def plan_show_windows():
     if active is None or not active.get("show_rules"):
         return {"channels": 0}
     apply_log_level(active.get("log_level", "INFO"))
-    rules = channel_rules(active)
-    digest = rules_hash(active["show_rules"])
     redis = RedisClient.get_client()
-    now = datetime.now(timezone.utc)
-    channels = with_effective_values(
-        Channel.objects.filter(uuid__in=list(rules)), select_related_fks=True,
-    ).select_related("epg_data__epg_source", "override__epg_data__epg_source")
-    planned = 0
-    for channel in channels:
-        channel_uuid = str(channel.uuid)
-        epg_data = channel.effective_epg_data_obj
-        programmes = []
-        if epg_data is not None:
-            rows = epg_data.programs.filter(
+    token = secrets.token_hex(8)
+    # Overlapping runs would each load and store the file; the later store
+    # could drop a window the other one kept alive.
+    if not redis.set(PLAN_LOCK_KEY, token, nx=True, ex=PLAN_LOCK_SECONDS):
+        return {"status": "busy"}
+    try:
+        now = datetime.now(timezone.utc)
+        channels = with_effective_values(
+            Channel.objects.filter(uuid__in=sorted(covered_channels(active))), select_related_fks=True,
+        ).select_related("epg_data__epg_source", "override__epg_data__epg_source")
+        epg_by_channel = {}
+        for channel in channels:
+            epg_data = channel.effective_epg_data_obj
+            if epg_data is not None:
+                epg_by_channel[str(channel.uuid)] = epg_data.id
+        programmes: dict[str, list[Programme] | None] = {channel: [] for channel in covered_channels(active)}
+        try:
+            channels_by_epg: dict[int, list[str]] = {}
+            for channel_uuid, epg_id in epg_by_channel.items():
+                channels_by_epg.setdefault(epg_id, []).append(channel_uuid)
+            from apps.epg.models import ProgramData
+
+            rows = ProgramData.objects.filter(
+                epg_id__in=list(channels_by_epg),
                 end_time__gt=now - timedelta(seconds=PLAN_PAST_SECONDS),
                 start_time__lt=now + timedelta(seconds=PLAN_AHEAD_SECONDS),
             ).order_by("start_time")
-            programmes = [
-                Programme(
+            for row in rows.iterator(chunk_size=1000):
+                programme = Programme(
                     row.start_time.timestamp(), row.end_time.timestamp(), row.title or "",
                     getattr(row, "sub_title", "") or "", row.description or "",
                 )
-                for row in rows.iterator(chunk_size=500)
-            ]
-        windows = plan_channel(redis, channel_uuid, digest, rules[channel_uuid], programmes, now.timestamp())
-        planned += 1
-        event("show_windows_planned", logging.DEBUG, windows=len(windows))
-    return {"channels": planned}
+                for channel_uuid in channels_by_epg.get(row.epg_id, ()):
+                    programmes[channel_uuid].append(programme)
+        except Exception as exc:
+            # Keep every channel's previous windows rather than closing them.
+            error("show_windows_failed", exc, callsite="show_windows_epg")
+            programmes = {channel: None for channel in programmes}
+        windows = plan_all(active, programmes, now.timestamp())
+        event("show_windows_planned", logging.DEBUG, channel_count=len(windows),
+              windows=sum(len(items) for items in windows.values()))
+        return {"channels": len(windows)}
+    finally:
+        if redis.get(PLAN_LOCK_KEY) in (token, token.encode()):
+            redis.delete(PLAN_LOCK_KEY)

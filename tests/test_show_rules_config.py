@@ -41,9 +41,20 @@ class ShowRuleConfigTests(unittest.TestCase):
         self.assertEqual({"title": {"starts_with": "News"}}, show["match"])
         self.assertIsNone(show["schedule"])
 
-    def test_default_scope_is_every_eligible_channel(self):
+    def test_default_scope_is_every_eligible_channel_with_epg(self):
         result = self.compile("version: 1\nrules:\n  - shows:\n      match: {title: {contains: x}}\n")
         self.assertEqual((A, B, C), result.channel_uuids)
+        self.channels[1]["has_epg"] = False
+        result = self.compile("version: 1\nrules:\n  - shows:\n      match: {title: {contains: x}}\n")
+        self.assertEqual((A, C), result.channel_uuids)
+
+    def test_ignored_m3u_filter_is_reported(self):
+        result = self.compile(
+            "version: 1\nrules:\n  - channels: {names: [Synthetic Channel A]}\n"
+            "  - shows:\n      match: {title: {contains: x}}\n    m3u: {include: [Source B]}\n"
+        )
+        self.assertEqual(1, len(result.warnings))
+        self.assertIn("does not apply to 1 channel", result.warnings[0])
 
     def test_channel_rule_keeps_its_schedule_and_policy_next_to_shows(self):
         result = self.compile(
@@ -96,6 +107,14 @@ class ShowRuleConfigTests(unittest.TestCase):
                 "  - shows: {match: {title: {contains: y}}}\n    m3u: {include: [Source B]}\n"
             ),
             "priority": "rules:\n  - shows: {match: {title: {contains: x}}}\n    m3u: {priority: {Source A: 1}}\n",
+            "priority outside include": (
+                "rules:\n  - shows: {match: {title: {contains: x}}}\n"
+                "    m3u: {include: [Source A], priority: {Source B: 1}}\n"
+            ),
+            "priority excluded": (
+                "rules:\n  - shows: {match: {title: {contains: x}}}\n"
+                "    m3u: {exclude: [Source B], priority: {Source B: 1}}\n"
+            ),
         }
         for name, body in cases.items():
             with self.subTest(name), self.assertRaises(SourceRuleError):

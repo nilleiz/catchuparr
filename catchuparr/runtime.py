@@ -460,7 +460,8 @@ def reconcile() -> None:
 def status(settings: dict, *, control_state=None) -> dict:
     from .engine.store import ArchiveStore
     from .recorder_control import RecorderControlError
-    from .schedule import ScheduleError, schedule_from_snapshot, schedule_is_active
+    from .schedule import ScheduleError, schedule_from_snapshot
+    from .show_windows import recording_window_open
 
     config = parse_settings(settings)
     store = ArchiveStore(config.archive_root)
@@ -535,8 +536,8 @@ def status(settings: dict, *, control_state=None) -> dict:
         if isinstance(schedules, dict) and isinstance(timezone_name, str):
             try:
                 schedule = schedule_from_snapshot(schedules[channel])
-                channel_status["recording_scheduled"] = schedule_is_active(
-                    schedule, timezone_name, now
+                channel_status["recording_scheduled"] = recording_window_open(
+                    settings, channel, schedule, timezone_name, now
                 )
             except (KeyError, ScheduleError, ValueError):
                 channel_status["recording_scheduled"] = None

@@ -8,7 +8,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 MAX_REGEX_LENGTH = 200
-MAX_TEXT_LENGTH = 256
+# Bounds the work of one regex search; EPG descriptions rarely exceed this.
+MAX_TEXT_LENGTH = 4096
 MAX_PADDING_MINUTES = 240
 MAX_ALTERNATIVES = 64
 MAX_DEPTH = 6
@@ -39,11 +40,28 @@ class Programme:
 
 
 @dataclass(frozen=True)
+class Text:
+    """A field normalized once: ``plain`` keeps case, ``folded`` is casefolded."""
+
+    plain: str
+    folded: str
+
+
+def prepare_text(value: str) -> Text:
+    plain = " ".join(unicodedata.normalize("NFKC", value or "")[:MAX_TEXT_LENGTH].split())
+    return Text(plain, plain.casefold())
+
+
+def programme_texts(programme: Programme) -> dict[str, Text]:
+    return {name: prepare_text(getattr(programme, name)) for name in TEXT_FIELDS}
+
+
+@dataclass(frozen=True)
 class ShowRule:
     """A compiled show matcher with its padding and optional start restriction."""
 
     index: int
-    matches: Callable[[Programme], bool]
+    matches: Callable[..., bool]
     before_seconds: float = 0.0
     after_seconds: float = 0.0
     start_allowed: Callable[[float], bool] | None = None
@@ -59,9 +77,8 @@ class Window:
 
 
 def normalize_text(value: str, *, case_sensitive: bool = False) -> str:
-    text = unicodedata.normalize("NFKC", value or "")[:MAX_TEXT_LENGTH]
-    text = " ".join(text.split())
-    return text if case_sensitive else text.casefold()
+    text = prepare_text(value)
+    return text.plain if case_sensitive else text.folded
 
 
 def _values(value, *, field: str) -> list[str]:
@@ -76,7 +93,7 @@ def _wildcard(pattern: str, flags: int) -> re.Pattern:
     return re.compile(body, flags | re.DOTALL)
 
 
-def _operator(name: str, value, *, field: str, case_sensitive: bool) -> Callable[[str], bool]:
+def _operator(name: str, value, *, field: str, case_sensitive: bool) -> Callable[[Text], bool]:
     values = _values(value, field=field)
     flags = 0 if case_sensitive else re.IGNORECASE
     if name == "regex":
@@ -90,10 +107,12 @@ def _operator(name: str, value, *, field: str, case_sensitive: bool) -> Callable
                 patterns.append(re.compile(text, flags))
             except re.error:
                 raise ShowRuleError(f"field {field}: invalid regular expression") from None
-        return lambda text: any(p.search(text) for p in patterns)
+        # Casefolding can change letters (for example a sharp s), so a regex
+        # runs on the case-preserving form and ignores case through its flag.
+        return lambda text: any(p.search(text.plain) for p in patterns)
     if name == "wildcard":
         patterns = [_wildcard(normalize_text(t, case_sensitive=case_sensitive), flags) for t in values]
-        return lambda text: any(p.fullmatch(text) for p in patterns)
+        return lambda text: any(p.fullmatch(_side(text, case_sensitive)) for p in patterns)
     needles = [normalize_text(t, case_sensitive=case_sensitive) for t in values]
     check = {
         "equals": lambda text, n: text == n,
@@ -102,11 +121,15 @@ def _operator(name: str, value, *, field: str, case_sensitive: bool) -> Callable
         "contains": lambda text, n: n in text,
         "includes": lambda text, n: n in text,
     }[name]
-    return lambda text: any(check(text, n) for n in needles)
+    return lambda text: any(check(_side(text, case_sensitive), n) for n in needles)
+
+
+def _side(text: Text, case_sensitive: bool) -> str:
+    return text.plain if case_sensitive else text.folded
 
 
 def compile_text_condition(spec, *, field: str, case_sensitive: bool = False,
-                           _depth: int = 0) -> Callable[[str], bool]:
+                           _depth: int = 0) -> Callable[[Text], bool]:
     """Compile a condition mapping; several keys in one mapping must all hold."""
     if _depth > MAX_DEPTH:
         raise ShowRuleError(f"field {field}: conditions are nested too deeply")
@@ -115,7 +138,7 @@ def compile_text_condition(spec, *, field: str, case_sensitive: bool = False,
     unknown = set(spec) - set(_OPERATORS) - set(_COMBINATORS)
     if unknown:
         raise ShowRuleError(f"field {field}: unknown condition key")
-    parts: list[Callable[[str], bool]] = []
+    parts: list[Callable[[Text], bool]] = []
     for key, value in spec.items():
         path = f"{field}.{key}"
         if key in _OPERATORS:
@@ -135,7 +158,7 @@ def compile_text_condition(spec, *, field: str, case_sensitive: bool = False,
     return lambda text: all(part(text) for part in parts)
 
 
-def compile_match(spec, *, field: str = "match") -> Callable[[Programme], bool]:
+def compile_match(spec, *, field: str = "match") -> Callable[..., bool]:
     """Compile a ``match`` mapping: fields combine with AND."""
     if not isinstance(spec, Mapping):
         raise ShowRuleError(f"field {field}: expected a mapping")
@@ -161,14 +184,13 @@ def compile_match(spec, *, field: str = "match") -> Callable[[Programme], bool]:
         for name in TEXT_FIELDS if name in spec
     ]
 
-    def matches(programme: Programme) -> bool:
+    def matches(programme: Programme, texts: Mapping[str, Text] | None = None) -> bool:
         length = programme.end - programme.start
         if length < limits.get("min_minutes", 0.0) or length > limits.get("max_minutes", float("inf")):
             return False
-        return all(
-            condition(normalize_text(getattr(programme, name), case_sensitive=case_sensitive))
-            for name, condition in conditions
-        )
+        if texts is None:
+            texts = programme_texts(programme)
+        return all(condition(texts[name]) for name, condition in conditions)
 
     return matches
 
@@ -207,10 +229,11 @@ def plan_windows(programmes: Iterable[Programme], rules: Sequence[ShowRule]) -> 
     for programme in programmes:
         if not programme.end > programme.start:
             continue
+        texts = programme_texts(programme)
         for rule in rules:
             if rule.start_allowed is not None and not rule.start_allowed(programme.start):
                 continue
-            if rule.matches(programme):
+            if rule.matches(programme, texts):
                 windows.append(Window(
                     programme.start - rule.before_seconds,
                     programme.end + rule.after_seconds,
@@ -225,7 +248,8 @@ def freeze_running(previous: Iterable[Window], planned: Iterable[Window], now: f
     A refresh of the EPG may replace or drop the programme that opened a window
     already recording; the recording must not be cut off by that.
     """
-    running = [w for w in previous if w.start <= now < w.end]
+    # A window counts as running from the moment admission opens it.
+    running = [w for w in previous if w.start - START_LOOKAHEAD_SECONDS <= now < w.end]
     return [w for w in merge_windows([*planned, *running]) if w.end > now]
 
 

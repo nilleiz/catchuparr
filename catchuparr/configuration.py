@@ -63,16 +63,29 @@ def load_draft_settings(fallback: dict | None = None) -> dict:
     return dict(fallback or {})
 
 
+def _channels_with_epg(channel_model) -> set[str] | None:
+    """UUIDs whose effective EPG is set, or ``None`` when that is unknown."""
+    try:
+        from apps.channels.managers import with_effective_values
+
+        channels = with_effective_values(channel_model.objects.all(), select_related_fks=True)
+        return {str(channel.uuid) for channel in channels if channel.effective_epg_data_obj is not None}
+    except Exception:
+        return None
+
+
 def source_catalog() -> SourceCatalog:
     """Build safe DTOs from channels, enabled profile memberships and sources."""
     from apps.channels.models import Channel, ChannelStream
 
+    with_epg = _channels_with_epg(Channel)
     channel_by_uuid = {
         str(channel.uuid): {
             "uuid": str(channel.uuid),
             "number": str(getattr(channel, "channel_number", "") or ""),
             "name": str(getattr(channel, "name", "") or ""),
             "group": _group_name(channel),
+            "has_epg": with_epg is None or str(channel.uuid) in with_epg,
         }
         for channel in Channel.objects.select_related("channel_group").all()
     }
