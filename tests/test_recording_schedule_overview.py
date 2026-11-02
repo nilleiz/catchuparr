@@ -47,7 +47,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         return join_rows(rows)
 
     def test_show_windows_join_the_weekly_windows_of_today(self):
-        from catchuparr.epg_rules import Window
+        from catchuparr.epg_rules import Show, Window
         from catchuparr.show_windows import store_windows, windows_path
 
         with tempfile.TemporaryDirectory() as root:
@@ -59,11 +59,21 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
             }]})
             day = datetime(2026, 11, 2, tzinfo=timezone.utc).timestamp()
             store_windows(windows_path(current), {"a": [
-                Window(day + 9.5 * 3600, day + 11 * 3600, (1,)),
-                Window(day + 20 * 3600, day + 22 * 3600, (1,)),
+                Window(day + 9.5 * 3600, day + 11 * 3600, (1,),
+                       (Show(day + 9.5 * 3600, day + 11 * 3600, "Show X", 1),)),
+                Window(day + 20 * 3600, day + 22 * 3600, (1,),
+                       (Show(day + 20 * 3600, day + 22 * 3600, "Show Y", 1),)),
                 Window(day + 30 * 3600, day + 31 * 3600, (1,)),
             ]})
             result = today_schedule(current, {}, now=datetime(2026, 11, 2, 12, tzinfo=timezone.utc))
+        shows = {row["channel_uuid"]: row["shows"] for row in result["channels"]}
+        self.assertEqual(
+            [("09:30", "11:00", "Show X"), ("20:00", "22:00", "Show Y")],
+            [(x["start"], x["end"], x["title"]) for x in shows["a"]],
+        )
+        self.assertEqual([], shows["b"])
+        self.assertIn("2 planned shows", result["message"])
+        self.assertIn("Show · 20:00–22:00 Show Y › Unknown channel", self.shown(result))
         by_name = {row["channel_uuid"]: row["windows"] for row in result["channels"]}
         self.assertEqual(
             [("09:00", "11:00", "past"), ("20:00", "22:00", "upcoming")],

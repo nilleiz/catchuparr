@@ -81,6 +81,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             "number": _safe_number(metadata.get("number")),
             "name": _safe_display(metadata.get("name")) or "Unknown channel",
             "windows": [],
+            "shows": [],
         }
         snapshot = schedules.get(channel_id)
         try:
@@ -108,6 +109,7 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             if opened is not None:
                 windows.append((opened, day_end))
         windows = _with_show_windows(settings, channel_id, windows, day_start, day_end, zone)
+        row["shows"] = _shows_of_day(settings, channel_id, day_start, day_end)
         for start, end in windows:
             if end.astimezone(timezone.utc) <= local_now.astimezone(timezone.utc):
                 status = "past"
@@ -134,10 +136,21 @@ def today_schedule(settings, channels, *, control_state=None, now=None):
             f"{start}–{end}" for start, end in key
         )
         lines.extend(split_group_row(period, groups[key]))
+    show_entries = [
+        (row["name"], show["start_ts"], show["end_ts"], show["title"])
+        for row in rows for show in row["shows"]
+    ]
+    if show_entries:
+        from .show_windows import format_show_rows
+
+        lines.extend(f"Show · {text}" for text in format_show_rows(
+            show_entries, timezone_name, local_now.timestamp(),
+        ))
     channel_total = sum(len(names) for names in groups.values())
     summary = ("Recording paused. " if paused is True else "") + (
         f"Today's schedule: {channel_total} {'channel' if channel_total == 1 else 'channels'} "
-        f"in {len(groups)} {'period' if len(groups) == 1 else 'periods'}."
+        f"in {len(groups)} {'period' if len(groups) == 1 else 'periods'}"
+        + (f", {len(show_entries)} planned show{'' if len(show_entries) == 1 else 's'}." if show_entries else ".")
         if lines else "No recordings scheduled today."
     )
     pause_label = "paused" if paused is True else "active" if paused is False else "unknown"
@@ -186,6 +199,25 @@ def _with_show_windows(settings, channel_id, windows, day_start, day_end, zone):
         else:
             merged.append((start, end))
     return merged
+
+
+def _shows_of_day(settings, channel_id, day_start, day_end):
+    """Planned programmes of the day with their local times, for the overview rows."""
+    if not settings.get("show_rules"):
+        return []
+    from .show_windows import day_shows, rule_names
+
+    names = rule_names(settings)
+    try:
+        shows = day_shows(settings, channel_id, day_start.timestamp(), day_end.timestamp())
+    except Exception:
+        return []
+    return [{
+        "title": show.title, "rule": names.get(show.rule, f"rule {show.rule}"),
+        "start": datetime.fromtimestamp(show.start, day_start.tzinfo).strftime("%H:%M"),
+        "end": datetime.fromtimestamp(show.end, day_start.tzinfo).strftime("%H:%M"),
+        "start_ts": show.start, "end_ts": show.end,
+    } for show in shows]
 
 
 def _error(status, message):

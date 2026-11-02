@@ -130,6 +130,7 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
             "reason": reason,
             "source": source,
             "scheduled_now": scheduled if not schedule_error else None,
+            "show": _current_show(settings, channel_uuid, instant),
         }
         if diagnostic and diagnostic.get("phase") == "error":
             channel_row["error_code"] = diagnostic.get("error_code")
@@ -357,7 +358,9 @@ def _message_row(row):
     attached = row.get("state") == "recording" and row.get("recent_media_progress") is True \
         and row.get("mode") == "borrowed"
     suffix = ", attached" if attached else ""
-    return f"{name} - {m3u_first_word or '—'} [{status}{suffix}]"
+    show = row.get("show")
+    label = f" · Show: {_safe_display(show.get('title'))}" if isinstance(show, dict) and show.get("title") else ""
+    return f"{name} - {m3u_first_word or '—'} [{status}{suffix}]{label}"
 
 
 _COMPACT_ERROR_LABELS = {
@@ -400,6 +403,18 @@ def _scheduled_now(schedule_channels, timezone_name, channel_uuid, now, active=N
         return recording_window_open(active or {}, channel_uuid, parsed, timezone_name, now), False
     except Exception:
         return False, True
+
+
+def _current_show(active, channel_uuid, now):
+    """The programme an open show window records for, or None."""
+    if not active or not active.get("show_rules"):
+        return None
+    try:
+        from .show_windows import current_show
+
+        return current_show(active, channel_uuid, now.timestamp())
+    except Exception:
+        return None
 
 
 def _deliver_rows(visible):
@@ -452,7 +467,9 @@ def _unknown_all(settings, channel_ids, control_state, reason, *, now=None):
         except (ValueError, TypeError, KeyError):
             schedule_unknown = True
     for row in rows:
-        scheduled, schedule_error = _scheduled_now(schedule_channels, timezone_name, row["channel_uuid"], now)
+        scheduled, schedule_error = _scheduled_now(
+            schedule_channels, timezone_name, row["channel_uuid"], now, settings,
+        )
         row["scheduled_now"] = scheduled if not schedule_error else None
         if schedule_error:
             row["reason"] = "schedule_unavailable"
