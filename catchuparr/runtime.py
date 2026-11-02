@@ -25,6 +25,7 @@ SNAPSHOT_TASK = "catchuparr.snapshot_epg"
 SNAPSHOT_SCHEDULE = "catchuparr-epg-snapshot"
 SHOW_WINDOWS_TASK = "catchuparr.plan_show_windows"
 SHOW_WINDOWS_SCHEDULE = "catchuparr-show-windows"
+SHOW_TOAST_PER_CHANNEL = 5
 
 
 @dataclass(frozen=True)
@@ -234,10 +235,11 @@ def deliver_show_matches(result: dict, matches: dict) -> str:
     names = {row["channel_uuid"]: row["channel_name"] for row in result["channels"]}
     entries = [
         (names.get(channel, "Unknown channel"), item["start"], item["end"], item["title"])
-        for channel, items in matches["channels"].items() for item in items
+        for channel, items in matches["channels"].items() for item in items[:SHOW_TOAST_PER_CHANNEL]
     ]
-    count = len({(start, end, title, channel) for channel, start, end, title in entries})
+    count = sum(len(items) for items in matches["channels"].values())
     summary = f"{result['message']} {count} upcoming show{'' if count == 1 else 's'} match"
+    summary += f" (the next {SHOW_TOAST_PER_CHANNEL} per channel are listed)" if count > len(entries) else ""
     summary += "; the EPG could not be read for some channels." if matches["epg_unavailable"] else "."
     if not entries:
         return summary
