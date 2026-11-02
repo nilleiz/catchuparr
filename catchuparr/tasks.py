@@ -469,7 +469,7 @@ def reconcile_recorders():
     from .recorder_control import RecorderControlError
     from .recorder_proxy import configuration_generation
     from .runtime import load_config, require_supported_version
-    from .schedule import ScheduleError, schedule_from_snapshot, schedule_is_active
+    from .schedule import ScheduleError, schedule_from_snapshot
 
     require_supported_version()
     reset_legacy_configuration()
@@ -544,7 +544,7 @@ def reconcile_recorders():
                         continue
                     try:
                         schedule = schedule_from_snapshot(channel_schedules[channel])
-                        if not schedule_is_active(schedule, timezone_name, now):
+                        if not _window_open(active, channel, schedule, timezone_name, now):
                             continue
                     except (KeyError, ScheduleError, ValueError):
                         continue
@@ -1724,7 +1724,7 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
     from .recorder_control import RecorderControlError
     from .recorder_proxy import configuration_generation
     from .runtime import load_config
-    from .schedule import ScheduleError, schedule_is_active
+    from .schedule import ScheduleError
 
     try:
         active, control = load_applied_state()
@@ -1756,7 +1756,49 @@ def _recorder_admission_state(channel_uuid, expected_generation, expected_contro
     except (ScheduleError, ValueError) as exc:
         error("schedule_install_failed", exc, callsite="schedule_validation")
         return {"status": "invalid_schedule"}
-    if not schedule_is_active(schedule, timezone_name, datetime.now(timezone.utc)):
+    if not _window_open(active, channel_uuid, schedule, timezone_name, datetime.now(timezone.utc)):
         event("recorder_schedule_closed")
         return {"status": "outside_schedule"}
     return {"status": "ready", "config": config, "active": active, "control": control}
+
+
+
+def _window_open(active, channel_uuid, schedule, timezone_name, now):
+    """Weekly schedule or an open shows window admits the channel's recorder."""
+    from .show_windows import recording_window_open
+
+    return recording_window_open(active, channel_uuid, schedule, timezone_name, now)
+
+
+@shared_task(name="catchuparr.plan_show_windows")
+def plan_show_windows():
+    """Match the EPG against the shows rules and store each channel's windows."""
+    from core.utils import RedisClient
+
+    from .configuration import load_active_configuration, reset_legacy_configuration
+    from .logging_utils import apply_log_level, event
+    from .runtime import require_supported_version
+    from .show_windows import PLAN_LOCK_KEY, PLAN_LOCK_SECONDS, load_programmes, plan_all
+
+    require_supported_version()
+    reset_legacy_configuration()
+    active = load_active_configuration()
+    if active is None or not active.get("show_rules"):
+        return {"channels": 0}
+    apply_log_level(active.get("log_level", "INFO"))
+    redis = RedisClient.get_client()
+    token = secrets.token_hex(8)
+    # Overlapping runs would each load and store the file; the later store
+    # could drop a window the other one kept alive.
+    if not redis.set(PLAN_LOCK_KEY, token, nx=True, ex=PLAN_LOCK_SECONDS):
+        return {"status": "busy"}
+    try:
+        now = datetime.now(timezone.utc)
+        programmes = load_programmes(active, now.timestamp())
+        windows = plan_all(active, programmes, now.timestamp())
+        event("show_windows_planned", logging.DEBUG, channel_count=len(windows),
+              windows=sum(len(items) for items in windows.values()))
+        return {"channels": len(windows)}
+    finally:
+        if redis.get(PLAN_LOCK_KEY) in (token, token.encode()):
+            redis.delete(PLAN_LOCK_KEY)
