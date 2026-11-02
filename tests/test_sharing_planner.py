@@ -206,6 +206,15 @@ class SharingPlannerTests(unittest.TestCase):
         self.assertEqual(SharingAction.WAIT, back.action)
         self.assertEqual(135, back.deadline)
 
+    def test_the_window_runs_from_when_the_viewer_started_watching(self):
+        settings = SharingSettings(True, live_stability_seconds=15)
+        watching = observe(None, observation(100, candidate=target(live_since=40.0), settings=settings))
+        self.assertEqual(SharingAction.ATTACH_BORROW, watching.action)
+        zapping = observe(None, observation(100, candidate=target(live_since=99.3), settings=settings))
+        self.assertEqual(SharingAction.WAIT, zapping.action)
+        self.assertAlmostEqual(114.3, zapping.deadline)
+        self.assertEqual(target(live_since=1.0), target(live_since=2.0))
+
     def test_without_a_working_own_source_the_recorder_attaches_at_once(self):
         settings = SharingSettings(True, live_stability_seconds=15)
         unavailable = observe(None, observation(

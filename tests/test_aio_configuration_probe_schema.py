@@ -142,6 +142,9 @@ class ActiveConfigurationProbeSchemaTests(unittest.TestCase):
             ordinary_client_ids=("viewer-synthetic",), owner_heartbeat_healthy=True,
             assigned_stream_matches=True, account_active=True, profile_active=True,
             media_compatible=True, useful_buffer_available=True, native_state_healthy=True,
+            # The viewer has watched longer than the stability window when the
+            # recorder first observes it, so the recorder borrows at once.
+            live_since=90.0,
         )
         initial_observation = SharingObservation(
             channel_uuid=channel, now=100, configuration_generation="config-synthetic",
