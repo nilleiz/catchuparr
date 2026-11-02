@@ -32,6 +32,13 @@ rules:
 - Fields: `title`, `sub_title`, `description`. In `match`, next to the
   fields, `case_sensitive: true` makes all text operators case-sensitive, and
   `min_minutes` / `max_minutes` (1-1440) bound the programme length.
+- Case-insensitive matching uses Unicode casefolding, so `strasse` also matches
+  `Straße`; `case_sensitive: true` compares the text as written. Combining
+  characters, no-break spaces and repeated white space are normalized first.
+- Cost: every rule is evaluated against every programme of every channel it
+  covers, about 20 microseconds each. A few rules over hundreds of channels take
+  seconds per planner run; 256 rules over 300 channels take about 20 seconds.
+  Scope rules to the channels they need.
 - Overlapping or touching windows (gap up to 60 s) are recorded as one
   uninterrupted window, across rules as well. A running window keeps its start
   and is never shortened by an EPG refresh.

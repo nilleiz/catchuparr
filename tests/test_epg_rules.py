@@ -93,6 +93,43 @@ def rule(index, spec, before=0, after=0, allowed=None):
     return ShowRule(index, compile_match(spec), before * 60.0, after * 60.0, allowed)
 
 
+class AlternativeTests(unittest.TestCase):
+    """Operators with several alternatives behave like one operator per alternative."""
+
+    def test_every_operator_accepts_a_list_of_alternatives(self):
+        cases = [
+            ("equals", ["Alpha", "Beta"], "beta", "Gamma"),
+            ("starts_with", ["Al", "Be"], "Beta show", "Gamma show"),
+            ("ends_with", ["pha", "eta"], "Alpha", "Gamma"),
+            ("contains", ["lph", "bet"], "a BETA b", "Gamma"),
+            ("wildcard", ["Al*", "?eta"], "Beta", "Gamma"),
+            ("regex", ["^Al", "eta$"], "Beta", "Gamma"),
+        ]
+        for operator, values, hit, miss in cases:
+            with self.subTest(operator=operator):
+                self.assertTrue(matches({"title": {operator: values}}, title=hit))
+                self.assertFalse(matches({"title": {operator: values}}, title=miss))
+
+    def test_combinators_short_circuit_correctly(self):
+        spec = {"title": {"any": [{"contains": "a"}, {"all": [{"contains": "b"}, {"not": {"contains": "c"}}]}]}}
+        self.assertTrue(matches(spec, title="xa"))
+        self.assertTrue(matches(spec, title="xb"))
+        self.assertFalse(matches(spec, title="xbc"))
+        self.assertFalse(matches(spec, title="x"))
+
+    def test_fields_still_combine_with_and(self):
+        spec = {"title": {"contains": "a"}, "description": {"contains": "b"}}
+        self.assertTrue(matches(spec, title="a", description="b"))
+        self.assertFalse(matches(spec, title="a", description="c"))
+        self.assertFalse(matches(spec, title="c", description="b"))
+
+    def test_sharp_s_and_decomposed_letters_match_their_folded_forms(self):
+        self.assertTrue(matches({"title": {"contains": "strasse"}}, title="Hauptstraße"))
+        self.assertTrue(matches({"title": {"contains": "für"}}, title="Fu\u0308r Elise"))
+        self.assertTrue(matches({"title": {"equals": "a b"}}, title="a\u00a0b"))
+        self.assertFalse(matches({"title": {"contains": "strasse"}, "case_sensitive": True}, title="Hauptstraße"))
+
+
 class WindowTests(unittest.TestCase):
     def test_padding_and_consecutive_programmes_merge(self):
         rules = [rule(0, {"title": {"starts_with": "Show"}}, before=1, after=2)]
