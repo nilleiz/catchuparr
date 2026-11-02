@@ -150,7 +150,7 @@ def probe_source_configuration(channel, root):
             "    - {start: '00:00', end: '24:00'}\n"
             "rules:\n"
             "  - channels: {profile: all}\n"
-            "    include: [Synthetic source B]\n"
+            "    m3u: {include: [Synthetic source B]}\n"
         ),
         "archive_root": str(root),
         "retention_hours": 1, "max_storage_gib": 1,
@@ -182,7 +182,7 @@ def probe_source_configuration(channel, root):
             f"profile: {profile_name}\n"
             "rules:\n"
             "  - channels: {profile: all}\n"
-            "    include: [Missing source]\n"
+            "    m3u: {include: [Missing source]}\n"
         ),
     )
     try:
@@ -200,7 +200,7 @@ def probe_source_configuration(channel, root):
                 f"profile: {profile_name}\n"
                 "rules:\n"
                 "  - channels: {profile: all}\n"
-                "    exclude: []\n"
+                "    m3u: {exclude: []}\n"
             ),
         ),
         active_path=active_path,
@@ -279,6 +279,201 @@ def probe_source_configuration(channel, root):
                 "Final teardown must remove the native release marker")
     redis_client.delete(credential_key)
     print("AIO source catalog, atomic Apply, policy ranking and native pool checks passed")
+
+
+def probe_show_rules(root):
+    """Show rules (0.8.0) against the real ORM: EPG lookup, planning, admission, overviews.
+
+    Uses its own archive root and active snapshot, so the playback and recorder
+    phases that follow never see these rules.
+    """
+    from apps.channels.models import (
+        Channel,
+        ChannelProfile,
+        ChannelProfileMembership,
+        ChannelStream,
+        Stream,
+    )
+    from apps.epg.models import EPGData, ProgramData
+    from apps.m3u.models import M3UAccount
+    from django_celery_beat.models import PeriodicTask
+
+    from catchuparr import runtime
+    from catchuparr.configuration import (
+        apply_configuration,
+        load_active_configuration,
+        validate_configuration,
+    )
+    from catchuparr.recorder_proxy import ranked_source_candidates
+    from catchuparr.recording_schedule_overview import channel_metadata, today_schedule
+    from catchuparr.show_windows import (
+        current_show,
+        load_programmes,
+        load_windows,
+        plan_all,
+        windows_path,
+    )
+    from catchuparr.tasks import _active_schedule, _window_open
+
+    beat = PeriodicTask.objects.filter(name=runtime.SHOW_WINDOWS_SCHEDULE).first()
+    require(beat is not None and beat.enabled and beat.task == runtime.SHOW_WINDOWS_TASK
+            and beat.interval.every == 60, "Bootstrap must register the minutely show planner")
+
+    show_root = root / "show-rules"
+    show_root.mkdir(parents=True, exist_ok=True)
+    active_path = show_root / "synthetic-show-settings.json"
+    profile_name = "Synthetic show profile"
+    profile = ChannelProfile.objects.create(name=profile_name)
+    ChannelProfileMembership.objects.filter(channel_profile=profile).update(enabled=False)
+    wanted = M3UAccount.objects.create(name="Synthetic show source", max_streams=2)
+    other = M3UAccount.objects.create(name="Synthetic show other", max_streams=2)
+    now = timezone.now().replace(second=0, microsecond=0)
+    minute = timedelta(minutes=1)
+    channels = {}
+    wanted_streams = {}
+    for number, label in ((21, "A"), (22, "B")):
+        channel = Channel.objects.create(name=f"Synthetic show {label}", channel_number=number,
+                                         user_level=0)
+        guide = EPGData.objects.create(name=f"Synthetic show guide {label}",
+                                       tvg_id=f"synthetic-show-{label.lower()}")
+        channel.epg_data = guide
+        channel.save(update_fields=["epg_data"])
+        for order, account in enumerate((other, wanted)):
+            stream = Stream.objects.create(
+                name=f"Synthetic show {label} {order}", url=f"http://127.0.0.1:1/show-{label}-{order}.ts",
+                m3u_account=account,
+            )
+            ChannelStream.objects.create(channel=channel, stream=stream, order=order)
+            if account is wanted:
+                wanted_streams[str(channel.uuid)] = str(stream.id)
+        ChannelProfileMembership.objects.update_or_create(
+            channel_profile=profile, channel=channel, defaults={"enabled": True},
+        )
+        channels[label] = (channel, guide)
+    channel_a, guide_a = channels["A"]
+    channel_b, guide_b = channels["B"]
+    uuid_a, uuid_b = str(channel_a.uuid), str(channel_b.uuid)
+
+    try:
+        def programme(guide, title, start, minutes):
+            return ProgramData.objects.create(epg=guide, title=title, start_time=start,
+                                              end_time=start + minutes * minute)
+
+        airing = programme(guide_a, "Synthetic news now", now - 5 * minute, 20)
+        programme(guide_a, "Synthetic weather", now + 15 * minute, 15)
+        programme(guide_a, "Synthetic news short", now + 60 * minute, 2)
+        programme(guide_a, "Synthetic news later", now + 180 * minute, 20)
+        later_b = programme(guide_b, "Synthetic news morning", now + 300 * minute, 20)
+
+        show_rule = (
+            "  - shows:\n"
+            "      name: Synthetic news\n"
+            "      match:\n"
+            "        title: {starts_with: Synthetic news}\n"
+            "        min_minutes: 5\n"
+            "      channels:\n"
+            "        include: {names: [Synthetic show A, Synthetic show B]}\n"
+            "      padding: {before: 1, after: 2}\n"
+        )
+        document = f"version: 1\nprofile: {profile_name}\ntimezone: UTC\nrules:\n"
+        settings = {
+            "filter_config": document + show_rule + "    m3u: {include: [Synthetic show source]}\n",
+            "archive_root": str(show_root), "retention_hours": 1, "max_storage_gib": 1,
+        }
+
+        # Validation: the preview reads the real EPG and lists only matching programmes.
+        validated = validate_configuration(settings, active_path=active_path,
+                                           show_preview=runtime._show_preview)
+        require(validated["valid"] and validated["show_rule_count"] == 1 and not validated["warnings"],
+                "Nested m3u shows rule must validate without warnings")
+        matches = validated.get("show_matches") or {}
+        require(not matches.get("epg_unavailable"), "Show preview could not read the real EPG")
+        titles = {uuid: [item["title"] for item in items]
+                  for uuid, items in matches.get("channels", {}).items()}
+        require(titles == {
+            uuid_a: ["Synthetic news now", "Synthetic news later"],
+            uuid_b: ["Synthetic news morning"],
+        }, f"Show preview must list exactly the matching programmes: {titles}")
+        message = runtime.deliver_show_matches(validated, matches)
+        require("3 upcoming shows match" in message, "Validation summary must count the matches")
+
+        flat = dict(settings, filter_config=document + show_rule + "    include: [Synthetic show source]\n")
+        require(any("deprecated" in text for text in validate_configuration(
+            flat, active_path=active_path)["warnings"]), "Flat provider filter must stay valid with a warning")
+        for invalid, reason in (
+            (document + show_rule + "    include: [Synthetic show source]\n"
+             "    m3u: {include: [Synthetic show source]}\n", "mixed flat and nested provider filter"),
+            (document + show_rule.replace(
+                "  - shows:", "  - channels: {names: [Synthetic show A]}\n    shows:", 1),
+             "channels and shows in one rule"),
+        ):
+            try:
+                validate_configuration(dict(settings, filter_config=invalid), active_path=active_path)
+            except ValueError:
+                continue
+            raise RuntimeError(f"Validation must reject {reason}")
+
+        # Apply and plan with the same loader and planner the minutely task uses.
+        apply_configuration(settings, active_path=active_path)
+        active = load_active_configuration(active_path)
+        require({uuid_a, uuid_b} <= set(active["channel_uuids"].splitlines()),
+                "Show-only channels must be selected for recording")
+        for channel_uuid in (uuid_a, uuid_b):
+            ranked = ranked_source_candidates(channel_uuid, active) or []
+            require([row["id"] for row in ranked] == [wanted_streams[channel_uuid]],
+                    "Show rule m3u filter must select only the wanted source")
+        stamp = now.timestamp()
+        programmes = load_programmes(active, stamp)
+        require(programmes[uuid_a] is not None and programmes[uuid_b] is not None,
+                "Show planner could not read the real EPG")
+        planned = plan_all(active, programmes, stamp)
+        stored = load_windows(windows_path(active))
+        spans = {uuid: [(w.start, w.end) for w in items] for uuid, items in stored.items()}
+        later_a = now + 180 * minute
+        require(spans == {
+            uuid_a: [((airing.start_time - minute).timestamp(), (airing.end_time + 2 * minute).timestamp()),
+                     ((later_a - minute).timestamp(), (later_a + 22 * minute).timestamp())],
+            uuid_b: [((later_b.start_time - minute).timestamp(), (later_b.end_time + 2 * minute).timestamp())],
+        } and planned.keys() == stored.keys(), f"Show windows must cover the padded matches: {spans}")
+
+        # Recorder admission: a show-only channel has no weekly window of its own.
+        def admitted(channel_uuid, moment):
+            schedule, zone = _active_schedule(active, channel_uuid)
+            return _window_open(active, channel_uuid, schedule, zone, moment)
+
+        require(admitted(uuid_a, now) and not admitted(uuid_b, now),
+                "Only an open show window may admit a show-only channel")
+        require(admitted(uuid_b, later_b.start_time) and not admitted(uuid_b, later_b.end_time + 3 * minute),
+                "Show window must open at the padded start and close after the padded end")
+
+        # An EPG refresh never shortens a running window.
+        airing.title = "Synthetic replacement"
+        airing.save(update_fields=["title"])
+        plan_all(active, load_programmes(active, stamp), stamp)
+        require(admitted(uuid_a, now + 10 * minute), "EPG refresh must keep the running window")
+        airing.title = "Synthetic news now"
+        airing.save(update_fields=["title"])
+        plan_all(active, load_programmes(active, stamp), stamp)
+
+        # Overviews name the planned and the currently recorded programme.
+        show = current_show(active, uuid_a, stamp)
+        require(show is not None and show["title"] == "Synthetic news now" and show["phase"] == "airing"
+                and show["rule"] == "Synthetic news", f"Current show must name the airing programme: {show}")
+        schedule = today_schedule(active, channel_metadata([uuid_a, uuid_b]), now=now)
+        rows = {row["channel_uuid"]: row for row in schedule.get("channels", [])}
+        require(any(item["title"] == "Synthetic news now" for item in rows.get(uuid_a, {}).get("shows", [])),
+                "Today's schedule must list the planned show")
+        require("planned show" in schedule.get("message", ""), "Today's schedule summary must count shows")
+    finally:
+        # Leave no show fixtures behind for the playback and recorder phases.
+        for channel, guide in channels.values():
+            channel.delete()
+            guide.delete()
+        Stream.objects.filter(m3u_account__in=(wanted, other)).delete()
+        wanted.delete()
+        other.delete()
+        profile.delete()
+    print("AIO show rules: preview, apply, planning, admission and overviews passed")
 
 
 def probe():
@@ -1088,6 +1283,9 @@ def probe():
         phase("source_configuration", "started")
         probe_source_configuration(channel, root)
         phase("source_configuration", "complete")
+        phase("show_rules", "started")
+        probe_show_rules(root)
+        phase("show_rules", "complete")
         if os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core":
             # The recorder media and failover phases take most of the run time and
             # are the release evidence of the full suite only.
