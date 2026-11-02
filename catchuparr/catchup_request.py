@@ -48,3 +48,14 @@ def archive_request_end(query, start: float, now: float, *, programme_end=None) 
     if not start < end <= start + MAX_ARCHIVE_SECONDS:
         raise ValueError("invalid catch-up range")
     return float(end)
+
+
+def has_explicit_end(query) -> bool:
+    """True when the client itself bounded the range with a real duration or end."""
+    for name, placeholders in (
+        ("duration", ("{duration}", "${duration}")),
+        ("utcend", ("{utcend}", "${end}")),
+    ):
+        if query.get(name, "") not in ("", *placeholders):
+            return True
+    return False

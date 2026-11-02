@@ -1020,8 +1020,8 @@ class ArchiveHTTPService:
             if end <= start or not isinstance(segment_id, str):
                 raise sqlite3.DatabaseError("invalid persisted HLS manifest range")
             if (
-                (programme_end is not None and end.timestamp() > programme_end)
-                or (playback_end is not None and end.timestamp() > playback_end)
+                (programme_end is not None and start.timestamp() >= programme_end)
+                or (playback_end is not None and start.timestamp() >= playback_end)
             ):
                 continue
             relative_path = Path(str(relative_path))
@@ -1044,9 +1044,12 @@ class ArchiveHTTPService:
                 continue
             candidate_start = candidate.start_utc.timestamp()
             candidate_end = candidate.end_utc.timestamp()
+            # A segment that starts inside the range is kept even when it ends
+            # a few seconds after it; dropping it left a request made just
+            # before a programme boundary with nothing to play (404).
             if (
-                (programme_end is not None and candidate_end > programme_end)
-                or (playback_end is not None and candidate_end > playback_end)
+                (programme_end is not None and candidate_start >= programme_end)
+                or (playback_end is not None and candidate_start >= playback_end)
             ):
                 continue
             if high_water is not None and candidate_start < high_water:
