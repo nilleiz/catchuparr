@@ -509,6 +509,26 @@ class CIChangeClassificationTest(unittest.TestCase):
         run["jobs"][1]["steps"][0]["conclusion"] = "skipped"
         self.assertFalse(_trusted_run(run, REPOSITORY, WORKFLOW_ID))
 
+    def test_only_the_full_suite_carries_the_release_evidence_step(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+        self.assertIn("labeled]", workflow)
+        evidence = workflow.index("- name: Synthetic playback in actual Dispatcharr AIO")
+        core = workflow.index("- name: Core checks in actual Dispatcharr AIO")
+        core_block = workflow[core:evidence]
+        evidence_block = workflow[evidence:workflow.index("- name: Record explicit manual")]
+        self.assertIn("--suite core", core_block)
+        self.assertIn("!contains(github.event.pull_request.labels.*.name, 'full-aio')", core_block)
+        self.assertIn("--suite full", evidence_block)
+        self.assertNotIn("--suite core", evidence_block)
+        self.assertIn("contains(github.event.pull_request.labels.*.name, 'full-aio')", evidence_block)
+
+    def test_core_suite_ends_after_the_show_rule_phase(self):
+        probe = (Path(__file__).resolve().parents[1] / "scripts/aio_integration_probe.py").read_text()
+        self.assertLess(probe.index('phase("show_rules", "complete")'),
+                        probe.index('os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core"'))
+        self.assertLess(probe.index('os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core"'),
+                        probe.index('phase("recorder_media", "started")'))
+
     def test_changed_paths_uses_nul_delimited_git_diff(self):
         sha = "a" * 40
         fake = type("Result", (), {"stdout": b"README.md\0docs/ci-workflow.md\0"})()
