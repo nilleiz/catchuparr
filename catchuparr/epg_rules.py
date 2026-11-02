@@ -131,23 +131,80 @@ def _operator(name: str, value, *, field: str, case_sensitive: bool) -> Callable
                 raise ShowRuleError(f"field {field}: invalid regular expression") from None
         # Casefolding can change letters (for example a sharp s), so a regex
         # runs on the case-preserving form and ignores case through its flag.
-        return lambda text: any(p.search(text.plain) for p in patterns)
+        return _first_true([pattern.search for pattern in patterns], lambda text: text.plain)
     if name == "wildcard":
         patterns = [_wildcard(normalize_text(t, case_sensitive=case_sensitive), flags) for t in values]
-        return lambda text: any(p.fullmatch(_side(text, case_sensitive)) for p in patterns)
+        return _first_true([pattern.fullmatch for pattern in patterns], _side_of(case_sensitive))
     needles = [normalize_text(t, case_sensitive=case_sensitive) for t in values]
-    check = {
-        "equals": lambda text, n: text == n,
-        "starts_with": lambda text, n: text.startswith(n),
-        "ends_with": lambda text, n: text.endswith(n),
-        "contains": lambda text, n: n in text,
-        "includes": lambda text, n: n in text,
-    }[name]
-    return lambda text: any(check(_side(text, case_sensitive), n) for n in needles)
+    side = _side_of(case_sensitive)
+    if name == "equals":
+        return lambda text, side=side: side(text) in needles
+    if name == "contains" or name == "includes":
+        if len(needles) == 1:
+            needle = needles[0]
+            return lambda text, side=side: needle in side(text)
+        return lambda text, side=side: _any_in(side(text), needles)
+    method = "startswith" if name == "starts_with" else "endswith"
+    if len(needles) == 1:
+        needle = needles[0]
+        return lambda text, side=side: getattr(side(text), method)(needle)
+    # str.startswith and str.endswith accept a tuple of alternatives.
+    alternatives = tuple(needles)
+    return lambda text, side=side: getattr(side(text), method)(alternatives)
 
 
 def _side(text: Text, case_sensitive: bool) -> str:
     return text.plain if case_sensitive else text.folded
+
+
+def _side_of(case_sensitive: bool) -> Callable[[Text], str]:
+    return (lambda text: text.plain) if case_sensitive else (lambda text: text.folded)
+
+
+def _any_in(haystack: str, needles: Sequence[str]) -> bool:
+    for needle in needles:
+        if needle in haystack:
+            return True
+    return False
+
+
+def _first_true(tests: Sequence[Callable[[str], object]], side: Callable[[Text], str]) -> Callable[[Text], bool]:
+    """True when any of ``tests`` accepts the text; loops instead of a generator for speed."""
+    if len(tests) == 1:
+        test = tests[0]
+        return lambda text: bool(test(side(text)))
+
+    def check(text):
+        value = side(text)
+        for test in tests:
+            if test(value):
+                return True
+        return False
+    return check
+
+
+def _any_of(parts: Sequence[Callable[[Text], bool]]) -> Callable[[Text], bool]:
+    if len(parts) == 1:
+        return parts[0]
+
+    def check(text):
+        for part in parts:
+            if part(text):
+                return True
+        return False
+    return check
+
+
+def _all_of(parts: Sequence[Callable[[Text], bool]]) -> Callable[[Text], bool]:
+    if len(parts) == 1:
+        return parts[0]
+
+    def check(text):
+        for part in parts:
+            if not part(text):
+                return False
+        return True
+    return check
 
 
 def compile_text_condition(spec, *, field: str, case_sensitive: bool = False,
@@ -175,9 +232,8 @@ def compile_text_condition(spec, *, field: str, case_sensitive: bool = False,
                 compile_text_condition(item, field=f"{path}[{n}]", case_sensitive=case_sensitive, _depth=_depth + 1)
                 for n, item in enumerate(value)
             ]
-            combine = any if key == "any" else all
-            parts.append(lambda text, inner=inner, combine=combine: combine(c(text) for c in inner))
-    return lambda text: all(part(text) for part in parts)
+            parts.append(_any_of(inner) if key == "any" else _all_of(inner))
+    return _all_of(parts)
 
 
 def compile_match(spec, *, field: str = "match") -> Callable[..., bool]:
@@ -212,7 +268,10 @@ def compile_match(spec, *, field: str = "match") -> Callable[..., bool]:
             return False
         if texts is None:
             texts = programme_texts(programme)
-        return all(condition(texts[name]) for name, condition in conditions)
+        for name, condition in conditions:
+            if not condition(texts[name]):
+                return False
+        return True
 
     return matches
 

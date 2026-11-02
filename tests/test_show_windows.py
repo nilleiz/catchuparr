@@ -264,3 +264,100 @@ class ShowListTests(unittest.TestCase):
         self.assertEqual(5, len(pushed["rows"]))
         self.assertIn("8 upcoming shows match (the next 5 per channel are listed)", summary)
         self.assertTrue(summary.endswith("could not be read for some channels."))
+
+
+def utc(*parts):
+    return datetime(*parts, tzinfo=timezone.utc).timestamp()
+
+
+class CalendarEdgeTests(unittest.TestCase):
+    """Windows are epoch based; only schedule restrictions use the local wall clock."""
+
+    def active(self, schedule=None, timezone_name="Europe/Berlin", **entry):
+        snapshot = normalize_schedule(schedule).to_snapshot() if schedule is not None else None
+        return {
+            "archive_root": "/unused", "show_rules": [show_entry(schedule=snapshot, **entry)],
+            "recording_schedule": {"timezone": timezone_name, "channels": {}},
+        }
+
+    def planned(self, active, *programmes):
+        from catchuparr.epg_rules import plan_windows
+        from catchuparr.show_windows import channel_rules
+
+        return plan_windows(list(programmes), channel_rules(active)[CHANNEL])
+
+    def test_a_programme_across_local_midnight_is_one_window(self):
+        active = self.active(padding={"before": 5.0, "after": 3.0})
+        start, end = utc(2026, 11, 3, 22, 30), utc(2026, 11, 3, 23, 30)  # 23:30-00:30 in Berlin
+        (window,) = self.planned(active, Programme(start, end, "Show night"))
+        self.assertEqual((start - 300, end + 180), (window.start, window.end))
+
+    def test_today_schedule_clips_the_window_at_local_midnight_on_both_days(self):
+        from catchuparr.recording_schedule_overview import today_schedule
+        from catchuparr.show_windows import store_windows, windows_path
+
+        start, end = utc(2026, 11, 3, 22, 30), utc(2026, 11, 3, 23, 30)
+        with tempfile.TemporaryDirectory() as root:
+            current = {
+                "channel_uuids": CHANNEL, "archive_root": root,
+                "show_rules": [show_entry()],
+                "recording_schedule": {"timezone": "Europe/Berlin", "channels": {
+                    CHANNEL: normalize_schedule({"sunday": []}).to_snapshot()}},
+            }
+            store_windows(windows_path(current), {CHANNEL: [
+                Window(start - 300, end + 180, (1,), (Show(start, end, "Show night", 1),)),
+            ]})
+            with patch("catchuparr.action_messages._default_sender", lambda: lambda payload: None):
+                first = today_schedule(current, {}, now=datetime(2026, 11, 3, 12, tzinfo=timezone.utc))
+                second = today_schedule(current, {}, now=datetime(2026, 11, 4, 12, tzinfo=timezone.utc))
+        self.assertEqual([("23:25", "24:00")], [(w["start"], w["end"]) for w in first["channels"][0]["windows"]])
+        self.assertEqual([("00:00", "00:33")], [(w["start"], w["end"]) for w in second["channels"][0]["windows"]])
+        self.assertEqual("23:30", first["channels"][0]["shows"][0]["start"])
+        self.assertEqual("00:30", second["channels"][0]["shows"][0]["end"])
+
+    def test_fall_back_hour_counts_both_occurrences_for_a_start_restriction(self):
+        # 2026-10-25: 03:00 CEST becomes 02:00 CET, so 02:30 happens twice.
+        active = self.active({"daily": [{"start": "02:00", "end": "03:00"}]})
+        first = Programme(utc(2026, 10, 25, 0, 30), utc(2026, 10, 25, 1, 0), "Show first")    # 02:30 CEST
+        second = Programme(utc(2026, 10, 25, 1, 30), utc(2026, 10, 25, 2, 0), "Show second")  # 02:30 CET
+        later = Programme(utc(2026, 10, 25, 2, 30), utc(2026, 10, 25, 3, 0), "Show later")    # 03:30 CET
+        titles = {show.title for window in self.planned(active, first, second, later) for show in window.shows}
+        self.assertEqual({"Show first", "Show second"}, titles)
+
+    def test_spring_forward_gap_has_no_two_oclock_start(self):
+        # 2026-03-29: 02:00 CET jumps to 03:00 CEST; nothing starts at 02:xx local.
+        active = self.active({"daily": [{"start": "02:00", "end": "03:00"}]})
+        after_gap = Programme(utc(2026, 3, 29, 1, 10), utc(2026, 3, 29, 1, 40), "Show after the gap")  # 03:10 CEST
+        before_gap = Programme(utc(2026, 3, 29, 0, 30), utc(2026, 3, 29, 0, 50), "Show before")      # 01:30 CET
+        self.assertEqual([], self.planned(active, after_gap, before_gap))
+        evening = self.active({"daily": [{"start": "01:00", "end": "02:00"}]})
+        (window,) = self.planned(evening, before_gap, after_gap)
+        self.assertEqual("Show before", window.shows[0].title)
+
+    def test_a_programme_spanning_the_gap_keeps_its_real_length(self):
+        active = self.active(padding={"before": 0.0, "after": 0.0})
+        start, end = utc(2026, 3, 29, 0, 30), utc(2026, 3, 29, 1, 30)  # 01:30 CET to 03:30 CEST
+        (window,) = self.planned(active, Programme(start, end, "Show gap"))
+        self.assertEqual(3600.0, window.end - window.start)
+
+    def test_weekly_schedule_and_show_window_open_the_channel_independently(self):
+        from catchuparr.schedule import schedule_from_snapshot
+        from catchuparr.show_windows import recording_window_open, store_windows, windows_path
+
+        weekly = schedule_from_snapshot(normalize_schedule({"daily": [{"start": "09:00", "end": "10:00"}]}).to_snapshot())
+        with tempfile.TemporaryDirectory() as root:
+            active = self.active()
+            active["archive_root"] = root
+            show_start = utc(2026, 11, 2, 12, 0)  # 13:00 Berlin
+            store_windows(windows_path(active), {CHANNEL: [Window(show_start, show_start + 1800, (1,))]})
+            def open_at(hour, minute):
+                return recording_window_open(
+                    active, CHANNEL, weekly, "Europe/Berlin",
+                    datetime(2026, 11, 2, hour, minute, tzinfo=timezone.utc),
+                )
+            self.assertTrue(open_at(8, 30))    # 09:30 local: weekly only
+            self.assertTrue(open_at(12, 10))   # 13:10 local: show window only
+            self.assertFalse(open_at(11, 0))   # 12:00 local: neither
+            self.assertFalse(open_at(12, 40))  # 13:40 local: window over
+            self.assertFalse(recording_window_open(
+                active, OTHER, weekly, "Europe/Berlin", datetime(2026, 11, 2, 12, 10, tzinfo=timezone.utc)))
