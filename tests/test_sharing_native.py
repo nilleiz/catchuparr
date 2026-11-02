@@ -189,6 +189,7 @@ class NativeSharingTests(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.target.ordinary_client_ids, ("viewer-synthetic-1",))
+        self.assertEqual(100.0, result.target.live_since)
         self.assertFalse(result.target.account_allowed_by_recording_policy)
         self.assertTrue(result.target.useful_buffer_available)
 

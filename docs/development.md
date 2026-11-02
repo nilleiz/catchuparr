@@ -23,6 +23,8 @@ Every change reaches `main` the same way:
    (not root), exercise the change against real EPG and sources, restart the
    container, and compare the applied configuration before and after. Restore
    the Dev settings afterwards. Keep every private detail out of the repository.
+   Stop the Dev container as soon as no test is running on it; start it again
+   only for the next test.
 5. **Pull request.** Open a PR to `main` with the problem, changes, verification
    and user impact in generic terms, and share the PR link in every status
    report. Its CI, including the native AIO job, must

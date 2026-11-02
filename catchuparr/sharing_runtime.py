@@ -868,16 +868,19 @@ class RecorderBorrowCoordinator:
                 last_viewer_left_at=None,
                 pending_action=None,
             )
+            failure_recovery = latest.state.phase is SharingPhase.FAILED
             observation = SharingObservation(
                 channel_uuid=self.channel_uuid, now=now,
                 configuration_generation=self.configuration_generation,
                 control_generation=self.control_generation,
                 recorder_fence=self.recorder_fence, lease_is_current=True,
-                settings=settings, target=target,
+                # Recovering from a failure is the one case that skips the
+                # stability window; ordinary viewers always wait for it.
+                settings=replace(settings, live_stability_seconds=0) if failure_recovery else settings,
+                target=target,
                 recording_enabled=True, schedule_open=True,
                 dedicated_source_available=self.dedicated_source_available,
             )
-            failure_recovery = latest.state.phase is SharingPhase.FAILED
             planning = replace(base, last_switch_at=None) if failure_recovery else base
             decision = observe(planning, observation)
             if failure_recovery:
