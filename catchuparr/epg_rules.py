@@ -67,13 +67,35 @@ class ShowRule:
     start_allowed: Callable[[float], bool] | None = None
 
 
+MAX_TITLE_LENGTH = 80
+
+
+@dataclass(frozen=True)
+class Show:
+    """One matched programme without padding; ``rule`` is the rule that matched it."""
+
+    start: float
+    end: float
+    title: str
+    rule: int
+
+
 @dataclass(frozen=True)
 class Window:
-    """A contiguous recording interval; ``rules`` holds the rules that opened it."""
+    """A contiguous recording interval; ``rules`` holds the rules that opened it.
+
+    ``shows`` lists the matched programmes inside it for the overviews.
+    """
 
     start: float
     end: float
     rules: tuple[int, ...] = ()
+    shows: tuple[Show, ...] = ()
+
+
+def _merged_shows(*groups: Iterable[Show]) -> tuple[Show, ...]:
+    return tuple(sorted({show for group in groups for show in group},
+                        key=lambda show: (show.start, show.end, show.rule, show.title)))
 
 
 def normalize_text(value: str, *, case_sensitive: bool = False) -> str:
@@ -217,7 +239,9 @@ def merge_windows(windows: Iterable[Window], *, gap: float = MERGE_GAP_SECONDS) 
         if merged and window.start <= merged[-1].end + gap:
             last = merged[-1]
             rules = last.rules if window.start > last.start else tuple(sorted({*last.rules, *window.rules}))
-            merged[-1] = Window(last.start, max(last.end, window.end), rules)
+            merged[-1] = Window(
+                last.start, max(last.end, window.end), rules, _merged_shows(last.shows, window.shows),
+            )
         else:
             merged.append(window)
     return merged
@@ -238,6 +262,7 @@ def plan_windows(programmes: Iterable[Programme], rules: Sequence[ShowRule]) -> 
                     programme.start - rule.before_seconds,
                     programme.end + rule.after_seconds,
                     (rule.index,),
+                    (Show(programme.start, programme.end, programme.title[:MAX_TITLE_LENGTH], rule.index),),
                 ))
     return merge_windows(windows)
 

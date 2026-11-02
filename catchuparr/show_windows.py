@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from .epg_rules import (
+    START_LOOKAHEAD_SECONDS,
     Programme,
+    Show,
     ShowRule,
     Window,
     compile_match,
@@ -79,7 +81,7 @@ def load_windows(path: Path) -> dict[str, list[Window]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         windows = {
-            str(channel): [Window(float(s), float(e), tuple(int(r) for r in rules)) for s, e, rules in items]
+            str(channel): [_window_from_json(item) for item in items]
             for channel, items in payload["channels"].items()
         }
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
@@ -88,9 +90,21 @@ def load_windows(path: Path) -> dict[str, list[Window]]:
     return windows
 
 
+def _window_from_json(item) -> Window:
+    start, end, rules, *rest = item
+    shows = tuple(
+        Show(float(s), float(e), str(title), int(rule)) for s, e, title, rule in (rest[0] if rest else ())
+    )
+    return Window(float(start), float(end), tuple(int(r) for r in rules), shows)
+
+
 def store_windows(path: Path, windows: Mapping[str, list[Window]]) -> None:
     payload = {"channels": {
-        channel: [[w.start, w.end, list(w.rules)] for w in items] for channel, items in sorted(windows.items())
+        channel: [
+            [w.start, w.end, list(w.rules), [[x.start, x.end, x.title, x.rule] for x in w.shows]]
+            for w in items
+        ]
+        for channel, items in sorted(windows.items())
     }}
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -182,7 +196,83 @@ def preview_show_matches(active: Mapping[str, Any], programmes_by_channel: Mappi
         matches = preview_matches(programmes, rules, now=now, limit=limit)
         if matches:
             channels[channel] = [{**m, "rules": [names[i] for i in m["rules"]]} for m in matches]
-    return {"channels": channels, "epg_unavailable": unreadable}
+    return {
+        "channels": channels, "epg_unavailable": unreadable,
+        "timezone": (active.get("recording_schedule") or {}).get("timezone") or "UTC",
+    }
+
+
+def rule_names(active: Mapping[str, Any]) -> dict[int, str]:
+    return {entry["index"]: entry["name"] for entry in active.get("show_rules") or ()}
+
+
+def day_shows(active: Mapping[str, Any], channel: str, day_start: float, day_end: float) -> list[Show]:
+    """Planned programmes of a channel that air between ``day_start`` and ``day_end``."""
+    if channel not in covered_channels(active):
+        return []
+    try:
+        windows = load_windows(windows_path(active)).get(channel, ())
+    except Exception:
+        return []
+    return sorted({
+        show for window in windows for show in window.shows if show.end > day_start and show.start < day_end
+    }, key=lambda show: (show.start, show.end, show.rule))
+
+
+def current_show(active: Mapping[str, Any], channel: str, now: float) -> dict[str, Any] | None:
+    """The programme a currently open show window records for, or None.
+
+    ``phase`` is ``airing`` while it is on, ``upcoming`` while the window waits
+    for it (padding before) and ``ended`` during padding after it.
+    """
+    if channel not in covered_channels(active):
+        return None
+    try:
+        windows = load_windows(windows_path(active)).get(channel, ())
+    except Exception:
+        return None
+    names = rule_names(active)
+    for window in windows:
+        if not window.start - START_LOOKAHEAD_SECONDS <= now < window.end or not window.shows:
+            continue
+        airing = [show for show in window.shows if show.start <= now < show.end]
+        upcoming = [show for show in window.shows if show.start > now]
+        ended = [show for show in window.shows if show.end <= now]
+        show, phase = (
+            (airing[0], "airing") if airing else
+            (upcoming[0], "upcoming") if upcoming else
+            (ended[-1], "ended")
+        )
+        return {
+            "title": show.title, "rule": names.get(show.rule, f"rule {show.rule}"),
+            "start": show.start, "end": show.end, "phase": phase,
+        }
+    return None
+
+
+def format_show_rows(entries, timezone_name: str, now: float) -> list[str]:
+    """Rows ``[Tue ]HH:MM–HH:MM title › channel, …``; ``entries`` are (channel, start, end, title)."""
+    from zoneinfo import ZoneInfo
+
+    from .action_messages import split_group_row
+
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ValueError, TypeError, KeyError):
+        zone = timezone.utc
+    today = datetime.fromtimestamp(now, zone).date()
+    groups: dict[tuple[float, float, str], list[str]] = {}
+    for channel, start, end, title in entries:
+        names = groups.setdefault((start, end, title), [])
+        if channel not in names:
+            names.append(channel)
+    rows = []
+    for (start, end, title), names in sorted(groups.items()):
+        first = datetime.fromtimestamp(start, zone)
+        day = "" if first.date() == today else first.strftime("%a ")
+        period = f"{day}{first:%H:%M}–{datetime.fromtimestamp(end, zone):%H:%M} {title or '(untitled)'}"
+        rows.extend(split_group_row(period, sorted(names)))
+    return rows
 
 
 def plan_all(active: Mapping[str, Any], programmes_by_channel: Mapping[str, list[Programme] | None],

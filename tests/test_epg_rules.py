@@ -2,6 +2,7 @@ import unittest
 
 from catchuparr.epg_rules import (
     Programme,
+    Show,
     ShowRule,
     ShowRuleError,
     Window,
@@ -98,9 +99,14 @@ class WindowTests(unittest.TestCase):
         windows = plan_windows([
             programme("Show 1", 1000, 2800), programme("Show 2", 2800, 4600), programme("Other", 4600, 5200),
         ], rules)
-        self.assertEqual([Window(940, 4720, (0,))], windows)
+        self.assertEqual([Window(940, 4720, (0,), (
+            Show(1000, 2800, "Show 1", 0), Show(2800, 4600, "Show 2", 0),
+        ))], windows)
         apart = plan_windows([programme("Show 1", 1000, 2800), programme("Show 2", 3400, 5200)], rules)
-        self.assertEqual([Window(940, 2920, (0,)), Window(3340, 5320, (0,))], apart)
+        self.assertEqual([
+            Window(940, 2920, (0,), (Show(1000, 2800, "Show 1", 0),)),
+            Window(3340, 5320, (0,), (Show(3400, 5200, "Show 2", 0),)),
+        ], apart)
 
     def test_touching_programmes_merge_across_rounding_gap(self):
         rules = [rule(0, {"title": {"starts_with": "Show"}})]
@@ -113,7 +119,10 @@ class WindowTests(unittest.TestCase):
             rule(1, {"title": {"contains": "a"}}, allowed=lambda start: start >= 5000),
         ]
         windows = plan_windows([programme("a", 0, 1000), programme("a", 5000, 6000)], rules)
-        self.assertEqual([Window(0, 1000, (0,)), Window(5000, 6000, (0, 1))], windows)
+        self.assertEqual([
+            Window(0, 1000, (0,), (Show(0, 1000, "a", 0),)),
+            Window(5000, 6000, (0, 1), (Show(5000, 6000, "a", 0), Show(5000, 6000, "a", 1))),
+        ], windows)
 
     def test_invalid_programme_bounds_are_ignored(self):
         self.assertEqual([], plan_windows([programme("a", 10, 10)], [rule(0, {"title": {"contains": "a"}})]))

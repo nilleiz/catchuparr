@@ -216,7 +216,33 @@ def apply_committed_log_level(settings: dict | None = None) -> str:
 def validate_configuration(settings: dict) -> dict:
     from .configuration import validate_configuration as validate
 
-    return validate(settings, show_preview=_show_preview)
+    result = validate(settings, show_preview=_show_preview)
+    matches = result.get("show_matches")
+    if matches:
+        result["message"] = deliver_show_matches(result, matches)
+    return result
+
+
+def deliver_show_matches(result: dict, matches: dict) -> str:
+    """Push the upcoming show matches as a toast and return the summary line."""
+    import time
+    from uuid import uuid4
+
+    from .action_messages import deliver_action_message
+    from .show_windows import format_show_rows
+
+    names = {row["channel_uuid"]: row["channel_name"] for row in result["channels"]}
+    entries = [
+        (names.get(channel, "Unknown channel"), item["start"], item["end"], item["title"])
+        for channel, items in matches["channels"].items() for item in items
+    ]
+    count = len({(start, end, title, channel) for channel, start, end, title in entries})
+    summary = f"{result['message']} {count} upcoming show{'' if count == 1 else 's'} match"
+    summary += "; the EPG could not be read for some channels." if matches["epg_unavailable"] else "."
+    if not entries:
+        return summary
+    rows = format_show_rows(entries, matches["timezone"], time.time())
+    return deliver_action_message(rows, title="Shows", summary=summary, run_key=f"shows-{uuid4().hex[:12]}")
 
 
 def _show_preview(active: dict) -> dict:

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from catchuparr.epg_rules import Programme, Window
+from catchuparr.epg_rules import Programme, Show, Window
 from catchuparr.schedule import normalize_schedule
 from catchuparr.show_windows import (
     load_windows,
@@ -46,6 +46,12 @@ def show_entry(**overrides):
     return entry
 
 
+def bare(by_channel):
+    return {
+        channel: [Window(w.start, w.end, w.rules) for w in windows] for channel, windows in by_channel.items()
+    }
+
+
 class ShowWindowTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -63,21 +69,24 @@ class ShowWindowTests(unittest.TestCase):
     def test_plan_keeps_running_windows_when_the_epg_row_vanishes(self):
         active = self.active(show_entry())
         planned = plan_all(active, {CHANNEL: [Programme(1000, 2000, "Show A")]}, 900)
-        self.assertEqual({CHANNEL: [Window(940, 2120, (1,))]}, planned)
+        self.assertEqual({CHANNEL: [Window(940, 2120, (1,))]}, bare(planned))
         self.assertEqual(planned, load_windows(windows_path(active)))
-        self.assertEqual({CHANNEL: [Window(940, 2120, (1,))]}, plan_all(active, {CHANNEL: []}, 1500))
+        self.assertEqual({CHANNEL: [Window(940, 2120, (1,))]}, bare(plan_all(active, {CHANNEL: []}, 1500)))
         self.assertEqual({CHANNEL: []}, plan_all(active, {CHANNEL: []}, 2200))
 
     def test_unreadable_epg_keeps_previous_windows(self):
         active = self.active(show_entry())
         plan_all(active, {CHANNEL: [Programme(5000, 6000, "Show A")]}, 900)
-        self.assertEqual({CHANNEL: [Window(4940, 6120, (1,))]}, plan_all(active, {CHANNEL: None}, 1000))
+        self.assertEqual({CHANNEL: [Window(4940, 6120, (1,))]}, bare(plan_all(active, {CHANNEL: None}, 1000)))
 
     def test_running_window_survives_a_rule_edit_but_not_its_removal(self):
         active = self.active(show_entry())
         plan_all(active, {CHANNEL: [Programme(1000, 2000, "Show A")]}, 900)
         edited = self.active(show_entry(match={"title": {"starts_with": "Other"}}))
-        self.assertEqual({CHANNEL: [Window(940, 2120, (1,))]}, plan_all(edited, {CHANNEL: [Programme(1000, 2000, "Show A")]}, 1500))
+        self.assertEqual(
+            {CHANNEL: [Window(940, 2120, (1,))]},
+            bare(plan_all(edited, {CHANNEL: [Programme(1000, 2000, "Show A")]}, 1500)),
+        )
         self.assertTrue(show_window_open(edited, CHANNEL, 1500))
         removed = self.active(show_entry(channel_uuids=[OTHER]))
         self.assertFalse(show_window_open(removed, CHANNEL, 1500))
@@ -145,7 +154,7 @@ class PreviewTests(unittest.TestCase):
         from catchuparr.show_windows import preview_show_matches
 
         result = preview_show_matches(self.active(show_entry()), {CHANNEL: None}, now=0)
-        self.assertEqual({"channels": {}, "epg_unavailable": True}, result)
+        self.assertEqual({"channels": {}, "epg_unavailable": True, "timezone": "UTC"}, result)
 
     def test_validation_attaches_matches_only_for_shows_rules(self):
         from catchuparr import configuration
@@ -158,3 +167,82 @@ class PreviewTests(unittest.TestCase):
             active["show_rules"] = []
             self.assertNotIn("show_matches", configuration.validate_configuration(
                 {}, show_preview=lambda a: {"seen": True}))
+
+
+SHOWS = (Show(1000, 1900, "Show A", 1), Show(1900, 2800, "Show B", 1))
+
+
+class ShowListTests(unittest.TestCase):
+    def active(self, *entries):
+        return {"archive_root": "/unused", "show_rules": list(entries),
+                "recording_schedule": {"timezone": "UTC", "channels": {}}}
+
+    def stored(self, root, *windows):
+        from catchuparr.show_windows import store_windows, windows_path
+
+        active = self.active(show_entry())
+        active["archive_root"] = root
+        store_windows(windows_path(active), {CHANNEL: list(windows)})
+        return active
+
+    def test_windows_keep_their_shows_in_the_file_and_old_files_still_load(self):
+        with tempfile.TemporaryDirectory() as root:
+            active = self.stored(root, Window(940, 2920, (1,), SHOWS))
+            self.assertEqual(SHOWS, load_windows(windows_path(active))[CHANNEL][0].shows)
+            windows_path(active).write_text(
+                '{"channels":{"%s":[[940.0,2920.0,[1]]]}}' % CHANNEL, encoding="utf-8",
+            )
+            from catchuparr.show_windows import _cache
+
+            _cache.clear()
+            self.assertEqual((), load_windows(windows_path(active))[CHANNEL][0].shows)
+
+    def test_running_window_keeps_its_shows_when_the_epg_row_vanishes(self):
+        with tempfile.TemporaryDirectory() as root:
+            active = self.stored(root, Window(940, 2920, (1,), SHOWS))
+            planned = plan_all(active, {CHANNEL: []}, 1500)
+        self.assertEqual(SHOWS, planned[CHANNEL][0].shows)
+
+    def test_current_show_names_the_airing_upcoming_and_ended_programme(self):
+        from catchuparr.show_windows import current_show
+
+        with tempfile.TemporaryDirectory() as root:
+            active = self.stored(root, Window(940, 2920, (1,), SHOWS))
+            self.assertEqual("Show A", current_show(active, CHANNEL, 1000)["title"])
+            self.assertEqual("airing", current_show(active, CHANNEL, 1000)["phase"])
+            self.assertEqual("Synthetic", current_show(active, CHANNEL, 2000)["rule"])
+            self.assertEqual("Show B", current_show(active, CHANNEL, 2000)["title"])
+            self.assertEqual(("Show A", "upcoming"), tuple(
+                current_show(active, CHANNEL, 950)[key] for key in ("title", "phase")))
+            self.assertEqual(("Show B", "ended"), tuple(
+                current_show(active, CHANNEL, 2850)[key] for key in ("title", "phase")))
+            self.assertIsNone(current_show(active, CHANNEL, 3000))
+            self.assertIsNone(current_show(active, OTHER, 1000))
+
+    def test_rows_group_channels_and_label_other_days(self):
+        from catchuparr.show_windows import format_show_rows
+
+        day = datetime(2026, 11, 2, 12, tzinfo=timezone.utc).timestamp()
+        rows = format_show_rows([
+            ("B", day + 3600, day + 4500, "News"), ("A", day + 3600, day + 4500, "News"),
+            ("A", day + 90000, day + 90900, "News"),
+        ], "UTC", day)
+        self.assertEqual(["13:00–13:15 News › A, B", "Tue 13:00–13:15 News › A"], rows)
+
+    def test_validation_pushes_the_matches_as_a_toast(self):
+        from catchuparr import runtime
+
+        pushed = {}
+
+        def fake(rows, **kwargs):
+            pushed["rows"], pushed["title"] = list(rows), kwargs["title"]
+            return "summary"
+
+        result = {"message": "1 channel(s) selected.", "channels": [{"channel_uuid": CHANNEL, "channel_name": "Ch"}]}
+        matches = {"channels": {CHANNEL: [{"title": "Show A", "start": 0, "end": 900, "rules": ["x"]}]},
+                   "epg_unavailable": False, "timezone": "UTC"}
+        with patch("catchuparr.action_messages.deliver_action_message", fake):
+            self.assertEqual("summary", runtime.deliver_show_matches(result, matches))
+        self.assertEqual("Shows", pushed["title"])
+        self.assertEqual(1, len(pushed["rows"]))
+        self.assertIn("Show A › Ch", pushed["rows"][0])
