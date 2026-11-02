@@ -24,7 +24,8 @@ Every change reaches `main` the same way:
    container, and compare the applied configuration before and after. Restore
    the Dev settings afterwards. Keep every private detail out of the repository.
 5. **Pull request.** Open a PR to `main` with the problem, changes, verification
-   and user impact in generic terms. Its CI, including the native AIO job, must
+   and user impact in generic terms, and share the PR link in every status
+   report. Its CI, including the native AIO job, must
    succeed for the exact tree that is merged.
 6. **Merge and release.** Merge only after green CI and completed Dev
    verification, with a merge commit. Then run the `Build and publish release`
