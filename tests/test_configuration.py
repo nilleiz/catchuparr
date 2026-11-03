@@ -131,6 +131,16 @@ class ConfigurationTests(unittest.TestCase):
             configuration.active_configuration_generation(active),
         )
 
+    def test_neighbour_options_persist_and_reload(self):
+        shows = dict(self.settings, filter_config=(
+            "version: 1\nrules:\n  - shows:\n      match: {title: {contains: x}}\n"
+            "      include_previous: {min: 10}\n      include_next: true\n"
+        ))
+        apply_configuration(shows, self.catalog, self.active_path)
+        rule = load_active_configuration(self.active_path)["show_rules"][0]
+        self.assertEqual({"min": 10}, rule["include_previous"])
+        self.assertEqual({}, rule["include_next"])
+
     def test_invalid_persisted_show_rules_are_rejected(self):
         shows = dict(self.settings, filter_config=(
             "version: 1\nrules:\n  - shows:\n      match: {title: {contains: x}}\n"
@@ -142,6 +152,9 @@ class ConfigurationTests(unittest.TestCase):
             lambda rule: rule.update(match={"title": {"regex": "("}}),
             lambda rule: rule.update(padding={"before": 999, "after": 0}),
             lambda rule: rule.update(unexpected=1),
+            lambda rule: rule.update(include_previous={"min": 0}),
+            lambda rule: rule.update(include_next=True),
+            lambda rule: rule.update(include_next={"min": 30, "max": 10}),
         ):
             broken = json.loads(json.dumps(saved))
             mutate(broken["show_rules"][0])

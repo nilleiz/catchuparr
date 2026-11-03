@@ -4,6 +4,17 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.8.2] - Prerelease
+
+### Added
+
+- Show rules can include the neighbouring programmes: `include_previous` and
+  `include_next` record the programme directly before or after a match, either
+  whole (`true`) or with optional `min` and `max` minutes. A neighbour shorter
+  than `min` brings exactly one more programme; `max` caps the whole extra time
+  before the start or after the end. Padding applies to the outer ends. The
+  validation preview shows the resulting recording span.
+
 ## [0.8.1] - Prerelease
 
 ### Fixed
