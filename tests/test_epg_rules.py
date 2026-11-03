@@ -1,17 +1,21 @@
 import unittest
 
 from catchuparr.epg_rules import (
+    Neighbour,
     Programme,
     Show,
     ShowRule,
     ShowRuleError,
     Window,
     compile_match,
+    compile_neighbour,
     compile_padding,
     freeze_running,
     merge_windows,
+    neighbour_snapshot,
     next_window_start,
     plan_windows,
+    preview_matches,
     window_active,
 )
 
@@ -91,6 +95,85 @@ class MatchTests(unittest.TestCase):
 
 def rule(index, spec, before=0, after=0, allowed=None):
     return ShowRule(index, compile_match(spec), before * 60.0, after * 60.0, allowed)
+
+
+def neighbours(previous=None, nxt=None, before=0, after=0):
+    return ShowRule(
+        0, compile_match({"title": {"equals": "Show"}}), before * 60.0, after * 60.0,
+        previous=compile_neighbour(previous, field="include_previous"),
+        next=compile_neighbour(nxt, field="include_next"),
+    )
+
+
+# 00:00 Magazine (30 min), 00:30 Weather (5 min), 00:35 Show (30 min),
+# 01:05 Short (5 min), 01:10 Film (90 min); seconds from 00:00.
+GUIDE = [
+    programme("Earlier", -1800, 0), programme("Magazine", 0, 1800), programme("Weather", 1800, 2100),
+    programme("Show", 2100, 3900), programme("Short", 3900, 4200), programme("Film", 4200, 9600),
+]
+
+
+def span(rule, guide=GUIDE):
+    (window,) = plan_windows(guide, [rule])
+    return window.start, window.end
+
+
+class NeighbourTests(unittest.TestCase):
+    def test_without_options_only_the_match_is_recorded(self):
+        self.assertEqual((2100, 3900), span(neighbours()))
+
+    def test_whole_previous_and_next_programme(self):
+        self.assertEqual((1800, 4200), span(neighbours(True, True)))
+
+    def test_min_adds_exactly_one_more_programme(self):
+        self.assertEqual((0, 3900), span(neighbours({"min": 10})))       # Weather < 10 min -> Magazine too
+        self.assertEqual((1800, 3900), span(neighbours({"min": 5})))     # Weather is not shorter than 5
+        self.assertEqual((2100, 9600), span(neighbours(None, {"min": 10})))
+        # Magazine (30 min) is shorter than 40, but never a third programme.
+        self.assertEqual((0, 3900), span(neighbours({"min": 40})))
+
+    def test_max_caps_the_whole_lead_and_tail(self):
+        self.assertEqual((900, 3900), span(neighbours({"min": 10, "max": 20})))
+        self.assertEqual((2100, 5700), span(neighbours(None, {"min": 10, "max": 30})))
+        self.assertEqual((1800, 3900), span(neighbours({"max": 60})))   # max above the neighbour length
+
+    def test_padding_applies_to_the_ends_of_the_neighbours(self):
+        self.assertEqual((1800 - 120, 4200 + 300), span(neighbours(True, True, before=2, after=5)))
+
+    def test_gaps_and_missing_neighbours(self):
+        gap = [programme("Weather", 1800, 2000), programme("Show", 2100, 3900)]
+        self.assertEqual((2100, 3900), span(neighbours(True, True), gap))
+        touching = [programme("Weather", 1800, 2070), programme("Show", 2100, 3900)]
+        self.assertEqual((1800, 3900), span(neighbours(True), touching))
+        self.assertEqual((2100, 3900), span(neighbours(True, True), [programme("Show", 2100, 3900)]))
+
+    def test_neighbour_spans_merge_with_another_match(self):
+        guide = [programme("Show", 0, 1800), programme("Between", 1800, 3600), programme("Show", 3600, 5400)]
+        (window,) = plan_windows(guide, [neighbours(None, True)])
+        self.assertEqual((0, 5400), (window.start, window.end))
+        self.assertEqual(["Show", "Show"], [show.title for show in window.shows])
+
+    def test_preview_reports_the_recording_span(self):
+        (match,) = [m for m in preview_matches(GUIDE, [neighbours({"min": 10}, True, before=2)], now=2000)]
+        self.assertEqual((2100, 3900), (match["start"], match["end"]))
+        self.assertEqual((0 - 120, 4200), (match["record_start"], match["record_end"]))
+        self.assertTrue(match["neighbours"])
+
+    def test_neighbour_options_are_validated(self):
+        self.assertIsNone(compile_neighbour(None, field="f"))
+        self.assertIsNone(compile_neighbour(False, field="f"))
+        self.assertEqual(Neighbour(), compile_neighbour(True, field="f"))
+        self.assertEqual(Neighbour(600.0, 3600.0), compile_neighbour({"min": 10, "max": 60}, field="f"))
+        for bad in ({"min": 0}, {"max": 1441}, {"min": 30, "max": 10}, {"later": 1}, {"min": "5"}, "yes", 3):
+            with self.subTest(bad=bad), self.assertRaises(ShowRuleError):
+                compile_neighbour(bad, field="f")
+
+    def test_snapshot_round_trip(self):
+        for spec in (True, {"min": 10}, {"max": 30}, {"min": 10, "max": 30}):
+            neighbour = compile_neighbour(spec, field="f")
+            self.assertEqual(neighbour, compile_neighbour(neighbour_snapshot(neighbour), field="f"))
+        self.assertEqual({}, neighbour_snapshot(Neighbour()))
+        self.assertIsNone(neighbour_snapshot(None))
 
 
 class AlternativeTests(unittest.TestCase):

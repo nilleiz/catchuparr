@@ -145,7 +145,8 @@ class PreviewTests(unittest.TestCase):
         ]}
         result = preview_show_matches(active, programmes, now=700, limit=1)
         self.assertEqual(
-            [{"title": "Show two", "sub_title": "", "start": 2000, "end": 2600, "rules": ["Synthetic"]}],
+            [{"title": "Show two", "sub_title": "", "start": 2000, "end": 2600, "rules": ["Synthetic"],
+              "record_start": 1940.0, "record_end": 2720.0, "neighbours": False}],
             result["channels"][CHANNEL],
         )
         self.assertFalse(result["epg_unavailable"])
@@ -361,3 +362,31 @@ class CalendarEdgeTests(unittest.TestCase):
             self.assertFalse(open_at(12, 40))  # 13:40 local: window over
             self.assertFalse(recording_window_open(
                 active, OTHER, weekly, "Europe/Berlin", datetime(2026, 11, 2, 12, 10, tzinfo=timezone.utc)))
+
+
+class NeighbourWindowTests(unittest.TestCase):
+    def test_planner_and_toast_use_the_neighbour_span(self):
+        from catchuparr.show_windows import format_show_rows, preview_show_matches
+
+        with tempfile.TemporaryDirectory() as root:
+            active = {
+                "archive_root": root, "recording_schedule": {"timezone": "UTC", "channels": {}},
+                "show_rules": [show_entry(include_previous={"min": 10}, include_next={"max": 30},
+                                          padding={"before": 0.0, "after": 0.0})],
+            }
+            guide = {CHANNEL: [
+                Programme(0, 1800, "Magazine"), Programme(1800, 2100, "Weather"),
+                Programme(2100, 3900, "Show one"), Programme(3900, 9300, "Film"),
+            ]}
+            (window,) = plan_all(active, guide, 0)[CHANNEL]
+            self.assertEqual((0, 3900 + 1800), (window.start, window.end))
+            self.assertEqual(("Show one",), tuple(show.title for show in window.shows))
+            # A running window keeps its extended span when the guide row vanishes.
+            (kept,) = plan_all(active, {CHANNEL: []}, 3000)[CHANNEL]
+            self.assertEqual((0, 5700), (kept.start, kept.end))
+            preview = preview_show_matches(active, guide, now=0)
+            (item,) = preview["channels"][CHANNEL]
+            self.assertEqual((0, 5700, True), (item["record_start"], item["record_end"], item["neighbours"]))
+        rows = format_show_rows([("Ch", 2100, 3900, "Show one", 0, 5700)], "UTC", 0)
+        self.assertEqual(["00:35–01:05 Show one (records 00:00–01:35) › Ch"], rows)
+        self.assertEqual(["00:35–01:05 Show one › Ch"], format_show_rows([("Ch", 2100, 3900, "Show one")], "UTC", 0))

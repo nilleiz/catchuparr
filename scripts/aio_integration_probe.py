@@ -282,7 +282,7 @@ def probe_source_configuration(channel, root):
 
 
 def probe_show_rules(root):
-    """Show rules (0.8.0) against the real ORM: EPG lookup, planning, admission, overviews.
+    """Show rules (0.8.0, neighbours 0.8.2) against the real ORM: EPG lookup, planning, admission, overviews.
 
     Uses its own archive root and active snapshot, so the playback and recorder
     phases that follow never see these rules.
@@ -464,6 +464,44 @@ def probe_show_rules(root):
         require(any(item["title"] == "Synthetic news now" for item in rows.get(uuid_a, {}).get("shows", [])),
                 "Today's schedule must list the planned show")
         require("planned show" in schedule.get("message", ""), "Today's schedule summary must count shows")
+
+        # Neighbour options (0.8.2): the 5-minute trailer before the match is
+        # shorter than min, so the programme before it is included too; the film
+        # after the match is capped at max. Padding applies to the outer ends.
+        feature_at = now + 600 * minute
+        programme(guide_b, "Synthetic lead-in", feature_at - 45 * minute, 40)
+        programme(guide_b, "Synthetic trailer", feature_at - 5 * minute, 5)
+        programme(guide_b, "Synthetic feature", feature_at, 30)
+        programme(guide_b, "Synthetic film", feature_at + 30 * minute, 120)
+        neighbour_rule = (
+            "  - shows:\n"
+            "      name: Synthetic feature\n"
+            "      match:\n"
+            "        title: {equals: Synthetic feature}\n"
+            "      channels:\n"
+            "        include: {names: [Synthetic show B]}\n"
+            "      include_previous: {min: 10}\n"
+            "      include_next: {max: 20}\n"
+            "      padding: {before: 1, after: 2}\n"
+            "    m3u: {include: [Synthetic show source]}\n"
+        )
+        neighbour_settings = dict(settings, filter_config=settings["filter_config"] + neighbour_rule)
+        expected = ((feature_at - 46 * minute).timestamp(), (feature_at + 52 * minute).timestamp())
+        validated = validate_configuration(neighbour_settings, active_path=active_path,
+                                           show_preview=runtime._show_preview)
+        feature = [item for item in validated["show_matches"]["channels"].get(uuid_b, [])
+                   if item["title"] == "Synthetic feature"]
+        require(len(feature) == 1 and feature[0]["neighbours"]
+                and (feature[0]["record_start"], feature[0]["record_end"]) == expected,
+                f"Show preview must report the neighbour span: {feature}")
+        apply_configuration(neighbour_settings, active_path=active_path)
+        active = load_active_configuration(active_path)
+        require(active["show_rules"][1]["include_previous"] == {"min": 10}
+                and active["show_rules"][1]["include_next"] == {"max": 20},
+                "Applied snapshot must keep the neighbour options")
+        plan_all(active, load_programmes(active, stamp), stamp)
+        spans_b = [(w.start, w.end) for w in load_windows(windows_path(active))[uuid_b]]
+        require(expected in spans_b, f"Neighbour window must start before the lead-in and stop at max: {spans_b}")
     finally:
         # Leave no show fixtures behind for the playback and recorder phases.
         for channel, guide in channels.values():

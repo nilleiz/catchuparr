@@ -12,7 +12,13 @@ from yaml.constructor import ConstructorError
 from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
 
-from .epg_rules import ShowRuleError, compile_match, compile_padding
+from .epg_rules import (
+    ShowRuleError,
+    compile_match,
+    compile_neighbour,
+    compile_padding,
+    neighbour_snapshot,
+)
 from .schedule import (
     CONTINUOUS_SCHEDULE,
     RecordingSchedule,
@@ -563,7 +569,8 @@ def _compile_show_rule(
     schedule_days,
 ) -> tuple[dict[str, Any], set[str]]:
     field = f"rules[{number - 1}].shows"
-    show = _mapping(rule["shows"], line=line, field=field, allowed={"name", "match", "channels", "padding"},
+    show = _mapping(rule["shows"], line=line, field=field,
+                    allowed={"name", "match", "channels", "padding", "include_previous", "include_next"},
                     required={"match"})
     name = show.get("name", f"rule {number}")
     if not isinstance(name, str) or not name:
@@ -573,6 +580,10 @@ def _compile_show_rule(
     try:
         compile_match(show["match"], field=f"{field}.match")
         before, after = compile_padding(show.get("padding"), field=f"{field}.padding")
+        neighbours = {
+            key: compile_neighbour(show.get(key), field=f"{field}.{key}")
+            for key in ("include_previous", "include_next")
+        }
     except ShowRuleError as exc:
         raise SourceRuleError(f"line {line}, {exc}") from None
     scope = _mapping(show.get("channels", {}), line=line, field=f"{field}.channels", allowed={"include", "exclude"})
@@ -609,6 +620,11 @@ def _compile_show_rule(
         "schedule": schedule,
         "line": line,
     }
+    # Stored only when used, so the snapshot of a rule without neighbours (and
+    # with it the configuration generation) stays as before.
+    for key, neighbour in neighbours.items():
+        if neighbour is not None:
+            compiled[key] = neighbour_snapshot(neighbour)
     return compiled, profile_ids
 
 

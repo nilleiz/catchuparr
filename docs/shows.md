@@ -1,4 +1,4 @@
-# Show rules (0.8.0 specification)
+# Show rules (0.8.0 specification, neighbours since 0.8.2)
 
 A rule selects either whole channels (`channels:`) or programmes (`shows:`);
 using both in one rule is a validation error. A `shows` rule records every
@@ -20,6 +20,8 @@ rules:
         include: { groups: [Example group] }  # optional, default: all channels with EPG
         exclude: { names: [Example channel] }
       padding: { before: 2, after: 10 }       # minutes, 0-240
+      include_previous: { min: 10, max: 60 }  # optional, since 0.8.2
+      include_next: true                      # optional, since 0.8.2
     m3u: { include: [Example provider] }      # nested provider filter
     schedule: { weekdays: [{ start: "18:00", end: "23:00" }] }
 ```
@@ -29,6 +31,20 @@ rules:
   200 characters, nested repetition rejected). Each takes one text or a list
   (any of); `any`, `all` and `not` combine conditions. Matching ignores case and
   is Unicode-normalized unless `case_sensitive: true`.
+- Neighbouring programmes (0.8.2): `include_previous` and `include_next` also
+  record the programme directly before or after a match on the same channel.
+  `true` takes the whole neighbour; a mapping takes optional `min` and `max`
+  minutes (1-1440, `min` not above `max`):
+  - `min`: if the neighbour is shorter than `min`, exactly one more programme
+    beyond it is included as well (never a third one).
+  - `max`: caps the whole extra time before the start or after the end of the
+    match, also when `min` added a second programme.
+  - A neighbour must touch the match (gap up to 60 s); without one, only the
+    padding applies.
+  - `padding.before` applies to the start of the included programmes before the
+    match, `padding.after` to the end of those after it.
+  - Overviews still name the matched programme only; the validation preview adds
+    the recording span, for example `20:00–20:15 Example (records 19:28–20:47)`.
 - Fields: `title`, `sub_title`, `description`. In `match`, next to the
   fields, `case_sensitive: true` makes all text operators case-sensitive, and
   `min_minutes` / `max_minutes` (1-1440) bound the programme length.
