@@ -22,6 +22,7 @@ from .epg_rules import (
     ShowRule,
     Window,
     compile_match,
+    compile_neighbour,
     compile_padding,
     freeze_running,
     plan_windows,
@@ -62,7 +63,11 @@ def channel_rules(active: Mapping[str, Any]) -> dict[str, list[ShowRule]]:
             def restriction(start, schedule=schedule):
                 return schedule_is_active(schedule, timezone_name, datetime.fromtimestamp(start, timezone.utc))
 
-        rule = ShowRule(entry["index"], compile_match(entry["match"]), before, after, restriction)
+        rule = ShowRule(
+            entry["index"], compile_match(entry["match"]), before, after, restriction,
+            previous=compile_neighbour(entry.get("include_previous"), field="include_previous"),
+            next=compile_neighbour(entry.get("include_next"), field="include_next"),
+        )
         for channel in entry["channel_uuids"]:
             result.setdefault(channel, []).append(rule)
     return result
@@ -138,6 +143,16 @@ def next_show_start(active: Mapping[str, Any], channel: str, now: float) -> floa
     return min(starts) if starts else None
 
 
+def _neighbour_reach(active: Mapping[str, Any], key: str) -> float:
+    """Extra EPG range so the second neighbour (below ``min``) is loaded too."""
+    reach = 0.0
+    for entry in active.get("show_rules") or ():
+        spec = entry.get(key)
+        if spec is not None:
+            reach = max(reach, 60.0 * max(spec.get("min", 0), spec.get("max", 0)))
+    return reach
+
+
 def load_programmes(active: Mapping[str, Any], now: float) -> dict[str, list[Programme] | None]:
     """EPG programmes around ``now`` for every covered channel, from one query.
 
@@ -166,8 +181,8 @@ def load_programmes(active: Mapping[str, Any], now: float) -> dict[str, list[Pro
         moment = datetime.fromtimestamp(now, timezone.utc)
         rows = ProgramData.objects.filter(
             epg_id__in=list(channels_by_epg),
-            end_time__gt=moment - timedelta(seconds=PLAN_PAST_SECONDS),
-            start_time__lt=moment + timedelta(seconds=PLAN_AHEAD_SECONDS),
+            end_time__gt=moment - timedelta(seconds=PLAN_PAST_SECONDS + _neighbour_reach(active, "include_previous")),
+            start_time__lt=moment + timedelta(seconds=PLAN_AHEAD_SECONDS + _neighbour_reach(active, "include_next")),
         ).order_by("start_time")
         for row in rows.iterator(chunk_size=1000):
             programme = Programme(
@@ -251,7 +266,11 @@ def current_show(active: Mapping[str, Any], channel: str, now: float) -> dict[st
 
 
 def format_show_rows(entries, timezone_name: str, now: float) -> list[str]:
-    """Rows ``[Tue ]HH:MM–HH:MM title › channel, …``; ``entries`` are (channel, start, end, title)."""
+    """Rows ``[Tue ]HH:MM–HH:MM title › channel, …``.
+
+    ``entries`` are (channel, start, end, title) or, for rules that include the
+    neighbouring programmes, (channel, start, end, title, record_start, record_end).
+    """
     from zoneinfo import ZoneInfo
 
     from .action_messages import split_group_row
@@ -261,16 +280,19 @@ def format_show_rows(entries, timezone_name: str, now: float) -> list[str]:
     except (ValueError, TypeError, KeyError):
         zone = timezone.utc
     today = datetime.fromtimestamp(now, zone).date()
-    groups: dict[tuple[float, float, str], list[str]] = {}
-    for channel, start, end, title in entries:
-        names = groups.setdefault((start, end, title), [])
+    groups: dict[tuple, list[str]] = {}
+    for channel, start, end, title, *record in entries:
+        names = groups.setdefault((start, end, title, *record), [])
         if channel not in names:
             names.append(channel)
     rows = []
-    for (start, end, title), names in sorted(groups.items()):
+    for (start, end, title, *record), names in sorted(groups.items()):
         first = datetime.fromtimestamp(start, zone)
         day = "" if first.date() == today else first.strftime("%a ")
         period = f"{day}{first:%H:%M}–{datetime.fromtimestamp(end, zone):%H:%M} {title or '(untitled)'}"
+        if record:
+            period += (f" (records {datetime.fromtimestamp(record[0], zone):%H:%M}–"
+                       f"{datetime.fromtimestamp(record[1], zone):%H:%M})")
         rows.extend(split_group_row(period, sorted(names)))
     return rows
 

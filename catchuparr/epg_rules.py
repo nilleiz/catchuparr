@@ -11,6 +11,7 @@ MAX_REGEX_LENGTH = 200
 # Bounds the work of one regex search; EPG descriptions rarely exceed this.
 MAX_TEXT_LENGTH = 4096
 MAX_PADDING_MINUTES = 240
+MAX_NEIGHBOUR_MINUTES = 1440
 MAX_ALTERNATIVES = 64
 MAX_DEPTH = 6
 # EPG providers round programme bounds; a shorter gap is treated as touching so
@@ -57,6 +58,18 @@ def programme_texts(programme: Programme) -> dict[str, Text]:
 
 
 @dataclass(frozen=True)
+class Neighbour:
+    """Include the adjacent programme before or after a match.
+
+    A neighbour shorter than ``min_seconds`` brings exactly one more programme;
+    ``max_seconds`` caps the whole extra time before the start or after the end.
+    """
+
+    min_seconds: float | None = None
+    max_seconds: float | None = None
+
+
+@dataclass(frozen=True)
 class ShowRule:
     """A compiled show matcher with its padding and optional start restriction."""
 
@@ -65,6 +78,8 @@ class ShowRule:
     before_seconds: float = 0.0
     after_seconds: float = 0.0
     start_allowed: Callable[[float], bool] | None = None
+    previous: Neighbour | None = None
+    next: Neighbour | None = None
 
 
 MAX_TITLE_LENGTH = 80
@@ -291,6 +306,102 @@ def compile_padding(spec, *, field: str = "padding") -> tuple[float, float]:
     return result[0], result[1]
 
 
+def compile_neighbour(spec, *, field: str) -> Neighbour | None:
+    """``true``/``false`` or a mapping with optional ``min`` and ``max`` minutes."""
+    if spec is None or spec is False:
+        return None
+    if spec is True:
+        return Neighbour()
+    if not isinstance(spec, Mapping) or set(spec) - {"min", "max"}:
+        raise ShowRuleError(f"field {field}: expected true or a mapping with min and max")
+    limits = {}
+    for key in ("min", "max"):
+        if key in spec:
+            value = spec[key]
+            if type(value) is not int or not 1 <= value <= MAX_NEIGHBOUR_MINUTES:
+                raise ShowRuleError(
+                    f"field {field}.{key}: expected minutes between 1 and {MAX_NEIGHBOUR_MINUTES}"
+                )
+            limits[key] = value * 60.0
+    if len(limits) == 2 and limits["min"] > limits["max"]:
+        raise ShowRuleError(f"field {field}: min exceeds max")
+    return Neighbour(limits.get("min"), limits.get("max"))
+
+
+def neighbour_snapshot(neighbour: Neighbour | None) -> dict[str, int] | None:
+    """The minutes mapping stored in the applied snapshot; ``{}`` means the whole programme."""
+    if neighbour is None:
+        return None
+    return {
+        key: int(value // 60) for key, value in (("min", neighbour.min_seconds), ("max", neighbour.max_seconds))
+        if value is not None
+    }
+
+
+def _usable(programme: Programme) -> bool:
+    return programme.end > programme.start
+
+
+def _adjacent_before(ordered: Sequence[Programme], index: int, boundary: float) -> int | None:
+    """The programme with the latest start before ``boundary`` that ends at it."""
+    for position in range(index - 1, -1, -1):
+        candidate = ordered[position]
+        if candidate.start >= boundary or not _usable(candidate):
+            continue
+        return position if abs(candidate.end - boundary) <= MERGE_GAP_SECONDS else None
+    return None
+
+
+def _adjacent_after(ordered: Sequence[Programme], index: int, boundary: float) -> int | None:
+    """The first programme that starts at ``boundary``."""
+    for position in range(index + 1, len(ordered)):
+        candidate = ordered[position]
+        if candidate.start < boundary - MERGE_GAP_SECONDS or not _usable(candidate):
+            continue
+        return position if candidate.start <= boundary + MERGE_GAP_SECONDS else None
+    return None
+
+
+def _lead_seconds(ordered: Sequence[Programme], index: int, neighbour: Neighbour) -> float:
+    show = ordered[index]
+    first = _adjacent_before(ordered, index, show.start)
+    if first is None:
+        return 0.0
+    chain_start = ordered[first].start
+    if neighbour.min_seconds is not None and ordered[first].end - ordered[first].start < neighbour.min_seconds:
+        second = _adjacent_before(ordered, first, ordered[first].start)
+        if second is not None:
+            chain_start = ordered[second].start
+    lead = max(0.0, show.start - chain_start)
+    return lead if neighbour.max_seconds is None else min(lead, neighbour.max_seconds)
+
+
+def _tail_seconds(ordered: Sequence[Programme], index: int, neighbour: Neighbour) -> float:
+    show = ordered[index]
+    first = _adjacent_after(ordered, index, show.end)
+    if first is None:
+        return 0.0
+    chain_end = ordered[first].end
+    if neighbour.min_seconds is not None and ordered[first].end - ordered[first].start < neighbour.min_seconds:
+        second = _adjacent_after(ordered, first, ordered[first].end)
+        if second is not None:
+            chain_end = ordered[second].end
+    tail = max(0.0, chain_end - show.end)
+    return tail if neighbour.max_seconds is None else min(tail, neighbour.max_seconds)
+
+
+def recording_span(ordered: Sequence[Programme], index: int, rule: ShowRule) -> tuple[float, float]:
+    """Start and end one rule records for ``ordered[index]``, neighbours and padding included."""
+    programme = ordered[index]
+    lead = _lead_seconds(ordered, index, rule.previous) if rule.previous is not None else 0.0
+    tail = _tail_seconds(ordered, index, rule.next) if rule.next is not None else 0.0
+    return programme.start - lead - rule.before_seconds, programme.end + tail + rule.after_seconds
+
+
+def _ordered(programmes: Iterable[Programme]) -> list[Programme]:
+    return sorted(programmes, key=lambda p: (p.start, p.end))
+
+
 def merge_windows(windows: Iterable[Window], *, gap: float = MERGE_GAP_SECONDS) -> list[Window]:
     """Union overlapping or touching windows into contiguous ones."""
     merged: list[Window] = []
@@ -309,7 +420,8 @@ def merge_windows(windows: Iterable[Window], *, gap: float = MERGE_GAP_SECONDS) 
 def plan_windows(programmes: Iterable[Programme], rules: Sequence[ShowRule]) -> list[Window]:
     """Recording windows of one channel for every programme any rule matches."""
     windows = []
-    for programme in programmes:
+    ordered = _ordered(programmes)
+    for index, programme in enumerate(ordered):
         if not programme.end > programme.start:
             continue
         texts = programme_texts(programme)
@@ -317,9 +429,10 @@ def plan_windows(programmes: Iterable[Programme], rules: Sequence[ShowRule]) -> 
             if rule.start_allowed is not None and not rule.start_allowed(programme.start):
                 continue
             if rule.matches(programme, texts):
+                start, end = recording_span(ordered, index, rule)
                 windows.append(Window(
-                    programme.start - rule.before_seconds,
-                    programme.end + rule.after_seconds,
+                    start,
+                    end,
                     (rule.index,),
                     (Show(programme.start, programme.end, programme.title[:MAX_TITLE_LENGTH], rule.index),),
                 ))
@@ -330,19 +443,25 @@ def preview_matches(programmes: Iterable[Programme], rules: Sequence[ShowRule], 
                     limit: int = 20) -> list[dict]:
     """Upcoming or running programmes any rule matches, soonest first, for the preview."""
     found = []
-    for programme in sorted(programmes, key=lambda p: (p.start, p.end)):
+    ordered = _ordered(programmes)
+    for index, programme in enumerate(ordered):
         if programme.end <= now or not programme.end > programme.start:
             continue
         texts = programme_texts(programme)
-        hits = [
-            rule.index for rule in rules
+        hit_rules = [
+            rule for rule in rules
             if (rule.start_allowed is None or rule.start_allowed(programme.start))
             and rule.matches(programme, texts)
         ]
-        if hits:
+        if hit_rules:
+            spans = [recording_span(ordered, index, rule) for rule in hit_rules]
             found.append({
                 "title": programme.title, "sub_title": programme.sub_title,
-                "start": programme.start, "end": programme.end, "rules": hits,
+                "start": programme.start, "end": programme.end,
+                "rules": [rule.index for rule in hit_rules],
+                "record_start": min(span[0] for span in spans),
+                "record_end": max(span[1] for span in spans),
+                "neighbours": any(rule.previous is not None or rule.next is not None for rule in hit_rules),
             })
             if len(found) >= limit:
                 break

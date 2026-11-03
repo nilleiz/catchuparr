@@ -91,6 +91,27 @@ class ShowRuleConfigTests(unittest.TestCase):
         self.assertEqual((), nested.warnings)
         self.assertEqual(1, len(flat.warnings))
 
+    def test_neighbour_options_are_stored_only_when_used(self):
+        result = self.compile(
+            "version: 1\nrules:\n  - shows:\n      match: {title: {contains: x}}\n"
+            "      include_previous: {min: 10, max: 60}\n      include_next: true\n"
+            "  - shows:\n      match: {title: {contains: y}}\n"
+        )
+        first, second = result.show_rules
+        self.assertEqual({"min": 10, "max": 60}, first["include_previous"])
+        self.assertEqual({}, first["include_next"])
+        self.assertNotIn("include_previous", second)
+        self.assertNotIn("include_next", second)
+
+    def test_invalid_neighbour_options_name_line_and_field(self):
+        with self.assertRaises(SourceRuleError) as caught:
+            self.compile(
+                "version: 1\nrules:\n  - shows:\n      match: {title: {contains: x}}\n"
+                "      include_previous: {min: 30, max: 10}\n"
+            )
+        self.assertIn("line 3", str(caught.exception))
+        self.assertIn("rules[0].shows.include_previous", str(caught.exception))
+
     def test_invalid_rules(self):
         cases = {
             "both": "rules:\n  - channels: {profile: all}\n    shows: {match: {title: {contains: x}}}\n",
@@ -100,6 +121,8 @@ class ShowRuleConfigTests(unittest.TestCase):
             "no match": "rules:\n  - shows: {name: x}\n",
             "padding": "rules:\n  - shows: {match: {title: {contains: x}}, padding: {before: 999}}\n",
             "unknown key": "rules:\n  - shows: {match: {title: {contains: x}}, when: now}\n",
+            "neighbour range": "rules:\n  - shows: {match: {title: {contains: x}}, include_next: {max: 0}}\n",
+            "neighbour key": "rules:\n  - shows: {match: {title: {contains: x}}, include_next: {length: 5}}\n",
             "mode": "rules:\n  - shows: {match: {title: {contains: x}}}\n    schedule: {daily: []}\n    schedule_mode: replace\n",
             "all excluded": "rules:\n  - shows: {match: {title: {contains: x}}, channels: {exclude: {profile: all}}}\n",
             "competing": (
