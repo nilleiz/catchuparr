@@ -235,6 +235,7 @@ def deliver_show_matches(result: dict, matches: dict) -> str:
     names = {row["channel_uuid"]: row["channel_name"] for row in result["channels"]}
     entries = [
         (names.get(channel, "Unknown channel"), item["start"], item["end"], item["title"])
+        + ((item["record_start"], item["record_end"]) if item.get("neighbours") else ())
         for channel, items in matches["channels"].items() for item in items[:SHOW_TOAST_PER_CHANNEL]
     ]
     count = sum(len(items) for items in matches["channels"].values())

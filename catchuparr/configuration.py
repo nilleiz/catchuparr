@@ -2293,14 +2293,15 @@ def _validate_recording_schedule(value: Any, channel_uuids: list[str]) -> None:
 
 
 def _validate_show_rules(value: Any, channels: set[str]) -> None:
-    from .epg_rules import ShowRuleError, compile_match, compile_padding
+    from .epg_rules import ShowRuleError, compile_match, compile_neighbour, compile_padding
     from .schedule import ScheduleError, schedule_from_snapshot
 
     fields = {"index", "name", "channel_uuids", "match", "padding", "schedule", "line"}
+    optional = {"include_previous", "include_next"}
     if not isinstance(value, list) or not value:
         raise ValueError("Active Catchuparr show rules are invalid")
     for rule in value:
-        if not isinstance(rule, dict) or set(rule) != fields:
+        if not isinstance(rule, dict) or not fields <= set(rule) <= fields | optional:
             raise ValueError("Active Catchuparr show rule fields are invalid")
         members = rule["channel_uuids"]
         if (type(rule["index"]) is not int or not isinstance(rule["name"], str)
@@ -2313,6 +2314,9 @@ def _validate_show_rules(value: Any, channels: set[str]) -> None:
                 raise ValueError
             compile_match(rule["match"])
             compile_padding({key: int(padding[key]) for key in padding})
+            for key in optional & set(rule):
+                if not isinstance(rule[key], dict) or compile_neighbour(rule[key], field=key) is None:
+                    raise ValueError
             if rule["schedule"] is not None:
                 schedule_from_snapshot(rule["schedule"])
         except (ShowRuleError, ScheduleError, TypeError, ValueError, KeyError):

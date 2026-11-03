@@ -9,7 +9,7 @@ from __future__ import annotations
 
 class Plugin:
     name = "Catchuparr"
-    version = "0.8.1"
+    version = "0.8.2"
     description = "Local rolling catch-up archive, start-over and optional live connection sharing"
     author = "nilleiz"
     help_url = "https://github.com/nilleiz/catchuparr"
