@@ -17,7 +17,11 @@ admission, today's schedule and current show). It takes about a minute and is
 not release evidence. The **full** suite adds the recorder media and failover
 phases (about 13 minutes) in the step "Synthetic playback in actual Dispatcharr
 AIO". It runs when the pull request carries the label `full-aio` (adding the
-label starts a new run) or on a manual dispatch without `skip_native`. The AIO job has a
+label starts a new run) or on a manual dispatch without `skip_native`. Add the
+label only after the run for the latest push has started: a run that starts
+later cancels the earlier one, and a push run reads the labels of its own event,
+so a push run that starts just after the label run would replace the full suite
+with the core suite. The AIO job has a
 40-minute outer timeout for its 30-minute probe budget plus bounded setup and
 cleanup time; the probe's own deadline and assertions remain its runtime limit.
 Pull-request runs use concurrency cancellation so obsolete revisions do not

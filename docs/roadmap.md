@@ -1,6 +1,10 @@
 # Catchuparr roadmap
 
-Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidates with publication gates recorded below. Version 0.6.0 adds optional live connection sharing; pinned Dispatcharr 0.32.0 synthetic native acceptance passed, while required GitHub CI and publication remain pending. This roadmap does not authorize production deployment.
+Baseline: 0.8.2 is released. It is the first full release after 0.5.1 and
+includes everything from the 0.6.0 to 0.8.1 prereleases: optional live
+connection sharing, gap-free source switching, continuous catch-up playback,
+recording overviews and show rules. The sections below 0.6.0 are historical
+planning records. This roadmap does not authorize production deployment.
 
 ## Workflow and release gates
 
@@ -22,8 +26,12 @@ Baseline: 0.4.0 is released. Versions 0.5.0 and 0.5.1 remain prerelease candidat
 | 0.5.0 | Optional native Dispatcharr M3U/XMLTV archive integration | High | User acceptance complete; final parity correction passed four focused native 0.32.0 cases; required release workflow remains pending; not yet published |
 | 0.5.1 | Inherited source filters and schedules for named profiles | Medium | Implemented in the prerelease candidate; the 453-test suite and full pinned AIO probes passed; CI and isolated Dev verification remain pending |
 | 0.6.0 | Optional sharing of compatible live connections | High | Historical candidate; full synthetic native acceptance passed on pinned Dispatcharr 0.32.0 |
-| 0.6.1 | Global sharing controls, legacy settings migration and immediate initial attach | Medium | Focused unit coverage; required GitHub CI and publication pending; real-player acceptance not established |
-| 0.6.2 | Continue catch-up playback across programme boundaries to the live archive edge | Medium | Prerelease candidate; focused unit coverage; required GitHub CI and real-player acceptance pending |
+| 0.6.1 | Global sharing controls, legacy settings migration and immediate initial attach | Medium | Published as prerelease; the immediate initial attach was replaced by the stability rule in 0.8.1 |
+| 0.6.2–0.6.10 | Continuous catch-up across programme boundaries, sharing recovery and cleanup hardening, recording overviews | Medium | Published as prereleases; included in 0.8.2 |
+| 0.7.0–0.7.13 | Native catch-up HLS and XC timelines, synchronized and gap-free source switching, delayed-provider handover, restart and Apply robustness | High | Published as prereleases; included in 0.8.2 |
+| 0.8.0 | Show rules: record programmes by EPG title, planned windows, overviews | High | Published as prerelease; included in 0.8.2 |
+| 0.8.1 | Live stability window for every borrow | Low | Published as prerelease; included in 0.8.2 |
+| 0.8.2 | Include neighbouring programmes in show rules | Medium | Released |
 
 Channel selection formerly planned for 0.6.0 is part of 0.2.1. The incomplete
 0.2.0 candidate is superseded and will not be published.
