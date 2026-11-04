@@ -1,7 +1,7 @@
 """Pure M3U/XMLTV helpers for exposing locally archived channel programmes.
 
-These functions emit the IPTV client's ``{utc}`` and ``{duration}`` placeholders in
-seconds.
+These functions emit the ``{utc}`` and ``{duration}`` placeholders that common
+IPTV clients expand, in seconds.
 """
 
 from __future__ import annotations
@@ -44,8 +44,8 @@ def build_catchup_source(
 
     The returned playlist URL is a bearer credential and must be treated as
     sensitive: do not log it or include it in diagnostics. Use a token scoped
-    to one user, and allow it to be revoked by the archive endpoint. the IPTV client
-    is not assumed to send separate authorization headers.
+    to one user, and allow it to be revoked by the archive endpoint. Playback
+    clients are not assumed to send separate authorization headers.
     """
     parts = urlsplit(endpoint)
     if parts.scheme not in {"http", "https"} or not parts.netloc:
