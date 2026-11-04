@@ -76,9 +76,24 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Privacy check
+        # Blocks private setup details in files, commit messages and the pull
+        # request text. Personal terms come from a secret and are never logged.
+        env:
+          CATCHUPARR_PRIVACY_DENYLIST: ${{ secrets.CATCHUPARR_PRIVACY_DENYLIST }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            python scripts/privacy_check.py --tree --commits "$BASE_SHA..$HEAD_SHA" --event "$GITHUB_EVENT_PATH"
+          else
+            python scripts/privacy_check.py --tree
+          fi
       - name: Install lint and YAML tools
         run: python -m pip install 'ruff==0.13.3' 'PyYAML==6.0.3'
       - name: Lint

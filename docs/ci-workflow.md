@@ -1,6 +1,7 @@
 # CI and release evidence
 
-Pull requests always run the unit and package checks. The pinned Dispatcharr
+Pull requests always run the privacy check (see the change workflow in the
+development guide) and the unit and package checks. The pinned Dispatcharr
 0.33.0 native AIO probe runs unless every changed path is explicitly limited to
 the provenance helper and its tests, Markdown documentation, README or
 changelog, or workflow YAML files. Unknown files and unavailable diff metadata
