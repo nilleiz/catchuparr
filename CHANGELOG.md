@@ -4,6 +4,19 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.8.3] - 2026-11-04
+
+### Changed
+
+- Code comments, docstrings and the documentation use neutral wording; the
+  plugin's behavior is unchanged from 0.8.2.
+- The Dev egress tool takes the approved endpoint as `--source-ip` and
+  `--source-port`, and the Dev compose file reads its host port from
+  `DEV_BIND_PORT`.
+- CI checks files, commit messages, pull request text and release notes for
+  private setup details, and runs the native AIO probe only when product code
+  or the probes change.
+
 ## [0.8.2] - 2026-11-04
 
 ### Added
