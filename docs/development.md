@@ -41,7 +41,7 @@ placeholder addresses, no personal setup.
 
 ## Local checks
 
-Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q catchuparr scripts tests`, and `ruff check .`. Build the importable archive with `python3 scripts/build_plugin.py`.
+During development run the tests of the touched modules and `ruff check .`; the full suite (`python3 -m unittest discover -s tests -v`) runs in GitHub CI (see the change workflow above). `python3 -m compileall -q catchuparr scripts tests` checks the syntax, and `python3 scripts/build_plugin.py` builds the importable archive.
 
 ## Installing the plugin
 
