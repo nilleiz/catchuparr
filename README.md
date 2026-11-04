@@ -31,7 +31,7 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The current release is **0.8.2**. Every release is gated by unit, package and
+- The current release is **0.8.3**. Every release is gated by unit, package and
   native Dispatcharr AIO CI. See the [changelog](CHANGELOG.md) and the
   [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.33.0**. The compatibility
