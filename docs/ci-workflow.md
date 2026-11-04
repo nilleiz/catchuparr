@@ -2,10 +2,11 @@
 
 Pull requests always run the privacy check (see the change workflow in the
 development guide) and the unit and package checks. The pinned Dispatcharr
-0.33.0 native AIO probe runs unless every changed path is explicitly limited to
-the provenance helper and its tests, Markdown documentation, README or
-changelog, or workflow YAML files. Unknown files and unavailable diff metadata
-run the full probe. Manual workflow dispatch runs it by default. The workflow
+0.33.0 native AIO probe runs only when the pull request changes product code
+(`catchuparr/`) or the AIO probes themselves (`scripts/aio_*.py`,
+`scripts/run_aio_*.py`); changes to tests, other scripts, documentation,
+workflows or Dev tooling skip it. Unavailable diff metadata or an unusual path
+runs the probe. Manual workflow dispatch runs it by default. The workflow
 offers an explicit `skip_native` input for a manually requested package/unit
 validation run; its default is false, and the skip does not produce release
 acceptance evidence.
@@ -39,7 +40,7 @@ Git tree exactly matches the release checkout. A merge commit SHA can differ
 from the release commit SHA; their tree identities must match. The
 `test-and-package` and `AIO integration (0.33.0)` jobs must both have succeeded,
 and the named native playback step inside the AIO job must itself have
-succeeded. An infrastructure-only run with the AIO step skipped is not release
+succeeded. A run with the AIO step skipped is not release
 acceptance evidence.
 
 Before release publication, the workflow downloads that run's CI artifact and
