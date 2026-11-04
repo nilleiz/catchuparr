@@ -1,4 +1,7 @@
-# Show rules (0.8.0 specification, neighbours since 0.8.2)
+# Show rules
+
+Show rules were added in 0.8.0; neighbouring programmes (`include_previous`,
+`include_next`) in 0.8.2.
 
 A rule selects either whole channels (`channels:`) or programmes (`shows:`);
 using both in one rule is a validation error. A `shows` rule records every

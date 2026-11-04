@@ -4,7 +4,7 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
-## [0.8.2] - Prerelease
+## [0.8.2] - 2026-11-04
 
 ### Added
 
