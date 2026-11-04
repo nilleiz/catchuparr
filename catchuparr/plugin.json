@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "description": "Local rolling catch-up archive, start-over and optional live connection sharing for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -135,6 +135,11 @@
       "id": "reconcile",
       "label": "Reconcile recorders",
       "button_label": "Reconcile"
+    },
+    {
+      "id": "reattach_recorders",
+      "label": "Reattach to preferred sources",
+      "button_label": "Reattach"
     },
     {
       "id": "create_access_token",

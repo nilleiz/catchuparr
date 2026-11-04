@@ -60,6 +60,10 @@ _EVENTS = frozenset({
     "sharing_tail_cleanup_pending",
     "recorder_orphans_reaped",
     "sharing_authority_stale",
+    "recorder_reattach_requested",
+    "recorder_reattach_started",
+    "recorder_reattached",
+    "recorder_reattach_failed",
 })
 _ERROR_CATEGORIES = frozenset({
     "configuration_recovery_failed",
@@ -99,6 +103,7 @@ _STATE_KEYS = frozenset({
     "generation", "config_generation", "control_generation", "channel_count",
     "source_policy_count", "queued", "paused", "enabled", "count", "level",
     "reason", "activation_pending", "outcome_unknown", "recovery_required", "seconds", "windows",
+    "rank",
 })
 _SAFE_REASONS = frozenset({
     "version", "proxy_api", "cleanup_guard", "xc_hooks", "xc_uninstall", "log_level",

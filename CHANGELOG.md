@@ -4,6 +4,22 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.8.4] - 2026-11-04
+
+### Added
+
+- **Reattach to preferred sources** action: every running dedicated recorder
+  that records from a fallback source ends that input and starts its best
+  ranked source again, with a 20-second startup limit. If the source still
+  delivers nothing, the recorder continues with the next ranked source.
+  Recorders attached to a viewer and recorders that are switching are not
+  changed, and nothing happens while recording is paused. The switch is not
+  synchronized and leaves a short gap in the archive.
+- **Current recordings** marks a dedicated recorder on a fallback source as
+  `[ok, fallback]` and reports `preferred_source` in its channel row.
+- Log events `recorder_reattach_requested`, `recorder_reattach_started`,
+  `recorder_reattached` and `recorder_reattach_failed`.
+
 ## [0.8.3] - 2026-11-04
 
 ### Changed

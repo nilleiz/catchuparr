@@ -31,7 +31,7 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The current release is **0.8.3**. Every release is gated by unit, package and
+- The current release is **0.8.4**. Every release is gated by unit, package and
   native Dispatcharr AIO CI. See the [changelog](CHANGELOG.md) and the
   [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.33.0**. The compatibility
@@ -454,6 +454,7 @@ programme changes in the intended client before relying on this path.
 | --- | --- |
 | **Archive status** | Show recorder state, selected/running counts, oldest indexed footage age and storage use. |
 | **Reconcile recorders** | Queue reconciliation against the current applied configuration. |
+| **Reattach to preferred sources** | Ask each running dedicated recorder that records from a fallback source to try its best ranked source again. Recorders attached to a viewer are not changed. |
 | **Create M3U/XMLTV access token** | Create a token for the configured existing user and return both links. |
 | **Validate configuration** | Check the complete draft and preview resolved channels, sources, priorities, schedules and upcoming show matches without applying it. |
 | **Current recordings** | Show the recorder and source state of the channels scheduled now, including the show a running show window records for. |
@@ -481,6 +482,15 @@ structured channel and summary fields for callers that need the full details.
   assignments in Dispatcharr. Catchuparr will not create assignments.
 - **Filtered source cannot start:** a dedicated worker may need another
   provider slot. Check Dispatcharr's account/profile capacity.
+- **A recorder stays on a fallback source:** when the best ranked source of a
+  channel fails, its recorder moves to the next one and stays there.
+  **Current recordings** marks such a channel `[ok, fallback]`. Once the best
+  source works again, press **Reattach to preferred sources**. The recorder
+  ends its fallback input and starts the best source with a 20-second startup
+  limit; if that source still delivers nothing, it continues with the next
+  source. The switch is not synchronized, so the archive gets a short gap of
+  about the source's startup time, or up to about 20 seconds plus the
+  fallback's restart when the attempt fails.
 - **Sharing stays idle:** confirm it is enabled for a selected channel and that
   an ordinary viewer is using a healthy, compatible assigned stream. Sharing
   never starts a source outside the allowed set.

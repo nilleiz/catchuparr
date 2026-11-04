@@ -22,6 +22,9 @@ RECORDER_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 RECORDER_CLEANUP_RETRY_SECONDS = 0.2
 SHARING_WATCH_INTERVAL_SECONDS = 1.0
 RECORDER_SUPERVISION_INTERVAL_SECONDS = 10.0
+# A requested return to the preferred source must not leave the archive
+# without media for the regular 60 s when that source is still down.
+REATTACH_STARTUP_TIMEOUT_SECONDS = 20.0
 
 
 def _sharing_watch_signature(redis, channel_uuid):
@@ -702,6 +705,10 @@ def record_channel(
         "syncing": False, "prepared_input": None,
         "return_syncing": False, "return_sync_marker": None,
         "return_tail": None,
+        # ``input_switch`` ends the current dedicated input on every channel;
+        # ``switch`` stays reserved for sharing channels. ``reattach`` marks an
+        # input ended to retry the preferred source.
+        "input_switch": None, "candidate_rank": None, "reattach": False,
     }
 
     def publish_dedicated_diagnostic(
@@ -917,6 +924,44 @@ def record_channel(
                 require_media_progress=True,
             )
 
+        def reattach_if_requested(current_active):
+            """Consume a reattach request and end a fallback input to retry the best source."""
+            from .reattach import reattach_key
+            from .recorder_proxy import is_preferred_source
+
+            if not redis.delete(reattach_key(channel_uuid)):
+                return False
+            with attempt_state_lock:
+                candidate = attempt_state["candidate"]
+                switch = attempt_state["input_switch"]
+                rank = attempt_state["candidate_rank"]
+                busy = (
+                    attempt_state["borrow"] is not None
+                    or attempt_state["active_borrow"] is not None
+                    or attempt_state["return_prepared"] is not None
+                    or attempt_state["syncing"] or attempt_state["return_syncing"]
+                    or attempt_state["cleaning_up"] or attempt_state["reattach"]
+                )
+            if candidate is None or switch is None or busy:
+                return False
+            if is_preferred_source(
+                channel_uuid,
+                str(candidate.get("id") or candidate.get("stream_id") or ""),
+                str(candidate.get("account_id") or ""),
+                current_active,
+            ) is not False:
+                return False
+            with attempt_state_lock:
+                if (attempt_state["candidate"] is not candidate
+                        or attempt_state["input_switch"] is not switch
+                        or attempt_state["borrow"] is not None
+                        or attempt_state["syncing"] or attempt_state["cleaning_up"]):
+                    return False
+                attempt_state["reattach"] = True
+                switch.request()
+            event("recorder_reattach_started", rank=rank if type(rank) is int else 0)
+            return True
+
         def supervise():
             superseded = {"attempt": None, "since": 0.0}
             signature = None
@@ -1033,6 +1078,7 @@ def record_channel(
                     ):
                         stop_event.set()
                         return
+                    reattach_if_requested(current_active)
                 except Exception as exc:
                     error("supervision_failed", exc, callsite="recorder_supervisor")
                     stop_event.set()
@@ -1306,10 +1352,14 @@ def record_channel(
             candidate_index = 0
             candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
             prior_operation_since = None
+            # True for the one attempt that returns to the preferred source
+            # after a reattach request ended the fallback input.
+            reattach_attempt = False
             while True:
                 while candidate_index < len(candidates):
                     if run_prepared_borrow():
                         candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
+                        reattach_attempt = False
                         continue
                     return_prepared = None
                     return_token = None
@@ -1357,8 +1407,15 @@ def record_channel(
                             error("sharing_binding_lost")
                             return {"status": "sharing_authority_unavailable"}
                         from .engine.recorder import RecorderAttemptSwitch
-    
+
                         attempt_switch = RecorderAttemptSwitch()
+                    if attempt_switch is not None:
+                        input_switch = attempt_switch
+                    else:
+                        from .engine.recorder import RecorderAttemptSwitch
+
+                        # Without sharing this switch only serves a reattach request.
+                        input_switch = RecorderAttemptSwitch()
                     try:
                         attempt = issue_recorder_attempt(
                             redis,
@@ -1406,6 +1463,8 @@ def record_channel(
                         attempt_state["attempt"] = attempt
                         attempt_state["candidate"] = candidate
                         attempt_state["switch"] = attempt_switch
+                        attempt_state["input_switch"] = input_switch
+                        attempt_state["candidate_rank"] = index
                         attempt_state["completed_return_media"] = None
                         attempt_state["return_prepared"] = return_prepared
                         attempt_state["return_token"] = return_token
@@ -1435,12 +1494,17 @@ def record_channel(
                                 },
                                 require_media_progress=True,
                             )
-                            if index:
+                            if index or reattach_attempt:
                                 recorder._mark_next_discontinuity = True
+                            reattach_media = {"reported": not reattach_attempt}
+
                             def acknowledge_return_media(media_at):
                                 publish_dedicated_diagnostic(
                                     attempt, "recording", started_at=dedicated_started_at,
                                 )
+                                if not reattach_media["reported"]:
+                                    reattach_media["reported"] = True
+                                    event("recorder_reattached", rank=index)
                                 if (return_token is None or return_prepared is None
                                         or sharing_coordinator is None):
                                     return True
@@ -1490,10 +1554,12 @@ def record_channel(
                                 else:
                                     result = recorder.run_candidate(
                                         stop_event,
-                                        startup_timeout=DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS,
+                                        startup_timeout=(
+                                            REATTACH_STARTUP_TIMEOUT_SECONDS if reattach_attempt
+                                            else DEFAULT_RECORDER_STARTUP_TIMEOUT_SECONDS
+                                        ),
                                         media_idle_timeout=DEFAULT_MEDIA_IDLE_TIMEOUT_SECONDS,
-                                        **({"attempt_switch": attempt_switch}
-                                           if attempt_switch is not None else {}),
+                                        attempt_switch=input_switch,
                                         **({"on_first_media": first_media_callback}
                                            if first_media_callback is not None else {}),
                                         **({"staged_input": staged_return}
@@ -1560,10 +1626,14 @@ def record_channel(
                                     attempt_state["attempt"] = None
                                     attempt_state["candidate"] = None
                                     attempt_state["switch"] = None
+                                    attempt_state["input_switch"] = None
+                                    attempt_state["candidate_rank"] = None
                                     attempt_state["completed_return_media"] = None
                                     attempt_state["return_token"] = None
                                     attempt_state["return_media_at"] = None
                                     attempt_state["cleaning_up"] = False
+                                reattach_requested = attempt_state["reattach"]
+                                attempt_state["reattach"] = False
                                 current_diagnostic = attempt_state.get("diagnostic")
                                 if (isinstance(current_diagnostic, dict)
                                         and current_diagnostic.get("kind") == "dedicated"
@@ -1571,6 +1641,11 @@ def record_channel(
                                     attempt_state["diagnostic"] = None
                     if admission_status is not None:
                         return {"status": admission_status}
+                    if reattach_attempt:
+                        reattach_attempt = False
+                        if (result is None or result.useful_segments == 0) and not stop_event.is_set():
+                            # Fall back by the regular ranking from here on.
+                            event("recorder_reattach_failed", rank=index)
                     if result is not None and result.useful_segments > 0:
                         candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
                     if result is not None and result.status == "stopped":
@@ -1582,6 +1657,20 @@ def record_channel(
                         # an allowlisted source after that reader closes at grace.
                         candidate_index = 0
                         candidate_retry_seconds = RECORDER_CANDIDATE_RETRY_INITIAL_SECONDS
+                        continue
+                    if reattach_requested and not stop_event.is_set():
+                        # The supervisor ended this fallback input on request.
+                        # Start again at the best source of a fresh ranking.
+                        try:
+                            refreshed = ranked_source_candidates(
+                                channel_uuid, current_state["active"], all_sources=all_sources,
+                            )
+                        except Exception:
+                            refreshed = None
+                        if refreshed:
+                            candidates = refreshed
+                        candidate_index = 0
+                        reattach_attempt = True
                         continue
                     if (result is not None and result.status == "switch_requested"
                             and result.useful_segments > 0

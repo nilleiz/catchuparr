@@ -9,7 +9,7 @@ from __future__ import annotations
 
 class Plugin:
     name = "Catchuparr"
-    version = "0.8.3"
+    version = "0.8.4"
     description = "Local rolling catch-up archive, start-over and optional live connection sharing"
     author = "nilleiz"
     help_url = "https://github.com/nilleiz/catchuparr"
@@ -20,6 +20,12 @@ class Plugin:
         bootstrap()
 
     def run(self, action: str, params: dict, context: dict):
+        if action == "reattach_recorders":
+            from .configuration import load_applied_state_readonly
+            from .reattach import request_reattach
+
+            settings, control = load_applied_state_readonly()
+            return request_reattach(settings, control)
         if action in {"current_recordings", "today_schedule"}:
             from .configuration import load_applied_state_readonly
 
