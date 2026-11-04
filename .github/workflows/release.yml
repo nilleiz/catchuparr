@@ -148,6 +148,11 @@ jobs:
               output.write(f"prerelease={'true' if prerelease else 'false'}\n")
           PY
 
+      - name: Privacy check of the release notes
+        env:
+          CATCHUPARR_PRIVACY_DENYLIST: ${{ secrets.CATCHUPARR_PRIVACY_DENYLIST }}
+        run: python scripts/privacy_check.py --file dist/RELEASE_NOTES.md
+
       - name: Create archive checksum
         working-directory: dist
         run: |

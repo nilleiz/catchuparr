@@ -66,9 +66,9 @@ jobs:
       - name: Record explicit manual native AIO skip
         if: github.event_name == 'workflow_dispatch' && inputs.skip_native
         run: echo "::notice title=Native AIO explicitly skipped::This manually requested run is package/unit validation only and cannot satisfy release acceptance."
-      - name: Record infrastructure-only validation
+      - name: Record validation without product code changes
         if: steps.classify.outputs.full == 'false'
-        run: echo "Native AIO skipped for allowlisted infrastructure-only changes. Release evidence still requires a successful native playback step."
+        run: echo "Native AIO skipped because no product code or AIO probe changed. Release evidence still requires a successful native playback step."
 
   test-and-package:
     runs-on: ubuntu-latest
@@ -76,9 +76,24 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Privacy check
+        # Blocks private setup details in files, commit messages and the pull
+        # request text. Personal terms come from a secret and are never logged.
+        env:
+          CATCHUPARR_PRIVACY_DENYLIST: ${{ secrets.CATCHUPARR_PRIVACY_DENYLIST }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            python scripts/privacy_check.py --tree --commits "$BASE_SHA..$HEAD_SHA" --event "$GITHUB_EVENT_PATH"
+          else
+            python scripts/privacy_check.py --tree
+          fi
       - name: Install lint and YAML tools
         run: python -m pip install 'ruff==0.13.3' 'PyYAML==6.0.3'
       - name: Lint

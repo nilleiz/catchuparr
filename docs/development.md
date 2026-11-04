@@ -39,6 +39,22 @@ Content of commits, PRs, documentation and release notes follows the privacy
 rules in `.agents/instructions/AGENTS.md`: synthetic channels and programmes,
 placeholder addresses, no personal setup.
 
+`scripts/privacy_check.py` enforces this. CI runs it on every pull request over
+all tracked files, the pull request's commit messages and its title and body,
+and the release workflow runs it on the release notes; a finding fails the job.
+Structural rules (private network addresses, home paths, local host names, MAC
+addresses, e-mail addresses outside example domains) are part of the script.
+Personal terms are never committed: CI reads them from the
+`CATCHUPARR_PRIVACY_DENYLIST` secret, and locally the script reads
+`~/.config/catchuparr/privacy-denylist.txt` (one term per line, `re:` for a
+regular expression). Findings name only the place and the rule. Run it before
+committing and before publishing any text on GitHub:
+
+```sh
+python3 scripts/privacy_check.py --tree --commits origin/main..HEAD
+python3 scripts/privacy_check.py --file pr-body.md
+```
+
 ## Local checks
 
 During development run the tests of the touched modules and `ruff check .`; the full suite (`python3 -m unittest discover -s tests -v`) runs in GitHub CI (see the change workflow above). `python3 -m compileall -q catchuparr scripts tests` checks the syntax, and `python3 scripts/build_plugin.py` builds the importable archive.

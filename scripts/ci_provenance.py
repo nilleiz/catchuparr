@@ -24,12 +24,9 @@ REQUIRED_JOBS = {"test-and-package", *REQUIRED_AIO_JOBS}
 REQUIRED_AIO_STEP = "Synthetic playback in actual Dispatcharr AIO"
 PACKAGE_SUFFIXES = {".py", ".json", ".png"}
 API_ROOT = "https://api.github.com"
-INFRA_CHANGE_FILES = {
-    "scripts/ci_provenance.py",
-    "tests/test_ci_provenance.py",
-    "README.md",
-    "CHANGELOG.md",
-}
+# Native AIO runs only when product code or the AIO probes themselves change.
+PRODUCT_PREFIXES = ("catchuparr/",)
+AIO_PROBE = re.compile(r"scripts/(?:aio_|run_aio_)\w+\.py")
 
 
 class ProvenanceError(Exception):
@@ -37,17 +34,14 @@ class ProvenanceError(Exception):
 
 
 def requires_aio(paths: list[str] | None) -> bool:
-    """Fail closed unless every changed path is an explicitly cheap input."""
+    """Run the native probe for product code or probe changes; fail closed on unknown diffs."""
     if not paths:
         return True
     for path in paths:
-        if path in INFRA_CHANGE_FILES:
-            continue
-        if path.startswith("docs/") and path.endswith(".md") and ".." not in path.split("/"):
-            continue
-        if path.startswith(".github/workflows/") and path.endswith(".yml") and ".." not in path.split("/"):
-            continue
-        return True
+        if path.startswith("/") or ".." in path.split("/"):
+            return True
+        if path.startswith(PRODUCT_PREFIXES) or AIO_PROBE.fullmatch(path):
+            return True
     return False
 
 

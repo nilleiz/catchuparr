@@ -28,11 +28,11 @@ class EgressRulesTests(unittest.TestCase):
 
     def test_extra_endpoints_follow_the_source_endpoint_before_reject(self):
         self.assertEqual(
-            dev_egress.rules("192.0.2.20", 8001, (("192.0.2.30", 5012),)),
+            dev_egress.rules("192.0.2.20", 8001, (("192.0.2.30", 8081),)),
             [
                 ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"],
                 ["-d", "192.0.2.20/32", "-p", "tcp", "--dport", "8001", "-j", "RETURN"],
-                ["-d", "192.0.2.30/32", "-p", "tcp", "--dport", "5012", "-j", "RETURN"],
+                ["-d", "192.0.2.30/32", "-p", "tcp", "--dport", "8081", "-j", "RETURN"],
                 ["-j", "REJECT"],
             ],
         )
@@ -41,12 +41,12 @@ class EgressRulesTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", [
                 "dev_egress.py", "apply", "--subnet", "192.0.2.0/24", "--source-ip", "192.0.2.20",
-                "--allow", "192.0.2.30:5012",
+                "--allow", "192.0.2.30:8081",
             ]),
             patch.object(dev_egress, "apply") as apply,
         ):
             dev_egress.main()
-        apply.assert_called_once_with("192.0.2.0/24", "192.0.2.20", 8001, extra=(("192.0.2.30", 5012),))
+        apply.assert_called_once_with("192.0.2.0/24", "192.0.2.20", 8001, extra=(("192.0.2.30", 8081),))
 
     def test_cli_rejects_a_hostname_endpoint(self):
         with (

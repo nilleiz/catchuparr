@@ -465,25 +465,28 @@ class CIProvenanceTest(unittest.TestCase):
 
 
 class CIChangeClassificationTest(unittest.TestCase):
-    def test_infrastructure_allowlist_skips_native_probe(self):
+    def test_changes_without_product_code_skip_native_probe(self):
         self.assertFalse(requires_aio([
             "scripts/ci_provenance.py",
+            "scripts/privacy_check.py",
             "tests/test_ci_provenance.py",
+            "tests/test_runtime.py",
             "docs/ci-workflow.md",
-            "docs/nested/example.md",
+            "docs/example.png",
             "README.md",
             "CHANGELOG.md",
             ".github/workflows/ci.yml",
-            ".github/workflows/release.yml",
+            "deploy/dev/compose.yml",
         ]))
 
-    def test_runtime_or_unknown_paths_require_native_probe(self):
+    def test_product_code_probes_or_unknown_paths_require_native_probe(self):
         for paths in (
             ["catchuparr/plugin.py"],
-            ["scripts/ci_provenance.py", "tests/test_ci_provenance.py", "tests/test_runtime.py"],
-            ["docs/example.png"],
-            [".github/workflows/ci.yaml"],
+            ["docs/ci-workflow.md", "catchuparr/adapters/m3u.py"],
+            ["scripts/aio_integration_probe.py"],
+            ["scripts/run_aio_integration.py"],
             ["docs/../catchuparr/plugin.py"],
+            ["/catchuparr/plugin.py"],
             [],
             None,
         ):
