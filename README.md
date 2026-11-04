@@ -16,6 +16,19 @@ Dispatcharr remains responsible for live streams, EPG data, users, channel
 permissions and provider assignments. Catchuparr does not create source
 assignments, cloud storage or a transcoding service.
 
+> [!WARNING]
+> **Early software.** Catchuparr is still young and hooks deeply into
+> Dispatcharr's live streams, workers and Redis state. Back up your Dispatcharr
+> instance (database and `/data`) before installing or updating the plugin, or
+> try it first in a separate test environment. Keep the previous plugin ZIP so
+> you can roll back.
+
+> [!NOTE]
+> **AI-assisted development.** Catchuparr is developed with the help of AI
+> coding assistants. Every change is reviewed, tested in CI against a real
+> Dispatcharr instance and verified in an isolated test environment before it
+> is released, but you should still review it like any third-party plugin.
+
 ## Version and compatibility
 
 - The current release is **0.8.2**. Every release is gated by unit, package and
@@ -34,6 +47,10 @@ assignments, cloud storage or a transcoding service.
   output into a requested profile.
 
 ## Install or update
+
+Back up Dispatcharr first (see the warning above): Dispatcharr's built-in
+backup covers its database; also keep a copy of `/data/plugins` and the previous
+plugin ZIP.
 
 1. Download `catchuparr-<version>.zip` and `SHA256SUMS` from a GitHub release
    and check the archive with `sha256sum -c SHA256SUMS`.
