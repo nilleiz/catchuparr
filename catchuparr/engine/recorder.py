@@ -280,7 +280,7 @@ class FFmpegCopyRecorder:
             command.extend(["-rw_timeout", str(INPUT_READ_TIMEOUT_SECONDS * 1_000_000)])
         command.extend([
             "-i", self.proxy_url,
-            # Vu+/DVB transport streams may contain private data PIDs that
+            # DVB receiver transport streams may contain private data PIDs that
             # FFmpeg cannot remux. Keep every audio/video/subtitle track while
             # excluding unsupported data streams.
             "-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy",

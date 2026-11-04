@@ -16,7 +16,7 @@ class EgressRulesTests(unittest.TestCase):
             ],
         )
 
-    def test_vu_allowlist_is_between_established_replies_and_reject(self):
+    def test_source_allowlist_is_between_established_replies_and_reject(self):
         self.assertEqual(
             dev_egress.rules("192.0.2.20", 8080),
             [
@@ -26,7 +26,7 @@ class EgressRulesTests(unittest.TestCase):
             ],
         )
 
-    def test_extra_endpoints_follow_the_vu_endpoint_before_reject(self):
+    def test_extra_endpoints_follow_the_source_endpoint_before_reject(self):
         self.assertEqual(
             dev_egress.rules("192.0.2.20", 8001, (("192.0.2.30", 5012),)),
             [
@@ -40,7 +40,7 @@ class EgressRulesTests(unittest.TestCase):
     def test_cli_passes_approved_extra_endpoints(self):
         with (
             patch.object(sys, "argv", [
-                "dev_egress.py", "apply", "--subnet", "192.0.2.0/24", "--vu-ip", "192.0.2.20",
+                "dev_egress.py", "apply", "--subnet", "192.0.2.0/24", "--source-ip", "192.0.2.20",
                 "--allow", "192.0.2.30:5012",
             ]),
             patch.object(dev_egress, "apply") as apply,
@@ -72,7 +72,7 @@ class EgressRulesTests(unittest.TestCase):
         with patch.object(dev_egress, "installed_rules", return_value=[*canonical, canonical[2]]):
             self.assertFalse(dev_egress.matches_rules("192.0.2.20", 8080))
 
-    def test_cli_applies_deny_all_without_vu_ip(self):
+    def test_cli_applies_deny_all_without_source_ip(self):
         with (
             patch.object(sys, "argv", ["dev_egress.py", "apply", "--subnet", "192.0.2.0/24"]),
             patch.object(dev_egress, "apply") as apply,
@@ -80,14 +80,14 @@ class EgressRulesTests(unittest.TestCase):
             dev_egress.main()
         apply.assert_called_once_with("192.0.2.0/24", None, 8001)
 
-    def test_cli_applies_vu_allowlist_with_the_requested_port(self):
+    def test_cli_applies_source_allowlist_with_the_requested_port(self):
         with (
             patch.object(
                 sys,
                 "argv",
                 [
                     "dev_egress.py", "apply", "--subnet", "192.0.2.0/24",
-                    "--vu-ip", "192.0.2.20", "--vu-port", "8080",
+                    "--source-ip", "192.0.2.20", "--source-port", "8080",
                 ],
             ),
             patch.object(dev_egress, "apply") as apply,
@@ -95,7 +95,7 @@ class EgressRulesTests(unittest.TestCase):
             dev_egress.main()
         apply.assert_called_once_with("192.0.2.0/24", "192.0.2.20", 8080)
 
-    def test_cli_checks_deny_all_without_vu_ip(self):
+    def test_cli_checks_deny_all_without_source_ip(self):
         with (
             patch.object(sys, "argv", ["dev_egress.py", "check", "--subnet", "192.0.2.0/24"]),
             patch.object(dev_egress, "assert_network") as assert_network,
@@ -107,12 +107,12 @@ class EgressRulesTests(unittest.TestCase):
         matches_rules.assert_called_once_with(None, 8001)
         jump_is_first.assert_called_once_with("192.0.2.0/24")
 
-    def test_cli_rejects_a_port_without_vu_ip(self):
+    def test_cli_rejects_a_port_without_source_ip(self):
         with (
             patch.object(
                 sys,
                 "argv",
-                ["dev_egress.py", "apply", "--subnet", "192.0.2.0/24", "--vu-port", "8080"],
+                ["dev_egress.py", "apply", "--subnet", "192.0.2.0/24", "--source-port", "8080"],
             ),
             patch.object(dev_egress, "apply") as apply,
             self.assertRaises(SystemExit),
@@ -151,7 +151,7 @@ class InstalledRulesTests(unittest.TestCase):
                 ],
             )
 
-    def test_installed_vu_rule_normalizes_iptables_tcp_module_rendering(self):
+    def test_installed_source_rule_normalizes_iptables_tcp_module_rendering(self):
         output = """-N CATCHUPARR_DEV_EGRESS
 -A CATCHUPARR_DEV_EGRESS -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
 -A CATCHUPARR_DEV_EGRESS -d 192.0.2.20/32 -p tcp -m tcp --dport 8080 -j RETURN

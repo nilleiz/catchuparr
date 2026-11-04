@@ -145,7 +145,7 @@ class ViewBoundaryTests(unittest.TestCase):
                 service, "viewer", "news", now - 130, now,
             ))
 
-    def test_shifted_tivimate_windows_are_bounded_across_epg_programmes(self):
+    def test_shifted_client_windows_are_bounded_across_epg_programmes(self):
         programme_start = datetime(2026, 10, 7, 15, 15, tzinfo=timezone.utc)
         programme_end = datetime(2026, 10, 7, 16, 0, tzinfo=timezone.utc)
         next_end = datetime(2026, 10, 7, 16, 45, tzinfo=timezone.utc)

@@ -16,7 +16,7 @@ services:
       PUID: '1000'
       PGID: '1000'
     ports:
-      - '${DEV_BIND_IP:?set-local-bind-ip}:15656:9191'
+      - '${DEV_BIND_IP:?set-local-bind-ip}:${DEV_BIND_PORT:?set-local-bind-port}:9191'
     volumes:
       - ${DEV_AIO_ROOT:?set-private-dev-root}/data:/data
       - ${DEV_AIO_ROOT:?set-private-dev-root}/archive:/data/catchuparr

@@ -201,7 +201,7 @@ class M3UOutputTests(unittest.TestCase):
     self.assertIn("access_token=opaque", template)
     self.assertIn("utc={utc}&duration={duration}", template)
 
-  def test_tivimate_template_keeps_utc_and_duration_in_seconds(self):
+  def test_client_template_keeps_utc_and_duration_in_seconds(self):
     source = '#EXTINF:-1 tvg-id="local",Local\n'
     result = annotate_m3u(source, {"local": "local"}, "https://tv.example/archive", "token")
     self.assertIn('catchup-timezone="UTC"', result)

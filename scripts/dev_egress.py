@@ -26,7 +26,7 @@ def network_state() -> dict:
 
 
 def rules(target: str | None, port: int, extra: tuple[tuple[str, int], ...] = ()) -> list[list[str]]:
-    """Deny-all chain with the Vu+ endpoint and explicitly approved extra endpoints."""
+    """Deny-all chain with the approved source endpoint and explicitly approved extra endpoints."""
     result = [["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"]]
     allowed = ([(target, port)] if target is not None else []) + list(extra)
     for address, allowed_port in allowed:
@@ -167,8 +167,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("apply", "check", "remove"))
     parser.add_argument("--subnet", required=True)
-    parser.add_argument("--vu-ip")
-    parser.add_argument("--vu-port", type=int, default=8001)
+    parser.add_argument("--source-ip")
+    parser.add_argument("--source-port", type=int, default=8001)
     parser.add_argument(
         "--allow", action="append", default=[], metavar="IP:PORT",
         help="additional TCP endpoint the user explicitly approved; repeatable",
@@ -177,11 +177,11 @@ def main() -> None:
     subnet = str(ipaddress.ip_network(args.subnet, strict=True))
     if not isinstance(ipaddress.ip_network(subnet), ipaddress.IPv4Network):
         parser.error("the Dev bridge must use IPv4")
-    target = str(ipaddress.IPv4Address(args.vu_ip)) if args.vu_ip else None
-    if not 1 <= args.vu_port <= 65535:
-        parser.error("--vu-port must be a TCP port")
-    if target is None and args.vu_port != 8001:
-        parser.error("--vu-port requires --vu-ip")
+    target = str(ipaddress.IPv4Address(args.source_ip)) if args.source_ip else None
+    if not 1 <= args.source_port <= 65535:
+        parser.error("--source-port must be a TCP port")
+    if target is None and args.source_port != 8001:
+        parser.error("--source-port requires --source-ip")
     extra = []
     for item in args.allow:
         address, _, allowed_port = item.rpartition(":")
@@ -194,12 +194,12 @@ def main() -> None:
         extra.append(endpoint)
     options = {"extra": tuple(extra)} if extra else {}
     if args.action == "apply":
-        apply(subnet, target, args.vu_port, **options)
+        apply(subnet, target, args.source_port, **options)
     elif args.action == "remove":
         remove(subnet)
     else:
         assert_network(subnet)
-        if not matches_rules(target, args.vu_port, **options) or not jump_is_first(subnet):
+        if not matches_rules(target, args.source_port, **options) or not jump_is_first(subnet):
             raise RuntimeError("Dev egress restriction is not installed as expected")
 
 
