@@ -1,5 +1,20 @@
 # Validation status
 
+## 0.8.2 release
+
+Version 0.8.2 is a full release and includes the 0.6.0 to 0.8.1 prereleases.
+Each of its pull requests passed the unit and package job and the full native
+AIO suite on the pinned Dispatcharr 0.33.0 image for the exact merged tree. The
+isolated Dev stack, restored from a current production-like backup, verified
+the show rules against a real guide: validation preview, planned windows,
+recorder start and stop at the window edges, a restart with empty Redis, an
+update during running windows, a stopped planner, the combination of weekly
+schedule and show window, neighbouring programmes with `min` and `max`, and the
+live stability window for zapping and lasting viewers. Real-player acceptance
+is not implied by these checks.
+
+## Earlier candidates (historical)
+
 Sections for 0.2.0 through 0.3.1 are historical candidate checkpoints; their
 pending release gates describe the status at that time. Version 0.4.0 is
 released. Version 0.5.0 implementation and user acceptance are complete, with
@@ -38,7 +53,7 @@ Synthetic server-side tests do not establish real-player acceptance.
 
 ## 0.6.1 global sharing settings candidate
 
-Version 0.6.1 replaces per-channel sharing YAML with global sharing settings, migrates uniform prior values and requires explicit confirmation for conflicts. Its initial attach skips the live stability delay while later switches preserve the configured timing and guards. Focused unit tests cover these changes; required GitHub CI and publication remain pending. See the [0.6.1 candidate guide](candidate-0.6.1.md).
+Version 0.6.1 replaces per-channel sharing YAML with global sharing settings, migrates uniform prior values and requires explicit confirmation for conflicts. Its initial attach skipped the live stability delay (replaced in 0.8.1 by a stability window counted from the viewer's connection) while later switches preserve the configured timing and guards. Focused unit tests cover these changes; required GitHub CI and publication remain pending. See the [0.6.1 candidate guide](candidate-0.6.1.md).
 
 ## 0.6.2 continuous catch-up candidate
 

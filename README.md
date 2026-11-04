@@ -8,8 +8,9 @@
 Catchuparr adds a local rolling catch-up archive and start-over playback to
 [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr). It records selected
 channels to a shared local archive and provides authenticated M3U/XMLTV links.
-It also includes guarded native XC playback hooks and optional reuse of a
-compatible live connection while recording.
+It also records individual programmes by EPG title (show rules), includes
+guarded native XC playback hooks and can reuse a compatible live connection
+while recording.
 
 Dispatcharr remains responsible for live streams, EPG data, users, channel
 permissions and provider assignments. Catchuparr does not create source
@@ -17,14 +18,13 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The package version is **0.7.3**. Its prerelease is gated by native and package
-  CI. See the [0.7.2 design record](docs/candidate-0.7.2.md) and the
+- The current release is **0.8.2**. Every release is gated by unit, package and
+  native Dispatcharr AIO CI. See the [changelog](CHANGELOG.md) and the
   [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.33.0**. The compatibility
-  guard accepts well-formed versions at or above that minimum. The
-  native CI covers the pinned 0.33.0 image; this run must
-  pass before this candidate is accepted. API-specific guards still fail
-  closed when the expected Dispatcharr interfaces do not match.
+  guard accepts well-formed versions at or above that minimum. Native CI covers
+  the pinned 0.33.0 image. API-specific guards still fail closed when the
+  expected Dispatcharr interfaces do not match.
 - The primary playback path is authenticated M3U/XMLTV with local HLS playback
   using MPEG-TS segments. Native XC is guarded; acceptance with a particular
   playback client is not established here.
@@ -35,8 +35,8 @@ assignments, cloud storage or a transcoding service.
 
 ## Install or update
 
-1. Download `catchuparr-<version>.zip` from a GitHub release once one is
-   published.
+1. Download `catchuparr-<version>.zip` and `SHA256SUMS` from a GitHub release
+   and check the archive with `sha256sum -c SHA256SUMS`.
 2. In Dispatcharr's Plugins page, import the ZIP and choose its update or
    overwrite option when replacing an existing installation.
 3. Follow Dispatcharr's restart or reload prompt so web and worker processes
@@ -63,10 +63,10 @@ immediate operational actions.
 
 | Setting | What it controls |
 | --- | --- |
-| **Channel and source filter (YAML)** | Channel selection, assigned M3U source include/exclude and priority, schedule and timezone. Blank YAML selects no channels. |
+| **Channel and source filter (YAML)** | Channel selection, show rules, assigned M3U source include/exclude and priority, schedule, timezone and delayed-source handover. Blank YAML selects no channels. |
 | **Share existing live connections** | Optional global reuse of compatible existing viewer connections on all selected channels. Disabled by default. |
 | **Try to synchronize before switching streams** | Optional, bounded overlap check when switching to a viewer or returning to a dedicated source. Enabled by default. |
-| **Live stability delay** | Delay before later switches to a new viewer connection. The first eligible attach is immediate. |
+| **Live stability delay** | How long an ordinary viewer must have been watching before a recorder borrows the connection. A recorder without a working source of its own attaches at once. |
 | **Return delay after last viewer leaves** | Grace before returning to an allowed source. |
 | **Minimum interval between switches** | Cooldown applied to later source switches. |
 | **Archive path** | Local writable storage shared by Dispatcharr web and worker processes. Default: `/data/catchuparr`. |
@@ -102,11 +102,15 @@ profile: all
 rules:
   - channels:
       profile: all
-    exclude: ["Synthetic Backup Source"]
+    m3u:
+      exclude: ["Synthetic Backup Source"]
 ```
 
-`include` and `exclude` refer only to exact M3U source names already assigned
-to a channel, and cannot appear together. `exclude: []` leaves all assigned
+Source filters belong in a rule's `m3u:` mapping with `include`, `exclude` and
+`priority`. The same keys directly on the rule are still accepted but report a
+deprecation warning; one rule cannot mix both forms. `include` and `exclude`
+refer only to exact M3U source names already assigned to a channel, and cannot
+appear together. `exclude: []` leaves all assigned
 sources eligible. An omitted filter inherits from a matching profile rule,
 then from a `profile: all` rule. An explicit filter replaces the inherited one.
 
@@ -129,18 +133,20 @@ profile: all
 rules:
   - channels:
       profile: "Synthetic Profile All"
-    exclude: ["Synthetic Source B"]
-    priority:
-      "Synthetic Source A": 20
+    m3u:
+      exclude: ["Synthetic Source B"]
+      priority:
+        "Synthetic Source A": 20
     schedule:
       daily:
         - start: "08:00"
           end: "18:00"
   - channels:
       names: ["Synthetic Channel A"]
-    include: ["Synthetic Source B"]
-    priority:
-      "Synthetic Source B": 50
+    m3u:
+      include: ["Synthetic Source B"]
+      priority:
+        "Synthetic Source B": 50
     schedule_mode: override_days
     schedule:
       weekdays:
@@ -197,7 +203,55 @@ The YAML parser rejects unknown and duplicate fields, tags, anchors, aliases
 and merges. Input is limited to 64 KiB and 256 rules. Validation errors name the
 field and line without echoing the full YAML document.
 
-## Smart live connection sharing (0.6.1 candidate)
+## Record programmes by title (show rules)
+
+A `shows:` rule records every EPG programme whose title, sub-title or
+description matches, on the channels it covers, independent of the weekly
+schedule. A channel with its own `channels:` rule keeps that rule's schedule and
+source filter; the show windows only add recording time.
+
+```yaml
+version: 1
+timezone: Etc/UTC
+rules:
+  - shows:
+      name: Synthetic magazine
+      match:
+        title:
+          starts_with: "Synthetic Magazine"
+      channels:
+        include:
+          names: ["Synthetic Channel A"]
+      include_previous:
+        min: 10
+        max: 30
+      include_next: true
+      padding:
+        before: 2
+        after: 5
+    m3u:
+      include: ["Synthetic Source A"]
+```
+
+- Text operators `equals`, `starts_with`, `ends_with`, `contains`, `wildcard`
+  and `regex` combine with `any`, `all` and `not`; `min_minutes`, `max_minutes`
+  and `case_sensitive` refine a match, and a rule `schedule` restricts which
+  start times count.
+- `include_previous` and `include_next` (0.8.2) also record the programme
+  directly before or after a match: a neighbour shorter than `min` brings
+  exactly one more programme, and `max` caps the whole extra time. Padding
+  applies to the outer ends.
+- A planner computes the recording windows every minute and stores them next
+  to the archive. Overlapping windows merge; a running window is never
+  shortened by a guide refresh, and a stopped planner only keeps planned
+  windows from being cut off.
+- **Validate configuration** lists the next matching programmes with their
+  recording times, **Today's recording schedule** lists the planned shows of the
+  day and **Current recordings** names the show a running window records for.
+
+The complete rules are in [docs/shows.md](docs/shows.md).
+
+## Smart live connection sharing
 
 Sharing is disabled by default. It uses one global setting and applies only to
 channels selected by the source filter. It can reuse a
@@ -210,10 +264,14 @@ sources allowed by the filter. If none is allowed, the recorder waits paused.
 The feature checks the existing Dispatcharr owner, assignment, account,
 profile, input compatibility, worker heartbeat and published media. It attaches
 an owned reader to that worker's published MPEG-TS buffer; it does not
-initialize or reserve another upstream stream. The initial recorder attach to
-an already eligible viewer is immediate. Later switches use the configured
-stability and minimum-interval delays; viewer churn does not reset stability
-for the same native connection. The default delays are 5 seconds for live
+initialize or reserve another upstream stream. A viewer must have been watching
+for the live stability delay, counted from when it connected, before the
+recorder borrows its connection; a viewer who only zaps through a channel never
+triggers a borrow, while a recorder that starts next to a viewer who has been
+watching longer borrows at once. Only a recorder without a working source of
+its own (paused, failed or without an available dedicated source) attaches
+immediately. Later switches also respect the minimum interval; viewer churn
+does not reset stability for the same native connection. The default delays are 5 seconds for live
 stability, 30 seconds after the last ordinary viewer leaves, and 60 seconds
 between later switches. Each delay accepts an integer from 0 through 3600.
 Zero disables that delay. Apply sharing settings together with the filter and
@@ -293,7 +351,8 @@ leaves within that time, the programme between the borrow and the return is not
 recorded.
 
 The [0.6.1 candidate notes](docs/candidate-0.6.1.md) retain the historical
-settings and migration details. Synthetic tests do not establish acceptance
+settings and migration details; the stability rule above replaced their
+immediate initial attach in 0.8.1. Synthetic tests do not establish acceptance
 by every real player.
 
 ## Continuous catch-up playback
@@ -308,7 +367,10 @@ waits no longer than 125 seconds for a next segment. That bound covers
 the recorder's 120-second media-idle timeout plus five seconds for indexing
 and finalization; a missing recorder lease closes XC follow mode promptly.
 HLS uses the same 125-second edge window and recorder lease, with a 24-hour
-session bound. Synthetic coverage does not replace real-player acceptance.
+session bound. A native catch-up link without its own `duration` or `utcend`
+continues past the end of its guide entry through the archive; only a range the
+client bounds itself stays closed. Synthetic coverage does not replace
+real-player acceptance.
 
 ## Access tokens and playback
 
@@ -376,20 +438,22 @@ programme changes in the intended client before relying on this path.
 | **Archive status** | Show recorder state, selected/running counts, oldest indexed footage age and storage use. |
 | **Reconcile recorders** | Queue reconciliation against the current applied configuration. |
 | **Create M3U/XMLTV access token** | Create a token for the configured existing user and return both links. |
-| **Validate configuration** | Check the complete draft and preview resolved channels, sources, priorities and schedules without applying it. |
+| **Validate configuration** | Check the complete draft and preview resolved channels, sources, priorities, schedules and upcoming show matches without applying it. |
+| **Current recordings** | Show the recorder and source state of the channels scheduled now, including the show a running show window records for. |
+| **Today's recording schedule** | Show today's recording windows and planned shows. |
 | **Apply configuration** | Validate and activate the full draft as one generation. |
 | **Pause recording** | Immediately pause recorder activity and fence stale queued starts. |
 | **Resume recording** | Re-enable recording according to the applied configuration and schedule. |
 
-Current recordings shows only channels scheduled at the current time, with a
-compact recorder and source status. Its message omits channel numbers and uses
-the first word of the validated M3U profile name; full numbers and names remain
-in the structured rows. Today's recording schedule lists channels with today's
-windows. Both actions retain their structured channel and summary fields for
-callers that need the full details.
-The host may collapse message line breaks; visible rows use a bounded
-nonbreaking-space gap. Copying the message may retain nonbreaking spaces, which
-can be replaced with ordinary spaces in the destination text.
+The green toast of an action only summarises its result, for example
+`Current recordings: 12 channels, 1 with problems. Details in 2 toasts.`; the
+rows follow in numbered blue toasts (`Catchuparr – Status 1/2`) that stay within
+Dispatcharr's notification height and are marked as read. Current recordings
+shows only channels scheduled now and uses the first word of the validated M3U
+profile name. Today's recording schedule groups channels with identical windows
+into one `period › channels` row and adds `Show · start–end title › channel`
+rows. Validate lists the next five matches per channel. All actions keep their
+structured channel and summary fields for callers that need the full details.
 
 ## Troubleshooting
 
@@ -412,6 +476,12 @@ can be replaced with ordinary spaces in the destination text.
   upstream connections. Its heartbeat key `live:worker:<host>:<pid>:heartbeat`
   is then missing in Redis. Restarting that worker (or Dispatcharr) releases
   the connections; Catchuparr recorders recover on their own.
+- **A show is not recorded:** run **Validate configuration** and check that the
+  programme appears among the upcoming matches; it needs an EPG entry on a
+  covered channel. Today's recording schedule lists the planned show windows.
+  The planner runs every minute and plans the next 48 hours.
+- **"flat include/exclude/priority is deprecated" warning:** move the rule's
+  source filter under `m3u:`; the configuration keeps working until then.
 - **Token links fail:** check the applied public URL, user ID, active user,
   channel permission, catch-up permission, stream limits and reverse-proxy path.
 - **History is missing:** verify local recording coverage, retention, selected
@@ -423,8 +493,10 @@ can be replaced with ordinary spaces in the destination text.
 
 ## Development checks
 
-The repository uses synthetic media and strict native hook checks. The normal
-local gates are:
+The repository uses synthetic media and strict native hook checks. Changes
+follow the [change workflow](docs/development.md#change-workflow): focused
+tests and `ruff check .` locally, the full suite in GitHub CI. The available
+gates are:
 
 ```sh
 python3 -m unittest discover -s tests -q
@@ -433,8 +505,9 @@ ruff check .
 python3 scripts/build_plugin.py
 ```
 
-Release CI requires the pinned Dispatcharr 0.33.0 AIO integration
-job, including its executed native playback step. The synthetic AIO checks include
+Pull requests run the core Dispatcharr 0.33.0 AIO suite; release CI requires
+the full suite (label `full-aio`), including its executed native playback step.
+See [CI and release evidence](docs/ci-workflow.md). The synthetic AIO checks include
 ordinary-viewer retention, first-viewer borrowing, cooldown timing, Stop and
 Apply revocation, restart recovery, exact client cleanup, source switching,
 and retryable acknowledgements.
