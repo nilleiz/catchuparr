@@ -789,7 +789,7 @@ def segment_view(request, channel_id: str, segment_id: str):
 
 
 def _catchup_epoch(value: str) -> float:
-    """Accept the IPTV client's UTC epoch placeholder and unambiguous ISO timestamps."""
+    """Accept the UTC epoch placeholder of IPTV clients and unambiguous ISO timestamps."""
     try:
         epoch = float(value)
     except ValueError:
