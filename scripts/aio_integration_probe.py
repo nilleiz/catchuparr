@@ -305,7 +305,7 @@ def probe_show_rules(root):
         validate_configuration,
     )
     from catchuparr.recorder_proxy import ranked_source_candidates
-    from catchuparr.recording_schedule_overview import channel_metadata, today_schedule
+    from catchuparr.recording_schedule_overview import channel_metadata, today_schedule, today_shows
     from catchuparr.show_windows import (
         current_show,
         load_programmes,
@@ -394,7 +394,7 @@ def probe_show_rules(root):
             uuid_a: ["Synthetic news now", "Synthetic news later"],
             uuid_b: ["Synthetic news morning"],
         }, f"Show preview must list exactly the matching programmes: {titles}")
-        message = runtime.deliver_show_matches(validated, matches)
+        message = runtime.show_match_summary(validated["message"], matches)
         require("3 upcoming shows match" in message, "Validation summary must count the matches")
 
         flat = dict(settings, filter_config=document + show_rule + "    include: [Synthetic show source]\n")
@@ -459,11 +459,16 @@ def probe_show_rules(root):
         show = current_show(active, uuid_a, stamp)
         require(show is not None and show["title"] == "Synthetic news now" and show["phase"] == "airing"
                 and show["rule"] == "Synthetic news", f"Current show must name the airing programme: {show}")
+        shows = today_shows(active, channel_metadata([uuid_a, uuid_b]), now=now)
+        rows = {row["channel_uuid"]: row for row in shows.get("channels", [])}
+        require(any(item["title"] == "Synthetic news now" and item["status"] == "current"
+                    for item in rows.get(uuid_a, {}).get("shows", [])),
+                "Today's shows schedule must list the airing show")
+        require(shows.get("message", "").startswith("Today's shows:"),
+                "Today's shows schedule summary must count shows")
         schedule = today_schedule(active, channel_metadata([uuid_a, uuid_b]), now=now)
-        rows = {row["channel_uuid"]: row for row in schedule.get("channels", [])}
-        require(any(item["title"] == "Synthetic news now" for item in rows.get(uuid_a, {}).get("shows", [])),
-                "Today's schedule must list the planned show")
-        require("planned show" in schedule.get("message", ""), "Today's schedule summary must count shows")
+        require(all("shows" not in row for row in schedule.get("channels", [])),
+                "Today's channel schedule must leave the shows to the shows schedule")
 
         # Neighbour options (0.8.2): the 5-minute trailer before the match is
         # shorter than min, so the programme before it is included too; the film
@@ -672,6 +677,7 @@ def probe():
     overview_plugin = Plugin.__new__(Plugin)
     current_result = overview_plugin.run("current_recordings", {}, {})
     schedule_result = overview_plugin.run("today_schedule", {}, {})
+    shows_result = overview_plugin.run("today_shows", {}, {})
     require(isinstance(current_result, dict) and isinstance(current_result.get("channels"), list)
             and isinstance(current_result.get("summary"), dict),
             "Current recordings action did not return the shared structured response format")
@@ -694,6 +700,9 @@ def probe():
             and "Pause state unknown" not in schedule_message
             and "No recording windows planned" not in schedule_message,
             "Today's schedule action returned the expanded schedule message")
+    require(isinstance(shows_result, dict) and isinstance(shows_result.get("channels"), list)
+            and isinstance(shows_result.get("summary"), dict) and shows_result.get("status") == "ok",
+            "Today's shows action did not return the shared structured response format")
     require(active_path.read_bytes() == active_before and control_path.read_bytes() == control_before
             and set(active_path.parent.iterdir()) == directory_before,
             "Read-only overview action changed Catchuparr configuration/control files")
@@ -1324,31 +1333,35 @@ def probe():
         phase("show_rules", "started")
         probe_show_rules(root)
         phase("show_rules", "complete")
-        if os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core":
+        suite = os.environ.get("CATCHUPARR_AIO_SUITE", "full")
+        if suite == "core":
             # The recorder media and failover phases take most of the run time and
-            # are the release evidence of the full suite only.
+            # are the release evidence; CI runs them as two parallel parts.
             print(f"AIO core checks passed: Dispatcharr {__version__}")
             return
+        require(suite in {"media", "failover", "full"}, f"Unknown AIO suite: {suite}")
         sys.path.insert(0, "/tmp")
-        from aio_recorder_media import probe_actual_recorder_media
+        if suite in {"media", "full"}:
+            from aio_recorder_media import probe_actual_recorder_media
 
-        # The media probe asserts both live recording modes before fixture teardown.
-        phase("recorder_overviews", "started")
-        phase("recorder_media", "started")
-        probe_actual_recorder_media(root)
-        phase("recorder_media", "complete")
-        phase("recorder_overviews", "complete")
-        from aio_recorder_failover import probe_recorder_failover
+            # The media probe asserts both live recording modes before fixture teardown.
+            phase("recorder_overviews", "started")
+            phase("recorder_media", "started")
+            probe_actual_recorder_media(root)
+            phase("recorder_media", "complete")
+            phase("recorder_overviews", "complete")
+        if suite in {"failover", "full"}:
+            from aio_recorder_failover import probe_recorder_failover
 
-        phase("recorder_failover", "started")
-        probe_recorder_failover(root)
-        phase("recorder_failover", "complete")
+            phase("recorder_failover", "started")
+            probe_recorder_failover(root)
+            phase("recorder_failover", "complete")
         phase("native_runtime_drain", "started")
         require_native_runtime_drained(native_server)
         phase("native_runtime_drain", "complete")
     finally:
         runtime.shutdown()
-    print(f"AIO integration passed: Dispatcharr {__version__}")
+    print(f"AIO integration passed ({suite}): Dispatcharr {__version__}")
 
 
 probe()

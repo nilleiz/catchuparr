@@ -11,22 +11,34 @@ on:
         type: boolean
         default: false
 
+# Only the label full-aio starts a run. Any other label gets a group of its own,
+# so it can neither cancel a running check nor start one (the jobs skip it).
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: >-
+    ci-${{ github.event.pull_request.number || github.ref }}${{
+    github.event.action == 'labeled' && github.event.label.name != 'full-aio'
+    && format('-label-{0}', github.event.label.name) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   aio-integration:
-    name: AIO integration (${{ matrix.version }})
+    name: AIO integration (${{ matrix.version }}, ${{ matrix.part }})
+    if: github.event.action != 'labeled' || github.event.label.name == 'full-aio'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
       contents: read
     strategy:
       fail-fast: false
+      # The full suite runs its two long phases in parallel containers; each
+      # part repeats the one-minute core checks it builds on.
       matrix:
         include:
           - version: '0.33.0'
+            part: media
+            image: ghcr.io/dispatcharr/dispatcharr@sha256:96bc548978c68e684677da7895692eeeefb7f0b2edfa38311dac2b702c61d236
+          - version: '0.33.0'
+            part: failover
             image: ghcr.io/dispatcharr/dispatcharr@sha256:96bc548978c68e684677da7895692eeeefb7f0b2edfa38311dac2b702c61d236
     steps:
       - uses: actions/checkout@v4
@@ -47,13 +59,15 @@ jobs:
           --head-sha "$PR_HEAD_SHA"
           --output "$GITHUB_OUTPUT"
       # Pull requests run the core checks (compatibility, routes, overviews, source
-      # configuration, show rules; about a minute). The recorder media and failover phases take
-      # about 13 minutes and are the release evidence: the label `full-aio` on the
-      # pull request, or a manual dispatch, runs them. Only the step below that
-      # carries the release-evidence name can satisfy scripts/ci_provenance.py.
+      # configuration, show rules; about a minute) once, in the media part. The
+      # recorder media (about 10 minutes) and failover (about 4 minutes) phases are
+      # the release evidence: the label `full-aio` on the pull request, or a manual
+      # dispatch, runs them. Only the step below that carries the release-evidence
+      # name can satisfy scripts/ci_provenance.py, in both parts.
       - name: Core checks in actual Dispatcharr AIO
         if: >-
           steps.classify.outputs.full == 'true'
+          && matrix.part == 'media'
           && github.event_name == 'pull_request'
           && !contains(github.event.pull_request.labels.*.name, 'full-aio')
         run: python scripts/run_aio_integration.py --suite core --image ${{ matrix.image }}
@@ -62,15 +76,13 @@ jobs:
           steps.classify.outputs.full == 'true'
           && !(github.event_name == 'workflow_dispatch' && inputs.skip_native)
           && (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'full-aio'))
-        run: python scripts/run_aio_integration.py --suite full --image ${{ matrix.image }}
+        run: python scripts/run_aio_integration.py --suite ${{ matrix.part }} --image ${{ matrix.image }}
       - name: Record explicit manual native AIO skip
         if: github.event_name == 'workflow_dispatch' && inputs.skip_native
         run: echo "::notice title=Native AIO explicitly skipped::This manually requested run is package/unit validation only and cannot satisfy release acceptance."
-      - name: Record validation without product code changes
-        if: steps.classify.outputs.full == 'false'
-        run: echo "Native AIO skipped because no product code or AIO probe changed. Release evidence still requires a successful native playback step."
 
   test-and-package:
+    if: github.event.action != 'labeled' || github.event.label.name == 'full-aio'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -98,14 +110,11 @@ jobs:
         run: python -m pip install 'ruff==0.13.3' 'PyYAML==6.0.3'
       - name: Lint
         run: ruff check .
-      - name: Compile
-        run: python -m compileall -q catchuparr scripts tests
+      # Includes the package layout and ZIP import checks (tests/test_package.py).
       - name: Unit and synthetic-stream tests
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests
       - name: Build importable plugin
         run: python scripts/build_plugin.py
-      - name: Check package layout
-        run: python -m unittest tests.test_package -v
       - name: Record package provenance
         run: python scripts/ci_provenance.py record --package-root catchuparr --dist-dir dist --output dist/ci-provenance.json
       - uses: actions/upload-artifact@v4

@@ -4,10 +4,16 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
-## [0.8.4] - 2026-11-04
+## [0.9.0] - 2026-11-05
+
+0.9.0 includes the Reattach action prepared as 0.8.4, which was not published
+on its own.
 
 ### Added
 
+- **Today's shows schedule** action: today's programmes planned by the show
+  rules as `start–end title › channels` rows; `shows` in each channel row
+  carries title, rule, times and `status` (`past`, `current`, `upcoming`).
 - **Reattach to preferred sources** action: every running dedicated recorder
   that records from a fallback source ends that input and starts its best
   ranked source again, with a 20-second startup limit. If the source still
@@ -19,6 +25,31 @@ included here to explain the feature history leading to 0.4.0.
   `[ok, fallback]` and reports `preferred_source` in its channel row.
 - Log events `recorder_reattach_requested`, `recorder_reattach_started`,
   `recorder_reattached` and `recorder_reattach_failed`.
+- Apply, Reconcile, Reattach, Pause and Resume ask for confirmation before
+  they run, and every action has a short description.
+
+### Changed
+
+- **Today's recording schedule** is now **Today's channel schedule** and shows
+  only the windows of the channel schedules; the planned shows moved to the new
+  shows schedule.
+- **Validate configuration** no longer pushes detail toasts with the upcoming
+  show matches. Its summary still counts them, and the result keeps
+  `show_matches`.
+- Buttons are colored by what they do: blue shows information, teal checks or
+  activates the configuration, orange intervenes in running recorders, red
+  pauses, green resumes and violet creates credentials. Actions of the same
+  kind are listed together.
+- CI runs the two long AIO phases, recorder media and failover, as parallel
+  parts, which shortens a full run by about four minutes. Labels other than
+  `full-aio` no longer start or cancel a run. The duplicate package test step,
+  the compile step and the unused native parity runner were removed.
+
+### Fixed
+
+- Detail toasts of an action arrive in order. Dispatcharr sends each
+  notification in its own greenlet, so pages sent back to back could overtake
+  each other; they are now sent 0.4 seconds apart.
 
 ## [0.8.3] - 2026-11-04
 

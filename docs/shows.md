@@ -71,12 +71,13 @@ rules:
   the shows rule does not apply to such a channel and is reported as a warning.
 - Several shows rules on the same channel must use identical `m3u` filters.
 - Which shows are planned:
-  - **Validate** pushes the next matching programmes per channel (five per
-    channel in the toast, twenty in the `show_matches` result) with the
-    programme title and time, and says when the EPG could not be read.
-  - **Today's schedule** lists the planned shows of the day (`Show · 17:00–17:15
-    Synthetic Programme › Synthetic Channel`) next to the weekly windows, and `shows` in each
-    channel row carries title, rule and time.
+  - **Validate** counts the upcoming matching programmes and says when the EPG
+    could not be read; the `show_matches` result lists up to twenty per channel
+    with programme title and time. It pushes no detail toasts.
+  - **Today's shows schedule** lists the planned shows of the day
+    (`17:00–17:15 Synthetic Programme › Synthetic Channel`), and `shows` in each
+    channel row carries title, rule, time and `status` (`past`, `current`,
+    `upcoming`). **Today's channel schedule** shows only the weekly windows.
   - **Current recordings** names the programme a running show window records for
     (`Synthetic Channel - Source [ok] · Show: Synthetic Programme`); the row's `show` field holds title,
     rule, times and `phase` (`upcoming` while the padding before it runs,

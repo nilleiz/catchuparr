@@ -114,6 +114,19 @@ class ActionMessageFormattingTests(unittest.TestCase):
             self.assertIs(notification["admin_only"], True)
             self.assertIs(notification["is_dismissed"], True)
 
+    def test_delayed_pages_are_sent_in_order_with_spacing(self):
+        from catchuparr import action_messages
+
+        events = []
+        notifications = [{"title": f"page {number}"} for number in range(1, 4)]
+        with patch.object(action_messages.time, "sleep", lambda seconds: events.append(seconds)):
+            action_messages._send_follow_ups_later(
+                notifications, lambda notification: events.append(notification["title"]),
+            )
+        spacing = action_messages.FOLLOW_UP_SPACING_SECONDS
+        self.assertGreater(spacing, 0)
+        self.assertEqual(["page 1", spacing, "page 2", spacing, "page 3"], events)
+
     def test_unavailable_push_shows_rows_with_missing_note(self):
         rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
 

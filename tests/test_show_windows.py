@@ -230,41 +230,31 @@ class ShowListTests(unittest.TestCase):
         ], "UTC", day)
         self.assertEqual(["13:00–13:15 News › A, B", "Tue 13:00–13:15 News › A"], rows)
 
-    def test_validation_pushes_the_matches_as_a_toast(self):
+    def test_validation_names_the_match_count_without_pushing_toasts(self):
         from catchuparr import runtime
-
-        pushed = {}
-
-        def fake(rows, **kwargs):
-            pushed["rows"], pushed["title"] = list(rows), kwargs["title"]
-            return "summary"
-
-        result = {"message": "1 channel(s) selected.", "channels": [{"channel_uuid": CHANNEL, "channel_name": "Ch"}]}
-        matches = {"channels": {CHANNEL: [{"title": "Show A", "start": 0, "end": 900, "rules": ["x"]}]},
-                   "epg_unavailable": False, "timezone": "UTC"}
-        with patch("catchuparr.action_messages.deliver_action_message", fake):
-            self.assertEqual("summary", runtime.deliver_show_matches(result, matches))
-        self.assertEqual("Shows", pushed["title"])
-        self.assertEqual(1, len(pushed["rows"]))
-        self.assertIn("Show A › Ch", pushed["rows"][0])
-
-    def test_validation_toast_lists_only_the_next_matches_per_channel(self):
-        from catchuparr import runtime
-
-        pushed = {}
-
-        def fake(rows, **kwargs):
-            pushed["rows"] = list(rows)
-            return kwargs["summary"]
 
         items = [{"title": f"Show {n}", "start": n * 1000, "end": n * 1000 + 900, "rules": ["x"]} for n in range(8)]
-        result = {"message": "1 channel(s) selected.", "channels": [{"channel_uuid": CHANNEL, "channel_name": "Ch"}]}
-        matches = {"channels": {CHANNEL: items}, "epg_unavailable": True, "timezone": "UTC"}
-        with patch("catchuparr.action_messages.deliver_action_message", fake):
-            summary = runtime.deliver_show_matches(result, matches)
-        self.assertEqual(5, len(pushed["rows"]))
-        self.assertIn("8 upcoming shows match (the next 5 per channel are listed)", summary)
-        self.assertTrue(summary.endswith("could not be read for some channels."))
+        matches = {"channels": {CHANNEL: items}, "epg_unavailable": False, "timezone": "UTC"}
+        validated = {"message": "1 channel(s) selected.", "show_matches": matches,
+                     "channels": [{"channel_uuid": CHANNEL, "channel_name": "Ch"}]}
+        with (
+            patch("catchuparr.configuration.validate_configuration", return_value=validated),
+            patch("catchuparr.action_messages.deliver_action_message") as deliver,
+        ):
+            result = runtime.validate_configuration({})
+        deliver.assert_not_called()
+        self.assertEqual("1 channel(s) selected. 8 upcoming shows match.", result["message"])
+        self.assertIs(matches, result["show_matches"])
+
+    def test_validation_summary_names_an_unreadable_epg(self):
+        from catchuparr import runtime
+
+        matches = {"channels": {CHANNEL: [{"title": "A", "start": 0, "end": 900}]},
+                   "epg_unavailable": True, "timezone": "UTC"}
+        self.assertEqual(
+            "Ok. 1 upcoming show match; the EPG could not be read for some channels.",
+            runtime.show_match_summary("Ok.", matches),
+        )
 
 
 def utc(*parts):
@@ -293,8 +283,8 @@ class CalendarEdgeTests(unittest.TestCase):
         (window,) = self.planned(active, Programme(start, end, "Show night"))
         self.assertEqual((start - 300, end + 180), (window.start, window.end))
 
-    def test_today_schedule_clips_the_window_at_local_midnight_on_both_days(self):
-        from catchuparr.recording_schedule_overview import today_schedule
+    def test_shows_schedule_lists_a_show_across_local_midnight_on_both_days(self):
+        from catchuparr.recording_schedule_overview import today_shows
         from catchuparr.show_windows import store_windows, windows_path
 
         start, end = utc(2026, 11, 3, 22, 30), utc(2026, 11, 3, 23, 30)
@@ -309,10 +299,8 @@ class CalendarEdgeTests(unittest.TestCase):
                 Window(start - 300, end + 180, (1,), (Show(start, end, "Show night", 1),)),
             ]})
             with patch("catchuparr.action_messages._default_sender", lambda: lambda payload: None):
-                first = today_schedule(current, {}, now=datetime(2026, 11, 3, 12, tzinfo=timezone.utc))
-                second = today_schedule(current, {}, now=datetime(2026, 11, 4, 12, tzinfo=timezone.utc))
-        self.assertEqual([("23:25", "24:00")], [(w["start"], w["end"]) for w in first["channels"][0]["windows"]])
-        self.assertEqual([("00:00", "00:33")], [(w["start"], w["end"]) for w in second["channels"][0]["windows"]])
+                first = today_shows(current, {}, now=datetime(2026, 11, 3, 12, tzinfo=timezone.utc))
+                second = today_shows(current, {}, now=datetime(2026, 11, 4, 12, tzinfo=timezone.utc))
         self.assertEqual("23:30", first["channels"][0]["shows"][0]["start"])
         self.assertEqual("00:30", second["channels"][0]["shows"][0]["end"])
 

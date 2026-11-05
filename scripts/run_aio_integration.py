@@ -28,14 +28,10 @@ def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True)
     parser.add_argument(
-        "--configuration-only",
-        action="store_true",
-        help="Run source-rule unit tests and the provider-free Django configuration probe, then stop.",
-    )
-    parser.add_argument(
-        "--suite", choices=("core", "full"), default="full",
+        "--suite", choices=("core", "media", "failover", "full"), default="full",
         help="core: compatibility, routes, overviews, source configuration and show rules (about a minute); "
-             "full: additionally the recorder media and failover phases (release evidence).",
+             "media or failover: the core checks and one recorder phase (CI runs both parts in parallel "
+             "as the release evidence); full: both recorder phases in one container.",
     )
     args = parser.parse_args()
     name = f"catchuparr-ci-{time.time_ns()}"
@@ -118,8 +114,6 @@ def run():
         if not receipts or receipts[-1].get("provider_connections") != 0:
             raise RuntimeError("Native 0.5.1 Django configuration probe did not pass cleanly")
         print(json.dumps(receipts[-1], sort_keys=True))
-        if args.configuration_only:
-            return
         with (ROOT / "scripts/aio_integration_probe.py").open("rb") as script:
             docker("exec", "-i", "-e", f"CATCHUPARR_AIO_SUITE={args.suite}",
                    name, "/dispatcharrpy/bin/python", "-c",

@@ -25,9 +25,9 @@ class PackageTest(unittest.TestCase):
             self.assertFalse(any("__pycache__" in name for name in names))
             manifest = json.loads(archive.read("catchuparr/plugin.json"))
             self.assertEqual(manifest["name"], "Catchuparr")
-            self.assertEqual(manifest["version"], "0.8.4")
+            self.assertEqual(manifest["version"], "0.9.0")
             self.assertEqual(Plugin.version, manifest["version"])
-            self.assertEqual(Path(archive_path).name, "catchuparr-0.8.4.zip")
+            self.assertEqual(Path(archive_path).name, "catchuparr-0.9.0.zip")
             self.assertEqual(
                 archive.read("catchuparr/logo.png"),
                 Path("docs/assets/catchuparr-icon-256.png").read_bytes(),
@@ -53,6 +53,38 @@ class PackageTest(unittest.TestCase):
             )
             self.assertIn("M3U/XMLTV", token_action["label"])
         self.assertTrue(Path(archive_path).is_file())
+
+    def test_actions_that_change_recording_ask_for_confirmation(self):
+        manifest = json.loads(Path("catchuparr/plugin.json").read_text())
+        actions = {action["id"]: action for action in manifest["actions"]}
+        confirmed = {action_id for action_id, action in actions.items() if action.get("confirm")}
+        self.assertEqual(
+            {"apply_configuration", "pause_recorders", "resume_recorders",
+             "reattach_recorders", "reconcile"},
+            confirmed,
+        )
+        for action_id in confirmed:
+            confirm = actions[action_id]["confirm"]
+            self.assertTrue(confirm["required"])
+            self.assertTrue(confirm["title"].endswith("?"))
+            self.assertTrue(confirm["message"])
+        # Mantine theme colors: blue views, teal configuration, orange recorder
+        # interventions, red/green pause/resume, violet credentials.
+        colors = {action_id: (action["button_variant"], action["button_color"])
+                  for action_id, action in actions.items()}
+        self.assertEqual({
+            "current_recordings": ("light", "blue"),
+            "today_schedule": ("light", "blue"),
+            "today_shows": ("light", "blue"),
+            "status": ("light", "blue"),
+            "validate_configuration": ("light", "teal"),
+            "apply_configuration": ("filled", "teal"),
+            "reconcile": ("light", "orange"),
+            "reattach_recorders": ("light", "orange"),
+            "pause_recorders": ("filled", "red"),
+            "resume_recorders": ("filled", "green"),
+            "create_access_token": ("light", "violet"),
+        }, colors)
 
     def test_runtime_modules_import_from_built_zip(self):
         archive_path = build()

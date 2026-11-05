@@ -25,7 +25,6 @@ SNAPSHOT_TASK = "catchuparr.snapshot_epg"
 SNAPSHOT_SCHEDULE = "catchuparr-epg-snapshot"
 SHOW_WINDOWS_TASK = "catchuparr.plan_show_windows"
 SHOW_WINDOWS_SCHEDULE = "catchuparr-show-windows"
-SHOW_TOAST_PER_CHANNEL = 5
 
 
 @dataclass(frozen=True)
@@ -220,32 +219,20 @@ def validate_configuration(settings: dict) -> dict:
     result = validate(settings, show_preview=_show_preview)
     matches = result.get("show_matches")
     if matches:
-        result["message"] = deliver_show_matches(result, matches)
+        result["message"] = show_match_summary(result["message"], matches)
     return result
 
 
-def deliver_show_matches(result: dict, matches: dict) -> str:
-    """Push the upcoming show matches as a toast and return the summary line."""
-    import time
-    from uuid import uuid4
+def show_match_summary(message: str, matches: dict) -> str:
+    """Add the number of upcoming show matches to the validation message.
 
-    from .action_messages import deliver_action_message
-    from .show_windows import format_show_rows
-
-    names = {row["channel_uuid"]: row["channel_name"] for row in result["channels"]}
-    entries = [
-        (names.get(channel, "Unknown channel"), item["start"], item["end"], item["title"])
-        + ((item["record_start"], item["record_end"]) if item.get("neighbours") else ())
-        for channel, items in matches["channels"].items() for item in items[:SHOW_TOAST_PER_CHANNEL]
-    ]
+    The matches themselves stay in the result; Today's shows schedule lists
+    them after Apply, so validation pushes no extra toasts.
+    """
     count = sum(len(items) for items in matches["channels"].values())
-    summary = f"{result['message']} {count} upcoming show{'' if count == 1 else 's'} match"
-    summary += f" (the next {SHOW_TOAST_PER_CHANNEL} per channel are listed)" if count > len(entries) else ""
+    summary = f"{message} {count} upcoming show{'' if count == 1 else 's'} match"
     summary += "; the EPG could not be read for some channels." if matches["epg_unavailable"] else "."
-    if not entries:
-        return summary
-    rows = format_show_rows(entries, matches["timezone"], time.time())
-    return deliver_action_message(rows, title="Shows", summary=summary, run_key=f"shows-{uuid4().hex[:12]}")
+    return summary
 
 
 def _show_preview(active: dict) -> dict:
