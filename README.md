@@ -31,7 +31,7 @@ assignments, cloud storage or a transcoding service.
 
 ## Version and compatibility
 
-- The current release is **0.8.3**. Every release is gated by unit, package and
+- The current release is **0.9.0**. Every release is gated by unit, package and
   native Dispatcharr AIO CI. See the [changelog](CHANGELOG.md) and the
   [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.33.0**. The compatibility
@@ -262,9 +262,9 @@ rules:
   to the archive. Overlapping windows merge; a running window is never
   shortened by a guide refresh, and a stopped planner only keeps planned
   windows from being cut off.
-- **Validate configuration** lists the next matching programmes with their
-  recording times, **Today's recording schedule** lists the planned shows of the
-  day and **Current recordings** names the show a running window records for.
+- **Validate configuration** counts the upcoming matching programmes,
+  **Today's shows schedule** lists the planned shows of the day and
+  **Current recordings** names the show a running window records for.
 
 The complete rules are in [docs/shows.md](docs/shows.md).
 
@@ -450,27 +450,36 @@ programme changes in the intended client before relying on this path.
 
 ## Actions
 
+The buttons are colored by what they do: blue buttons only show information,
+teal ones check or activate the configuration, orange ones intervene in running
+recorders, red pauses and green resumes recording, and violet creates
+credentials. Every action that changes recording (Apply, Reconcile, Reattach,
+Pause and Resume) asks for confirmation first.
+
 | Action | Use |
 | --- | --- |
-| **Archive status** | Show recorder state, selected/running counts, oldest indexed footage age and storage use. |
-| **Reconcile recorders** | Queue reconciliation against the current applied configuration. |
-| **Create M3U/XMLTV access token** | Create a token for the configured existing user and return both links. |
-| **Validate configuration** | Check the complete draft and preview resolved channels, sources, priorities, schedules and upcoming show matches without applying it. |
 | **Current recordings** | Show the recorder and source state of the channels scheduled now, including the show a running show window records for. |
-| **Today's recording schedule** | Show today's recording windows and planned shows. |
+| **Today's channel schedule** | Show today's recording windows from the channel schedules. |
+| **Today's shows schedule** | Show today's programmes planned by the show rules. |
+| **Archive status** | Show recorder state, selected/running counts, oldest indexed footage age and storage use. |
+| **Validate configuration** | Check the complete draft and preview resolved channels, sources, priorities, schedules and the number of upcoming show matches without applying it. |
 | **Apply configuration** | Validate and activate the full draft as one generation. |
+| **Reconcile recorders** | Queue reconciliation against the current applied configuration. |
+| **Reattach to preferred sources** | Ask each running dedicated recorder that records from a fallback source to try its best ranked source again. Recorders attached to a viewer are not changed. |
 | **Pause recording** | Immediately pause recorder activity and fence stale queued starts. |
 | **Resume recording** | Re-enable recording according to the applied configuration and schedule. |
+| **Create M3U/XMLTV access token** | Create a token for the configured existing user and return both links. |
 
 The green toast of an action only summarises its result, for example
 `Current recordings: 12 channels, 1 with problems. Details in 2 toasts.`; the
 rows follow in numbered blue toasts (`Catchuparr – Status 1/2`) that stay within
-Dispatcharr's notification height and are marked as read. Current recordings
-shows only channels scheduled now and uses the first word of the validated M3U
-profile name. Today's recording schedule groups channels with identical windows
-into one `period › channels` row and adds `Show · start–end title › channel`
-rows. Validate lists the next five matches per channel. All actions keep their
-structured channel and summary fields for callers that need the full details.
+Dispatcharr's notification height and are marked as read. They arrive in
+order. Current recordings shows only channels scheduled now and uses the first
+word of the validated M3U profile name. Today's channel schedule groups channels
+with identical windows into one `period › channels` row; Today's shows schedule
+lists `start–end title › channels` rows. Validate pushes no detail toasts; its
+summary counts the upcoming show matches. All actions keep their structured
+channel and summary fields for callers that need the full details.
 
 ## Troubleshooting
 
@@ -481,6 +490,15 @@ structured channel and summary fields for callers that need the full details.
   assignments in Dispatcharr. Catchuparr will not create assignments.
 - **Filtered source cannot start:** a dedicated worker may need another
   provider slot. Check Dispatcharr's account/profile capacity.
+- **A recorder stays on a fallback source:** when the best ranked source of a
+  channel fails, its recorder moves to the next one and stays there.
+  **Current recordings** marks such a channel `[ok, fallback]`. Once the best
+  source works again, press **Reattach to preferred sources**. The recorder
+  ends its fallback input and starts the best source with a 20-second startup
+  limit; if that source still delivers nothing, it continues with the next
+  source. The switch is not synchronized, so the archive gets a short gap of
+  about the source's startup time, or up to about 20 seconds plus the
+  fallback's restart when the attempt fails.
 - **Sharing stays idle:** confirm it is enabled for a selected channel and that
   an ordinary viewer is using a healthy, compatible assigned stream. Sharing
   never starts a source outside the allowed set.
@@ -495,7 +513,7 @@ structured channel and summary fields for callers that need the full details.
   the connections; Catchuparr recorders recover on their own.
 - **A show is not recorded:** run **Validate configuration** and check that the
   programme appears among the upcoming matches; it needs an EPG entry on a
-  covered channel. Today's recording schedule lists the planned show windows.
+  covered channel. Today's shows schedule lists the planned shows of the day.
   The planner runs every minute and plans the next 48 hours.
 - **"flat include/exclude/priority is deprecated" warning:** move the rule's
   source filter under `m3u:`; the configuration keeps working until then.

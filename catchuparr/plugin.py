@@ -9,7 +9,7 @@ from __future__ import annotations
 
 class Plugin:
     name = "Catchuparr"
-    version = "0.8.3"
+    version = "0.9.0"
     description = "Local rolling catch-up archive, start-over and optional live connection sharing"
     author = "nilleiz"
     help_url = "https://github.com/nilleiz/catchuparr"
@@ -20,7 +20,13 @@ class Plugin:
         bootstrap()
 
     def run(self, action: str, params: dict, context: dict):
-        if action in {"current_recordings", "today_schedule"}:
+        if action == "reattach_recorders":
+            from .configuration import load_applied_state_readonly
+            from .reattach import request_reattach
+
+            settings, control = load_applied_state_readonly()
+            return request_reattach(settings, control)
+        if action in {"current_recordings", "today_schedule", "today_shows"}:
             from .configuration import load_applied_state_readonly
 
             settings, control = load_applied_state_readonly()
@@ -41,10 +47,11 @@ class Plugin:
                 from .recording_overview import current_recordings
 
                 return current_recordings(settings, control_state=control)
-            from .recording_schedule_overview import channel_metadata, today_schedule
+            from .recording_schedule_overview import channel_metadata, today_schedule, today_shows
 
+            overview = today_shows if action == "today_shows" else today_schedule
             ids = settings.get("channel_uuids", "").splitlines()
-            return today_schedule(settings, channel_metadata(ids), control_state=control)
+            return overview(settings, channel_metadata(ids), control_state=control)
         from .logging_utils import apply_log_level
         from .runtime import (
             apply_committed_log_level,

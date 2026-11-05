@@ -11,23 +11,32 @@ offers an explicit `skip_native` input for a manually requested package/unit
 validation run; its default is false, and the skip does not produce release
 acceptance evidence.
 
-The AIO probe has two suites. A pull request runs the **core** suite in the step
-"Core checks in actual Dispatcharr AIO": compatibility, archive routes, the
-overview actions, source configuration with nested `m3u` filters, and show rules
-(validation preview, Apply, planning from the real EPG tables, recorder
-admission, today's schedule and current show). It takes about a minute and is
-not release evidence. The **full** suite adds the recorder media and failover
-phases (about 13 minutes) in the step "Synthetic playback in actual Dispatcharr
-AIO". It runs when the pull request carries the label `full-aio` (adding the
-label starts a new run) or on a manual dispatch without `skip_native`. Add the
-label only after the run for the latest push has started: a run that starts
-later cancels the earlier one, and a push run reads the labels of its own event,
-so a push run that starts just after the label run would replace the full suite
-with the core suite. The AIO job has a
-40-minute outer timeout for its 30-minute probe budget plus bounded setup and
-cleanup time; the probe's own deadline and assertions remain its runtime limit.
-Pull-request runs use concurrency cancellation so obsolete revisions do not
-continue consuming an AIO runner. CI does not rerun on every push to `main`.
+The AIO job is a matrix of two parts, `media` and `failover`, each in its own
+disposable container. A pull request runs the **core** suite once, in the media
+part, in the step "Core checks in actual Dispatcharr AIO": compatibility, archive
+routes, the overview actions, source configuration with nested `m3u` filters,
+and show rules (validation preview, Apply, planning from the real EPG tables,
+recorder admission, today's channel and shows schedules and current show). It
+takes about a minute and is not release evidence. The release evidence is the
+step "Synthetic playback in actual Dispatcharr AIO" in both parts: each repeats
+the core checks and then runs one recorder phase, media (about 10 minutes) or
+failover (about 4 minutes). Running them in parallel shortens a full run from
+about 15 to about 11 minutes. The step runs when the pull request carries the
+label `full-aio` (adding the label starts a new run) or on a manual dispatch
+without `skip_native`. Any other label neither starts a run nor cancels one: it
+gets a concurrency group of its own and every job skips it. Add `full-aio` only
+after the run for the latest push has started: a run that starts later cancels
+the earlier one, and a push run reads the labels of its own event, so a push run
+that starts just after the label run would replace the full suite with the core
+suite. Each AIO part has a 40-minute outer timeout for its 30-minute probe
+budget plus bounded setup and cleanup time; the probe's own deadline and
+assertions remain its runtime limit. Pull-request runs use concurrency
+cancellation so obsolete revisions do not continue consuming an AIO runner. CI
+does not rerun on every push to `main`.
+
+The `test-and-package` job runs the privacy check, `ruff` (which also reports
+syntax errors) and the unit tests, which include the package layout and ZIP
+import checks, then builds the plugin ZIP.
 
 The `test-and-package` job uploads the plugin ZIP with a provenance document.
 That document records the repository, CI workflow ref, run and attempt IDs,
@@ -38,9 +47,9 @@ The release workflow does not invoke CI. It searches successful, same-repository
 pull-request runs of the trusted CI workflow and accepts a run only when its
 Git tree exactly matches the release checkout. A merge commit SHA can differ
 from the release commit SHA; their tree identities must match. The
-`test-and-package` and `AIO integration (0.33.0)` jobs must both have succeeded,
-and the named native playback step inside the AIO job must itself have
-succeeded. A run with the AIO step skipped is not release
+`test-and-package`, `AIO integration (0.33.0, media)` and
+`AIO integration (0.33.0, failover)` jobs must all have succeeded, and the
+named native playback step inside both AIO parts must itself have succeeded. A run with the AIO step skipped is not release
 acceptance evidence.
 
 Before release publication, the workflow downloads that run's CI artifact and

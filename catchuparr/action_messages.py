@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import unicodedata
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
@@ -23,6 +24,9 @@ ROW_SEPARATOR = "\u3000" * 40
 TEXT_WIDTH_PX = 230.0
 MAX_LINES_PER_TOAST = 7
 FOLLOW_UP_DELAY_SECONDS = 0.8
+# Under gevent Dispatcharr hands every notification to its own greenlet, so
+# pages sent back to back can overtake each other. Spacing keeps their order.
+FOLLOW_UP_SPACING_SECONDS = 0.4
 _FONT_SCALE = 14.0 / 17.0
 _PAGE_PREFIX_ALLOWANCE = "00/00 · "
 FALLBACK_LATIN_WIDTH_PX = 8.5
@@ -245,14 +249,17 @@ def paginate_rows(rows: Iterable[str], max_lines: int = MAX_LINES_PER_TOAST) -> 
     return pages
 
 
-def _send_follow_ups(notifications: list[dict], sender: Callable[[dict], None]) -> None:
-    for notification in notifications:
+def _send_follow_ups(notifications: list[dict], sender: Callable[[dict], None],
+                     spacing: float = 0.0) -> None:
+    for number, notification in enumerate(notifications):
+        if number and spacing > 0:
+            time.sleep(spacing)
         sender(notification)
 
 
 def _send_follow_ups_later(notifications: list[dict], sender: Callable[[dict], None]) -> None:
     try:
-        _send_follow_ups(notifications, sender)
+        _send_follow_ups(notifications, sender, FOLLOW_UP_SPACING_SECONDS)
     except Exception:
         logger.warning("Unable to push follow-up Catchuparr action toasts", exc_info=True)
 

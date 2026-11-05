@@ -1025,6 +1025,32 @@ def candidate_is_current(
         return False
 
 
+def is_preferred_source(
+    channel_uuid: str,
+    stream_id: str,
+    account_id: str,
+    active_configuration: Mapping[str, Any],
+) -> bool | None:
+    """Return whether a source is the first one a recorder would try.
+
+    ``None`` means the channel has no ranked source list (the default live
+    route applies), so there is no preferred source to return to.
+    """
+    sharing = active_configuration.get("connection_sharing")
+    sharing_setting = sharing.get(str(channel_uuid)) if isinstance(sharing, dict) else None
+    candidates = ranked_source_candidates(
+        str(channel_uuid), active_configuration,
+        all_sources=isinstance(sharing_setting, dict) and sharing_setting.get("enabled") is True,
+    )
+    if not candidates:
+        return None
+    best = candidates[0]
+    return (
+        str(best.get("id") or best.get("stream_id") or "") == str(stream_id)
+        and str(best.get("account_id") or "") == str(account_id)
+    )
+
+
 def _secret_key() -> bytes:
     from django.conf import settings
 

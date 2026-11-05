@@ -1,6 +1,6 @@
 {
   "name": "Catchuparr",
-  "version": "0.8.3",
+  "version": "0.9.0",
   "description": "Local rolling catch-up archive, start-over and optional live connection sharing for Dispatcharr",
   "author": "nilleiz",
   "help_url": "https://github.com/nilleiz/catchuparr",
@@ -124,42 +124,118 @@
     }
   ],
   "actions": [
-    {"id": "current_recordings", "label": "Current recordings", "button_label": "Show recordings"},
-    {"id": "today_schedule", "label": "Today's recording schedule", "button_label": "Show today's schedule"},
+    {
+      "id": "current_recordings",
+      "label": "Current recordings",
+      "description": "What each selected channel records right now.",
+      "button_label": "Show recordings",
+      "button_variant": "light",
+      "button_color": "blue"
+    },
+    {
+      "id": "today_schedule",
+      "label": "Today's channel schedule",
+      "description": "Today's recording windows from the channel schedules.",
+      "button_label": "Show channel schedule",
+      "button_variant": "light",
+      "button_color": "blue"
+    },
+    {
+      "id": "today_shows",
+      "label": "Today's shows schedule",
+      "description": "Today's programmes planned by the show rules.",
+      "button_label": "Show shows schedule",
+      "button_variant": "light",
+      "button_color": "blue"
+    },
     {
       "id": "status",
       "label": "Archive status",
-      "button_label": "Show status"
-    },
-    {
-      "id": "reconcile",
-      "label": "Reconcile recorders",
-      "button_label": "Reconcile"
-    },
-    {
-      "id": "create_access_token",
-      "label": "Create M3U/XMLTV access token",
-      "button_label": "Create token"
+      "description": "Archive size, retention and running recorders.",
+      "button_label": "Show status",
+      "button_variant": "light",
+      "button_color": "blue"
     },
     {
       "id": "validate_configuration",
       "label": "Validate configuration",
-      "button_label": "Validate"
+      "description": "Checks the settings above without changing anything.",
+      "button_label": "Validate",
+      "button_variant": "light",
+      "button_color": "teal"
     },
     {
       "id": "apply_configuration",
       "label": "Apply configuration",
-      "button_label": "Apply configuration"
+      "description": "Activates the settings above.",
+      "button_label": "Apply configuration",
+      "button_variant": "filled",
+      "button_color": "teal",
+      "confirm": {
+        "required": true,
+        "title": "Apply the configuration?",
+        "message": "Catchuparr activates the settings above. Every running recorder restarts, which leaves a short gap in each running recording."
+      }
+    },
+    {
+      "id": "reconcile",
+      "label": "Reconcile recorders",
+      "description": "Re-reads the EPG and starts or stops recorders to match the schedule.",
+      "button_label": "Reconcile",
+      "button_variant": "light",
+      "button_color": "orange",
+      "confirm": {
+        "required": true,
+        "title": "Reconcile the recorders?",
+        "message": "Catchuparr re-reads the EPG, plans the show windows again, starts recorders that should run and stops recorders that should not."
+      }
+    },
+    {
+      "id": "reattach_recorders",
+      "label": "Reattach to preferred sources",
+      "description": "Moves recorders on a fallback source back to their preferred source.",
+      "button_label": "Reattach",
+      "button_variant": "light",
+      "button_color": "orange",
+      "confirm": {
+        "required": true,
+        "title": "Reattach to the preferred sources?",
+        "message": "Recorders on a fallback source switch back to their preferred source. Each switch leaves a gap of a few seconds in that channel's archive."
+      }
     },
     {
       "id": "pause_recorders",
       "label": "Pause recording",
-      "button_label": "Pause"
+      "description": "Stops all recorders until Resume.",
+      "button_label": "Pause",
+      "button_variant": "filled",
+      "button_color": "red",
+      "confirm": {
+        "required": true,
+        "title": "Pause recording?",
+        "message": "All recorders stop immediately and nothing is recorded until you resume. Playback of the existing archive keeps working."
+      }
     },
     {
       "id": "resume_recorders",
       "label": "Resume recording",
-      "button_label": "Resume"
+      "description": "Starts the scheduled recorders again.",
+      "button_label": "Resume",
+      "button_variant": "filled",
+      "button_color": "green",
+      "confirm": {
+        "required": true,
+        "title": "Resume recording?",
+        "message": "Recorders start again for every channel that is scheduled now."
+      }
+    },
+    {
+      "id": "create_access_token",
+      "label": "Create M3U/XMLTV access token",
+      "description": "Creates playlist and guide links for the user ID above.",
+      "button_label": "Create token",
+      "button_variant": "light",
+      "button_color": "violet"
     }
   ]
 }

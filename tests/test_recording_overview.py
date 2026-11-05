@@ -114,6 +114,19 @@ class ActionMessageFormattingTests(unittest.TestCase):
             self.assertIs(notification["admin_only"], True)
             self.assertIs(notification["is_dismissed"], True)
 
+    def test_delayed_pages_are_sent_in_order_with_spacing(self):
+        from catchuparr import action_messages
+
+        events = []
+        notifications = [{"title": f"page {number}"} for number in range(1, 4)]
+        with patch.object(action_messages.time, "sleep", lambda seconds: events.append(seconds)):
+            action_messages._send_follow_ups_later(
+                notifications, lambda notification: events.append(notification["title"]),
+            )
+        spacing = action_messages.FOLLOW_UP_SPACING_SECONDS
+        self.assertGreater(spacing, 0)
+        self.assertEqual(["page 1", spacing, "page 2", spacing, "page 3"], events)
+
     def test_unavailable_push_shows_rows_with_missing_note(self):
         rows = [f"Synthetic Channel {index} - Source [ok]" for index in range(30)]
 
@@ -477,6 +490,29 @@ class RecordingOverviewTests(unittest.TestCase):
         self.assertEqual(self.shown(result),
                          "Synthetic Channel A - Synthetic [ok, attached]")
         self.assertEqual(result["channels"][0]["state"], "recording")
+        self.assertNotIn("preferred_source", result["channels"][0])
+
+    def test_dedicated_recorder_on_a_fallback_source_is_marked(self):
+        started = self.now.timestamp() - 20
+        with sqlite3.connect(self.database) as db:
+            db.execute("INSERT INTO segments VALUES (?, ?, ?, ?)", (
+                self.channel, started, self.now.timestamp(), self.now.timestamp(),
+            ))
+        diagnostic = self._diagnostic(started=started)
+        diagnostic[self.channel]["source"] = "dedicated"
+        for preferred, expected in ((False, "[ok, fallback]"), (True, "[ok]"), (None, "[ok]")):
+            with patch("catchuparr.recording_overview._channel_metadata", return_value={
+                self.channel: {"number": 12, "name": "Synthetic Channel A"},
+            }), patch("catchuparr.recording_overview.read_recorder_diagnostics", return_value=diagnostic), \
+                 patch("catchuparr.recording_overview.source_metadata", return_value={
+                     "stream_name": "Synthetic Stream Name", "m3u_profile_name": "Synthetic M3U Profile",
+                     "provider_id": "42", "stream_id": "17",
+                 }), patch("catchuparr.recorder_proxy.is_preferred_source", return_value=preferred):
+                result = current_recordings(
+                    self.settings, self.control, redis_client=self.redis, now=self.now,
+                )
+            self.assertEqual(self.shown(result), f"Synthetic Channel A - Synthetic {expected}")
+            self.assertIs(result["channels"][0]["preferred_source"], preferred)
 
     def test_active_error_is_safe_and_unknown_schedule_is_explicit(self):
         error = self._diagnostic(started=self.now.timestamp(), phase="error")

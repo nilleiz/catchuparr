@@ -8,7 +8,7 @@ from unittest.mock import patch
 from catchuparr.action_messages import ROW_SEPARATOR, join_rows
 from catchuparr.configuration import SourceCatalog, apply_configuration, load_applied_state_readonly
 from catchuparr.plugin import Plugin
-from catchuparr.recording_schedule_overview import today_schedule
+from catchuparr.recording_schedule_overview import today_schedule, today_shows
 from catchuparr.schedule import normalize_schedule
 
 
@@ -46,40 +46,75 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         self.sent.clear()
         return join_rows(rows)
 
-    def test_show_windows_join_the_weekly_windows_of_today(self):
+    def _with_show_windows(self, root):
         from catchuparr.epg_rules import Show, Window
         from catchuparr.show_windows import store_windows, windows_path
 
+        current = settings({"a": {"daily": [{"start": "09:00", "end": "10:00"}]}, "b": "continuous"},
+                           "UTC")
+        current.update({"archive_root": root, "show_rules": [{
+            "index": 1, "name": "n", "channel_uuids": ["a", "b"], "match": {}, "schedule": None,
+            "padding": {"before": 0, "after": 0},
+        }]})
+        day = datetime(2026, 11, 2, tzinfo=timezone.utc).timestamp()
+        store_windows(windows_path(current), {"a": [
+            Window(day + 9.5 * 3600, day + 11 * 3600, (1,),
+                   (Show(day + 9.5 * 3600, day + 11 * 3600, "Show X", 1),)),
+            Window(day + 20 * 3600, day + 22 * 3600, (1,),
+                   (Show(day + 20 * 3600, day + 22 * 3600, "Show Y", 1),)),
+            Window(day + 30 * 3600, day + 31 * 3600, (1,)),
+        ]})
+        return current
+
+    def test_channel_schedule_lists_only_the_weekly_windows(self):
         with tempfile.TemporaryDirectory() as root:
-            current = settings({"a": {"daily": [{"start": "09:00", "end": "10:00"}]}, "b": "continuous"},
-                               "UTC")
-            current.update({"archive_root": root, "show_rules": [{
-                "index": 1, "name": "n", "channel_uuids": ["a", "b"], "match": {}, "schedule": None,
-                "padding": {"before": 0, "after": 0},
-            }]})
-            day = datetime(2026, 11, 2, tzinfo=timezone.utc).timestamp()
-            store_windows(windows_path(current), {"a": [
-                Window(day + 9.5 * 3600, day + 11 * 3600, (1,),
-                       (Show(day + 9.5 * 3600, day + 11 * 3600, "Show X", 1),)),
-                Window(day + 20 * 3600, day + 22 * 3600, (1,),
-                       (Show(day + 20 * 3600, day + 22 * 3600, "Show Y", 1),)),
-                Window(day + 30 * 3600, day + 31 * 3600, (1,)),
-            ]})
+            current = self._with_show_windows(root)
             result = today_schedule(current, {}, now=datetime(2026, 11, 2, 12, tzinfo=timezone.utc))
-        shows = {row["channel_uuid"]: row["shows"] for row in result["channels"]}
-        self.assertEqual(
-            [("09:30", "11:00", "Show X"), ("20:00", "22:00", "Show Y")],
-            [(x["start"], x["end"], x["title"]) for x in shows["a"]],
-        )
-        self.assertEqual([], shows["b"])
-        self.assertIn("2 planned shows", result["message"])
-        self.assertIn("Show · 20:00–22:00 Show Y › Unknown channel", self.shown(result))
         by_name = {row["channel_uuid"]: row["windows"] for row in result["channels"]}
-        self.assertEqual(
-            [("09:00", "11:00", "past"), ("20:00", "22:00", "upcoming")],
-            [(w["start"], w["end"], w["status"]) for w in by_name["a"]],
-        )
+        self.assertEqual([("09:00", "10:00", "past")],
+                         [(w["start"], w["end"], w["status"]) for w in by_name["a"]])
         self.assertEqual([("00:00", "24:00")], [(w["start"], w["end"]) for w in by_name["b"]])
+        self.assertNotIn("shows", result["channels"][0])
+        self.assertNotIn("Show", self.shown(result))
+        self.assertEqual(2, result["summary"]["window_count"])
+
+    def test_shows_schedule_lists_the_planned_programmes_of_today(self):
+        with tempfile.TemporaryDirectory() as root:
+            current = self._with_show_windows(root)
+            result = today_shows(current, {"a": {"number": 1, "name": "Synthetic Channel A"}},
+                                 now=datetime(2026, 11, 2, 12, tzinfo=timezone.utc))
+        self.assertEqual(["a"], [row["channel_uuid"] for row in result["channels"]])
+        self.assertEqual(
+            [("09:30", "11:00", "Show X", "past"), ("20:00", "22:00", "Show Y", "upcoming")],
+            [(x["start"], x["end"], x["title"], x["status"]) for x in result["channels"][0]["shows"]],
+        )
+        self.assertEqual("Today's shows: 2 shows on 1 channel. Details in 1 toast.", result["message"])
+        self.assertEqual(join_rows((
+            "09:30–11:00 Show X › Synthetic Channel A",
+            "20:00–22:00 Show Y › Synthetic Channel A",
+        )), self.shown(result))
+        self.assertEqual(2, result["summary"]["show_count"])
+
+    def test_shows_schedule_without_rules_or_shows_says_so(self):
+        plain = today_shows(settings({"a": "continuous"}), {},
+                            now=datetime(2026, 11, 2, 12, tzinfo=timezone.utc))
+        self.assertEqual("No show rules are applied.", plain["message"])
+        self.assertEqual([], plain["channels"])
+        with tempfile.TemporaryDirectory() as root:
+            current = self._with_show_windows(root)
+            paused = today_shows(current, {}, control_state=SimpleNamespace(paused=True),
+                                 now=datetime(2026, 11, 4, 12, tzinfo=timezone.utc))
+        self.assertEqual("Recording paused. No shows planned today.", paused["message"])
+        invalid = today_shows({"channel_uuids": "a", "recording_schedule": {}}, {})
+        self.assertEqual("schedule_unavailable", invalid["status"])
+
+    def test_shows_action_routes_to_the_shows_schedule(self):
+        with patch("catchuparr.configuration.load_applied_state_readonly",
+                   return_value=(settings({"a": "continuous"}), None)), \
+             patch("catchuparr.recording_schedule_overview.channel_metadata", return_value={}):
+            result = Plugin.__new__(Plugin).run("today_shows", {}, {})
+        self.assertEqual("ok", result["status"])
+        self.assertEqual("No show rules are applied.", result["message"])
 
     def test_continuous_and_multiple_windows_sorted_with_channel_metadata(self):
         result = today_schedule(settings({"a": "continuous", "b": {"daily": [
@@ -111,7 +146,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                                 now=datetime(2026, 10, 19, 7, tzinfo=timezone.utc))
         self.assertTrue(result["recording_paused"])
         self.assertEqual(result["message"],
-                         "Recording paused. Today's schedule: 1 channel in 1 period. Details in 1 toast.")
+                         "Recording paused. Today's channel schedule: 1 channel in 1 period. Details in 1 toast.")
         self.assertEqual(self.shown(result), "09:00–10:00 › Unknown channel")
         active = today_schedule(settings({"a": "continuous"}), {},
                                  control_state=type("Control", (), {"paused": False})(),
@@ -124,7 +159,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
                                       now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
         self.assertTrue(paused_empty["recording_paused"])
         self.assertEqual(self.shown(paused_empty),
-                         "Recording paused. No recordings scheduled today.")
+                         "Recording paused. No channel recordings scheduled today.")
         self.assertEqual(self.sent, [])
 
     def test_past_current_and_upcoming_statuses(self):
@@ -159,7 +194,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
     def test_empty_message_and_schedule_unavailable_are_explicit(self):
         empty = today_schedule(settings({"free": {"sunday": []}}), {},
                                now=datetime(2026, 10, 18, 8, tzinfo=timezone.utc))
-        self.assertEqual(self.shown(empty), "No recordings scheduled today.")
+        self.assertEqual(self.shown(empty), "No channel recordings scheduled today.")
         invalid = today_schedule({"channel_uuids": "a", "recording_schedule": {}}, {})
         self.assertEqual(invalid["status"], "schedule_unavailable")
         self.assertIn("unavailable", self.shown(invalid).lower())
@@ -265,7 +300,7 @@ class RecordingScheduleOverviewTests(unittest.TestCase):
         )
         self.assertEqual(
             result["message"],
-            "Recording paused. Today's schedule: 2 channels in 1 period. Details in 1 toast.",
+            "Recording paused. Today's channel schedule: 2 channels in 1 period. Details in 1 toast.",
         )
         self.assertNotIn("\u00a0", self.shown(result))
         self.assertNotIn("\n", self.shown(result))

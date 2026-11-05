@@ -132,6 +132,8 @@ def current_recordings(settings, control_state=None, *, redis_client=None, now=N
             "scheduled_now": scheduled if not schedule_error else None,
             "show": _current_show(settings, channel_uuid, instant),
         }
+        if source is not None and mode == "dedicated":
+            channel_row["preferred_source"] = _preferred_source(channel_uuid, source, settings)
         if diagnostic and diagnostic.get("phase") == "error":
             channel_row["error_code"] = diagnostic.get("error_code")
         if diagnostic and diagnostic.get("phase") == "recording":
@@ -239,6 +241,18 @@ def _source_for_diagnostic(channel_uuid, diagnostic):
         "m3u_profile_id": diagnostic.get("m3u_profile_id"),
         "input_profile_id": diagnostic.get("input_profile_id") or None,
     }
+
+
+def _preferred_source(channel_uuid, source, settings):
+    """Whether a dedicated recorder uses its best ranked source; None if unknown."""
+    try:
+        from .recorder_proxy import is_preferred_source
+
+        return is_preferred_source(
+            channel_uuid, source.get("stream_id"), source.get("account_id"), settings,
+        )
+    except Exception:
+        return None
 
 
 def _mode(diagnostic):
@@ -355,9 +369,13 @@ def _message_row(row):
         status = "unconfirmed"
     else:
         status = "failed: unknown"
-    attached = row.get("state") == "recording" and row.get("recent_media_progress") is True \
-        and row.get("mode") == "borrowed"
-    suffix = ", attached" if attached else ""
+    working = row.get("state") == "recording" and row.get("recent_media_progress") is True
+    if working and row.get("mode") == "borrowed":
+        suffix = ", attached"
+    elif working and row.get("mode") == "dedicated" and row.get("preferred_source") is False:
+        suffix = ", fallback"
+    else:
+        suffix = ""
     show = row.get("show")
     label = f" · Show: {_safe_display(show.get('title'))}" if isinstance(show, dict) and show.get("title") else ""
     return f"{name} - {m3u_first_word or '—'} [{status}{suffix}]{label}"

@@ -195,7 +195,8 @@ For a rebuild instead of an in-place upgrade, use the backup ZIP/API restoration
 procedure below. Run `python3 scripts/run_aio_integration.py --image <pinned-image>`
 once for the pinned Dispatcharr version (`--suite core` stops after the source
 configuration and show-rule checks, about a minute; the default `full` suite adds the recorder media
-and failover phases, about 13 minutes). Each invocation creates a uniquely
+and failover phases, about 14 minutes; `--suite media` or `--suite failover` runs only one of them,
+as the two parallel CI parts do). Each invocation creates a uniquely
 named, networkless container with its own anonymous `/data` volume and no fixed
 host ports. Capture the run's
 output in a separate private log outside the repository. The runner refuses

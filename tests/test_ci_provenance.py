@@ -68,7 +68,12 @@ def _run() -> dict:
         "jobs": [
             {"name": "test-and-package", "conclusion": "success"},
             {
-                "name": "AIO integration (0.33.0)",
+                "name": "AIO integration (0.33.0, media)",
+                "conclusion": "success",
+                "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
+            },
+            {
+                "name": "AIO integration (0.33.0, failover)",
                 "conclusion": "success",
                 "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
             },
@@ -154,8 +159,9 @@ class CIProvenanceTest(unittest.TestCase):
         )
         matrix = workflow["jobs"]["aio-integration"]["strategy"]["matrix"]["include"]
         self.assertEqual(REQUIRED_AIO_JOBS, {
-            f"AIO integration ({entry['version']})" for entry in matrix
+            f"AIO integration ({entry['version']}, {entry['part']})" for entry in matrix
         })
+        self.assertEqual({"media", "failover"}, {entry["part"] for entry in matrix})
         for entry in matrix:
             self.assertRegex(entry["image"], r"^ghcr\.io/dispatcharr/dispatcharr@sha256:[a-f0-9]{64}$")
 
@@ -521,16 +527,32 @@ class CIChangeClassificationTest(unittest.TestCase):
         evidence_block = workflow[evidence:workflow.index("- name: Record explicit manual")]
         self.assertIn("--suite core", core_block)
         self.assertIn("!contains(github.event.pull_request.labels.*.name, 'full-aio')", core_block)
-        self.assertIn("--suite full", evidence_block)
+        self.assertIn("--suite ${{ matrix.part }}", evidence_block)
+        self.assertIn("matrix.part == 'media'", core_block)
         self.assertNotIn("--suite core", evidence_block)
         self.assertIn("contains(github.event.pull_request.labels.*.name, 'full-aio')", evidence_block)
 
     def test_core_suite_ends_after_the_show_rule_phase(self):
         probe = (Path(__file__).resolve().parents[1] / "scripts/aio_integration_probe.py").read_text()
         self.assertLess(probe.index('phase("show_rules", "complete")'),
-                        probe.index('os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core"'))
-        self.assertLess(probe.index('os.environ.get("CATCHUPARR_AIO_SUITE", "full") == "core"'),
+                        probe.index('if suite == "core":'))
+        self.assertLess(probe.index('if suite == "core":'),
                         probe.index('phase("recorder_media", "started")'))
+        self.assertLess(probe.index('if suite in {"media", "full"}:'),
+                        probe.index('phase("recorder_media", "started")'))
+        self.assertLess(probe.index('if suite in {"failover", "full"}:'),
+                        probe.index('phase("recorder_failover", "started")'))
+
+    def test_unrelated_labels_neither_cancel_nor_start_a_run(self):
+        import yaml
+
+        workflow = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(),
+        )
+        guard = "github.event.action != 'labeled' || github.event.label.name == 'full-aio'"
+        for job in workflow["jobs"].values():
+            self.assertEqual(guard, job["if"])
+        self.assertIn("format('-label-{0}', github.event.label.name)", workflow["concurrency"]["group"])
 
     def test_changed_paths_uses_nul_delimited_git_diff(self):
         sha = "a" * 40
