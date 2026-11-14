@@ -25,6 +25,16 @@ class LoggingUtilsTests(unittest.TestCase):
             self.assertEqual(logging.INFO, logging.getLogger("catchuparr").level)
         self.assertIn("[Catchuparr] setting_invalid reason=log_level", captured.output[0])
 
+    def test_handover_fallback_reasons_are_logged_and_others_dropped(self):
+        with self.assertLogs("catchuparr", level="INFO") as captured:
+            event("sync_handover_fallback", reason="old_input_ended")
+            event("sync_handover_fallback", reason="Synthetic Free Text")
+        self.assertEqual(
+            "[Catchuparr] sync_handover_fallback reason=old_input_ended",
+            captured.records[0].getMessage(),
+        )
+        self.assertEqual("[Catchuparr] sync_handover_fallback", captured.records[1].getMessage())
+
     def test_error_categories_remain_visible_at_error_level(self):
         apply_log_level("ERROR")
         with self.assertLogs("catchuparr", level="ERROR") as captured:

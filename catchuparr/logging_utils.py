@@ -107,6 +107,8 @@ _STATE_KEYS = frozenset({
 })
 _SAFE_REASONS = frozenset({
     "version", "proxy_api", "cleanup_guard", "xc_hooks", "xc_uninstall", "log_level",
+    "start_failed", "limits", "old_input_ended", "new_input_ended", "timeout",
+    "archive_changed", "error",
 })
 _SAFE_ERROR_CALLSITES = frozenset({
     "show_windows_epg",
