@@ -4,6 +4,16 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.9.1] - 2026-11-14
+
+### Changed
+
+- The `sync_handover_fallback` log event names its cause as `reason=`:
+  `start_failed` (the new input could not be started), `limits` (the staged
+  input exceeded its size or time limits), `old_input_ended`, `new_input_ended`,
+  `timeout` (no overlap found within the allowed time), `archive_changed` or
+  `error`. Recording behavior is unchanged.
+
 ## [0.9.0] - 2026-11-05
 
 0.9.0 includes the Reattach action prepared as 0.8.4, which was not published

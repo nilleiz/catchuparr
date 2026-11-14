@@ -567,7 +567,7 @@ class FFmpegCopyRecorder:
         try:
             staged = target._start_staged_input()
         except Exception:
-            event("sync_handover_fallback")
+            event("sync_handover_fallback", reason="start_failed")
             switch.request()
             return None, offset, 0
         committed_total = 0
@@ -586,7 +586,7 @@ class FFmpegCopyRecorder:
                     notify(committed)
                 rows, complete_offset = _staged_csv_rows(staged.output_dir)
                 if not staged.within_limits():
-                    event("sync_handover_fallback")
+                    event("sync_handover_fallback", reason="limits")
                     switch.request()
                     return staged, offset, committed_total
                 if current_process.poll() is None and staged.process.poll() is None:
@@ -666,6 +666,11 @@ class FFmpegCopyRecorder:
                                     return staged, offset, committed_total
                 if (current_process.poll() is not None or staged.process.poll() is not None
                         or time.monotonic() >= deadline):
+                    reason = (
+                        "old_input_ended" if current_process.poll() is not None
+                        else "new_input_ended" if staged.process.poll() is not None
+                        else "timeout"
+                    )
                     if current_process.poll() is not None:
                         # The outgoing input ended on its own, so its final
                         # closed segment is still this attempt's to publish.
@@ -681,7 +686,7 @@ class FFmpegCopyRecorder:
                     # The attempted comparison timed out or an input stopped.
                     # Retain this exact one-use reader for the normal handover.
                     staged.offset = self._fallback_offset(rows, complete_offset)
-                    event("sync_handover_fallback")
+                    event("sync_handover_fallback", reason=reason)
                     switch.request()
                     return staged, offset, committed_total
                 stop_event.wait(0.2)
@@ -694,7 +699,7 @@ class FFmpegCopyRecorder:
             # that capability for a second time.
             staged.close()
             if not stop_event.is_set():
-                event("sync_handover_fallback")
+                event("sync_handover_fallback", reason="error")
                 switch.request()
                 return staged, offset, committed_total
         staged.close()
@@ -717,7 +722,7 @@ class FFmpegCopyRecorder:
         try:
             staged = self._start_staged_input()
         except Exception:
-            event("sync_handover_fallback")
+            event("sync_handover_fallback", reason="start_failed")
             return None
         return self._join_archive_tail(
             staged, previous[-1], stop_event, switch,
@@ -757,7 +762,7 @@ class FFmpegCopyRecorder:
             while not interrupted():
                 rows, _ = _staged_csv_rows(staged.output_dir)
                 if not staged.within_limits():
-                    event("sync_handover_fallback")
+                    event("sync_handover_fallback", reason="limits")
                     return staged
                 current = self.store.segments(self.channel_id)
                 if not current or current[-1].id != previous_segment_id:
@@ -794,14 +799,18 @@ class FFmpegCopyRecorder:
             if interrupted():
                 staged.close()
                 return staged
-            event("sync_handover_fallback")
+            event("sync_handover_fallback", reason=(
+                "new_input_ended" if staged.process.poll() is not None
+                else "timeout" if time.monotonic() >= deadline
+                else "archive_changed"
+            ))
             # This reader was opened after the prior cleanup, so its earliest
             # staged segment is eligible for the normal dedicated fallback.
             return staged
         except Exception:
             staged.close()
             if not stop_event.is_set():
-                event("sync_handover_fallback")
+                event("sync_handover_fallback", reason="error")
             return staged
 
     def run_candidate(
