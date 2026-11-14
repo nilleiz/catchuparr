@@ -560,7 +560,10 @@ class FFmpegCopyRecorder:
     def _try_synchronized_handover(
         self, target, current_process, list_path, offset, stop_event, switch, notify,
     ):
-        """Keep recording while a bounded, content-proven overlap is sought."""
+        """Keep recording while a bounded, content-proven overlap is sought.
+
+        Every fallback to the normal handover is logged with its cause.
+        """
         from ..logging_utils import event
         from .handover import matching_completed_segments
 
