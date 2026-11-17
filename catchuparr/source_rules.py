@@ -504,7 +504,8 @@ def _load_document(text: str) -> tuple[dict[str, Any] | None, tuple[int, ...]]:
         document,
         line=1,
         field="filter_config",
-        allowed={"version", "profile", "rules", "timezone", "schedule", "handover"},
+        allowed={"version", "profile", "rules", "timezone", "schedule", "handover",
+                 "default_show_padding", "default_show_include_previous", "default_show_include_next"},
         required={"version", "rules"},
     )
     return document, rule_lines
@@ -558,6 +559,23 @@ def _flatten_m3u(rule: dict[str, Any], *, line: int, field: str) -> tuple[dict[s
     return {**{key: value for key, value in rule.items() if key != "m3u"}, **nested}, False
 
 
+_SHOW_DEFAULT_KEYS = ("padding", "include_previous", "include_next")
+
+
+def _resolve_show_defaults(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the top-level ``default_show_*`` keys applied to every shows rule."""
+    defaults = {
+        key: document[f"default_show_{key}"] for key in _SHOW_DEFAULT_KEYS if f"default_show_{key}" in document
+    }
+    try:
+        compile_padding(defaults.get("padding"), field="default_show_padding")
+        for key in ("include_previous", "include_next"):
+            compile_neighbour(defaults.get(key), field=f"default_show_{key}")
+    except ShowRuleError as exc:
+        raise SourceRuleError(f"line 1, {exc}") from None
+    return defaults
+
+
 def _compile_show_rule(
     rule: dict[str, Any],
     *,
@@ -567,11 +585,15 @@ def _compile_show_rule(
     eligible_ids: set[str],
     profiles_by_name: dict[str, dict[str, Any]],
     schedule_days,
+    defaults: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], set[str]]:
     field = f"rules[{number - 1}].shows"
     show = _mapping(rule["shows"], line=line, field=field,
                     allowed={"name", "match", "channels", "padding", "include_previous", "include_next"},
                     required={"match"})
+    # Top-level default_show_* keys fill in what the rule leaves out; a rule value,
+    # including false, always wins.
+    show = {**(defaults or {}), **show}
     name = show.get("name", f"rule {number}")
     if not isinstance(name, str) or not name:
         raise SourceRuleError(f"line {line}, field {field}.name: expected text")
@@ -684,6 +706,7 @@ def compile_filter_config(
         document.get("handover"), account_names=account_names, account_ids=account_ids,
         ambiguous_account_names=ambiguous_account_names,
     )
+    show_defaults = _resolve_show_defaults(document)
     all_rule = None
     warnings: list[str] = []
     show_entries: list[dict[str, Any]] = []
@@ -726,7 +749,7 @@ def compile_filter_config(
             compiled_show, show_profile_ids = _rule_call(
                 index, _compile_show_rule, rule, number=index, line=line, channel_rows=channel_rows,
                 eligible_ids=eligible_ids, profiles_by_name=profiles_by_name,
-                schedule_days=rule_schedule_days,
+                schedule_days=rule_schedule_days, defaults=show_defaults,
             )
             referenced_profile_ids.update(show_profile_ids)
             patch = _rule_call(

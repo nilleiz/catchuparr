@@ -141,6 +141,27 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual({"min": 10}, rule["include_previous"])
         self.assertEqual({}, rule["include_next"])
 
+    def test_show_defaults_apply_unless_rule_overrides(self):
+        shows = dict(self.settings, filter_config=(
+            "version: 1\n"
+            "default_show_include_previous: {min: 5, max: 30}\ndefault_show_include_next: {min: 5, max: 60}\n"
+            "rules:\n  - shows:\n      match: {title: {contains: x}}\n"
+            "  - shows:\n      match: {title: {contains: y}}\n"
+            "      include_previous: false\n      include_next: {max: 10}\n"
+        ))
+        apply_configuration(shows, self.catalog, self.active_path)
+        first, second = load_active_configuration(self.active_path)["show_rules"]
+        self.assertEqual({"min": 5, "max": 30}, first["include_previous"])
+        self.assertEqual({"min": 5, "max": 60}, first["include_next"])
+        self.assertNotIn("include_previous", second)
+        self.assertEqual({"max": 10}, second["include_next"])
+        broken = dict(self.settings, filter_config=(
+            "version: 1\ndefault_show_include_next: {min: 0}\n"
+            "rules:\n  - shows:\n      match: {title: {contains: x}}\n"
+        ))
+        with self.assertRaises(Exception):
+            validate_configuration(broken, self.catalog)
+
     def test_invalid_persisted_show_rules_are_rejected(self):
         shows = dict(self.settings, filter_config=(
             "version: 1\nrules:\n  - shows:\n      match: {title: {contains: x}}\n"

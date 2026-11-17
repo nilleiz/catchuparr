@@ -48,6 +48,18 @@ rules:
     match, `padding.after` to the end of those after it.
   - Overviews still name the matched programme only; the validation preview adds
     the recording span, for example `20:00–20:15 Example (records 19:28–20:47)`.
+- Global defaults: the top-level keys `default_show_padding`,
+  `default_show_include_previous` and `default_show_include_next` apply to
+  every shows rule that does not set `padding`, `include_previous` or
+  `include_next` itself. A rule value, including `false`, always wins.
+  `channels` rules are not affected:
+
+  ```yaml
+  version: 1
+  default_show_include_previous: { min: 5, max: 30 }
+  default_show_include_next: { min: 5, max: 60 }
+  rules: [...]
+  ```
 - Fields: `title`, `sub_title`, `description`. In `match`, next to the
   fields, `case_sensitive: true` makes all text operators case-sensitive, and
   `min_minutes` / `max_minutes` (1-1440) bound the programme length.
