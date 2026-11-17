@@ -6,6 +6,12 @@ included here to explain the feature history leading to 0.4.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Native CI and release evidence now cover Dispatcharr 0.34.0 in addition to
+  0.33.0 (both versions, media and failover). The minimum supported version is
+  still 0.33.0.
+
 ### Fixed
 
 - Dispatcharr 0.34.0 compatibility: that image has no `TZ`, no `/etc/timezone`

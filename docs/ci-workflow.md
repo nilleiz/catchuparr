@@ -2,7 +2,7 @@
 
 Pull requests always run the privacy check (see the change workflow in the
 development guide) and the unit and package checks. The pinned Dispatcharr
-0.33.0 native AIO probe runs only when the pull request changes product code
+0.33.0 and 0.34.0 native AIO probes runs only when the pull request changes product code
 (`catchuparr/`) or the AIO probes themselves (`scripts/aio_*.py`,
 `scripts/run_aio_*.py`); changes to tests, other scripts, documentation,
 workflows or Dev tooling skip it. Unavailable diff metadata or an unusual path
@@ -11,7 +11,8 @@ offers an explicit `skip_native` input for a manually requested package/unit
 validation run; its default is false, and the skip does not produce release
 acceptance evidence.
 
-The AIO job is a matrix of two parts, `media` and `failover`, each in its own
+The AIO job is a matrix of the pinned Dispatcharr versions 0.33.0 and 0.34.0,
+each with two parts, `media` and `failover`, each in its own
 disposable container. A pull request runs the **core** suite once, in the media
 part, in the step "Core checks in actual Dispatcharr AIO": compatibility, archive
 routes, the overview actions, source configuration with nested `m3u` filters,
@@ -47,8 +48,9 @@ The release workflow does not invoke CI. It searches successful, same-repository
 pull-request runs of the trusted CI workflow and accepts a run only when its
 Git tree exactly matches the release checkout. A merge commit SHA can differ
 from the release commit SHA; their tree identities must match. The
-`test-and-package`, `AIO integration (0.33.0, media)` and
-`AIO integration (0.33.0, failover)` jobs must all have succeeded, and the
+`test-and-package` job and the `media` and `failover` AIO jobs of both pinned
+versions (`AIO integration (0.33.0, media)`, `AIO integration (0.33.0, failover)`,
+`AIO integration (0.34.0, media)`, `AIO integration (0.34.0, failover)`) must all have succeeded, and the
 named native playback step inside both AIO parts must itself have succeeded. A run with the AIO step skipped is not release
 acceptance evidence.
 

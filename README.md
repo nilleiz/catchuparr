@@ -36,7 +36,7 @@ assignments, cloud storage or a transcoding service.
   [validation record](docs/validation.md).
 - The minimum supported Dispatcharr version is **0.33.0**. The compatibility
   guard accepts well-formed versions at or above that minimum. Native CI covers
-  the pinned 0.33.0 image. API-specific guards still fail closed when the
+  the pinned 0.33.0 and 0.34.0 images. API-specific guards still fail closed when the
   expected Dispatcharr interfaces do not match.
 - The primary playback path is authenticated M3U/XMLTV with local HLS playback
   using MPEG-TS segments. Native XC is guarded; acceptance with a particular
@@ -540,7 +540,7 @@ ruff check .
 python3 scripts/build_plugin.py
 ```
 
-Pull requests run the core Dispatcharr 0.33.0 AIO suite; release CI requires
+Pull requests run the core Dispatcharr AIO suite on 0.33.0 and 0.34.0; release CI requires
 the full suite (label `full-aio`), including its executed native playback step.
 See [CI and release evidence](docs/ci-workflow.md). The synthetic AIO checks include
 ordinary-viewer retention, first-viewer borrowing, cooldown timing, Stop and
