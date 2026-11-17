@@ -119,9 +119,30 @@ def resolve_timezone(
                 return validate_timezone(zone_name, field="system timezone")
             except ScheduleError:
                 continue
+    # Newer images ship /etc/localtime as a plain copy instead of a symlink. Only
+    # an exact UTC copy is recognised; any other zone is never guessed.
+    if _is_utc_copy(system_localtime):
+        return "Etc/UTC"
     raise ScheduleError(
         "field system timezone: could not determine an IANA timezone; set timezone or TZ"
     )
+
+
+def _is_utc_copy(path: Path) -> bool:
+    """Return whether ``path`` is a regular file identical to the installed UTC zone."""
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return False
+    if not content:
+        return False
+    for root in TZPATH:
+        try:
+            if (Path(root) / "Etc" / "UTC").read_bytes() == content:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _parse_clock(
