@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.ffmpeg_args import passthrough_args
 from catchuparr.engine.ts_timeline import (
     BASE_CLOCK,
     CLOCK_HZ,
@@ -16,6 +15,7 @@ from catchuparr.engine.ts_timeline import (
     _write_pts,
     mapped_chunks,
 )
+from tests.ffmpeg_args import passthrough_args
 
 
 class TransportClockTests(unittest.TestCase):

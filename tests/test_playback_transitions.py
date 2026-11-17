@@ -6,12 +6,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from tests.ffmpeg_args import passthrough_args
 from catchuparr.engine.store import ArchiveStore, Segment
 from catchuparr.engine.ts_timeline import PlaybackClockMap, mapped_chunks
 from catchuparr.http import ArchiveHTTPService
 from catchuparr.security import TokenStore
 from catchuparr.ts_http import ArchiveTSPlaybackService
+from tests.ffmpeg_args import passthrough_args
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires FFmpeg")
