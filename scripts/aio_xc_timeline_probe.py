@@ -7,6 +7,15 @@ from datetime import timedelta
 from urllib.parse import parse_qs, urlsplit
 
 
+def passthrough_args():
+    """Use -fps_mode where available; -vsync was removed in ffmpeg 9."""
+    help_text = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-h", "full"], check=False,
+        capture_output=True, text=True, timeout=30,
+    ).stdout
+    return ["-fps_mode", "passthrough"] if "-fps_mode" in help_text else ["-vsync", "0"]
+
+
 def _hls_transition_prefix(playlist_text, expected_ids):
     """Isolate the exact fixture transition from a continuous HLS playlist."""
     urls = [line for line in playlist_text.splitlines() if line and not line.startswith("#")]
@@ -88,7 +97,7 @@ def probe_xc_timeline(*, root, store, channel, start, timeshift, request, xc_par
     def verify_decode(path):
         decoded = subprocess.run([
             "ffmpeg", "-v", "error", "-xerror", "-protocol_whitelist", "file,crypto,data",
-            "-i", str(path), "-map", "0", "-vsync", "0", "-f", "framemd5", "-",
+            "-i", str(path), "-map", "0", *passthrough_args(), "-f", "framemd5", "-",
         ], check=False, capture_output=True, text=True, timeout=30)
         if decoded.returncode:
             # This diagnostic reads only generated synthetic fixture files.

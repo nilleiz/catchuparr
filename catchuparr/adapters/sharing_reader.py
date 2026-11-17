@@ -69,6 +69,12 @@ def redis_backend_signature(redis_client: Any) -> str:
         "socket_connect_timeout", "socket_keepalive", "socket_keepalive_options",
         "retry_on_timeout", "retry_on_error", "health_check_interval", "client_name",
         "protocol",
+        # redis-py 8 adds internal pool bookkeeping (maintenance notifications and
+        # copies of the original endpoint/timeouts). It never changes which
+        # backend or credentials the pool uses; host/port/db/auth stay hashed.
+        "himport_registry", "maint_notifications_config",
+        "maint_notifications_pool_handler", "orig_host_address",
+        "orig_socket_connect_timeout", "orig_socket_timeout",
     }
     allowed_fields = backend_fields | harmless_tuning_fields | {"credential_provider"}
     if set(kwargs) - allowed_fields:

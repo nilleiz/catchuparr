@@ -4,6 +4,24 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [Unreleased]
+
+### Fixed
+
+- Dispatcharr 0.34.0 compatibility: that image has no `TZ`, no `/etc/timezone`
+  and ships `/etc/localtime` as a plain UTC copy instead of a symlink, so rule
+  files without an explicit `timezone` were rejected. A `/etc/localtime` that is
+  byte-identical to the installed UTC zone is now recognised as `Etc/UTC`; other
+  zones are still never guessed.
+- Dispatcharr 0.34.0 exposes the TS stream route for GET and HEAD. The recorder
+  compatibility check now accepts HEAD in addition to GET; other methods are
+  still rejected.
+- Test and probe ffmpeg calls use `-fps_mode passthrough` where available,
+  because ffmpeg 9 in 0.34.0 no longer accepts `-vsync`.
+- Connection sharing no longer rejects the Redis pool of Dispatcharr 0.34.0.
+  Its redis-py 8 adds internal pool bookkeeping options; they are treated as
+  tuning and do not enter the backend identity.
+
 ## [0.9.1] - 2026-11-14
 
 ### Changed

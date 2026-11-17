@@ -259,6 +259,29 @@ class ScheduleTests(unittest.TestCase):
                 ),
             )
 
+    def test_system_timezone_detects_plain_utc_copy_of_localtime(self):
+        zone_file = Path(TZPATH[0]) / "Etc" / "UTC"
+        if not zone_file.is_file():
+            self.skipTest("system IANA timezone database is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            localtime = Path(directory) / "localtime"
+            localtime.write_bytes(zone_file.read_bytes())
+            self.assertEqual(
+                "Etc/UTC",
+                resolve_timezone(
+                    environ={},
+                    timezone_file=Path(directory) / "missing-timezone",
+                    localtime_path=localtime,
+                ),
+            )
+            localtime.write_bytes(b"not a zone")
+            with self.assertRaisesRegex(ScheduleError, "could not determine"):
+                resolve_timezone(
+                    environ={},
+                    timezone_file=Path(directory) / "missing-timezone",
+                    localtime_path=localtime,
+                )
+
     def test_invalid_timezone_inputs_and_undetectable_system_timezone_fail(self):
         with self.assertRaisesRegex(ScheduleError, "unknown IANA timezone"):
             resolve_timezone("Synthetic/Invalid", environ={"TZ": "Etc/UTC"})

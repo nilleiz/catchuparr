@@ -1042,6 +1042,8 @@ class RecorderMediaProbeTests(unittest.TestCase):
             "stdout_json_shape": "object",
             "known_result_keys": ["error", "exception_class"],
             "child_exception_class": "RuntimeError",
+            "child_exception_name": "",
+            "child_exception_frame": "",
         }, diagnostic)
         self.assertNotIn("synthetic-bearer-secret", json.dumps(diagnostic))
 

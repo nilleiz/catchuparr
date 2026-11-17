@@ -15,6 +15,7 @@ from catchuparr.engine.ts_timeline import (
     _write_pts,
     mapped_chunks,
 )
+from tests.ffmpeg_args import passthrough_args
 
 
 class TransportClockTests(unittest.TestCase):
@@ -138,7 +139,7 @@ class TransportClockTests(unittest.TestCase):
             def decoded_frames(path):
                 decoded = subprocess.run([
                     "ffmpeg", "-v", "error", "-xerror", "-i", str(path), "-map", "0",
-                    "-vsync", "0", "-f", "framemd5", "-",
+                    *passthrough_args(), "-f", "framemd5", "-",
                 ], check=True, capture_output=True, text=True)
                 streams = {}
                 for line in decoded.stdout.splitlines():

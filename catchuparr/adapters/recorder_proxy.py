@@ -294,7 +294,7 @@ def _stream_route_channel_id_issue(route, index: int, expected_view) -> str | No
         return f"signature:{route_name}.view-class"
 
     methods = set(getattr(view_class, "http_method_names", ()))
-    if "get" not in methods or not methods <= {"get", "options"}:
+    if "get" not in methods or not methods <= {"get", "head", "options"}:
         return f"methods:{route_name}.get"
     handler = getattr(view_class, "get", None)
     if handler is None:

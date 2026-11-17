@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -300,6 +301,14 @@ def assert_applied_global_sharing(
              "Applied channel runtime sharing values differ from the GUI settings")
 
 
+def _safe_token(value, key):
+    """Return a short identifier-like diagnostic token or an empty string."""
+    token = value.get(key) if isinstance(value, dict) else None
+    if isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_.:<>-]{1,120}", token):
+        return token
+    return ""
+
+
 def _crash_child_failure_diagnostic(result, expected_code, parsed_value, stdout_shape):
     """Describe a child failure without exposing captured stdout or stderr."""
     if not isinstance(parsed_value, dict):
@@ -313,6 +322,7 @@ def _crash_child_failure_diagnostic(result, expected_code, parsed_value, stdout_
             if key in {
                 "native_registered", "completed", "pending", "denied",
                 "closed", "opened", "read_ts", "error", "exception_class",
+                "exception_name", "exception_frame",
             }
         )
         raw_exception_class = parsed_value.get("exception_class")
@@ -333,6 +343,8 @@ def _crash_child_failure_diagnostic(result, expected_code, parsed_value, stdout_
         "stdout_json_shape": shape,
         "known_result_keys": keys,
         "child_exception_class": exception_class,
+        "child_exception_name": _safe_token(parsed_value, "exception_name"),
+        "child_exception_frame": _safe_token(parsed_value, "exception_frame"),
     }
 
 
