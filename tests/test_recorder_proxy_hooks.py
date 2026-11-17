@@ -323,7 +323,7 @@ class RecorderProxyHookTests(unittest.TestCase):
             (),
             {
                 "__module__": proxy_views.__name__,
-                "http_method_names": ["get", "options"],
+                "http_method_names": ["get", "head", "options"],
                 "get": drf_get_handler,
             },
         )

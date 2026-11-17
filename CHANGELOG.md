@@ -13,6 +13,11 @@ included here to explain the feature history leading to 0.4.0.
   files without an explicit `timezone` were rejected. A `/etc/localtime` that is
   byte-identical to the installed UTC zone is now recognised as `Etc/UTC`; other
   zones are still never guessed.
+- Dispatcharr 0.34.0 exposes the TS stream route for GET and HEAD. The recorder
+  compatibility check now accepts HEAD in addition to GET; other methods are
+  still rejected.
+- Test and probe ffmpeg calls use `-fps_mode passthrough` where available,
+  because ffmpeg 9 in 0.34.0 no longer accepts `-vsync`.
 
 ## [0.9.1] - 2026-11-14
 
