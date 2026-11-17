@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .file_locking import cooperative_flock
 from .native_output_security import ensure_native_key, native_key_id_valid
 from .runtime import PLUGIN_KEY, parse_settings
 
@@ -2379,7 +2380,7 @@ class _config_lock:
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.handle = self.path.with_suffix(self.path.suffix + ".lock").open("a+")
-        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH)
+        cooperative_flock(self.handle.fileno(), fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH)
         return self
 
     def __exit__(self, exc_type, exc, traceback):
