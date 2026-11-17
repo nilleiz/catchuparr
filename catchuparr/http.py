@@ -26,6 +26,7 @@ from urllib.parse import quote
 
 from .engine.admission import playback_admission_lock
 from .engine.store import TIMELINE_GAP_TOLERANCE_SECONDS
+from .file_locking import cooperative_flock
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +158,7 @@ def _error(status: int, message: str = "") -> HTTPResponse:
 def _archive_file_lock(root: Path | str, name: str):
     lock_path = Path(root) / f".http-playback-{name}.lock"
     with lock_path.open("a") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        cooperative_flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
