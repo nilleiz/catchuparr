@@ -1,0 +1,133 @@
+name: Upstream compatibility
+
+# Checks every new stable Dispatcharr release against the plugin: runs the
+# release-evidence AIO suites (media and failover) on the new official image and
+# opens one issue per version with the result. A version is checked once; the
+# existing issue (open or closed) is the record. A manual dispatch can recheck a
+# specific stable version.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable Dispatcharr version to check (for example 0.34.0); empty checks the newest unchecked release"
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: upstream-compat
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect new stable release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      check: ${{ steps.decide.outputs.check }}
+      version: ${{ steps.release.outputs.version }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Find the newest stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: python scripts/upstream_release.py --version "$REQUESTED_VERSION" --output "$GITHUB_OUTPUT"
+      - name: Skip versions that already have a result issue
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          NEWER: ${{ steps.release.outputs.check }}
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          check=false
+          if [ "$NEWER" = "true" ] && [ -n "$VERSION" ]; then
+            check=true
+            if [ -z "$MANUAL_VERSION" ]; then
+              found=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --label upstream-compat \
+                --search "\"Dispatcharr $VERSION:\" in:title" --json title --jq 'length')
+              [ "$found" -gt 0 ] && check=false
+            fi
+          fi
+          echo "check=$check" >> "$GITHUB_OUTPUT"
+          echo "Dispatcharr $VERSION: check=$check"
+      - name: Resolve the official image digest
+        id: image
+        if: steps.decide.outputs.check == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "ghcr.io/dispatcharr/dispatcharr:${VERSION}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"' > digest.txt
+          digest=$(cat digest.txt)
+          case "$digest" in sha256:*) ;; *) echo "No image digest for $VERSION" >&2; exit 1;; esac
+          echo "image=ghcr.io/dispatcharr/dispatcharr@${digest}" >> "$GITHUB_OUTPUT"
+
+  aio:
+    name: AIO ${{ needs.detect.outputs.version }} (${{ matrix.part }})
+    needs: detect
+    if: needs.detect.outputs.check == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [media, failover]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Synthetic playback in the new Dispatcharr AIO
+        env:
+          IMAGE: ${{ needs.detect.outputs.image }}
+        run: python scripts/run_aio_integration.py --suite ${{ matrix.part }} --image "$IMAGE"
+
+  report:
+    name: Report result
+    needs: [detect, aio]
+    if: always() && needs.detect.outputs.check == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open the result issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          IMAGE: ${{ needs.detect.outputs.image }}
+          RESULT: ${{ needs.aio.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create upstream-compat --repo "$GITHUB_REPOSITORY" \
+            --description "Dispatcharr release compatibility check" --color 0e8a16 2>/dev/null || true
+          if [ "$RESULT" = "success" ]; then
+            title="Dispatcharr $VERSION: compatible"
+            body="The AIO suites (media and failover) passed on Dispatcharr $VERSION (\`$IMAGE\`).
+
+          Next step: add \`$VERSION\` to \`TESTED_DISPATCHARR_VERSIONS\` in \`catchuparr/compatibility.py\`, update the pinned CI image and the documentation, and release.
+
+          Run: $RUN_URL"
+          else
+            title="Dispatcharr $VERSION: incompatible ($RESULT)"
+            body="The AIO suites did not pass on Dispatcharr $VERSION (\`$IMAGE\`); result: \`$RESULT\`. Check whether the plugin or the probe needs an adjustment before this version is recommended.
+
+          Run: $RUN_URL"
+          fi
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label upstream-compat

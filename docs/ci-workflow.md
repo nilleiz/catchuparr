@@ -70,3 +70,17 @@ with an instruction to rerun the complete pull-request CI workflow explicitly
 for the exact source tree. A manual CI dispatch is useful for diagnosis, but
 the release accepts pull-request CI provenance only. The release workflow never
 starts another AIO run automatically.
+
+## Upstream release check
+
+The workflow `upstream-compat.yml` runs daily and on manual dispatch. It looks up
+the newest stable Dispatcharr release (no pre-releases or drafts), and if that
+version is higher than the highest entry of `TESTED_DISPATCHARR_VERSIONS` in
+`catchuparr/compatibility.py` and has no result issue yet, it resolves the
+official image digest and runs the `media` and `failover` AIO suites against it.
+It then opens one issue labelled `upstream-compat`: "Dispatcharr X: compatible"
+(next step: add the version to the tested list, update the pinned CI image and
+release) or "Dispatcharr X: incompatible". The issue also marks the version as
+checked. A manual dispatch with the `version` input rechecks a specific stable
+version regardless of existing issues. The check is advisory and not release
+evidence; the release still requires pull-request CI on the pinned image.
