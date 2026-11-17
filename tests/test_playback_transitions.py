@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from tests.ffmpeg_args import passthrough_args
 from catchuparr.engine.store import ArchiveStore, Segment
 from catchuparr.engine.ts_timeline import PlaybackClockMap, mapped_chunks
 from catchuparr.http import ArchiveHTTPService
@@ -52,7 +53,7 @@ class PlaybackTransitionTests(unittest.TestCase):
             combined.write_bytes(output)
             subprocess.run([
                 "ffmpeg", "-v", "error", "-xerror", "-i", str(combined),
-                "-map", "0", "-vsync", "0", "-f", "framemd5", "-",
+                "-map", "0", *passthrough_args(), "-f", "framemd5", "-",
             ], check=True, capture_output=True, timeout=30)
 
     def test_independent_av_sessions_cross_transition_without_replaying_the_gap(self):
@@ -146,7 +147,7 @@ class PlaybackTransitionTests(unittest.TestCase):
                     for playback in (local_playlist, transport_file):
                         decoded = subprocess.run([
                             "ffmpeg", "-v", "error", "-xerror", "-protocol_whitelist", "file,crypto,data",
-                            "-i", str(playback), "-map", "0", "-vsync", "0", "-f", "framemd5", "-",
+                            "-i", str(playback), "-map", "0", *passthrough_args(), "-f", "framemd5", "-",
                         ], check=True, capture_output=True, text=True, timeout=30)
                         counts = {}
                         for line in decoded.stdout.splitlines():
