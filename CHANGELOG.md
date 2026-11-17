@@ -4,9 +4,9 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
-## [0.9.2] - 2026-11-17
+## [0.9.3] - 2026-11-17
 
-Compatibility with Dispatcharr 0.34.0 and global defaults for show rules.
+Global defaults for show rules.
 
 ### Added
 
@@ -14,6 +14,10 @@ Compatibility with Dispatcharr 0.34.0 and global defaults for show rules.
   `default_show_include_next` set `padding`, `include_previous` and
   `include_next` for every shows rule that does not set them itself. A rule
   value, including `false`, always wins; `channels` rules are not affected.
+
+## [0.9.2] - 2026-11-17
+
+Compatibility with Dispatcharr 0.34.0.
 
 ### Changed
 
