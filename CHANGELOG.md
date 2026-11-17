@@ -4,7 +4,9 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
-## [Unreleased]
+## [0.9.2] - 2026-11-17
+
+Compatibility with Dispatcharr 0.34.0.
 
 ### Changed
 
