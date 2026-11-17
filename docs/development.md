@@ -90,7 +90,7 @@ previous ZIP for rollback. Both POST routes require an admin account in the
 inspected image. It is no longer a supported runtime; use the Plugins page or
 verify the equivalent admin interface on the current image.
 
-The minimum supported Dispatcharr version is v0.33.0. Well-formed versions at or above that minimum pass version admission; runtime API capability checks remain mandatory. Authoritative CI covers the pinned 0.33.0 image. The native playback step and package job must succeed before release-artifact reuse; missing, skipped or failed evidence is insufficient. Custom images must retain the inspected core signatures and pass request tests before compatibility is claimed.
+The minimum supported Dispatcharr version is v0.33.0. Well-formed versions at or above that minimum pass version admission; runtime API capability checks remain mandatory. Authoritative CI covers the pinned 0.33.0 and 0.34.0 images. The native playback step and package job must succeed before release-artifact reuse; missing, skipped or failed evidence is insufficient. Custom images must retain the inspected core signatures and pass request tests before compatibility is claimed.
 
 Create a separate archive access token for each playback device. Session identity is scoped to the credential, not proof of physical device identity: copying a playlist to another player shares its slot. Playlist reloads for the same programme reuse its session; switching programmes replaces that credential's session while preserving its previous segment URLs for a 30-second grace period.
 

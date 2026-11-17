@@ -3,7 +3,7 @@
 import re
 
 MINIMUM_DISPATCHARR_VERSION = "0.33.0"
-TESTED_DISPATCHARR_VERSIONS = ("0.33.0",)
+TESTED_DISPATCHARR_VERSIONS = ("0.33.0", "0.34.0")
 _MINIMUM_PARTS = tuple(int(part) for part in MINIMUM_DISPATCHARR_VERSION.split("."))
 
 # Compatibility aliases for callers that imported the earlier constants.

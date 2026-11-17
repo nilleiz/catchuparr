@@ -77,6 +77,16 @@ def _run() -> dict:
                 "conclusion": "success",
                 "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
             },
+            {
+                "name": "AIO integration (0.34.0, media)",
+                "conclusion": "success",
+                "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
+            },
+            {
+                "name": "AIO integration (0.34.0, failover)",
+                "conclusion": "success",
+                "steps": [{"name": REQUIRED_AIO_STEP, "conclusion": "success"}],
+            },
         ],
     }
 

@@ -20,7 +20,11 @@ WORKFLOW_PATH = ".github/workflows/ci.yml"
 ARTIFACT_NAME = "catchuparr-plugin"
 SCHEMA_VERSION = 1
 # The full AIO suite runs as two parallel parts; both must pass the evidence step.
-REQUIRED_AIO_JOBS = {"AIO integration (0.33.0, media)", "AIO integration (0.33.0, failover)"}
+REQUIRED_AIO_JOBS = {
+    f"AIO integration ({version}, {part})"
+    for version in ("0.33.0", "0.34.0")
+    for part in ("media", "failover")
+}
 REQUIRED_JOBS = {"test-and-package", *REQUIRED_AIO_JOBS}
 REQUIRED_AIO_STEP = "Synthetic playback in actual Dispatcharr AIO"
 PACKAGE_SUFFIXES = {".py", ".json", ".png"}

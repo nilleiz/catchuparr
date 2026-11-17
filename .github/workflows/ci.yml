@@ -40,6 +40,12 @@ jobs:
           - version: '0.33.0'
             part: failover
             image: ghcr.io/dispatcharr/dispatcharr@sha256:96bc548978c68e684677da7895692eeeefb7f0b2edfa38311dac2b702c61d236
+          - version: '0.34.0'
+            part: media
+            image: ghcr.io/dispatcharr/dispatcharr@sha256:bcf8dda41864e52b00f30136d882d8b61299a1ca6612d61124850186b2320f60
+          - version: '0.34.0'
+            part: failover
+            image: ghcr.io/dispatcharr/dispatcharr@sha256:bcf8dda41864e52b00f30136d882d8b61299a1ca6612d61124850186b2320f60
     steps:
       - uses: actions/checkout@v4
         with:
