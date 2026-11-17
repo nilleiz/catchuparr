@@ -4,6 +4,17 @@ Changes are listed from version 0.2.0 onward. Versions 0.2.0 through 0.3.1
 were development candidates and were not published as GitHub releases. They are
 included here to explain the feature history leading to 0.4.0.
 
+## [0.9.4] - 2026-11-17
+
+Fixes a startup deadlock.
+
+### Fixed
+
+- Dispatcharr's web workers could hang at startup and stop answering: under
+  uWSGI with gevent a blocking file lock stopped the whole worker, including
+  the greenlet that already held the lock. Catchuparr's configuration and
+  playback locks now wait cooperatively.
+
 ## [0.9.3] - 2026-11-17
 
 Global defaults for show rules.
