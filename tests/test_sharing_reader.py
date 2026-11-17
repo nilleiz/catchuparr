@@ -674,6 +674,12 @@ class SharingReaderTests(unittest.TestCase):
         tuned = ssl_pool(socket_timeout=0.25, health_check_interval=10,
                          socket_keepalive=True, decode_responses=False)
         self.assertEqual(redis_backend_signature(baseline), redis_backend_signature(tuned))
+        redis8 = ssl_pool(
+            himport_registry=object(), maint_notifications_config=object(),
+            maint_notifications_pool_handler=object(), orig_host_address="synthetic.invalid",
+            orig_socket_connect_timeout=5, orig_socket_timeout=60,
+        )
+        self.assertEqual(redis_backend_signature(baseline), redis_backend_signature(redis8))
         with self.assertRaises(BorrowReaderUnavailable) as captured:
             redis_backend_signature(ssl_pool(credential_provider=object()))
         self.assertNotIn("synthetic-secret", str(captured.exception))

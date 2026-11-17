@@ -18,6 +18,9 @@ included here to explain the feature history leading to 0.4.0.
   still rejected.
 - Test and probe ffmpeg calls use `-fps_mode passthrough` where available,
   because ffmpeg 9 in 0.34.0 no longer accepts `-vsync`.
+- Connection sharing no longer rejects the Redis pool of Dispatcharr 0.34.0.
+  Its redis-py 8 adds internal pool bookkeeping options; they are treated as
+  tuning and do not enter the backend identity.
 
 ## [0.9.1] - 2026-11-14
 
