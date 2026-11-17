@@ -23,14 +23,15 @@ class CrashProbeBootstrapTests(unittest.TestCase):
         )
 
         self.assertEqual(70, result.returncode)
-        self.assertEqual(
-            {"error": True, "exception_class": "JSONDecodeError"},
-            json.loads(next(
-                line.split(" ", 1)[1]
-                for line in result.stdout.splitlines()
-                if line.startswith("CATCHUPARR_SHARING_CRASH_CHILD_RESULT ")
-            )),
-        )
+        emitted = json.loads(next(
+            line.split(" ", 1)[1]
+            for line in result.stdout.splitlines()
+            if line.startswith("CATCHUPARR_SHARING_CRASH_CHILD_RESULT ")
+        ))
+        self.assertEqual({"error", "exception_class", "exception_name", "exception_frame"}, set(emitted))
+        self.assertEqual("JSONDecodeError", emitted["exception_class"])
+        self.assertEqual("JSONDecodeError", emitted["exception_name"])
+        self.assertNotIn("not-json-private-payload", json.dumps(emitted))
         self.assertNotIn("not-json-private-payload", result.stdout + result.stderr)
 
     def test_child_imports_native_app_and_plugin_from_explicit_roots(self):

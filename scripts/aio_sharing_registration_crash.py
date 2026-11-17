@@ -169,11 +169,24 @@ def main(argv: list[str] | None = None) -> int:
             "TypeError", "ValueError",
         }
         exception_class = type(exc).__name__
+        # Fixed-shape location of the failing call (file base name, function,
+        # line); no message text is included.
+        frame = ""
+        tb = exc.__traceback__
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        if tb is not None:
+            frame = (
+                f"{Path(tb.tb_frame.f_code.co_filename).name}:"
+                f"{tb.tb_frame.f_code.co_name}:{tb.tb_lineno}"
+            )
         _emit({
             "error": True,
             "exception_class": (
                 exception_class if exception_class in allowed_exception_classes else "other"
             ),
+            "exception_name": exception_class[:80],
+            "exception_frame": frame[:120],
         })
         return 70
 
